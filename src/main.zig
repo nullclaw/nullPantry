@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const compat = @import("compat.zig");
 const api = @import("api.zig");
+const ids = @import("ids.zig");
 const store_mod = @import("store.zig");
 
 const default_port: u16 = 8765;
@@ -17,6 +18,13 @@ const RuntimeConfig = struct {
     token: ?[]const u8 = null,
     actor_scopes_json: []const u8 = "[\"admin\"]",
     actor_capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
+};
+
+const ServerState = struct {
+    allocator: std.mem.Allocator,
+    store: *store_mod.Store,
+    cfg: RuntimeConfig,
+    store_mutex: std.Io.Mutex = .init,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -43,44 +51,61 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("listening on http://{s}:{d}\n", .{ cfg.host, cfg.port });
     std.debug.print("storage backend: {s}\n", .{@tagName(cfg.backend)});
 
+    var state = ServerState{ .allocator = allocator, .store = &store, .cfg = cfg };
     while (true) {
-        var conn = server.accept(compat.io()) catch |err| {
+        const conn = server.accept(compat.io()) catch |err| {
             std.debug.print("accept error: {}\n", .{err});
             continue;
         };
-        defer conn.close(compat.io());
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const req_alloc = arena.allocator();
-
-        const raw = readHttpRequest(req_alloc, &conn, max_request_size) catch |err| {
-            std.debug.print("request read error: {}\n", .{err});
+        const thread = std.Thread.spawn(.{}, handleConnection, .{ &state, conn }) catch |err| {
+            var close_conn = conn;
+            close_conn.close(compat.io());
+            std.debug.print("spawn error: {}\n", .{err});
             continue;
-        } orelse continue;
-
-        const first_line_end = std.mem.indexOf(u8, raw, "\r\n") orelse continue;
-        const first_line = raw[0..first_line_end];
-        var parts = std.mem.splitScalar(u8, first_line, ' ');
-        const method = parts.next() orelse continue;
-        const target = parts.next() orelse continue;
-        const body = @import("json_util.zig").extractBody(raw);
-
-        var ctx = api.Context{ .allocator = req_alloc, .store = &store, .required_token = cfg.token, .actor_scopes_json = cfg.actor_scopes_json, .actor_capabilities_json = cfg.actor_capabilities_json };
-        const response = api.handleRequest(&ctx, method, target, body, raw);
-
-        var header_buf: [512]u8 = undefined;
-        const header = std.fmt.bufPrint(
-            &header_buf,
-            "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-            .{ response.status, response.body.len },
-        ) catch continue;
-        var write_buffer: [4096]u8 = undefined;
-        var writer = conn.writer(compat.io(), &write_buffer);
-        writer.interface.writeAll(header) catch continue;
-        writer.interface.writeAll(response.body) catch continue;
-        writer.interface.flush() catch continue;
+        };
+        thread.detach();
     }
+}
+
+fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
+    var conn = conn_value;
+    defer conn.close(compat.io());
+
+    var arena = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena.deinit();
+    const req_alloc = arena.allocator();
+    const request_id = ids.make(req_alloc, "req_") catch "req_error";
+
+    const raw = readHttpRequest(req_alloc, &conn, max_request_size) catch |err| {
+        std.debug.print("request_id={s} event=request_read_error error={}\n", .{ request_id, err });
+        return;
+    } orelse return;
+
+    const first_line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return;
+    const first_line = raw[0..first_line_end];
+    var parts = std.mem.splitScalar(u8, first_line, ' ');
+    const method = parts.next() orelse return;
+    const target = parts.next() orelse return;
+    const body = @import("json_util.zig").extractBody(raw);
+
+    var ctx = api.Context{ .allocator = req_alloc, .store = state.store, .required_token = state.cfg.token, .actor_scopes_json = state.cfg.actor_scopes_json, .actor_capabilities_json = state.cfg.actor_capabilities_json };
+    state.store_mutex.lockUncancelable(compat.io());
+    const response = api.handleRequest(&ctx, method, target, body, raw);
+    state.store_mutex.unlock(compat.io());
+
+    std.debug.print("request_id={s} method={s} target={s} status=\"{s}\"\n", .{ request_id, method, target, response.status });
+
+    var header_buf: [1024]u8 = undefined;
+    const header = std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n",
+        .{ response.status, response.body.len, request_id },
+    ) catch return;
+    var write_buffer: [4096]u8 = undefined;
+    var writer = conn.writer(compat.io(), &write_buffer);
+    writer.interface.writeAll(header) catch return;
+    writer.interface.writeAll(response.body) catch return;
+    writer.interface.flush() catch return;
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeConfig {
