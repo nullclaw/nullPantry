@@ -7,6 +7,29 @@ pub const sqlite_schema =
     \\  applied_at_ms INTEGER NOT NULL
     \\);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (1, 'core_primitives', strftime('%s','now') * 1000);
+    \\CREATE TABLE IF NOT EXISTS spaces (
+    \\  id TEXT PRIMARY KEY,
+    \\  name TEXT NOT NULL UNIQUE,
+    \\  title TEXT NOT NULL,
+    \\  description TEXT,
+    \\  scope TEXT NOT NULL DEFAULT 'workspace',
+    \\  permissions_json TEXT NOT NULL DEFAULT '[]',
+    \\  metadata_json TEXT NOT NULL DEFAULT '{}',
+    \\  created_at_ms INTEGER NOT NULL,
+    \\  updated_at_ms INTEGER NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_spaces_scope ON spaces(scope);
+    \\CREATE TABLE IF NOT EXISTS policy_scopes (
+    \\  scope TEXT PRIMARY KEY,
+    \\  visibility TEXT NOT NULL DEFAULT 'workspace',
+    \\  permissions_json TEXT NOT NULL DEFAULT '[]',
+    \\  owner TEXT,
+    \\  ttl_ms INTEGER,
+    \\  review_after_ms INTEGER,
+    \\  metadata_json TEXT NOT NULL DEFAULT '{}',
+    \\  created_at_ms INTEGER NOT NULL,
+    \\  updated_at_ms INTEGER NOT NULL
+    \\);
     \\CREATE TABLE IF NOT EXISTS sources (
     \\  id TEXT PRIMARY KEY,
     \\  type TEXT NOT NULL,
@@ -232,6 +255,7 @@ pub const sqlite_schema =
     \\  PRIMARY KEY (connector, scope)
     \\);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', strftime('%s','now') * 1000);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (5, 'spaces_policy_scopes', strftime('%s','now') * 1000);
 ;
 
 pub const postgres_schema =
@@ -243,6 +267,29 @@ pub const postgres_schema =
     \\  applied_at_ms bigint NOT NULL
     \\);
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (1, 'core_primitives', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+    \\CREATE TABLE IF NOT EXISTS spaces (
+    \\  id text PRIMARY KEY,
+    \\  name text NOT NULL UNIQUE,
+    \\  title text NOT NULL,
+    \\  description text,
+    \\  scope text NOT NULL DEFAULT 'workspace',
+    \\  permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    \\  metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+    \\  created_at_ms bigint NOT NULL,
+    \\  updated_at_ms bigint NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_spaces_scope ON spaces(scope);
+    \\CREATE TABLE IF NOT EXISTS policy_scopes (
+    \\  scope text PRIMARY KEY,
+    \\  visibility text NOT NULL DEFAULT 'workspace',
+    \\  permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    \\  owner text,
+    \\  ttl_ms bigint,
+    \\  review_after_ms bigint,
+    \\  metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+    \\  created_at_ms bigint NOT NULL,
+    \\  updated_at_ms bigint NOT NULL
+    \\);
     \\CREATE TABLE IF NOT EXISTS sources (
     \\  id text PRIMARY KEY,
     \\  type text NOT NULL,
@@ -470,12 +517,15 @@ pub const postgres_schema =
     \\  PRIMARY KEY (connector, scope)
     \\);
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (5, 'spaces_policy_scopes', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
 ;
 
 test "sqlite migration includes core primitive tables and indexes" {
     const std = @import("std");
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS sources") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS schema_migrations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS spaces") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS policy_scopes") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS artifacts") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS entities") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS relations") != null);
@@ -498,6 +548,7 @@ test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS knowledge_conflicts") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS connector_cursors") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'ingest_jobs_conflicts'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'spaces_policy_scopes'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE UNIQUE INDEX IF NOT EXISTS idx_compat_memories_key_session") != null);
 }
 
@@ -505,6 +556,8 @@ test "postgres migration includes fts vector and expression indexes" {
     const std = @import("std");
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS sources") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS schema_migrations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS spaces") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS policy_scopes") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS artifacts") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS entities") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS relations") != null);
@@ -523,6 +576,7 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS knowledge_conflicts") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS connector_cursors") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'ingest_jobs_conflicts'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'spaces_policy_scopes'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE EXTENSION IF NOT EXISTS vector") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "embedding vector(1536)") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "vector_cosine_ops") != null);

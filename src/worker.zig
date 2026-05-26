@@ -2,12 +2,18 @@ const std = @import("std");
 const store_mod = @import("store.zig");
 const domain = @import("domain.zig");
 const extraction = @import("extraction.zig");
+const providers = @import("providers.zig");
 const vector = @import("vector.zig");
 
 pub const RunOptions = struct {
     scopes_json: []const u8 = "[\"admin\"]",
     job_limit: usize = 25,
     outbox_limit: usize = 100,
+    embedding_base_url: ?[]const u8 = null,
+    embedding_api_key: ?[]const u8 = null,
+    embedding_model: ?[]const u8 = null,
+    embedding_dimensions: usize = 64,
+    provider_timeout_secs: u32 = 30,
 };
 
 pub const RunResult = struct {
@@ -31,7 +37,8 @@ pub fn runOnce(allocator: std.mem.Allocator, store: *store_mod.Store, options: R
     });
     result.jobs_checked = jobs.len;
     for (jobs) |job| {
-        if (runJob(allocator, store, job)) |summary_json| {
+        if (!(try store.claimJob(job.id))) continue;
+        if (runClaimedJob(allocator, store, job, options)) |summary_json| {
             _ = try store.finishJob(job.id, "succeeded", summary_json, null);
             result.jobs_succeeded += 1;
         } else |err| {
@@ -43,7 +50,18 @@ pub fn runOnce(allocator: std.mem.Allocator, store: *store_mod.Store, options: R
     return result;
 }
 
-fn runJob(allocator: std.mem.Allocator, store: *store_mod.Store, job: store_mod.Job) ![]const u8 {
+pub fn runJobById(allocator: std.mem.Allocator, store: *store_mod.Store, id: []const u8, options: RunOptions) !store_mod.Job {
+    const job = (try store.getJob(allocator, id)) orelse return error.JobNotFound;
+    if (!try store.claimJob(job.id)) return error.JobNotQueued;
+    if (runClaimedJob(allocator, store, job, options)) |summary_json| {
+        _ = try store.finishJob(job.id, "succeeded", summary_json, null);
+    } else |err| {
+        _ = try store.finishJob(job.id, "failed", "{}", @errorName(err));
+    }
+    return (try store.getJob(allocator, id)) orelse job;
+}
+
+pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job: store_mod.Job, options: RunOptions) ![]const u8 {
     if (std.mem.eql(u8, job.job_type, "vector_outbox")) {
         const outbox = try store.runVectorOutbox(1000);
         return try std.fmt.allocPrint(allocator, "{{\"vector_outbox_processed\":{d},\"vector_outbox_failed\":{d}}}", .{ outbox.processed, outbox.failed });
@@ -60,7 +78,7 @@ fn runJob(allocator: std.mem.Allocator, store: *store_mod.Store, job: store_mod.
     if (std.mem.eql(u8, job.job_type, "extract_memory") or std.mem.eql(u8, job.job_type, "ingest_source") or std.mem.eql(u8, job.job_type, "ingest")) {
         if (job.object_id.len == 0 or !std.mem.eql(u8, job.object_type, "source")) return error.UnsupportedJob;
         const source = (try store.getSource(allocator, job.object_id)) orelse return error.SourceNotFound;
-        const extracted = try extractSource(allocator, store, source);
+        const extracted = try extractSource(allocator, store, source, options);
         return try std.fmt.allocPrint(allocator, "{{\"source_id\":\"{s}\",\"artifact_count\":{d},\"memory_atom_count\":{d},\"entity_count\":{d},\"vector_chunk_count\":{d}}}", .{ source.id, extracted.artifact_count, extracted.memory_atom_count, extracted.entity_count, extracted.vector_chunk_count });
     }
     return error.UnsupportedJob;
@@ -73,9 +91,9 @@ const ExtractionCounts = struct {
     vector_chunk_count: usize = 0,
 };
 
-fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: domain.Source) !ExtractionCounts {
+fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: domain.Source, options: RunOptions) !ExtractionCounts {
     var counts = ExtractionCounts{};
-    try upsertVector(allocator, store, "source", source.id, source.content, source.scope, source.permissions_json);
+    try upsertVector(allocator, store, options, "source", source.id, source.content, source.scope, source.permissions_json);
     counts.vector_chunk_count += 1;
 
     const source_ids_json = try extraction.sourceIdsJson(allocator, source.id);
@@ -99,12 +117,18 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
         .agent_summary = agent_summary,
     });
     counts.artifact_count = 1;
-    try upsertVector(allocator, store, "artifact", artifact.id, source.content, source.scope, source.permissions_json);
+    try upsertVector(allocator, store, options, "artifact", artifact.id, source.content, source.scope, source.permissions_json);
     counts.vector_chunk_count += 1;
 
     var lines = std.mem.splitScalar(u8, source.content, '\n');
-    while (lines.next()) |line| {
+    var offset: usize = 0;
+    var line_no: usize = 1;
+    while (lines.next()) |line| : ({
+        offset += line.len + 1;
+        line_no += 1;
+    }) {
         const parsed = extraction.parseMemoryLine(line) orelse continue;
+        const evidence_ranges_json = try extraction.evidenceRangeJson(allocator, source.id, offset, offset + line.len, line_no);
         const atom = try store.createMemoryAtom(allocator, .{
             .subject_entity_id = if (entities.len > 0) entities[0].id else null,
             .predicate = parsed.predicate,
@@ -113,12 +137,12 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
             .scope = source.scope,
             .confidence = parsed.confidence,
             .source_ids_json = source_ids_json,
-            .evidence_ranges_json = "[]",
+            .evidence_ranges_json = evidence_ranges_json,
             .created_by = "agent",
             .permissions_json = source.permissions_json,
             .tags_json = parsed.tags_json,
         });
-        try upsertVector(allocator, store, "memory_atom", atom.id, atom.text, atom.scope, atom.permissions_json);
+        try upsertVector(allocator, store, options, "memory_atom", atom.id, atom.text, atom.scope, atom.permissions_json);
         counts.memory_atom_count += 1;
         counts.vector_chunk_count += 1;
     }
@@ -140,9 +164,15 @@ fn resolveEntities(allocator: std.mem.Allocator, store: *store_mod.Store, names_
     return out.toOwnedSlice(allocator);
 }
 
-fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, object_type: []const u8, object_id: []const u8, text: []const u8, scope: []const u8, permissions_json: []const u8) !void {
-    const embedding = try vector.deterministicEmbedding(allocator, text, 64);
-    const embedding_json = try vector.embeddingToJson(allocator, embedding);
+fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: RunOptions, object_type: []const u8, object_id: []const u8, text: []const u8, scope: []const u8, permissions_json: []const u8) !void {
+    const embedding_result = try providers.embedText(allocator, .{
+        .base_url = options.embedding_base_url,
+        .api_key = options.embedding_api_key,
+        .model = options.embedding_model,
+        .dimensions = options.embedding_dimensions,
+        .timeout_secs = options.provider_timeout_secs,
+    }, text, options.embedding_dimensions);
+    const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
     _ = try store.upsertVectorChunk(allocator, .{
         .object_type = object_type,
         .object_id = object_id,
@@ -150,8 +180,8 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, object_ty
         .scope = scope,
         .permissions_json = permissions_json,
         .embedding_json = embedding_json,
-        .model = "local-deterministic",
-        .dimensions = 64,
+        .model = embedding_result.model,
+        .dimensions = @intCast(embedding_result.embedding.len),
     });
 }
 

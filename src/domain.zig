@@ -223,6 +223,8 @@ pub const SearchResult = struct {
     status: []const u8,
     score: f64,
     source_ids_json: []const u8,
+    created_at_ms: i64 = 0,
+    confidence: f64 = 0.5,
 
     pub fn writeJson(self: SearchResult, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
         try out.appendSlice(allocator, "{\"id\":");
@@ -237,7 +239,7 @@ pub const SearchResult = struct {
         try json.appendString(out, allocator, self.scope);
         try out.appendSlice(allocator, ",\"status\":");
         try json.appendString(out, allocator, self.status);
-        try out.print(allocator, ",\"score\":{d},\"citations\":", .{self.score});
+        try out.print(allocator, ",\"score\":{d},\"created_at_ms\":{d},\"confidence\":{d},\"citations\":", .{ self.score, self.created_at_ms, self.confidence });
         try json.appendRawJsonOr(out, allocator, self.source_ids_json, "[]");
         try out.append(allocator, '}');
     }
@@ -347,6 +349,17 @@ pub fn hasActorScope(actor_scopes_json: []const u8, scope: []const u8) bool {
     return quotedStringContains(actor_scopes_json, scope);
 }
 
+fn hasPrefixedActorScope(actor_scopes_json: []const u8, prefix: []const u8, scope: []const u8) bool {
+    var cursor: usize = 0;
+    while (nextQuotedString(actor_scopes_json, &cursor)) |actor_scope| {
+        if (actor_scope.len == prefix.len + 1 and std.mem.startsWith(u8, actor_scope, prefix) and actor_scope[actor_scope.len - 1] == '*') return true;
+        if (actor_scope.len != prefix.len + scope.len) continue;
+        if (!std.mem.startsWith(u8, actor_scope, prefix)) continue;
+        if (std.mem.eql(u8, actor_scope[prefix.len..], scope)) return true;
+    }
+    return false;
+}
+
 pub fn hasCapability(actor_scopes_json: []const u8, actor_capabilities_json: []const u8, capability: []const u8) bool {
     if (hasActorScope(actor_scopes_json, "admin")) return true;
     return quotedStringContains(actor_capabilities_json, capability);
@@ -387,7 +400,18 @@ pub fn scopeVisible(scope: []const u8, actor_scopes_json: []const u8) bool {
 }
 
 pub fn scopeWritable(scope: []const u8, actor_scopes_json: []const u8) bool {
-    return scopeVisible(scope, actor_scopes_json);
+    if (hasActorScope(actor_scopes_json, "admin")) return true;
+    return hasPrefixedActorScope(actor_scopes_json, "write:", scope);
+}
+
+pub fn scopeVerifiable(scope: []const u8, actor_scopes_json: []const u8) bool {
+    if (hasActorScope(actor_scopes_json, "admin")) return true;
+    return hasPrefixedActorScope(actor_scopes_json, "verify:", scope) or scopeWritable(scope, actor_scopes_json);
+}
+
+pub fn scopeDeletable(scope: []const u8, actor_scopes_json: []const u8) bool {
+    if (hasActorScope(actor_scopes_json, "admin")) return true;
+    return hasPrefixedActorScope(actor_scopes_json, "delete:", scope);
 }
 
 pub fn recordVisible(scope: []const u8, permissions_json: []const u8, actor_scopes_json: []const u8) bool {
@@ -406,6 +430,11 @@ test "scope and permission checks use exact grants" {
     try std.testing.expect(scopeVisible("project:nullpantry", "[\"project:nullpantry\"]"));
     try std.testing.expect(!scopeVisible("project:null", "[\"project:nullpantry\"]"));
     try std.testing.expect(scopeVisible("public", "[]"));
+    try std.testing.expect(!scopeWritable("project:nullpantry", "[\"project:nullpantry\"]"));
+    try std.testing.expect(scopeWritable("project:nullpantry", "[\"project:nullpantry\",\"write:project:nullpantry\"]"));
+    try std.testing.expect(scopeWritable("project:nullpantry", "[\"write:*\"]"));
+    try std.testing.expect(scopeVerifiable("project:nullpantry", "[\"verify:project:nullpantry\"]"));
+    try std.testing.expect(scopeDeletable("project:nullpantry", "[\"delete:project:nullpantry\"]"));
     try std.testing.expect(recordVisible("project:nullpantry", "[\"team:platform\"]", "[\"project:nullpantry\",\"team:platform\"]"));
     try std.testing.expect(!recordVisible("project:nullpantry", "[\"team:platform\"]", "[\"project:nullpantry\"]"));
     try std.testing.expect(permissionsVisible("[\"public\"]", "[]"));

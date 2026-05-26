@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const compat = @import("compat.zig");
 const api = @import("api.zig");
@@ -8,7 +9,11 @@ const worker = @import("worker.zig");
 
 const default_port: u16 = 8765;
 const max_request_size: usize = 2 * 1024 * 1024;
+const max_header_bytes: usize = 64 * 1024;
+const max_header_lines: usize = 128;
 const read_chunk_size: usize = 4096;
+const socket_timeout_secs: i64 = 30;
+const max_active_connections: usize = 128;
 
 const RuntimeConfig = struct {
     host: []const u8 = "127.0.0.1",
@@ -35,6 +40,7 @@ const ServerState = struct {
     store: *store_mod.Store,
     cfg: RuntimeConfig,
     store_mutex: std.Io.Mutex = .init,
+    active_connections: std.atomic.Value(usize) = .init(0),
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -72,7 +78,16 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("accept error: {}\n", .{err});
             continue;
         };
+        const active = state.active_connections.fetchAdd(1, .acq_rel);
+        if (active >= max_active_connections) {
+            _ = state.active_connections.fetchSub(1, .acq_rel);
+            var close_conn = conn;
+            close_conn.close(compat.io());
+            std.debug.print("event=connection_rejected reason=max_active_connections limit={d}\n", .{max_active_connections});
+            continue;
+        }
         const thread = std.Thread.spawn(.{}, handleConnection, .{ &state, conn }) catch |err| {
+            _ = state.active_connections.fetchSub(1, .acq_rel);
             var close_conn = conn;
             close_conn.close(compat.io());
             std.debug.print("spawn error: {}\n", .{err});
@@ -85,6 +100,8 @@ pub fn main(init: std.process.Init) !void {
 fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
     var conn = conn_value;
     defer conn.close(compat.io());
+    defer _ = state.active_connections.fetchSub(1, .acq_rel);
+    setSocketTimeouts(&conn);
 
     var arena = std.heap.ArenaAllocator.init(state.allocator);
     defer arena.deinit();
@@ -146,6 +163,11 @@ fn workerLoop(state: *ServerState) void {
             .scopes_json = state.cfg.actor_scopes_json,
             .job_limit = 25,
             .outbox_limit = 250,
+            .embedding_base_url = state.cfg.embedding_base_url,
+            .embedding_api_key = state.cfg.embedding_api_key,
+            .embedding_model = state.cfg.embedding_model,
+            .embedding_dimensions = state.cfg.embedding_dimensions,
+            .provider_timeout_secs = state.cfg.provider_timeout_secs,
         }) catch |err| {
             state.store_mutex.unlock(compat.io());
             arena.deinit();
@@ -157,6 +179,17 @@ fn workerLoop(state: *ServerState) void {
         if (result.jobs_checked > 0 or result.vector_outbox_processed > 0 or result.vector_outbox_failed > 0) {
             std.debug.print("event=worker_run jobs_checked={d} jobs_succeeded={d} jobs_failed={d} vector_outbox_processed={d} vector_outbox_failed={d}\n", .{ result.jobs_checked, result.jobs_succeeded, result.jobs_failed, result.vector_outbox_processed, result.vector_outbox_failed });
         }
+    }
+}
+
+fn setSocketTimeouts(conn: *std.Io.net.Stream) void {
+    switch (builtin.target.os.tag) {
+        .windows => {},
+        else => {
+            const timeout = std.posix.timeval{ .sec = socket_timeout_secs, .usec = 0 };
+            std.posix.setsockopt(conn.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+            std.posix.setsockopt(conn.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+        },
     }
 }
 
@@ -313,12 +346,16 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max
 
     var read_buffer: [read_chunk_size]u8 = undefined;
     var reader = stream.reader(compat.io(), &read_buffer);
+    var header_lines: usize = 0;
     while (true) {
         const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
             error.EndOfStream => return if (buffer.items.len == 0) null else error.UnexpectedEof,
             else => |e| return e,
         };
         if (buffer.items.len + line.len > max_bytes) return error.RequestTooLarge;
+        if (buffer.items.len + line.len > max_header_bytes) return error.RequestHeaderTooLarge;
+        header_lines += 1;
+        if (header_lines > max_header_lines) return error.TooManyHeaders;
         try buffer.appendSlice(allocator, line);
         if (std.mem.endsWith(u8, buffer.items, "\r\n\r\n")) break;
     }

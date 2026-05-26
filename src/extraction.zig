@@ -35,6 +35,14 @@ pub fn sourceIdsJson(allocator: std.mem.Allocator, source_id: []const u8) ![]u8 
     return out.toOwnedSlice(allocator);
 }
 
+pub fn evidenceRangeJson(allocator: std.mem.Allocator, source_id: []const u8, start: usize, end: usize, line_no: usize) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.appendSlice(allocator, "[{\"source_id\":");
+    try json.appendString(&out, allocator, source_id);
+    try out.print(allocator, ",\"start\":{d},\"end\":{d},\"line\":{d}}}]", .{ start, end, line_no });
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn parseMemoryLine(line: []const u8) ?ParsedMemory {
     const trimmed = std.mem.trim(u8, line, " \t\r\n-*");
     if (trimmed.len == 0) return null;

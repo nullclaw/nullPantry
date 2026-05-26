@@ -40,16 +40,12 @@ pub const CompletionResult = struct {
 
 pub fn embedText(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []const u8, fallback_dimensions: usize) !EmbeddingResult {
     if (cfg.enabled()) {
-        if (callOpenAICompatibleEmbedding(allocator, cfg, text)) |embedding| {
-            return .{
-                .provider = "openai-compatible",
-                .model = cfg.model orelse "unknown",
-                .embedding = embedding,
-            };
-        } else |err| switch (err) {
-            error.ProviderUnavailable, error.ProviderInvalidResponse, error.ProviderHttpError => {},
-            else => |e| return e,
-        }
+        const embedding = try callOpenAICompatibleEmbedding(allocator, cfg, text);
+        return .{
+            .provider = "openai-compatible",
+            .model = cfg.model orelse "unknown",
+            .embedding = embedding,
+        };
     }
 
     return .{
