@@ -44,7 +44,7 @@ pub fn evidenceRangeJson(allocator: std.mem.Allocator, source_id: []const u8, st
 }
 
 pub fn parseMemoryLine(line: []const u8) ?ParsedMemory {
-    const trimmed = std.mem.trim(u8, line, " \t\r\n-*");
+    const trimmed = normalizeMemoryLine(line);
     if (trimmed.len == 0) return null;
     if (afterPrefix(trimmed, "Decision:")) |value| return .{ .predicate = "decision", .object = value, .text = trimmed, .confidence = 0.86, .tags_json = "[\"decision\"]" };
     if (afterPrefix(trimmed, "ADR:")) |value| return .{ .predicate = "decision", .object = value, .text = trimmed, .confidence = 0.84, .tags_json = "[\"decision\",\"adr\"]" };
@@ -55,6 +55,38 @@ pub fn parseMemoryLine(line: []const u8) ?ParsedMemory {
     if (afterPrefix(trimmed, "Owner:")) |value| return .{ .predicate = "owner", .object = value, .text = trimmed, .confidence = 0.7, .tags_json = "[\"owner\"]" };
     if (afterPrefix(trimmed, "Supersedes:")) |value| return .{ .predicate = "supersedes", .object = value, .text = trimmed, .confidence = 0.8, .tags_json = "[\"supersedes\"]" };
     return null;
+}
+
+fn normalizeMemoryLine(line: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, line, " \t\r\n-*");
+    if (trimmed.len == 0) return trimmed;
+    if (trimmed[0] == '[') {
+        if (std.mem.indexOfScalar(u8, trimmed, ']')) |end| {
+            trimmed = std.mem.trim(u8, trimmed[end + 1 ..], " \t\r\n-");
+        }
+    }
+    if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
+        const prefix = std.mem.trim(u8, trimmed[0..colon], " \t\r\n");
+        if (isLikelySpeaker(prefix)) {
+            trimmed = std.mem.trim(u8, trimmed[colon + 1 ..], " \t\r\n-");
+        }
+    }
+    return trimmed;
+}
+
+fn isLikelySpeaker(value: []const u8) bool {
+    if (value.len == 0 or value.len > 80) return false;
+    if (startsWithIgnoreCase(value, "Decision") or startsWithIgnoreCase(value, "ADR") or startsWithIgnoreCase(value, "Constraint") or startsWithIgnoreCase(value, "Action") or startsWithIgnoreCase(value, "Question") or startsWithIgnoreCase(value, "Risk") or startsWithIgnoreCase(value, "Owner") or startsWithIgnoreCase(value, "Supersedes")) return false;
+    var saw_alpha = false;
+    for (value) |ch| {
+        if (std.ascii.isAlphabetic(ch)) {
+            saw_alpha = true;
+            continue;
+        }
+        if (std.ascii.isDigit(ch) or ch == ' ' or ch == '_' or ch == '-' or ch == '.') continue;
+        return false;
+    }
+    return saw_alpha;
 }
 
 fn afterPrefix(value: []const u8, prefix: []const u8) ?[]const u8 {
@@ -108,6 +140,10 @@ test "extraction parses structured meeting lines" {
 
     const risk = parseMemoryLine("- Risk: stale memory can leak bad context").?;
     try std.testing.expectEqualStrings("risk", risk.predicate);
+
+    const transcript_decision = parseMemoryLine("[00:01:04] Alice: Decision: Meeting Memory is a pipeline").?;
+    try std.testing.expectEqualStrings("decision", transcript_decision.predicate);
+    try std.testing.expectEqualStrings("Meeting Memory is a pipeline", transcript_decision.object);
 }
 
 test "extraction emits unique Null ecosystem entities" {

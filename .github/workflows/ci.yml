@@ -18,7 +18,7 @@ jobs:
       binary_name: nullpantry
       artifact_prefix: nullpantry
       zig_version: "0.16.0"
-      test_command: zig build test --summary all
+      test_command: zig build test --summary all && zig build nullclaw-contract --summary all
       targets_json: >-
         [
           {"os":"ubuntu-latest","target":"linux-x86_64","zig_target":"x86_64-linux-musl"},

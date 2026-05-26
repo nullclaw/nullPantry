@@ -180,21 +180,46 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
     const is_put = std.mem.eql(u8, method, "PUT");
     const is_delete = std.mem.eql(u8, method, "DELETE");
 
-    if (eql(seg2, "memories") and eql(seg3, "search") and is_post) return compatSearch(ctx, body);
-    if (eql(seg2, "memories") and eql(seg3, "count") and is_get) return compatCount(ctx);
+    if (eql(seg2, "memories") and eql(seg3, "search") and is_post) {
+        if (!nullclawReadAllowed(ctx)) return forbidden(ctx);
+        return compatSearch(ctx, body);
+    }
+    if (eql(seg2, "memories") and eql(seg3, "count") and is_get) {
+        if (!nullclawReadAllowed(ctx)) return forbidden(ctx);
+        return compatCount(ctx);
+    }
     if (eql(seg2, "memories")) {
-        if (is_put and seg3 != null) return compatStore(ctx, seg3.?, body);
-        if (is_get and seg3 != null) return compatGet(ctx, seg3.?, query);
-        if (is_delete and seg3 != null) return compatDelete(ctx, seg3.?, query);
-        if (is_get and seg3 == null) return compatList(ctx, query);
+        if (is_put and seg3 != null) {
+            if (!nullclawWriteAllowed(ctx)) return forbidden(ctx);
+            return compatStore(ctx, seg3.?, body);
+        }
+        if (is_get and seg3 != null) {
+            if (!nullclawReadAllowed(ctx)) return forbidden(ctx);
+            return compatGet(ctx, seg3.?, query);
+        }
+        if (is_delete and seg3 != null) {
+            if (!nullclawDeleteAllowed(ctx)) return forbidden(ctx);
+            return compatDelete(ctx, seg3.?, query);
+        }
+        if (is_get and seg3 == null) {
+            if (!nullclawReadAllowed(ctx)) return forbidden(ctx);
+            return compatList(ctx, query);
+        }
     }
 
     if (eql(seg2, "sessions") and eql(seg3, "auto-saved") and is_delete) {
         const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+        if (session_id) |sid| {
+            if (!sessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+        } else if (!domain.hasActorScope(ctx.actor_scopes_json, "admin") and !nullclawWriteAllowed(ctx)) {
+            return forbidden(ctx);
+        }
         ctx.store.clearAutoSaved(session_id) catch return serverError(ctx);
         return ok(ctx, "{\"ok\":true}");
     }
     if (eql(seg2, "sessions") and seg3 != null and eql(seg4, "messages")) {
+        if ((is_post or is_delete) and !sessionWriteAllowed(ctx, seg3.?)) return forbidden(ctx);
+        if (is_get and !sessionReadAllowed(ctx, seg3.?)) return forbidden(ctx);
         if (is_post) return saveMessage(ctx, seg3.?, body);
         if (is_get) return loadMessages(ctx, seg3.?);
         if (is_delete) {
@@ -203,6 +228,8 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
         }
     }
     if (eql(seg2, "sessions") and seg3 != null and eql(seg4, "usage")) {
+        if ((is_put or is_delete) and !sessionWriteAllowed(ctx, seg3.?)) return forbidden(ctx);
+        if (is_get and !sessionReadAllowed(ctx, seg3.?)) return forbidden(ctx);
         if (is_put) return saveUsage(ctx, seg3.?, body);
         if (is_get) return loadUsage(ctx, seg3.?);
         if (is_delete) {
@@ -211,12 +238,14 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
         }
     }
     if (eql(seg2, "history") and seg3 == null and is_get) {
+        if (!domain.hasActorScope(ctx.actor_scopes_json, "admin") and !nullclawReadAllowed(ctx)) return forbidden(ctx);
         const limit = parseLimit(json.queryParam(query, "limit"), 50);
         const offset = parseLimit(json.queryParam(query, "offset"), 0);
         const result = ctx.store.listSessions(ctx.allocator, limit, offset) catch return serverError(ctx);
         return writeHistoryList(ctx, result, limit, offset);
     }
     if (eql(seg2, "history") and seg3 != null and is_get) {
+        if (!sessionReadAllowed(ctx, seg3.?)) return forbidden(ctx);
         const limit = parseLimit(json.queryParam(query, "limit"), 100);
         const offset = parseLimit(json.queryParam(query, "offset"), 0);
         const result = ctx.store.history(ctx.allocator, seg3.?, limit, offset) catch return serverError(ctx);
@@ -224,6 +253,35 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
     }
 
     return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
+}
+
+fn sessionReadAllowed(ctx: *Context, session_id: []const u8) bool {
+    if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
+    if (nullclawReadAllowed(ctx)) return true;
+    const scope = std.fmt.allocPrint(ctx.allocator, "session:{s}", .{session_id}) catch return false;
+    return domain.scopeVisible(scope, ctx.actor_scopes_json) and hasCapability(ctx, "read");
+}
+
+fn sessionWriteAllowed(ctx: *Context, session_id: []const u8) bool {
+    if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
+    if (nullclawWriteAllowed(ctx)) return true;
+    const scope = std.fmt.allocPrint(ctx.allocator, "session:{s}", .{session_id}) catch return false;
+    return hasCapability(ctx, "write") and domain.scopeWritable(scope, ctx.actor_scopes_json);
+}
+
+fn nullclawReadAllowed(ctx: *Context) bool {
+    if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
+    return domain.hasActorScope(ctx.actor_scopes_json, "agent:nullclaw") and hasCapability(ctx, "read");
+}
+
+fn nullclawWriteAllowed(ctx: *Context) bool {
+    if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
+    return domain.hasActorScope(ctx.actor_scopes_json, "agent:nullclaw") and hasCapability(ctx, "write");
+}
+
+fn nullclawDeleteAllowed(ctx: *Context) bool {
+    if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
+    return domain.hasActorScope(ctx.actor_scopes_json, "agent:nullclaw") and (hasCapability(ctx, "delete") or hasCapability(ctx, "write"));
 }
 
 fn authorized(ctx: *Context, raw_request: []const u8) bool {
@@ -281,7 +339,7 @@ fn createSource(ctx: *Context, body: []const u8) HttpResponse {
 fn getSource(ctx: *Context, id: []const u8) HttpResponse {
     const source = ctx.store.getSource(ctx.allocator, id) catch return serverError(ctx);
     if (source == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Source not found");
-    if (!domain.recordVisible(source.?.scope, source.?.permissions_json, ctx.actor_scopes_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Source not found");
+    if (!recordVisibleToActor(ctx, source.?.scope, source.?.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Source not found");
     return objectResponse(ctx, "source", source.?);
 }
 
@@ -290,8 +348,9 @@ fn createArtifact(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const title = json.stringField(obj, "title") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing title");
+    const scope = json.stringField(obj, "scope") orelse "workspace";
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
-    if (!canWritePermissions(ctx, permissions_json)) return forbidden(ctx);
+    if (!canWriteRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     const artifact_type = json.stringField(obj, "type") orelse "page";
     const status = json.stringField(obj, "status") orelse if (std.mem.eql(u8, artifact_type, "decision")) "proposed" else "draft";
     if (!artifacts.validStatus(artifact_type, status)) {
@@ -306,6 +365,7 @@ fn createArtifact(ctx: *Context, body: []const u8) HttpResponse {
         .status = status,
         .owner = json.nullableStringField(obj, "owner"),
         .space_id = json.nullableStringField(obj, "space_id"),
+        .scope = scope,
         .source_ids_json = source_ids_json,
         .related_entities_json = rawField(ctx.allocator, obj, "related_entities", "[]") catch return serverError(ctx),
         .permissions_json = permissions_json,
@@ -318,7 +378,7 @@ fn createArtifact(ctx: *Context, body: []const u8) HttpResponse {
 fn getArtifact(ctx: *Context, id: []const u8) HttpResponse {
     const artifact = ctx.store.getArtifact(ctx.allocator, id) catch return serverError(ctx);
     if (artifact == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Artifact not found");
-    if (!domain.permissionsVisible(artifact.?.permissions_json, ctx.actor_scopes_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Artifact not found");
+    if (!recordVisibleToActor(ctx, artifact.?.scope, artifact.?.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Artifact not found");
     return artifactResponse(ctx, artifact.?);
 }
 
@@ -328,12 +388,17 @@ fn resolveEntity(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const name = json.stringField(obj, "name") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing name");
+    const scope = json.stringField(obj, "scope") orelse "workspace";
+    const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    if (!canWriteRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     const entity = ctx.store.resolveEntity(ctx.allocator, .{
         .entity_type = json.stringField(obj, "type") orelse "concept",
         .name = name,
         .aliases_json = rawField(ctx.allocator, obj, "aliases", "[]") catch return serverError(ctx),
         .description = json.nullableStringField(obj, "description"),
         .canonical_artifact_id = json.nullableStringField(obj, "canonical_artifact_id"),
+        .scope = scope,
+        .permissions_json = permissions_json,
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch return serverError(ctx),
     }) catch return serverError(ctx);
     return objectResponse(ctx, "entity", entity);
@@ -347,12 +412,17 @@ fn createRelation(ctx: *Context, body: []const u8) HttpResponse {
     const from_entity_id = json.stringField(obj, "from_entity_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing from_entity_id");
     const to_entity_id = json.stringField(obj, "to_entity_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing to_entity_id");
     const source_ids_json = rawField(ctx.allocator, obj, "source_ids", "[]") catch return serverError(ctx);
+    const scope = json.stringField(obj, "scope") orelse "workspace";
+    const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    if (!canWriteRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     if (!sourceIdsVisible(ctx, source_ids_json)) return forbidden(ctx);
     const relation = ctx.store.createRelation(ctx.allocator, .{
         .from_entity_id = from_entity_id,
         .relation_type = json.stringField(obj, "relation_type") orelse "related_to",
         .to_entity_id = to_entity_id,
         .source_ids_json = source_ids_json,
+        .scope = scope,
+        .permissions_json = permissions_json,
         .confidence = json.floatField(obj, "confidence") orelse 0.5,
         .status = json.stringField(obj, "status") orelse "proposed",
     }) catch |err| switch (err) {
@@ -413,7 +483,7 @@ fn createSpace(ctx: *Context, body: []const u8) HttpResponse {
 fn getSpace(ctx: *Context, id: []const u8) HttpResponse {
     const space = ctx.store.getSpace(ctx.allocator, id) catch return serverError(ctx);
     if (space == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Space not found");
-    if (!domain.recordVisible(space.?.scope, space.?.permissions_json, ctx.actor_scopes_json)) return forbidden(ctx);
+    if (!recordVisibleToActor(ctx, space.?.scope, space.?.permissions_json)) return forbidden(ctx);
     return objectResponse(ctx, "space", space.?);
 }
 
@@ -452,7 +522,7 @@ fn upsertPolicyScope(ctx: *Context, body: []const u8) HttpResponse {
 fn getPolicyScope(ctx: *Context, scope: []const u8) HttpResponse {
     const policy = ctx.store.getPolicyScope(ctx.allocator, scope) catch return serverError(ctx);
     if (policy == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Policy scope not found");
-    if (!domain.recordVisible(policy.?.scope, policy.?.permissions_json, ctx.actor_scopes_json)) return forbidden(ctx);
+    if (!recordVisibleToActor(ctx, policy.?.scope, policy.?.permissions_json)) return forbidden(ctx);
     return objectResponse(ctx, "policy_scope", policy.?);
 }
 
@@ -526,7 +596,7 @@ fn extractMemory(ctx: *Context, body: []const u8) HttpResponse {
     const obj = parsed.value.object;
     const source_id = json.stringField(obj, "source_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing source_id");
     const source = (ctx.store.getSource(ctx.allocator, source_id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Source not found");
-    if (!domain.recordVisible(source.scope, source.permissions_json, ctx.actor_scopes_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Source not found");
+    if (!recordVisibleToActor(ctx, source.scope, source.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Source not found");
     if (!canProposeRecord(ctx, source.scope, source.permissions_json)) return forbidden(ctx);
 
     const job = ctx.store.createJob(ctx.allocator, .{
@@ -545,12 +615,11 @@ fn extractMemory(ctx: *Context, body: []const u8) HttpResponse {
 
 fn runExtraction(ctx: *Context, source: domain.Source, create_artifact: bool, extract_memory: bool) !ExtractionOutput {
     var vector_chunks: usize = 0;
-    try upsertAutoVector(ctx, "source", source.id, source.content, source.scope, source.permissions_json);
-    vector_chunks += 1;
+    vector_chunks += try upsertAutoVector(ctx, "source", source.id, source.content, source.scope, source.permissions_json);
 
     const source_ids_json = try extraction.sourceIdsJson(ctx.allocator, source.id);
     const entity_names_json = try extraction.extractEntityNamesJson(ctx.allocator, source.content);
-    const entities = try resolveExtractedEntities(ctx, entity_names_json);
+    const entities = try resolveExtractedEntities(ctx, entity_names_json, source.scope, source.permissions_json);
 
     var artifact: ?domain.Artifact = null;
     if (create_artifact) {
@@ -563,21 +632,27 @@ fn runExtraction(ctx: *Context, source: domain.Source, create_artifact: bool, ex
             .body = source.content,
             .status = "verified",
             .owner = source.author,
+            .scope = source.scope,
             .source_ids_json = source_ids_json,
             .related_entities_json = entity_names_json,
             .permissions_json = source.permissions_json,
             .summary = summary,
             .agent_summary = agent_summary,
         });
-        try upsertAutoVector(ctx, "artifact", artifact.?.id, source.content, source.scope, source.permissions_json);
-        vector_chunks += 1;
+        vector_chunks += try upsertAutoVector(ctx, "artifact", artifact.?.id, source.content, source.scope, source.permissions_json);
     }
 
     var atoms: std.ArrayListUnmanaged(domain.MemoryAtom) = .empty;
     if (extract_memory) {
         var lines = std.mem.splitScalar(u8, source.content, '\n');
-        while (lines.next()) |line| {
+        var offset: usize = 0;
+        var line_no: usize = 1;
+        while (lines.next()) |line| : ({
+            offset += line.len + 1;
+            line_no += 1;
+        }) {
             const parsed = extraction.parseMemoryLine(line) orelse continue;
+            const evidence_ranges_json = try extraction.evidenceRangeJson(ctx.allocator, source.id, offset, offset + line.len, line_no);
             const atom = try ctx.store.createMemoryAtom(ctx.allocator, .{
                 .subject_entity_id = if (entities.len > 0) entities[0].id else null,
                 .predicate = parsed.predicate,
@@ -586,21 +661,20 @@ fn runExtraction(ctx: *Context, source: domain.Source, create_artifact: bool, ex
                 .scope = source.scope,
                 .confidence = parsed.confidence,
                 .source_ids_json = source_ids_json,
-                .evidence_ranges_json = "[]",
+                .evidence_ranges_json = evidence_ranges_json,
                 .created_by = "agent",
                 .permissions_json = source.permissions_json,
                 .tags_json = parsed.tags_json,
             });
             try atoms.append(ctx.allocator, atom);
-            try upsertAutoVector(ctx, "memory_atom", atom.id, atom.text, atom.scope, atom.permissions_json);
-            vector_chunks += 1;
+            vector_chunks += try upsertAutoVector(ctx, "memory_atom", atom.id, atom.text, atom.scope, atom.permissions_json);
         }
     }
 
     return .{ .artifact = artifact, .atoms = try atoms.toOwnedSlice(ctx.allocator), .entities = entities, .vector_chunks = vector_chunks };
 }
 
-fn resolveExtractedEntities(ctx: *Context, names_json: []const u8) ![]domain.Entity {
+fn resolveExtractedEntities(ctx: *Context, names_json: []const u8, scope: []const u8, permissions_json: []const u8) ![]domain.Entity {
     const parsed = try std.json.parseFromSlice(std.json.Value, ctx.allocator, names_json, .{});
     defer parsed.deinit();
     if (parsed.value != .array) return ctx.allocator.alloc(domain.Entity, 0);
@@ -610,30 +684,55 @@ fn resolveExtractedEntities(ctx: *Context, names_json: []const u8) ![]domain.Ent
             .string => |s| s,
             else => continue,
         };
-        try out.append(ctx.allocator, try ctx.store.resolveEntity(ctx.allocator, .{ .entity_type = "project", .name = name }));
+        try out.append(ctx.allocator, try ctx.store.resolveEntity(ctx.allocator, .{ .entity_type = "project", .name = name, .scope = scope, .permissions_json = permissions_json }));
     }
     return out.toOwnedSlice(ctx.allocator);
 }
 
-fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u8, text: []const u8, scope: []const u8, permissions_json: []const u8) !void {
-    const embedding_result = try providers.embedText(ctx.allocator, .{
-        .base_url = ctx.embedding_base_url,
-        .api_key = ctx.embedding_api_key,
-        .model = ctx.embedding_model,
-        .dimensions = ctx.embedding_dimensions,
-        .timeout_secs = ctx.provider_timeout_secs,
-    }, text, ctx.embedding_dimensions);
-    const embedding_json = try vector_mod.embeddingToJson(ctx.allocator, embedding_result.embedding);
-    _ = try ctx.store.upsertVectorChunk(ctx.allocator, .{
-        .object_type = object_type,
-        .object_id = object_id,
-        .text = text,
-        .scope = scope,
-        .permissions_json = permissions_json,
-        .embedding_json = embedding_json,
-        .model = embedding_result.model,
-        .dimensions = @intCast(embedding_result.embedding.len),
-    });
+fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u8, text: []const u8, scope: []const u8, permissions_json: []const u8) !usize {
+    if (text.len == 0) return 0;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < text.len) {
+        const end = vectorChunkEnd(text, start);
+        const chunk_text = std.mem.trim(u8, text[start..end], " \t\r\n");
+        if (chunk_text.len > 0) {
+            const embedding_result = try providers.embedText(ctx.allocator, .{
+                .base_url = ctx.embedding_base_url,
+                .api_key = ctx.embedding_api_key,
+                .model = ctx.embedding_model,
+                .dimensions = ctx.embedding_dimensions,
+                .timeout_secs = ctx.provider_timeout_secs,
+            }, chunk_text, ctx.embedding_dimensions);
+            const embedding_json = try vector_mod.embeddingToJson(ctx.allocator, embedding_result.embedding);
+            _ = try ctx.store.upsertVectorChunk(ctx.allocator, .{
+                .object_type = object_type,
+                .object_id = object_id,
+                .chunk_ordinal = @intCast(count),
+                .text = chunk_text,
+                .scope = scope,
+                .permissions_json = permissions_json,
+                .embedding_json = embedding_json,
+                .model = embedding_result.model,
+                .dimensions = @intCast(embedding_result.embedding.len),
+            });
+            count += 1;
+        }
+        start = end;
+    }
+    return count;
+}
+
+fn vectorChunkEnd(text: []const u8, start: usize) usize {
+    const max_chars: usize = 1800;
+    const min_chars: usize = 600;
+    const end = @min(text.len, start + max_chars);
+    if (end == text.len) return end;
+    var scan = end;
+    while (scan > start + min_chars) : (scan -= 1) {
+        if (text[scan - 1] == '\n') return scan;
+    }
+    return end;
 }
 
 fn extractionResponse(ctx: *Context, job: store_mod.Job, source: domain.Source, output: ExtractionOutput) HttpResponse {
@@ -819,8 +918,20 @@ fn search(ctx: *Context, body: []const u8) HttpResponse {
     const obj = parsed.value.object;
     const query = json.stringField(obj, "query") orelse json.stringField(obj, "q") orelse "";
     const input = buildSearchInput(ctx, obj, query, positiveLimit(json.intField(obj, "limit"), 10), false) catch return serverError(ctx);
+    const use_cache = json.boolField(obj, "use_cache") orelse true;
+    const cache_ttl_ms = json.intField(obj, "cache_ttl_ms") orelse 0;
+    const cache_key = automaticCacheKey(ctx.allocator, "search", input.scopes_json, body) catch return serverError(ctx);
+    if (use_cache) {
+        if (ctx.store.getResponseCache(ctx.allocator, cache_key, ids.nowMs()) catch return serverError(ctx)) |hit| {
+            return .{ .status = "200 OK", .body = hit.response_json };
+        }
+    }
     const results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
-    return searchResponse(ctx, results);
+    const response = searchResponse(ctx, results);
+    if (cache_ttl_ms > 0 and hasCapability(ctx, "write")) {
+        ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response.body, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
+    }
+    return response;
 }
 
 fn vectorUpsert(ctx: *Context, body: []const u8) HttpResponse {
@@ -1045,12 +1156,28 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     if (!canWriteRecord(ctx, scope, "[]")) return forbidden(ctx);
     const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
+    var memory_input: ?store_mod.MemoryAtomInput = null;
+    if (std.mem.eql(u8, object_type, "memory_atom")) {
+        memory_input = buildAppliedMemoryAtomInput(ctx, payload_json, scope) catch |err| switch (err) {
+            error.Forbidden => return forbidden(ctx),
+            error.MissingText, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Memory apply payload must include text/content"),
+            else => return serverError(ctx),
+        };
+    }
     var reserved_event_id: ?i64 = null;
     if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| {
         if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key) catch return serverError(ctx)) |event| {
             if (!domain.scopeVisible(event.scope, ctx.actor_scopes_json)) return forbidden(ctx);
-            if (!std.mem.eql(u8, event.status, "applied")) return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying");
-            return appliedFeedResponse(ctx, event.id, if (std.mem.eql(u8, event.object_type, "memory_atom")) event.object_id else null);
+            if (!std.mem.eql(u8, event.status, "applied")) {
+                const stale_apply_ms: i64 = 5 * 60 * 1000;
+                if (std.mem.eql(u8, event.status, "applying") and ids.nowMs() - event.created_at_ms > stale_apply_ms) {
+                    _ = ctx.store.releaseFeedEventReservation(event.id) catch return serverError(ctx);
+                } else {
+                    return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying");
+                }
+            } else {
+                return appliedFeedResponse(ctx, event.id, if (std.mem.eql(u8, event.object_type, "memory_atom")) event.object_id else null);
+            }
         }
         const reservation_id = ids.make(ctx.allocator, "apply_") catch return serverError(ctx);
         reserved_event_id = ctx.store.appendFeedEvent(.{
@@ -1069,12 +1196,12 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
         }
     }
     var memory_atom_id: ?[]const u8 = null;
-    if (std.mem.eql(u8, object_type, "memory_atom")) {
-        const atom = parseAppliedMemoryAtom(ctx, payload_json, scope) catch |err| switch (err) {
+    if (memory_input) |input| {
+        const with_provenance = ensureMemoryProvenance(ctx, input) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
-            error.MissingText, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Memory apply payload must include text/content"),
             else => return serverError(ctx),
         };
+        const atom = ctx.store.createMemoryAtom(ctx.allocator, with_provenance) catch return serverError(ctx);
         memory_atom_id = atom.id;
     }
     if (reserved_event_id) |event_id| {
@@ -1096,7 +1223,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     return appliedFeedResponse(ctx, id, memory_atom_id);
 }
 
-fn parseAppliedMemoryAtom(ctx: *Context, payload_json: []const u8, fallback_scope: []const u8) !domain.MemoryAtom {
+fn buildAppliedMemoryAtomInput(ctx: *Context, payload_json: []const u8, fallback_scope: []const u8) !store_mod.MemoryAtomInput {
     const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
     defer payload.deinit();
     if (payload.value != .object) return error.InvalidPayload;
@@ -1118,8 +1245,7 @@ fn parseAppliedMemoryAtom(ctx: *Context, payload_json: []const u8, fallback_scop
         .tags_json = rawField(ctx.allocator, obj, "tags", "[\"feed\"]") catch "[\"feed\"]",
     };
     if (!canCreateMemoryAtom(ctx, input)) return error.Forbidden;
-    const with_provenance = try ensureMemoryProvenance(ctx, input);
-    return try ctx.store.createMemoryAtom(ctx.allocator, with_provenance);
+    return input;
 }
 
 fn lifecycleDiagnostics(ctx: *Context) HttpResponse {
@@ -1315,9 +1441,26 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
     const scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx);
     var input = buildSearchInput(ctx, obj, query, 6, false) catch return serverError(ctx);
     input.scopes_json = scopes_json;
-    const results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
     const include_conflicts = json.boolField(obj, "include_conflicts") orelse true;
-    const scan_conflicts = json.boolField(obj, "scan_conflicts") orelse include_conflicts;
+    const scan_conflicts = json.boolField(obj, "scan_conflicts") orelse false;
+    if (scan_conflicts and !hasCapability(ctx, "verify") and !hasCapability(ctx, "write")) return forbidden(ctx);
+    const use_cache = json.boolField(obj, "use_cache") orelse true;
+    const use_semantic_cache = json.boolField(obj, "use_semantic_cache") orelse false;
+    const cache_ttl_ms = json.intField(obj, "cache_ttl_ms") orelse 0;
+    const cache_key = automaticCacheKey(ctx.allocator, "ask", scopes_json, body) catch return serverError(ctx);
+    if (use_cache and !scan_conflicts) {
+        if (ctx.store.getResponseCache(ctx.allocator, cache_key, ids.nowMs()) catch return serverError(ctx)) |hit| {
+            return .{ .status = "200 OK", .body = hit.response_json };
+        }
+        if (use_semantic_cache) {
+            if (input.query_embedding_json) |embedding_json| {
+                if (ctx.store.searchSemanticCache(ctx.allocator, .{ .embedding_json = embedding_json, .min_score = @floatCast(json.floatField(obj, "semantic_cache_min_score") orelse 0.94) }) catch return serverError(ctx)) |hit| {
+                    return .{ .status = "200 OK", .body = hit.response_json };
+                }
+            }
+        }
+    }
+    const results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
     const conflicts = if (include_conflicts)
         (if (scan_conflicts)
             ctx.store.scanConflicts(ctx.allocator, .{ .scopes_json = scopes_json, .status = "open", .limit = 10 }) catch return serverError(ctx)
@@ -1375,7 +1518,16 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
     out.appendSlice(ctx.allocator, ",\"conflicts\":") catch return serverError(ctx);
     appendConflictsArray(ctx, &out, conflicts) catch return serverError(ctx);
     out.append(ctx.allocator, '}') catch return serverError(ctx);
-    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+    const response_body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx);
+    if (cache_ttl_ms > 0 and hasCapability(ctx, "write") and !scan_conflicts) {
+        ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response_body, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
+        if (use_semantic_cache) {
+            if (input.query_embedding_json) |embedding_json| {
+                ctx.store.putSemanticCache(.{ .cache_key = cache_key, .query = query, .response_json = response_body, .embedding_json = embedding_json, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
+            }
+        }
+    }
+    return .{ .status = "200 OK", .body = response_body };
 }
 
 fn writeExtractiveAnswer(ctx: *Context, out: *std.ArrayListUnmanaged(u8), results: []domain.SearchResult) !void {
@@ -1384,7 +1536,7 @@ fn writeExtractiveAnswer(ctx: *Context, out: *std.ArrayListUnmanaged(u8), result
         if (i > 0) try out.appendSlice(ctx.allocator, " ");
         try out.appendSlice(ctx.allocator, result.text);
         try out.appendSlice(ctx.allocator, " [");
-        try out.appendSlice(ctx.allocator, result.id);
+        try out.appendSlice(ctx.allocator, try citationLabel(ctx, result));
         try out.appendSlice(ctx.allocator, "]");
     }
 }
@@ -1397,7 +1549,7 @@ fn buildAskPrompt(ctx: *Context, query: []const u8, results: []domain.SearchResu
     try out.appendSlice(ctx.allocator, "\n\nAccessible context with citations:\n");
     for (results) |result| {
         try out.appendSlice(ctx.allocator, "- [");
-        try out.appendSlice(ctx.allocator, result.id);
+        try out.appendSlice(ctx.allocator, try citationLabel(ctx, result));
         try out.appendSlice(ctx.allocator, "] ");
         try out.appendSlice(ctx.allocator, result.result_type);
         try out.appendSlice(ctx.allocator, " status=");
@@ -1410,6 +1562,16 @@ fn buildAskPrompt(ctx: *Context, query: []const u8, results: []domain.SearchResu
     }
     try out.appendSlice(ctx.allocator, "\nAnswer with citations in square brackets.");
     return out.toOwnedSlice(ctx.allocator);
+}
+
+fn citationLabel(ctx: *Context, result: domain.SearchResult) ![]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, result.source_ids_json, .{}) catch return result.id;
+    defer parsed.deinit();
+    if (parsed.value != .array) return result.id;
+    for (parsed.value.array.items) |item| {
+        if (item == .string and item.string.len > 0) return try ctx.allocator.dupe(u8, item.string);
+    }
+    return result.id;
 }
 
 fn appendAskWarnings(ctx: *Context, out: *std.ArrayListUnmanaged(u8), results: []domain.SearchResult, conflicts: []store_mod.KnowledgeConflict) !void {
@@ -1457,6 +1619,7 @@ fn contextPack(ctx: *Context, body: []const u8) HttpResponse {
         .token_budget = json.intField(obj, "token_budget") orelse 12000,
         .scopes_json = search_input.scopes_json,
         .query_embedding_json = search_input.query_embedding_json,
+        .query_embedding_provider = search_input.query_embedding_provider,
         .embedding_dimensions = search_input.embedding_dimensions,
     }) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -1746,9 +1909,20 @@ fn effectiveScopes(ctx: *Context, obj: std.json.ObjectMap) ![]const u8 {
     return ctx.actor_scopes_json;
 }
 
+fn automaticCacheKey(allocator: std.mem.Allocator, namespace: []const u8, scopes_json: []const u8, body: []const u8) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(namespace);
+    hasher.update("\n");
+    hasher.update(scopes_json);
+    hasher.update("\n");
+    hasher.update(body);
+    return std.fmt.allocPrint(allocator, "auto:{s}:{d}", .{ namespace, hasher.final() });
+}
+
 fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, limit: usize, include_sessions_default: bool) !store_mod.SearchInput {
     const use_vector = json.boolField(obj, "use_vector") orelse true;
     var query_embedding_json: ?[]const u8 = null;
+    var query_embedding_provider: []const u8 = "none";
     var embedding_dimensions: usize = @max(@as(usize, 1), @min(ctx.embedding_dimensions, @as(usize, 4096)));
     if (use_vector and query.len > 0) {
         const embedding_result = try providers.embedText(ctx.allocator, .{
@@ -1759,6 +1933,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
             .timeout_secs = ctx.provider_timeout_secs,
         }, query, embedding_dimensions);
         query_embedding_json = try vector_mod.embeddingToJson(ctx.allocator, embedding_result.embedding);
+        query_embedding_provider = embedding_result.provider;
         embedding_dimensions = embedding_result.embedding.len;
     }
     return .{
@@ -1773,6 +1948,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
         .allow_reranker = json.boolField(obj, "allow_reranker") orelse false,
         .half_life_days = json.floatField(obj, "half_life_days") orelse 30,
         .query_embedding_json = query_embedding_json,
+        .query_embedding_provider = query_embedding_provider,
         .embedding_dimensions = embedding_dimensions,
     };
 }
@@ -1875,7 +2051,7 @@ fn sourceIdsVisible(ctx: *Context, source_ids_json: []const u8) bool {
             else => return false,
         };
         const source = (ctx.store.getSource(ctx.allocator, source_id) catch return false) orelse return false;
-        if (!domain.recordVisible(source.scope, source.permissions_json, ctx.actor_scopes_json)) return false;
+        if (!recordVisibleToActor(ctx, source.scope, source.permissions_json)) return false;
     }
     return true;
 }
@@ -1897,7 +2073,7 @@ fn sanitizeSourceIdsForActor(ctx: *Context, source_ids_json: []const u8) ![]cons
             else => continue,
         };
         const source = (try ctx.store.getSource(ctx.allocator, source_id)) orelse continue;
-        if (!domain.recordVisible(source.scope, source.permissions_json, ctx.actor_scopes_json)) continue;
+        if (!recordVisibleToActor(ctx, source.scope, source.permissions_json)) continue;
         if (!first) try out.append(ctx.allocator, ',');
         first = false;
         try json.appendString(&out, ctx.allocator, source_id);
@@ -1915,13 +2091,28 @@ fn canWritePermissions(ctx: *Context, permissions_json: []const u8) bool {
 }
 
 fn canWriteRecord(ctx: *Context, scope: []const u8, permissions_json: []const u8) bool {
-    return canWritePermissions(ctx, permissions_json) and domain.scopeWritable(scope, ctx.actor_scopes_json);
+    if (!canWritePermissions(ctx, permissions_json) or !domain.scopeWritable(scope, ctx.actor_scopes_json)) return false;
+    const policy = ctx.store.getPolicyScope(ctx.allocator, scope) catch return false;
+    if (policy) |p| {
+        if (!domain.permissionsWritable(p.permissions_json, ctx.actor_scopes_json)) return false;
+    }
+    return true;
 }
 
 fn canProposeRecord(ctx: *Context, scope: []const u8, permissions_json: []const u8) bool {
-    return (hasCapability(ctx, "propose") or hasCapability(ctx, "write")) and
+    if (!((hasCapability(ctx, "propose") or hasCapability(ctx, "write")) and
         domain.scopeVisible(scope, ctx.actor_scopes_json) and
-        domain.permissionsWritable(permissions_json, ctx.actor_scopes_json);
+        domain.permissionsWritable(permissions_json, ctx.actor_scopes_json))) return false;
+    const policy = ctx.store.getPolicyScope(ctx.allocator, scope) catch return false;
+    if (policy) |p| return domain.permissionsWritable(p.permissions_json, ctx.actor_scopes_json);
+    return true;
+}
+
+fn recordVisibleToActor(ctx: *Context, scope: []const u8, permissions_json: []const u8) bool {
+    if (!domain.recordVisible(scope, permissions_json, ctx.actor_scopes_json)) return false;
+    const policy = ctx.store.getPolicyScope(ctx.allocator, scope) catch return false;
+    if (policy) |p| return domain.recordVisible(p.scope, p.permissions_json, ctx.actor_scopes_json);
+    return true;
 }
 
 fn canCreateMemoryAtom(ctx: *Context, input: store_mod.MemoryAtomInput) bool {
@@ -1940,7 +2131,11 @@ fn memoryAtomWritable(ctx: *Context, id: []const u8) bool {
 fn canChangeMemoryStatus(ctx: *Context, id: []const u8, status: []const u8) bool {
     const atom = ctx.store.getMemoryAtom(ctx.allocator, id) catch return false;
     const existing = atom orelse return false;
-    if (!domain.recordVisible(existing.scope, existing.permissions_json, ctx.actor_scopes_json)) return false;
+    if (!recordVisibleToActor(ctx, existing.scope, existing.permissions_json)) return false;
+    const policy = ctx.store.getPolicyScope(ctx.allocator, existing.scope) catch return false;
+    if (policy) |p| {
+        if (!domain.permissionsWritable(p.permissions_json, ctx.actor_scopes_json)) return false;
+    }
     if (std.mem.eql(u8, status, "verified")) return hasCapability(ctx, "verify") and domain.scopeVerifiable(existing.scope, ctx.actor_scopes_json) and domain.permissionsWritable(existing.permissions_json, ctx.actor_scopes_json);
     if (std.mem.eql(u8, status, "deprecated") or std.mem.eql(u8, status, "rejected")) return hasCapability(ctx, "delete") and domain.scopeDeletable(existing.scope, ctx.actor_scopes_json) and domain.permissionsWritable(existing.permissions_json, ctx.actor_scopes_json);
     if (std.mem.eql(u8, status, "stale") or std.mem.eql(u8, status, "superseded")) return hasCapability(ctx, "verify") and domain.scopeVerifiable(existing.scope, ctx.actor_scopes_json) and domain.permissionsWritable(existing.permissions_json, ctx.actor_scopes_json);
@@ -1969,8 +2164,8 @@ fn resolveVectorAcl(ctx: *Context, object_type: []const u8, object_id: []const u
     }
     if (std.mem.eql(u8, object_type, "artifact")) {
         const artifact = (try ctx.store.getArtifact(ctx.allocator, object_id)) orelse return error.NotFound;
-        if (!canWritePermissions(ctx, artifact.permissions_json)) return error.Forbidden;
-        return .{ .scope = requested_scope, .permissions_json = artifact.permissions_json };
+        if (!canWriteRecord(ctx, artifact.scope, artifact.permissions_json)) return error.Forbidden;
+        return .{ .scope = artifact.scope, .permissions_json = artifact.permissions_json };
     }
     if (!canWriteRecord(ctx, requested_scope, requested_permissions)) return error.Forbidden;
     return .{ .scope = requested_scope, .permissions_json = requested_permissions };
@@ -2109,7 +2304,7 @@ test "api artifact citations are permission sanitized" {
     const public_source = try store.createSource(alloc, .{ .title = "Public source", .content = "visible", .scope = "public" });
     const secret_source = try store.createSource(alloc, .{ .title = "Secret source", .content = "hidden", .scope = "project:secret", .permissions_json = "[\"project:secret\"]" });
     const source_ids = try std.fmt.allocPrint(alloc, "[\"{s}\",\"{s}\"]", .{ public_source.id, secret_source.id });
-    const artifact = try store.createArtifact(alloc, .{ .title = "Mixed artifact", .body = "body", .source_ids_json = source_ids });
+    const artifact = try store.createArtifact(alloc, .{ .title = "Mixed artifact", .body = "body", .scope = "public", .source_ids_json = source_ids });
     const path = try std.fmt.allocPrint(alloc, "/v1/artifacts/{s}", .{artifact.id});
 
     var public_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\",\"write:public\"]" };
@@ -2234,6 +2429,40 @@ test "api nullclaw compatibility requires agent scope" {
     try std.testing.expectEqualStrings("403 Forbidden", resp.status);
 }
 
+test "api nullclaw service token contract works without admin" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const raw_auth = "GET / HTTP/1.1\r\nAuthorization: Bearer dev-secret\r\n\r\n";
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .store = &store,
+        .required_token = "dev-secret",
+        .actor_scopes_json = "[\"agent:nullclaw\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"delete\"]",
+    };
+
+    const put = handleRequest(&ctx, "PUT", "/v1/nullclaw/memories/pref.lang", "{\"content\":\"Zig\",\"category\":\"core\",\"session_id\":null}", raw_auth);
+    try std.testing.expectEqualStrings("200 OK", put.status);
+    const get = handleRequest(&ctx, "GET", "/v1/nullclaw/memories/pref.lang", "", raw_auth);
+    try std.testing.expectEqualStrings("200 OK", get.status);
+    const save = handleRequest(&ctx, "POST", "/v1/nullclaw/sessions/sess_1/messages", "{\"role\":\"user\",\"content\":\"hello\"}", raw_auth);
+    try std.testing.expectEqualStrings("200 OK", save.status);
+    const history = handleRequest(&ctx, "GET", "/v1/nullclaw/history?limit=10&offset=0", "", raw_auth);
+    try std.testing.expectEqualStrings("200 OK", history.status);
+
+    var read_only = Context{
+        .allocator = arena.allocator(),
+        .store = &store,
+        .required_token = "dev-secret",
+        .actor_scopes_json = "[\"agent:nullclaw\"]",
+        .actor_capabilities_json = "[\"read\"]",
+    };
+    const denied_put = handleRequest(&read_only, "PUT", "/v1/nullclaw/memories/nope", "{\"content\":\"nope\"}", raw_auth);
+    try std.testing.expectEqualStrings("403 Forbidden", denied_put.status);
+}
+
 test "api nullclaw session history protocol shapes" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -2294,6 +2523,32 @@ test "api nullclaw session history protocol shapes" {
 
     const missing_usage = handleRequest(&ctx, "GET", "/v1/nullclaw/sessions/agent%3Acoder/usage", "", "");
     try std.testing.expectEqualStrings("404 Not Found", missing_usage.status);
+}
+
+test "api nullclaw service token can use session endpoints without admin" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var admin_ctx = Context{ .allocator = alloc, .store = &store };
+    const save = handleRequest(&admin_ctx, "POST", "/v1/nullclaw/sessions/sess_1/messages", "{\"role\":\"user\",\"content\":\"hello\"}", "");
+    try std.testing.expectEqualStrings("200 OK", save.status);
+
+    var service_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"agent:nullclaw\"]", .actor_capabilities_json = "[\"read\",\"write\"]" };
+    const service_read = handleRequest(&service_ctx, "GET", "/v1/nullclaw/sessions/sess_1/messages", "", "");
+    try std.testing.expectEqualStrings("200 OK", service_read.status);
+    const service_write = handleRequest(&service_ctx, "POST", "/v1/nullclaw/sessions/sess_1/messages", "{\"role\":\"assistant\",\"content\":\"service\"}", "");
+    try std.testing.expectEqualStrings("200 OK", service_write.status);
+
+    var read_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"agent:nullclaw\",\"session:sess_1\"]", .actor_capabilities_json = "[\"read\"]" };
+    const allowed_read = handleRequest(&read_ctx, "GET", "/v1/nullclaw/sessions/sess_1/messages", "", "");
+    try std.testing.expectEqualStrings("200 OK", allowed_read.status);
+
+    var write_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"agent:nullclaw\",\"write:session:sess_1\"]", .actor_capabilities_json = "[\"read\",\"write\"]" };
+    const allowed_write = handleRequest(&write_ctx, "POST", "/v1/nullclaw/sessions/sess_1/messages", "{\"role\":\"assistant\",\"content\":\"world\"}", "");
+    try std.testing.expectEqualStrings("200 OK", allowed_write.status);
 }
 
 test "api exposes engine registry retrieval plan vector and lifecycle endpoints" {
@@ -2401,7 +2656,7 @@ test "api ask returns citation ids and conflict warnings" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"potential_conflicts\"") != null);
 }
 
-test "api ask scans visible conflicts by default and rejects provider overrides" {
+test "api ask scans visible conflicts when requested and rejects provider overrides" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2413,7 +2668,7 @@ test "api ask scans visible conflicts by default and rejects provider overrides"
     _ = try store.createMemoryAtom(alloc, .{ .subject_entity_id = entity.id, .predicate = "uses_database", .object = "sqlite", .text = "NullPantry uses SQLite.", .scope = "public", .created_by = "human", .status = "verified" });
     _ = try store.createMemoryAtom(alloc, .{ .subject_entity_id = entity.id, .predicate = "uses_database", .object = "postgres", .text = "NullPantry uses Postgres.", .scope = "public", .created_by = "human", .status = "verified" });
 
-    const ask_resp = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"NullPantry database\",\"scopes\":[\"public\"]}", "");
+    const ask_resp = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"NullPantry database\",\"scopes\":[\"public\"],\"scan_conflicts\":true}", "");
     try std.testing.expectEqualStrings("200 OK", ask_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, ask_resp.body, "\"potential_conflicts\"") != null);
     const conflicts = try store.listConflicts(alloc, .{ .scopes_json = "[\"public\"]" });
@@ -2421,6 +2676,25 @@ test "api ask scans visible conflicts by default and rejects provider overrides"
 
     const override_resp = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"x\",\"llm_base_url\":\"http://127.0.0.1:9\",\"llm_model\":\"x\"}", "");
     try std.testing.expectEqualStrings("400 Bad Request", override_resp.status);
+}
+
+test "api ask does not write conflict records unless scan is requested" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Context{ .allocator = alloc, .store = &store };
+
+    const entity = try store.resolveEntity(alloc, .{ .entity_type = "project", .name = "NullPantry", .scope = "public" });
+    _ = try store.createMemoryAtom(alloc, .{ .subject_entity_id = entity.id, .predicate = "uses_database", .object = "sqlite", .text = "NullPantry uses SQLite.", .scope = "public", .created_by = "human", .status = "verified" });
+    _ = try store.createMemoryAtom(alloc, .{ .subject_entity_id = entity.id, .predicate = "uses_database", .object = "postgres", .text = "NullPantry uses Postgres.", .scope = "public", .created_by = "human", .status = "verified" });
+
+    const ask_resp = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"NullPantry database\",\"scopes\":[\"public\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", ask_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ask_resp.body, "\"potential_conflicts\"") == null);
+    const conflicts = try store.listConflicts(alloc, .{ .scopes_json = "[\"public\"]" });
+    try std.testing.expectEqual(@as(usize, 0), conflicts.len);
 }
 
 test "api lifecycle cache semantic cache summarize rollout and hygiene endpoints" {
@@ -2443,6 +2717,13 @@ test "api lifecycle cache semantic cache summarize rollout and hygiene endpoints
     try std.testing.expectEqualStrings("200 OK", search_semantic.status);
     try std.testing.expect(std.mem.indexOf(u8, search_semantic.body, "\"hit\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, search_semantic.body, "semantic cached") != null);
+
+    const memory = handleRequest(&ctx, "POST", "/v1/memory-atoms", "{\"text\":\"cached retrieval memory\",\"scope\":\"public\",\"created_by\":\"human\",\"status\":\"verified\"}", "");
+    try std.testing.expectEqualStrings("200 OK", memory.status);
+    const cached_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"cached retrieval\",\"scopes\":[\"public\"],\"cache_ttl_ms\":10000}", "");
+    try std.testing.expectEqualStrings("200 OK", cached_search.status);
+    const cached_ask = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"cached retrieval\",\"scopes\":[\"public\"],\"cache_ttl_ms\":10000,\"use_semantic_cache\":true}", "");
+    try std.testing.expectEqualStrings("200 OK", cached_ask.status);
 
     const summary = handleRequest(&ctx, "POST", "/v1/lifecycle/summarize", "{\"messages\":[{\"content\":\"hello\"},{\"content\":\"world\"}],\"max_chars\":8}", "");
     try std.testing.expectEqualStrings("200 OK", summary.status);
@@ -2592,6 +2873,27 @@ test "api vector upsert cannot publish private object text" {
     try std.testing.expect(std.mem.indexOf(u8, vector_search_resp.body, "secret vector leak") == null);
 }
 
+test "api vector upsert inherits artifact acl instead of requested scope" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const artifact = try store.createArtifact(alloc, .{ .title = "Secret artifact", .body = "secret artifact body", .scope = "project:secret", .permissions_json = "[\"project:secret\"]" });
+    const body = try std.fmt.allocPrint(alloc, "{{\"object_type\":\"artifact\",\"object_id\":\"{s}\",\"text\":\"artifact vector leak\",\"scope\":\"public\",\"embedding\":[1,0],\"dimensions\":2}}", .{artifact.id});
+
+    var admin_ctx = Context{ .allocator = alloc, .store = &store };
+    const inserted = handleRequest(&admin_ctx, "POST", "/v1/vector/upsert", body, "");
+    try std.testing.expectEqualStrings("200 OK", inserted.status);
+    try std.testing.expect(std.mem.indexOf(u8, inserted.body, "\"scope\":\"project:secret\"") != null);
+
+    var public_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\"]" };
+    const public_search = handleRequest(&public_ctx, "POST", "/v1/vector/search", "{\"embedding\":[1,0],\"scopes\":[\"public\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", public_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, public_search.body, "artifact vector leak") == null);
+}
+
 test "api search does not trust requested scopes from body" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -2712,6 +3014,9 @@ test "api ingest creates source artifact extracted memory entities vectors and j
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"memory_atoms\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"predicate\":\"decision\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"name\":\"NullPantry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"artifact\":{\"id\":\"art_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"entities\":[{\"id\":\"ent_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"scope\":\"project:nullpantry\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"vector_chunk_count\":5") != null);
 
     const search_resp = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"ingestion jobs\",\"scopes\":[\"project:nullpantry\"]}", "");

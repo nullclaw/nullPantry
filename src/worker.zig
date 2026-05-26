@@ -93,12 +93,11 @@ const ExtractionCounts = struct {
 
 fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: domain.Source, options: RunOptions) !ExtractionCounts {
     var counts = ExtractionCounts{};
-    try upsertVector(allocator, store, options, "source", source.id, source.content, source.scope, source.permissions_json);
-    counts.vector_chunk_count += 1;
+    counts.vector_chunk_count += try upsertVector(allocator, store, options, "source", source.id, source.content, source.scope, source.permissions_json);
 
     const source_ids_json = try extraction.sourceIdsJson(allocator, source.id);
     const entity_names_json = try extraction.extractEntityNamesJson(allocator, source.content);
-    const entities = try resolveEntities(allocator, store, entity_names_json);
+    const entities = try resolveEntities(allocator, store, entity_names_json, source.scope, source.permissions_json);
     counts.entity_count = entities.len;
 
     const artifact_title = try extraction.sourceTitleForArtifact(allocator, source.title, source.source_type);
@@ -110,6 +109,7 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
         .body = source.content,
         .status = "verified",
         .owner = source.author,
+        .scope = source.scope,
         .source_ids_json = source_ids_json,
         .related_entities_json = entity_names_json,
         .permissions_json = source.permissions_json,
@@ -117,8 +117,7 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
         .agent_summary = agent_summary,
     });
     counts.artifact_count = 1;
-    try upsertVector(allocator, store, options, "artifact", artifact.id, source.content, source.scope, source.permissions_json);
-    counts.vector_chunk_count += 1;
+    counts.vector_chunk_count += try upsertVector(allocator, store, options, "artifact", artifact.id, source.content, source.scope, source.permissions_json);
 
     var lines = std.mem.splitScalar(u8, source.content, '\n');
     var offset: usize = 0;
@@ -142,14 +141,13 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
             .permissions_json = source.permissions_json,
             .tags_json = parsed.tags_json,
         });
-        try upsertVector(allocator, store, options, "memory_atom", atom.id, atom.text, atom.scope, atom.permissions_json);
+        counts.vector_chunk_count += try upsertVector(allocator, store, options, "memory_atom", atom.id, atom.text, atom.scope, atom.permissions_json);
         counts.memory_atom_count += 1;
-        counts.vector_chunk_count += 1;
     }
     return counts;
 }
 
-fn resolveEntities(allocator: std.mem.Allocator, store: *store_mod.Store, names_json: []const u8) ![]domain.Entity {
+fn resolveEntities(allocator: std.mem.Allocator, store: *store_mod.Store, names_json: []const u8, scope: []const u8, permissions_json: []const u8) ![]domain.Entity {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, names_json, .{});
     defer parsed.deinit();
     if (parsed.value != .array) return allocator.alloc(domain.Entity, 0);
@@ -159,30 +157,55 @@ fn resolveEntities(allocator: std.mem.Allocator, store: *store_mod.Store, names_
             .string => |s| s,
             else => continue,
         };
-        try out.append(allocator, try store.resolveEntity(allocator, .{ .entity_type = "project", .name = name }));
+        try out.append(allocator, try store.resolveEntity(allocator, .{ .entity_type = "project", .name = name, .scope = scope, .permissions_json = permissions_json }));
     }
     return out.toOwnedSlice(allocator);
 }
 
-fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: RunOptions, object_type: []const u8, object_id: []const u8, text: []const u8, scope: []const u8, permissions_json: []const u8) !void {
-    const embedding_result = try providers.embedText(allocator, .{
-        .base_url = options.embedding_base_url,
-        .api_key = options.embedding_api_key,
-        .model = options.embedding_model,
-        .dimensions = options.embedding_dimensions,
-        .timeout_secs = options.provider_timeout_secs,
-    }, text, options.embedding_dimensions);
-    const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
-    _ = try store.upsertVectorChunk(allocator, .{
-        .object_type = object_type,
-        .object_id = object_id,
-        .text = text,
-        .scope = scope,
-        .permissions_json = permissions_json,
-        .embedding_json = embedding_json,
-        .model = embedding_result.model,
-        .dimensions = @intCast(embedding_result.embedding.len),
-    });
+fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: RunOptions, object_type: []const u8, object_id: []const u8, text: []const u8, scope: []const u8, permissions_json: []const u8) !usize {
+    if (text.len == 0) return 0;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < text.len) {
+        const end = vectorChunkEnd(text, start);
+        const chunk_text = std.mem.trim(u8, text[start..end], " \t\r\n");
+        if (chunk_text.len > 0) {
+            const embedding_result = try providers.embedText(allocator, .{
+                .base_url = options.embedding_base_url,
+                .api_key = options.embedding_api_key,
+                .model = options.embedding_model,
+                .dimensions = options.embedding_dimensions,
+                .timeout_secs = options.provider_timeout_secs,
+            }, chunk_text, options.embedding_dimensions);
+            const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
+            _ = try store.upsertVectorChunk(allocator, .{
+                .object_type = object_type,
+                .object_id = object_id,
+                .chunk_ordinal = @intCast(count),
+                .text = chunk_text,
+                .scope = scope,
+                .permissions_json = permissions_json,
+                .embedding_json = embedding_json,
+                .model = embedding_result.model,
+                .dimensions = @intCast(embedding_result.embedding.len),
+            });
+            count += 1;
+        }
+        start = end;
+    }
+    return count;
+}
+
+fn vectorChunkEnd(text: []const u8, start: usize) usize {
+    const max_chars: usize = 1800;
+    const min_chars: usize = 600;
+    const end = @min(text.len, start + max_chars);
+    if (end == text.len) return end;
+    var scan = end;
+    while (scan > start + min_chars) : (scan -= 1) {
+        if (text[scan - 1] == '\n') return scan;
+    }
+    return end;
 }
 
 test "worker processes vector outbox and queued hygiene job" {

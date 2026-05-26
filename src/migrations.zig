@@ -60,6 +60,7 @@ pub const sqlite_schema =
     \\  created_at_ms INTEGER NOT NULL,
     \\  updated_at_ms INTEGER NOT NULL,
     \\  last_verified_at_ms INTEGER,
+    \\  scope TEXT NOT NULL DEFAULT 'workspace',
     \\  source_ids_json TEXT NOT NULL DEFAULT '[]',
     \\  related_entities_json TEXT NOT NULL DEFAULT '[]',
     \\  permissions_json TEXT NOT NULL DEFAULT '[]',
@@ -74,11 +75,13 @@ pub const sqlite_schema =
     \\  aliases_json TEXT NOT NULL DEFAULT '[]',
     \\  description TEXT,
     \\  canonical_artifact_id TEXT,
+    \\  scope TEXT NOT NULL DEFAULT 'workspace',
+    \\  permissions_json TEXT NOT NULL DEFAULT '[]',
     \\  metadata_json TEXT NOT NULL DEFAULT '{}',
     \\  created_at_ms INTEGER NOT NULL,
     \\  updated_at_ms INTEGER NOT NULL
     \\);
-    \\CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_type_name ON entities(type, lower(name));
+    \\CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_type_name_scope ON entities(type, lower(name), scope);
     \\CREATE TABLE IF NOT EXISTS memory_atoms (
     \\  id TEXT PRIMARY KEY,
     \\  subject_entity_id TEXT,
@@ -135,6 +138,8 @@ pub const sqlite_schema =
     \\  relation_type TEXT NOT NULL,
     \\  to_entity_id TEXT NOT NULL,
     \\  source_ids_json TEXT NOT NULL DEFAULT '[]',
+    \\  scope TEXT NOT NULL DEFAULT 'workspace',
+    \\  permissions_json TEXT NOT NULL DEFAULT '[]',
     \\  confidence REAL NOT NULL DEFAULT 0.5,
     \\  status TEXT NOT NULL DEFAULT 'proposed',
     \\  created_at_ms INTEGER NOT NULL
@@ -319,6 +324,7 @@ pub const postgres_schema =
     \\  created_at_ms bigint NOT NULL,
     \\  updated_at_ms bigint NOT NULL,
     \\  last_verified_at_ms bigint,
+    \\  scope text NOT NULL DEFAULT 'workspace',
     \\  source_ids_json jsonb NOT NULL DEFAULT '[]',
     \\  related_entities_json jsonb NOT NULL DEFAULT '[]',
     \\  permissions_json jsonb NOT NULL DEFAULT '[]',
@@ -334,11 +340,13 @@ pub const postgres_schema =
     \\  aliases_json jsonb NOT NULL DEFAULT '[]',
     \\  description text,
     \\  canonical_artifact_id text,
+    \\  scope text NOT NULL DEFAULT 'workspace',
+    \\  permissions_json jsonb NOT NULL DEFAULT '[]',
     \\  metadata_json jsonb NOT NULL DEFAULT '{}',
     \\  created_at_ms bigint NOT NULL,
     \\  updated_at_ms bigint NOT NULL
     \\);
-    \\CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_idx ON entities(type, lower(name));
+    \\CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx ON entities(type, lower(name), scope);
     \\CREATE TABLE IF NOT EXISTS memory_atoms (
     \\  id text PRIMARY KEY,
     \\  subject_entity_id text,
@@ -399,6 +407,8 @@ pub const postgres_schema =
     \\  relation_type text NOT NULL,
     \\  to_entity_id text NOT NULL,
     \\  source_ids_json jsonb NOT NULL DEFAULT '[]',
+    \\  scope text NOT NULL DEFAULT 'workspace',
+    \\  permissions_json jsonb NOT NULL DEFAULT '[]',
     \\  confidence double precision NOT NULL DEFAULT 0.5,
     \\  status text NOT NULL DEFAULT 'proposed',
     \\  created_at_ms bigint NOT NULL
@@ -581,7 +591,7 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "embedding vector(1536)") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "vector_cosine_ops") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "USING gin(search_tsv)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS compat_memories_key_session_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "UNIQUE(type, lower(name))") == null);
 }

@@ -62,6 +62,7 @@ pub const Artifact = struct {
     created_at_ms: i64,
     updated_at_ms: i64,
     last_verified_at_ms: ?i64,
+    scope: []const u8,
     source_ids_json: []const u8,
     related_entities_json: []const u8,
     permissions_json: []const u8,
@@ -86,6 +87,8 @@ pub const Artifact = struct {
         try out.print(allocator, ",\"version\":{d},\"created_at_ms\":{d},\"updated_at_ms\":{d}", .{ self.version, self.created_at_ms, self.updated_at_ms });
         try out.appendSlice(allocator, ",\"last_verified_at_ms\":");
         if (self.last_verified_at_ms) |v| try out.print(allocator, "{d}", .{v}) else try out.appendSlice(allocator, "null");
+        try out.appendSlice(allocator, ",\"scope\":");
+        try json.appendString(out, allocator, self.scope);
         try out.appendSlice(allocator, ",\"source_ids\":");
         try json.appendRawJsonOr(out, allocator, self.source_ids_json, "[]");
         try out.appendSlice(allocator, ",\"related_entities\":");
@@ -163,6 +166,8 @@ pub const Entity = struct {
     aliases_json: []const u8,
     description: ?[]const u8,
     canonical_artifact_id: ?[]const u8,
+    scope: []const u8,
+    permissions_json: []const u8,
     metadata_json: []const u8,
     created_at_ms: i64,
     updated_at_ms: i64,
@@ -180,6 +185,10 @@ pub const Entity = struct {
         try json.appendNullableString(out, allocator, self.description);
         try out.appendSlice(allocator, ",\"canonical_artifact_id\":");
         try json.appendNullableString(out, allocator, self.canonical_artifact_id);
+        try out.appendSlice(allocator, ",\"scope\":");
+        try json.appendString(out, allocator, self.scope);
+        try out.appendSlice(allocator, ",\"permissions\":");
+        try json.appendRawJsonOr(out, allocator, self.permissions_json, "[]");
         try out.appendSlice(allocator, ",\"metadata\":");
         try json.appendRawJsonOr(out, allocator, self.metadata_json, "{}");
         try out.print(allocator, ",\"created_at_ms\":{d},\"updated_at_ms\":{d}}}", .{ self.created_at_ms, self.updated_at_ms });
@@ -192,6 +201,8 @@ pub const Relation = struct {
     relation_type: []const u8,
     to_entity_id: []const u8,
     source_ids_json: []const u8,
+    scope: []const u8,
+    permissions_json: []const u8,
     confidence: f64,
     status: []const u8,
     created_at_ms: i64,
@@ -207,6 +218,10 @@ pub const Relation = struct {
         try json.appendString(out, allocator, self.to_entity_id);
         try out.appendSlice(allocator, ",\"source_ids\":");
         try json.appendRawJsonOr(out, allocator, self.source_ids_json, "[]");
+        try out.appendSlice(allocator, ",\"scope\":");
+        try json.appendString(out, allocator, self.scope);
+        try out.appendSlice(allocator, ",\"permissions\":");
+        try json.appendRawJsonOr(out, allocator, self.permissions_json, "[]");
         try out.print(allocator, ",\"confidence\":{d}", .{self.confidence});
         try out.appendSlice(allocator, ",\"status\":");
         try json.appendString(out, allocator, self.status);
@@ -317,7 +332,7 @@ pub fn intersectJsonStringLists(allocator: std.mem.Allocator, requested_json: []
     var first = true;
     var cursor: usize = 0;
     while (nextQuotedString(requested, &cursor)) |item| {
-        if (!std.mem.eql(u8, item, "public") and !quotedStringContains(allowed_json, item)) continue;
+        if (!std.mem.eql(u8, item, "public") and !scopeGrantedByList(allowed_json, item)) continue;
         if (!first) try out.append(allocator, ',');
         first = false;
         try json.appendString(&out, allocator, item);
@@ -347,6 +362,17 @@ fn nextQuotedString(list_json: []const u8, cursor: *usize) ?[]const u8 {
 
 pub fn hasActorScope(actor_scopes_json: []const u8, scope: []const u8) bool {
     return quotedStringContains(actor_scopes_json, scope);
+}
+
+fn scopeGrantedByList(actor_scopes_json: []const u8, scope: []const u8) bool {
+    if (quotedStringContains(actor_scopes_json, scope)) return true;
+    var cursor: usize = 0;
+    while (nextQuotedString(actor_scopes_json, &cursor)) |actor_scope| {
+        if (actor_scope.len < 2 or actor_scope[actor_scope.len - 1] != '*') continue;
+        const prefix = actor_scope[0 .. actor_scope.len - 1];
+        if (std.mem.startsWith(u8, scope, prefix)) return true;
+    }
+    return false;
 }
 
 fn hasPrefixedActorScope(actor_scopes_json: []const u8, prefix: []const u8, scope: []const u8) bool {
@@ -396,7 +422,7 @@ pub fn permissionsWritable(permissions_json: []const u8, actor_scopes_json: []co
 pub fn scopeVisible(scope: []const u8, actor_scopes_json: []const u8) bool {
     if (std.mem.eql(u8, scope, "public")) return true;
     if (hasActorScope(actor_scopes_json, "admin")) return true;
-    return hasActorScope(actor_scopes_json, scope);
+    return scopeGrantedByList(actor_scopes_json, scope);
 }
 
 pub fn scopeWritable(scope: []const u8, actor_scopes_json: []const u8) bool {
@@ -430,6 +456,7 @@ test "scope and permission checks use exact grants" {
     try std.testing.expect(scopeVisible("project:nullpantry", "[\"project:nullpantry\"]"));
     try std.testing.expect(!scopeVisible("project:null", "[\"project:nullpantry\"]"));
     try std.testing.expect(scopeVisible("public", "[]"));
+    try std.testing.expect(scopeVisible("session:sess_1", "[\"session:*\"]"));
     try std.testing.expect(!scopeWritable("project:nullpantry", "[\"project:nullpantry\"]"));
     try std.testing.expect(scopeWritable("project:nullpantry", "[\"project:nullpantry\",\"write:project:nullpantry\"]"));
     try std.testing.expect(scopeWritable("project:nullpantry", "[\"write:*\"]"));
@@ -448,6 +475,10 @@ test "json string list intersection prevents escalation" {
     defer alloc.free(filtered);
     try std.testing.expect(std.mem.indexOf(u8, filtered, "project:nullpantry") != null);
     try std.testing.expect(std.mem.indexOf(u8, filtered, "project:secret") == null);
+
+    const wildcard_filtered = try intersectJsonStringLists(alloc, "[\"session:sess_1\",\"session:sess_2\",\"project:secret\"]", "[\"session:*\"]");
+    defer alloc.free(wildcard_filtered);
+    try std.testing.expectEqualStrings("[\"session:sess_1\",\"session:sess_2\"]", wildcard_filtered);
 
     const admin_filtered = try intersectJsonStringLists(alloc, "[\"project:secret\"]", "[\"admin\"]");
     defer alloc.free(admin_filtered);

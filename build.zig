@@ -46,4 +46,9 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_tests.step);
+
+    const nullclaw_contract_cmd = b.addSystemCommand(&.{ "sh", "scripts/nullclaw_api_contract.sh" });
+    nullclaw_contract_cmd.step.dependOn(b.getInstallStep());
+    const nullclaw_contract_step = b.step("nullclaw-contract", "Run live NullClaw API compatibility contract against the installed service");
+    nullclaw_contract_step.dependOn(&nullclaw_contract_cmd.step);
 }

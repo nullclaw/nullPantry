@@ -39,7 +39,6 @@ const ServerState = struct {
     allocator: std.mem.Allocator,
     store: *store_mod.Store,
     cfg: RuntimeConfig,
-    store_mutex: std.Io.Mutex = .init,
     active_connections: std.atomic.Value(usize) = .init(0),
 };
 
@@ -135,9 +134,7 @@ fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
         .llm_model = state.cfg.llm_model,
         .provider_timeout_secs = state.cfg.provider_timeout_secs,
     };
-    state.store_mutex.lockUncancelable(compat.io());
     const response = api.handleRequest(&ctx, method, target, body, raw);
-    state.store_mutex.unlock(compat.io());
 
     std.debug.print("request_id={s} method={s} target={s} status=\"{s}\"\n", .{ request_id, method, target, response.status });
 
@@ -158,7 +155,6 @@ fn workerLoop(state: *ServerState) void {
     while (true) {
         std.Io.sleep(compat.io(), .fromNanoseconds(@intCast(state.cfg.worker_interval_ms * std.time.ns_per_ms)), .awake) catch {};
         var arena = std.heap.ArenaAllocator.init(state.allocator);
-        state.store_mutex.lockUncancelable(compat.io());
         const result = worker.runOnce(arena.allocator(), state.store, .{
             .scopes_json = state.cfg.actor_scopes_json,
             .job_limit = 25,
@@ -169,12 +165,10 @@ fn workerLoop(state: *ServerState) void {
             .embedding_dimensions = state.cfg.embedding_dimensions,
             .provider_timeout_secs = state.cfg.provider_timeout_secs,
         }) catch |err| {
-            state.store_mutex.unlock(compat.io());
             arena.deinit();
             std.debug.print("event=worker_error error={}\n", .{err});
             continue;
         };
-        state.store_mutex.unlock(compat.io());
         arena.deinit();
         if (result.jobs_checked > 0 or result.vector_outbox_processed > 0 or result.vector_outbox_failed > 0) {
             std.debug.print("event=worker_run jobs_checked={d} jobs_succeeded={d} jobs_failed={d} vector_outbox_processed={d} vector_outbox_failed={d}\n", .{ result.jobs_checked, result.jobs_succeeded, result.jobs_failed, result.vector_outbox_processed, result.vector_outbox_failed });
@@ -197,6 +191,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     var cfg = RuntimeConfig{};
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_TOKEN")) |token| {
         cfg.token = token;
+        cfg.actor_scopes_json = "[\"public\"]";
+        cfg.actor_capabilities_json = "[\"read\"]";
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_DATABASE_URL")) |url| {
         cfg.backend = .postgres;
@@ -265,6 +261,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--token") and i + 1 < args.len) {
             i += 1;
             cfg.token = args[i];
+            cfg.actor_scopes_json = "[\"public\"]";
+            cfg.actor_capabilities_json = "[\"read\"]";
         } else if (std.mem.eql(u8, arg, "--actor-scopes") and i + 1 < args.len) {
             i += 1;
             cfg.actor_scopes_json = args[i];
