@@ -3,6 +3,7 @@ const ids = @import("ids.zig");
 const domain = @import("domain.zig");
 const migrations = @import("migrations.zig");
 const compat = @import("compat.zig");
+const vector_mod = @import("vector.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -34,7 +35,9 @@ pub const Store = struct {
     }
 
     pub fn initPostgres(allocator: std.mem.Allocator, url: []const u8) !Store {
-        return .{ .allocator = allocator, .backend = .{ .postgres = try PostgresStore.init(allocator, url) } };
+        _ = allocator;
+        _ = url;
+        return error.PostgresAdapterIncomplete;
     }
 
     pub fn deinit(self: *Store) void {
@@ -118,6 +121,69 @@ pub const Store = struct {
         return switch (self.backend) {
             .sqlite => |*s| s.search(allocator, input),
             .postgres => |*p| p.search(allocator, input),
+        };
+    }
+
+    pub fn upsertVectorChunk(self: *Store, allocator: std.mem.Allocator, input: VectorChunkInput) !VectorChunk {
+        return switch (self.backend) {
+            .sqlite => |*s| s.upsertVectorChunk(allocator, input),
+            .postgres => |*p| p.upsertVectorChunk(allocator, input),
+        };
+    }
+
+    pub fn vectorSearch(self: *Store, allocator: std.mem.Allocator, input: VectorSearchInput) ![]vector_mod.VectorMatch {
+        return switch (self.backend) {
+            .sqlite => |*s| s.vectorSearch(allocator, input),
+            .postgres => |*p| p.vectorSearch(allocator, input),
+        };
+    }
+
+    pub fn enqueueVectorOutbox(self: *Store, input: VectorOutboxInput) !i64 {
+        return switch (self.backend) {
+            .sqlite => |*s| s.enqueueVectorOutbox(input),
+            .postgres => |*p| p.enqueueVectorOutbox(input),
+        };
+    }
+
+    pub fn countVectorOutbox(self: *Store, status: ?[]const u8) !usize {
+        return switch (self.backend) {
+            .sqlite => |*s| s.countVectorOutbox(status),
+            .postgres => |*p| p.countVectorOutbox(status),
+        };
+    }
+
+    pub fn appendFeedEvent(self: *Store, input: FeedEventInput) !i64 {
+        return switch (self.backend) {
+            .sqlite => |*s| s.appendFeedEvent(input),
+            .postgres => |*p| p.appendFeedEvent(input),
+        };
+    }
+
+    pub fn listFeedEvents(self: *Store, allocator: std.mem.Allocator, input: FeedListInput) ![]FeedEvent {
+        return switch (self.backend) {
+            .sqlite => |*s| s.listFeedEvents(allocator, input),
+            .postgres => |*p| p.listFeedEvents(allocator, input),
+        };
+    }
+
+    pub fn getFeedEventByDedupeKey(self: *Store, allocator: std.mem.Allocator, dedupe_key: []const u8) !?FeedEvent {
+        return switch (self.backend) {
+            .sqlite => |*s| s.getFeedEventByDedupeKey(allocator, dedupe_key),
+            .postgres => |*p| p.getFeedEventByDedupeKey(allocator, dedupe_key),
+        };
+    }
+
+    pub fn createLifecycleSnapshot(self: *Store, allocator: std.mem.Allocator, snapshot_type: []const u8, summary_json: []const u8) !LifecycleSnapshot {
+        return switch (self.backend) {
+            .sqlite => |*s| s.createLifecycleSnapshot(allocator, snapshot_type, summary_json),
+            .postgres => |*p| p.createLifecycleSnapshot(allocator, snapshot_type, summary_json),
+        };
+    }
+
+    pub fn lifecycleDiagnostics(self: *Store) !LifecycleDiagnostics {
+        return switch (self.backend) {
+            .sqlite => |*s| s.lifecycleDiagnostics(),
+            .postgres => |*p| p.lifecycleDiagnostics(),
         };
     }
 
@@ -299,6 +365,109 @@ pub const SearchInput = struct {
     include_deprecated: bool = false,
 };
 
+pub const VectorChunkInput = struct {
+    object_type: []const u8 = "memory_atom",
+    object_id: []const u8,
+    chunk_ordinal: i64 = 0,
+    text: []const u8 = "",
+    scope: []const u8 = "workspace",
+    permissions_json: []const u8 = "[]",
+    embedding_json: []const u8,
+    model: ?[]const u8 = null,
+    dimensions: i64,
+};
+
+pub const VectorChunk = struct {
+    id: []const u8,
+    object_type: []const u8,
+    object_id: []const u8,
+    chunk_ordinal: i64,
+    text: []const u8,
+    scope: []const u8,
+    permissions_json: []const u8,
+    embedding_json: []const u8,
+    model: ?[]const u8,
+    dimensions: i64,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+};
+
+pub const VectorSearchInput = struct {
+    embedding_json: []const u8,
+    scopes_json: []const u8 = "[]",
+    limit: usize = 10,
+};
+
+pub const VectorOutboxInput = struct {
+    action: []const u8,
+    object_type: []const u8,
+    object_id: []const u8,
+    payload_json: []const u8 = "{}",
+};
+
+pub const FeedEventInput = struct {
+    event_type: []const u8,
+    object_type: []const u8,
+    object_id: []const u8,
+    scope: []const u8 = "workspace",
+    dedupe_key: ?[]const u8 = null,
+    payload_json: []const u8 = "{}",
+    status: []const u8 = "pending",
+};
+
+pub const FeedListInput = struct {
+    since_id: i64 = 0,
+    limit: usize = 100,
+    scopes_json: []const u8 = "[]",
+};
+
+pub const FeedEvent = struct {
+    id: i64,
+    event_type: []const u8,
+    object_type: []const u8,
+    object_id: []const u8,
+    scope: []const u8,
+    dedupe_key: ?[]const u8,
+    payload_json: []const u8,
+    status: []const u8,
+    created_at_ms: i64,
+    applied_at_ms: ?i64,
+
+    pub fn writeJson(self: FeedEvent, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+        try out.print(allocator, "{{\"id\":{d},\"event_type\":", .{self.id});
+        try @import("json_util.zig").appendString(out, allocator, self.event_type);
+        try out.appendSlice(allocator, ",\"object_type\":");
+        try @import("json_util.zig").appendString(out, allocator, self.object_type);
+        try out.appendSlice(allocator, ",\"object_id\":");
+        try @import("json_util.zig").appendString(out, allocator, self.object_id);
+        try out.appendSlice(allocator, ",\"scope\":");
+        try @import("json_util.zig").appendString(out, allocator, self.scope);
+        try out.appendSlice(allocator, ",\"dedupe_key\":");
+        try @import("json_util.zig").appendNullableString(out, allocator, self.dedupe_key);
+        try out.appendSlice(allocator, ",\"payload\":");
+        try @import("json_util.zig").appendRawJsonOr(out, allocator, self.payload_json, "{}");
+        try out.appendSlice(allocator, ",\"status\":");
+        try @import("json_util.zig").appendString(out, allocator, self.status);
+        try out.print(allocator, ",\"created_at_ms\":{d},\"applied_at_ms\":", .{self.created_at_ms});
+        if (self.applied_at_ms) |v| try out.print(allocator, "{d}", .{v}) else try out.appendSlice(allocator, "null");
+        try out.append(allocator, '}');
+    }
+};
+
+pub const LifecycleSnapshot = struct {
+    id: []const u8,
+    snapshot_type: []const u8,
+    summary_json: []const u8,
+    created_at_ms: i64,
+};
+
+pub const LifecycleDiagnostics = struct {
+    total_memory_atoms: usize,
+    stale_memory_atoms: usize,
+    vector_outbox_pending: usize,
+    cache_entries: usize,
+};
+
 pub const ContextPackInput = struct {
     purpose: []const u8 = "task",
     target: []const u8 = "agent",
@@ -313,6 +482,8 @@ pub const ContextPackResult = struct {
     target: []const u8,
     query: []const u8,
     generated_summary: []const u8,
+    included_sources_json: []const u8,
+    included_artifacts_json: []const u8,
     included_memory_atoms_json: []const u8,
     token_budget: i64,
     created_at_ms: i64,
@@ -364,6 +535,7 @@ pub const SQLiteStore = struct {
         _ = c.sqlite3_busy_timeout(db.?, 5000);
         var self = Self{ .allocator = allocator, .db = db.? };
         try self.exec(migrations.sqlite_schema);
+        try self.applyCompatibilityMigrations();
         return self;
     }
 
@@ -391,6 +563,28 @@ pub const SQLiteStore = struct {
             return error.SqlPrepareFailed;
         }
         return stmt.?;
+    }
+
+    fn applyCompatibilityMigrations(self: *Self) !void {
+        if (!try self.columnExists("vector_chunks", "permissions_json")) {
+            try self.exec("ALTER TABLE vector_chunks ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '[]'");
+        }
+        if (!try self.columnExists("memory_feed_events", "dedupe_key")) {
+            try self.exec("ALTER TABLE memory_feed_events ADD COLUMN dedupe_key TEXT");
+        }
+        try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_feed_events_dedupe_key ON memory_feed_events(dedupe_key) WHERE dedupe_key IS NOT NULL");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (2, 'security_and_retrieval_hardening', strftime('%s','now') * 1000)");
+    }
+
+    fn columnExists(self: *Self, comptime table: []const u8, column: []const u8) !bool {
+        const stmt = try self.prepare("PRAGMA table_info(" ++ table ++ ")");
+        defer _ = c.sqlite3_finalize(stmt);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const name = try columnText(self.allocator, stmt, 1);
+            defer self.allocator.free(name);
+            if (std.mem.eql(u8, name, column)) return true;
+        }
+        return false;
     }
 
     fn bindText(stmt: *c.sqlite3_stmt, index: c_int, value: []const u8) void {
@@ -774,14 +968,26 @@ pub const SQLiteStore = struct {
         const limit = @max(@as(usize, 1), @min(input.limit, 100));
         const fts_query = try buildFtsQuery(allocator, input.query);
         const use_fts = fts_query.len > 0;
+        var results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
+        errdefer results.deinit(allocator);
+
+        try self.searchMemoryAtoms(allocator, input, fts_query, use_fts, &results);
+        try self.searchSources(allocator, input, fts_query, use_fts, &results);
+        try self.searchArtifacts(allocator, input, fts_query, use_fts, &results);
+        try self.searchEntities(allocator, input, &results);
+
+        sortSearchResults(results.items);
+        if (results.items.len > limit) results.shrinkRetainingCapacity(limit);
+        return results.toOwnedSlice(allocator);
+    }
+
+    fn searchMemoryAtoms(self: *Self, allocator: std.mem.Allocator, input: SearchInput, fts_query: []const u8, use_fts: bool, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const stmt = if (use_fts)
             try self.prepare("SELECT ma.id,ma.text,ma.scope,ma.status,ma.confidence,ma.source_ids_json,ma.created_at_ms,ma.permissions_json,bm25(memory_atoms_fts) FROM memory_atoms_fts JOIN memory_atoms ma ON ma.id = memory_atoms_fts.id WHERE memory_atoms_fts MATCH ?1 ORDER BY bm25(memory_atoms_fts) LIMIT 1000")
         else
             try self.prepare("SELECT id,text,scope,status,confidence,source_ids_json,created_at_ms,permissions_json,0 FROM memory_atoms ORDER BY created_at_ms DESC LIMIT 1000");
         defer _ = c.sqlite3_finalize(stmt);
         if (use_fts) bindText(stmt, 1, fts_query);
-        var results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
-        errdefer results.deinit(allocator);
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const id_text = try columnText(allocator, stmt, 0);
             const text = try columnText(allocator, stmt, 1);
@@ -794,6 +1000,7 @@ pub const SQLiteStore = struct {
             if (!domain.recordVisible(scope, permissions, input.scopes_json)) continue;
             const relevance = if (use_fts) @max(0.0, 10.0 - c.sqlite3_column_double(stmt, 8)) else scoreText(input.query, text);
             if (!use_fts and relevance <= 0 and input.query.len > 0) continue;
+            const citations = try self.sanitizeSourceIds(allocator, source_ids, input.scopes_json);
             try results.append(allocator, .{
                 .id = id_text,
                 .result_type = "memory_atom",
@@ -802,11 +1009,108 @@ pub const SQLiteStore = struct {
                 .scope = scope,
                 .status = status,
                 .score = relevance + confidence,
-                .source_ids_json = source_ids,
+                .source_ids_json = citations,
             });
-            if (results.items.len >= limit) break;
         }
-        return results.toOwnedSlice(allocator);
+    }
+
+    fn searchSources(self: *Self, allocator: std.mem.Allocator, input: SearchInput, fts_query: []const u8, use_fts: bool, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const stmt = if (use_fts)
+            try self.prepare("SELECT s.id,s.title,s.content,s.scope,s.permissions_json,bm25(sources_fts) FROM sources_fts JOIN sources s ON s.id = sources_fts.id WHERE sources_fts MATCH ?1 ORDER BY bm25(sources_fts) LIMIT 500")
+        else
+            try self.prepare("SELECT id,title,content,scope,permissions_json,0 FROM sources ORDER BY imported_at_ms DESC LIMIT 500");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (use_fts) bindText(stmt, 1, fts_query);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id_text = try columnText(allocator, stmt, 0);
+            const title = try columnText(allocator, stmt, 1);
+            const content = try columnText(allocator, stmt, 2);
+            const scope = try columnText(allocator, stmt, 3);
+            const permissions = try columnText(allocator, stmt, 4);
+            if (!domain.recordVisible(scope, permissions, input.scopes_json)) continue;
+            const relevance = if (use_fts) @max(0.0, 9.0 - c.sqlite3_column_double(stmt, 5)) else scoreText(input.query, title) + scoreText(input.query, content);
+            if (!use_fts and relevance <= 0 and input.query.len > 0) continue;
+            const citations = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{id_text});
+            try results.append(allocator, .{ .id = id_text, .result_type = "source", .title = title, .text = content, .scope = scope, .status = "active", .score = relevance, .source_ids_json = citations });
+        }
+    }
+
+    fn searchArtifacts(self: *Self, allocator: std.mem.Allocator, input: SearchInput, fts_query: []const u8, use_fts: bool, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const stmt = if (use_fts)
+            try self.prepare("SELECT a.id,a.title,a.body,a.status,a.permissions_json,a.source_ids_json,bm25(artifacts_fts) FROM artifacts_fts JOIN artifacts a ON a.id = artifacts_fts.id WHERE artifacts_fts MATCH ?1 ORDER BY bm25(artifacts_fts) LIMIT 500")
+        else
+            try self.prepare("SELECT id,title,body,status,permissions_json,source_ids_json,0 FROM artifacts ORDER BY updated_at_ms DESC LIMIT 500");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (use_fts) bindText(stmt, 1, fts_query);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id_text = try columnText(allocator, stmt, 0);
+            const title = try columnText(allocator, stmt, 1);
+            const body = try columnText(allocator, stmt, 2);
+            const status = try columnText(allocator, stmt, 3);
+            const permissions = try columnText(allocator, stmt, 4);
+            const source_ids = try columnText(allocator, stmt, 5);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
+            if (!domain.permissionsVisible(permissions, input.scopes_json)) continue;
+            const relevance = if (use_fts) @max(0.0, 9.0 - c.sqlite3_column_double(stmt, 6)) else scoreText(input.query, title) + scoreText(input.query, body);
+            if (!use_fts and relevance <= 0 and input.query.len > 0) continue;
+            const citations = try self.sanitizeSourceIds(allocator, source_ids, input.scopes_json);
+            try results.append(allocator, .{ .id = id_text, .result_type = "artifact", .title = title, .text = body, .scope = "artifact", .status = status, .score = relevance, .source_ids_json = citations });
+        }
+    }
+
+    fn searchEntities(self: *Self, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const stmt = try self.prepare("SELECT id,type,name,aliases_json,description FROM entities ORDER BY updated_at_ms DESC LIMIT 500");
+        defer _ = c.sqlite3_finalize(stmt);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id_text = try columnText(allocator, stmt, 0);
+            const entity_type = try columnText(allocator, stmt, 1);
+            const name = try columnText(allocator, stmt, 2);
+            const aliases = try columnText(allocator, stmt, 3);
+            const description = try columnTextNullable(allocator, stmt, 4);
+            const text = description orelse name;
+            const relevance = scoreText(input.query, name) + scoreText(input.query, aliases) + scoreText(input.query, text);
+            if (relevance <= 0 and input.query.len > 0) continue;
+            const title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ entity_type, name });
+            try results.append(allocator, .{ .id = id_text, .result_type = "entity", .title = title, .text = text, .scope = "entity", .status = "active", .score = relevance + 0.25, .source_ids_json = "[]" });
+        }
+    }
+
+    fn sanitizeSourceIds(self: *Self, allocator: std.mem.Allocator, source_ids_json: []const u8, scopes_json: []const u8) ![]const u8 {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, source_ids_json, .{}) catch return allocator.dupe(u8, "[]");
+        defer parsed.deinit();
+        const arr = switch (parsed.value) {
+            .array => |a| a,
+            else => return allocator.dupe(u8, "[]"),
+        };
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.append(allocator, '[');
+        var first = true;
+        for (arr.items) |item| {
+            const source_id = switch (item) {
+                .string => |s| s,
+                else => continue,
+            };
+            const source = (try self.getSource(allocator, source_id)) orelse continue;
+            if (!domain.recordVisible(source.scope, source.permissions_json, scopes_json)) continue;
+            if (!first) try out.append(allocator, ',');
+            first = false;
+            try @import("json_util.zig").appendString(&out, allocator, source_id);
+        }
+        try out.append(allocator, ']');
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn sortSearchResults(items: []domain.SearchResult) void {
+        var i: usize = 0;
+        while (i < items.len) : (i += 1) {
+            var best = i;
+            var j = i + 1;
+            while (j < items.len) : (j += 1) {
+                if (items[j].score > items[best].score) best = j;
+            }
+            if (best != i) std.mem.swap(domain.SearchResult, &items[i], &items[best]);
+        }
     }
 
     fn buildFtsQuery(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
@@ -839,32 +1143,247 @@ pub const SQLiteStore = struct {
         return score;
     }
 
+    pub fn upsertVectorChunk(self: *Self, allocator: std.mem.Allocator, input: VectorChunkInput) !VectorChunk {
+        _ = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
+        const id = try std.fmt.allocPrint(allocator, "vec_{s}_{d}", .{ input.object_id, input.chunk_ordinal });
+        const now = ids.nowMs();
+        const stmt = try self.prepare("INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(id) DO UPDATE SET text=excluded.text, scope=excluded.scope, permissions_json=excluded.permissions_json, embedding_json=excluded.embedding_json, model=excluded.model, dimensions=excluded.dimensions, updated_at_ms=excluded.updated_at_ms");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, id);
+        bindText(stmt, 2, input.object_type);
+        bindText(stmt, 3, input.object_id);
+        _ = c.sqlite3_bind_int64(stmt, 4, input.chunk_ordinal);
+        bindText(stmt, 5, input.text);
+        bindText(stmt, 6, input.scope);
+        bindText(stmt, 7, input.permissions_json);
+        bindText(stmt, 8, input.embedding_json);
+        bindNullableText(stmt, 9, input.model);
+        _ = c.sqlite3_bind_int64(stmt, 10, input.dimensions);
+        _ = c.sqlite3_bind_int64(stmt, 11, now);
+        _ = c.sqlite3_bind_int64(stmt, 12, now);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+        _ = try self.enqueueVectorOutbox(.{ .action = "upsert", .object_type = input.object_type, .object_id = input.object_id, .payload_json = "{}" });
+        self.insertAudit("vector_chunk.upserted", "vector_chunk", id);
+        return .{
+            .id = id,
+            .object_type = input.object_type,
+            .object_id = input.object_id,
+            .chunk_ordinal = input.chunk_ordinal,
+            .text = input.text,
+            .scope = input.scope,
+            .permissions_json = input.permissions_json,
+            .embedding_json = input.embedding_json,
+            .model = input.model,
+            .dimensions = input.dimensions,
+            .created_at_ms = now,
+            .updated_at_ms = now,
+        };
+    }
+
+    pub fn vectorSearch(self: *Self, allocator: std.mem.Allocator, input: VectorSearchInput) ![]vector_mod.VectorMatch {
+        const query = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
+        defer allocator.free(query);
+        const stmt = try self.prepare("SELECT id,object_type,text,scope,permissions_json,embedding_json FROM vector_chunks ORDER BY updated_at_ms DESC LIMIT 2000");
+        defer _ = c.sqlite3_finalize(stmt);
+        var records: std.ArrayListUnmanaged(vector_mod.VectorRecord) = .empty;
+        defer records.deinit(allocator);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id_text = try columnText(allocator, stmt, 0);
+            const object_type = try columnText(allocator, stmt, 1);
+            const text = try columnText(allocator, stmt, 2);
+            const scope = try columnText(allocator, stmt, 3);
+            const permissions = try columnText(allocator, stmt, 4);
+            const embedding_json = try columnText(allocator, stmt, 5);
+            if (!domain.recordVisible(scope, permissions, input.scopes_json)) continue;
+            const embedding = vector_mod.embeddingFromJson(allocator, embedding_json) catch continue;
+            try records.append(allocator, .{
+                .id = id_text,
+                .object_type = object_type,
+                .text = text,
+                .scope = scope,
+                .embedding = embedding,
+            });
+        }
+        return vector_mod.bruteForceSearch(allocator, query, records.items, @max(@as(usize, 1), @min(input.limit, 100)));
+    }
+
+    pub fn enqueueVectorOutbox(self: *Self, input: VectorOutboxInput) !i64 {
+        const now = ids.nowMs();
+        const stmt = try self.prepare("INSERT INTO vector_outbox (action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms) VALUES (?1,?2,?3,'pending',0,?4,?5,?6)");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, input.action);
+        bindText(stmt, 2, input.object_type);
+        bindText(stmt, 3, input.object_id);
+        bindText(stmt, 4, input.payload_json);
+        _ = c.sqlite3_bind_int64(stmt, 5, now);
+        _ = c.sqlite3_bind_int64(stmt, 6, now);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+        return c.sqlite3_last_insert_rowid(self.db);
+    }
+
+    pub fn countVectorOutbox(self: *Self, status: ?[]const u8) !usize {
+        if (status) |s| {
+            const stmt = try self.prepare("SELECT COUNT(*) FROM vector_outbox WHERE status = ?1");
+            defer _ = c.sqlite3_finalize(stmt);
+            bindText(stmt, 1, s);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+            return @intCast(c.sqlite3_column_int64(stmt, 0));
+        }
+        return @intCast(try self.countSql("SELECT COUNT(*) FROM vector_outbox"));
+    }
+
+    pub fn appendFeedEvent(self: *Self, input: FeedEventInput) !i64 {
+        if (input.dedupe_key) |key| {
+            if (try self.feedEventIdByDedupeKey(key)) |existing_id| return existing_id;
+        }
+        const now = ids.nowMs();
+        const applied = if (std.mem.eql(u8, input.status, "applied")) now else null;
+        const stmt = try self.prepare("INSERT INTO memory_feed_events (event_type,object_type,object_id,scope,dedupe_key,payload_json,status,created_at_ms,applied_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, input.event_type);
+        bindText(stmt, 2, input.object_type);
+        bindText(stmt, 3, input.object_id);
+        bindText(stmt, 4, input.scope);
+        bindNullableText(stmt, 5, input.dedupe_key);
+        bindText(stmt, 6, input.payload_json);
+        bindText(stmt, 7, input.status);
+        _ = c.sqlite3_bind_int64(stmt, 8, now);
+        if (applied) |v| _ = c.sqlite3_bind_int64(stmt, 9, v) else _ = c.sqlite3_bind_null(stmt, 9);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+        const id = c.sqlite3_last_insert_rowid(self.db);
+        self.insertAudit("memory_feed.appended", "memory_feed_event", input.object_id);
+        return id;
+    }
+
+    fn feedEventIdByDedupeKey(self: *Self, dedupe_key: []const u8) !?i64 {
+        const stmt = try self.prepare("SELECT id FROM memory_feed_events WHERE dedupe_key = ?1 LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, dedupe_key);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return c.sqlite3_column_int64(stmt, 0);
+    }
+
+    pub fn getFeedEventByDedupeKey(self: *Self, allocator: std.mem.Allocator, dedupe_key: []const u8) !?FeedEvent {
+        const stmt = try self.prepare("SELECT id,event_type,object_type,object_id,scope,dedupe_key,payload_json,status,created_at_ms,applied_at_ms FROM memory_feed_events WHERE dedupe_key = ?1 LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, dedupe_key);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try readFeedEvent(allocator, stmt);
+    }
+
+    pub fn listFeedEvents(self: *Self, allocator: std.mem.Allocator, input: FeedListInput) ![]FeedEvent {
+        const stmt = try self.prepare("SELECT id,event_type,object_type,object_id,scope,dedupe_key,payload_json,status,created_at_ms,applied_at_ms FROM memory_feed_events WHERE id > ?1 ORDER BY id ASC LIMIT ?2");
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, input.since_id);
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(@max(@as(usize, 1), @min(input.limit, 500))));
+        var out: std.ArrayListUnmanaged(FeedEvent) = .empty;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const scope = try columnText(allocator, stmt, 4);
+            if (!domain.scopeVisible(scope, input.scopes_json)) continue;
+            try out.append(allocator, try readFeedEventWithScope(allocator, stmt, scope));
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn readFeedEvent(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !FeedEvent {
+        const scope = try columnText(allocator, stmt, 4);
+        return readFeedEventWithScope(allocator, stmt, scope);
+    }
+
+    fn readFeedEventWithScope(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, scope: []const u8) !FeedEvent {
+        return .{
+            .id = c.sqlite3_column_int64(stmt, 0),
+            .event_type = try columnText(allocator, stmt, 1),
+            .object_type = try columnText(allocator, stmt, 2),
+            .object_id = try columnText(allocator, stmt, 3),
+            .scope = scope,
+            .dedupe_key = try columnTextNullable(allocator, stmt, 5),
+            .payload_json = try columnText(allocator, stmt, 6),
+            .status = try columnText(allocator, stmt, 7),
+            .created_at_ms = c.sqlite3_column_int64(stmt, 8),
+            .applied_at_ms = if (c.sqlite3_column_type(stmt, 9) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 9),
+        };
+    }
+
+    pub fn createLifecycleSnapshot(self: *Self, allocator: std.mem.Allocator, snapshot_type: []const u8, summary_json: []const u8) !LifecycleSnapshot {
+        const id = try ids.make(allocator, "snap_");
+        const now = ids.nowMs();
+        const stmt = try self.prepare("INSERT INTO lifecycle_snapshots (id,snapshot_type,summary_json,created_at_ms) VALUES (?1,?2,?3,?4)");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, id);
+        bindText(stmt, 2, snapshot_type);
+        bindText(stmt, 3, summary_json);
+        _ = c.sqlite3_bind_int64(stmt, 4, now);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+        self.insertAudit("lifecycle.snapshot", "lifecycle_snapshot", id);
+        return .{ .id = id, .snapshot_type = snapshot_type, .summary_json = summary_json, .created_at_ms = now };
+    }
+
+    pub fn lifecycleDiagnostics(self: *Self) !LifecycleDiagnostics {
+        const total = try self.countSql("SELECT COUNT(*) FROM memory_atoms");
+        const stale = try self.countSql("SELECT COUNT(*) FROM memory_atoms WHERE status = 'stale'");
+        const pending = try self.countVectorOutbox("pending");
+        const response_cache = try self.countSql("SELECT COUNT(*) FROM response_cache");
+        const semantic_cache = try self.countSql("SELECT COUNT(*) FROM semantic_cache");
+        return .{
+            .total_memory_atoms = @intCast(total),
+            .stale_memory_atoms = @intCast(stale),
+            .vector_outbox_pending = pending,
+            .cache_entries = @intCast(response_cache + semantic_cache),
+        };
+    }
+
     pub fn createContextPack(self: *Self, allocator: std.mem.Allocator, input: ContextPackInput) !ContextPackResult {
         const search_results = try self.search(allocator, .{ .query = input.query, .limit = 8, .scopes_json = input.scopes_json });
         const id = try ids.make(allocator, "ctx_");
         const now = ids.nowMs();
+        var sources_json: std.ArrayListUnmanaged(u8) = .empty;
+        var artifacts_json: std.ArrayListUnmanaged(u8) = .empty;
         var atoms_json: std.ArrayListUnmanaged(u8) = .empty;
+        try sources_json.append(allocator, '[');
+        try artifacts_json.append(allocator, '[');
         try atoms_json.append(allocator, '[');
+        var source_count: usize = 0;
+        var artifact_count: usize = 0;
+        var atom_count: usize = 0;
         for (search_results, 0..) |result, i| {
-            if (i > 0) try atoms_json.append(allocator, ',');
-            try atoms_json.print(allocator, "\"{s}\"", .{result.id});
+            _ = i;
+            if (std.mem.eql(u8, result.result_type, "source")) {
+                if (source_count > 0) try sources_json.append(allocator, ',');
+                try @import("json_util.zig").appendString(&sources_json, allocator, result.id);
+                source_count += 1;
+            } else if (std.mem.eql(u8, result.result_type, "artifact")) {
+                if (artifact_count > 0) try artifacts_json.append(allocator, ',');
+                try @import("json_util.zig").appendString(&artifacts_json, allocator, result.id);
+                artifact_count += 1;
+            } else if (std.mem.eql(u8, result.result_type, "memory_atom")) {
+                if (atom_count > 0) try atoms_json.append(allocator, ',');
+                try @import("json_util.zig").appendString(&atoms_json, allocator, result.id);
+                atom_count += 1;
+            }
         }
+        try sources_json.append(allocator, ']');
+        try artifacts_json.append(allocator, ']');
         try atoms_json.append(allocator, ']');
+        const sources = try sources_json.toOwnedSlice(allocator);
+        const artifacts = try artifacts_json.toOwnedSlice(allocator);
         const atoms = try atoms_json.toOwnedSlice(allocator);
         const summary = try buildContextSummary(allocator, input.query, search_results);
-        const stmt = try self.prepare("INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,generated_summary,token_budget,created_at_ms) VALUES (?1,?2,?3,?4,'[]','[]',?5,?6,?7,?8)");
+        const stmt = try self.prepare("INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,generated_summary,token_budget,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         bindText(stmt, 2, input.purpose);
         bindText(stmt, 3, input.target);
         bindText(stmt, 4, input.query);
-        bindText(stmt, 5, atoms);
-        bindText(stmt, 6, summary);
-        _ = c.sqlite3_bind_int64(stmt, 7, input.token_budget);
-        _ = c.sqlite3_bind_int64(stmt, 8, now);
+        bindText(stmt, 5, sources);
+        bindText(stmt, 6, artifacts);
+        bindText(stmt, 7, atoms);
+        bindText(stmt, 8, summary);
+        _ = c.sqlite3_bind_int64(stmt, 9, input.token_budget);
+        _ = c.sqlite3_bind_int64(stmt, 10, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
         self.insertAudit("context_pack.created", "context_pack", id);
-        return .{ .id = id, .purpose = input.purpose, .target = input.target, .query = input.query, .generated_summary = summary, .included_memory_atoms_json = atoms, .token_budget = input.token_budget, .created_at_ms = now };
+        return .{ .id = id, .purpose = input.purpose, .target = input.target, .query = input.query, .generated_summary = summary, .included_sources_json = sources, .included_artifacts_json = artifacts, .included_memory_atoms_json = atoms, .token_budget = input.token_budget, .created_at_ms = now };
     }
 
     fn buildContextSummary(allocator: std.mem.Allocator, query: []const u8, results: []const domain.SearchResult) ![]u8 {
@@ -907,7 +1426,7 @@ pub const SQLiteStore = struct {
     }
 
     fn compatDeleteExact(self: *Self, key: []const u8, session_id: ?[]const u8) !void {
-        const stmt = try self.prepare("SELECT memory_atom_id FROM compat_memories WHERE key = ?1 AND ((?2 IS NULL AND session_id IS NULL) OR session_id = ?2) LIMIT 1");
+        const stmt = try self.prepare("SELECT memory_atom_id FROM compat_memories WHERE key = ?1 AND ((?2 IS NULL AND session_id IS NULL) OR (?2 IS NOT NULL AND session_id = ?2)) LIMIT 1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, key);
         bindNullableText(stmt, 2, session_id);
@@ -920,7 +1439,7 @@ pub const SQLiteStore = struct {
             _ = try self.patchMemoryAtomStatus(id_text, "deprecated", false);
         }
 
-        const del = try self.prepare("DELETE FROM compat_memories WHERE key = ?1 AND ((?2 IS NULL AND session_id IS NULL) OR session_id = ?2)");
+        const del = try self.prepare("DELETE FROM compat_memories WHERE key = ?1 AND ((?2 IS NULL AND session_id IS NULL) OR (?2 IS NOT NULL AND session_id = ?2))");
         defer _ = c.sqlite3_finalize(del);
         bindText(del, 1, key);
         bindNullableText(del, 2, session_id);
@@ -967,7 +1486,7 @@ pub const SQLiteStore = struct {
     }
 
     pub fn compatDelete(self: *Self, key: []const u8, session_id: ?[]const u8) !bool {
-        const stmt = try self.prepare("SELECT memory_atom_id FROM compat_memories WHERE key = ?1 AND (?2 IS NULL OR session_id = ?2)");
+        const stmt = try self.prepare("SELECT memory_atom_id FROM compat_memories WHERE key = ?1 AND ((?2 IS NULL AND session_id IS NULL) OR (?2 IS NOT NULL AND session_id = ?2))");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, key);
         bindNullableText(stmt, 2, session_id);
@@ -976,7 +1495,7 @@ pub const SQLiteStore = struct {
             defer self.allocator.free(id_text);
             _ = try self.patchMemoryAtomStatus(id_text, "deprecated", false);
         }
-        const del = try self.prepare("DELETE FROM compat_memories WHERE key = ?1 AND (?2 IS NULL OR session_id = ?2)");
+        const del = try self.prepare("DELETE FROM compat_memories WHERE key = ?1 AND ((?2 IS NULL AND session_id IS NULL) OR (?2 IS NOT NULL AND session_id = ?2))");
         defer _ = c.sqlite3_finalize(del);
         bindText(del, 1, key);
         bindNullableText(del, 2, session_id);
@@ -991,7 +1510,7 @@ pub const SQLiteStore = struct {
     fn compatSelectSql(comptime extra_where: []const u8, comptime tail: []const u8) [*:0]const u8 {
         return "SELECT ma.id, cm.key, ma.text, cm.category, cm.timestamp_ms, cm.session_id, ma.confidence " ++
             "FROM compat_memories cm JOIN memory_atoms ma ON ma.id = cm.memory_atom_id " ++
-            "WHERE (?2 IS NULL OR cm.session_id = ?2) " ++ extra_where ++ " " ++ tail;
+            "WHERE ((?2 IS NULL AND cm.session_id IS NULL) OR (?2 IS NOT NULL AND cm.session_id = ?2)) " ++ extra_where ++ " " ++ tail;
     }
 
     fn readCompatMemory(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !domain.CompatMemory {
@@ -1177,6 +1696,33 @@ pub const PostgresStore = struct {
     pub fn search(_: *PostgresStore, _: std.mem.Allocator, _: SearchInput) ![]domain.SearchResult {
         return error.PostgresAdapterIncomplete;
     }
+    pub fn upsertVectorChunk(_: *PostgresStore, _: std.mem.Allocator, _: VectorChunkInput) !VectorChunk {
+        return error.PostgresAdapterIncomplete;
+    }
+    pub fn vectorSearch(_: *PostgresStore, allocator: std.mem.Allocator, _: VectorSearchInput) ![]vector_mod.VectorMatch {
+        return allocator.alloc(vector_mod.VectorMatch, 0);
+    }
+    pub fn enqueueVectorOutbox(_: *PostgresStore, _: VectorOutboxInput) !i64 {
+        return error.PostgresAdapterIncomplete;
+    }
+    pub fn countVectorOutbox(_: *PostgresStore, _: ?[]const u8) !usize {
+        return error.PostgresAdapterIncomplete;
+    }
+    pub fn appendFeedEvent(_: *PostgresStore, _: FeedEventInput) !i64 {
+        return error.PostgresAdapterIncomplete;
+    }
+    pub fn listFeedEvents(_: *PostgresStore, allocator: std.mem.Allocator, _: FeedListInput) ![]FeedEvent {
+        return allocator.alloc(FeedEvent, 0);
+    }
+    pub fn getFeedEventByDedupeKey(_: *PostgresStore, _: std.mem.Allocator, _: []const u8) !?FeedEvent {
+        return error.PostgresAdapterIncomplete;
+    }
+    pub fn createLifecycleSnapshot(_: *PostgresStore, _: std.mem.Allocator, _: []const u8, _: []const u8) !LifecycleSnapshot {
+        return error.PostgresAdapterIncomplete;
+    }
+    pub fn lifecycleDiagnostics(_: *PostgresStore) !LifecycleDiagnostics {
+        return error.PostgresAdapterIncomplete;
+    }
     pub fn createContextPack(_: *PostgresStore, _: std.mem.Allocator, _: ContextPackInput) !ContextPackResult {
         return error.PostgresAdapterIncomplete;
     }
@@ -1311,6 +1857,7 @@ test "sqlite storage contract covers primitives lifecycle and audit events" {
     try std.testing.expect(verified.last_verified_at_ms != null);
 
     try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM audit_events")) >= 7);
+    try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1,2)")) == 2);
 }
 
 test "sqlite search excludes deprecated and superseded memory by default" {
@@ -1356,6 +1903,154 @@ test "sqlite search excludes deprecated and superseded memory by default" {
     try std.testing.expectEqual(@as(usize, 3), all_results.len);
 }
 
+test "sqlite vector layer stores chunks searches and enqueues outbox" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const a_json = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0, 0 });
+    const b_json = try vector_mod.embeddingToJson(alloc, &[_]f32{ 0, 1, 0 });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_id = "mem_a", .text = "agent memory", .scope = "project:nullpantry", .embedding_json = a_json, .dimensions = 3 });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_id = "mem_b", .text = "other memory", .scope = "project:nullpantry", .embedding_json = b_json, .dimensions = 3 });
+
+    try std.testing.expectEqual(@as(usize, 2), try store.countVectorOutbox("pending"));
+    const results = try store.vectorSearch(alloc, .{ .embedding_json = a_json, .scopes_json = "[\"project:nullpantry\"]", .limit = 2 });
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("vec_mem_a_0", results[0].id);
+}
+
+test "sqlite vector search filters permissions" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_id = "mem_public", .text = "public vector", .scope = "public", .embedding_json = embedding, .dimensions = 2 });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_id = "mem_secret", .text = "secret vector", .scope = "project:secret", .permissions_json = "[\"project:secret\"]", .embedding_json = embedding, .dimensions = 2 });
+
+    const public_results = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), public_results.len);
+    try std.testing.expectEqualStrings("vec_mem_public_0", public_results[0].id);
+
+    const admin_results = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"admin\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 2), admin_results.len);
+}
+
+test "sqlite global search covers primitives and sanitizes inaccessible citations" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const public_source = try store.createSource(alloc, .{ .title = "Public transcript", .content = "shared roadmap pantry", .scope = "public" });
+    const secret_source = try store.createSource(alloc, .{ .title = "Secret transcript", .content = "hidden roadmap pantry", .scope = "project:secret", .permissions_json = "[\"project:secret\"]" });
+    _ = try store.createArtifact(alloc, .{ .title = "Roadmap artifact", .body = "artifact pantry roadmap", .status = "accepted" });
+    _ = try store.createMemoryAtom(alloc, .{
+        .text = "roadmap atom",
+        .scope = "public",
+        .created_by = "human",
+        .source_ids_json = try std.fmt.allocPrint(alloc, "[\"{s}\",\"{s}\"]", .{ public_source.id, secret_source.id }),
+    });
+
+    const results = try store.search(alloc, .{ .query = "roadmap", .scopes_json = "[\"public\"]", .limit = 20 });
+    var saw_source = false;
+    var saw_artifact = false;
+    var saw_atom = false;
+    for (results) |result| {
+        if (std.mem.eql(u8, result.result_type, "source")) saw_source = true;
+        if (std.mem.eql(u8, result.result_type, "artifact")) saw_artifact = true;
+        if (std.mem.eql(u8, result.result_type, "memory_atom")) {
+            saw_atom = true;
+            try std.testing.expect(std.mem.indexOf(u8, result.source_ids_json, public_source.id) != null);
+            try std.testing.expect(std.mem.indexOf(u8, result.source_ids_json, secret_source.id) == null);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, result.text, "hidden roadmap pantry") == null);
+    }
+    try std.testing.expect(saw_source);
+    try std.testing.expect(saw_artifact);
+    try std.testing.expect(saw_atom);
+}
+
+test "sqlite memory feed append list and apply events are scope filtered" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const public_id = try store.appendFeedEvent(.{
+        .event_type = "memory_atom.upsert",
+        .object_type = "memory_atom",
+        .object_id = "mem_public",
+        .scope = "public",
+        .payload_json = "{\"text\":\"public\"}",
+    });
+    _ = public_id;
+    _ = try store.appendFeedEvent(.{
+        .event_type = "memory_atom.upsert",
+        .object_type = "memory_atom",
+        .object_id = "mem_secret",
+        .scope = "project:secret",
+        .payload_json = "{\"text\":\"secret\"}",
+        .status = "applied",
+    });
+
+    const visible = try store.listFeedEvents(alloc, .{ .scopes_json = "[\"public\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), visible.len);
+    try std.testing.expectEqualStrings("mem_public", visible[0].object_id);
+    try std.testing.expectEqualStrings("pending", visible[0].status);
+    try std.testing.expect(visible[0].applied_at_ms == null);
+
+    const all = try store.listFeedEvents(alloc, .{ .scopes_json = "[\"admin\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 2), all.len);
+    try std.testing.expect(all[1].applied_at_ms != null);
+}
+
+test "sqlite memory feed dedupe key is idempotent" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+
+    const first = try store.appendFeedEvent(.{ .event_type = "memory_atom.upsert", .object_type = "memory_atom", .object_id = "mem_a", .scope = "public", .dedupe_key = "evt-1", .payload_json = "{\"text\":\"one\"}" });
+    const second = try store.appendFeedEvent(.{ .event_type = "memory_atom.upsert", .object_type = "memory_atom", .object_id = "mem_b", .scope = "public", .dedupe_key = "evt-1", .payload_json = "{\"text\":\"two\"}" });
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM memory_feed_events"));
+}
+
+test "sqlite lifecycle snapshots are persisted and audited" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const snapshot = try store.createLifecycleSnapshot(alloc, "manual", "{\"memory_atoms\":0}");
+    try std.testing.expect(std.mem.startsWith(u8, snapshot.id, "snap_"));
+    try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM lifecycle_snapshots")) == 1);
+    try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM audit_events WHERE event_type = 'lifecycle.snapshot'")) == 1);
+}
+
+test "sqlite lifecycle diagnostics reads real counts" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const atom = try store.createMemoryAtom(alloc, .{ .text = "diagnostic memory", .scope = "public", .created_by = "human" });
+    try std.testing.expect(try store.patchMemoryAtomStatus(atom.id, "stale", false));
+    _ = try store.enqueueVectorOutbox(.{ .action = "upsert", .object_type = "memory_atom", .object_id = atom.id });
+
+    const diag = try store.lifecycleDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diag.total_memory_atoms);
+    try std.testing.expectEqual(@as(usize, 1), diag.stale_memory_atoms);
+    try std.testing.expectEqual(@as(usize, 1), diag.vector_outbox_pending);
+}
+
 test "nullclaw compatibility maps key memory to memory atom" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -1383,7 +2078,7 @@ test "nullclaw compatibility upsert preserves scoped memories" {
     const scoped = (try store.compatGet(alloc, "pref.lang", "agent:coder")).?;
     try std.testing.expectEqualStrings("Session value", scoped.content);
     const global = (try store.compatGet(alloc, "pref.lang", null)).?;
-    try std.testing.expect(std.mem.eql(u8, global.content, "Session value") or std.mem.eql(u8, global.content, "Global value"));
+    try std.testing.expectEqualStrings("Global value", global.content);
     try std.testing.expectEqual(@as(usize, 2), try store.compatCount());
 }
 

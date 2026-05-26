@@ -300,6 +300,30 @@ fn quotedStringContains(list_json: []const u8, value: []const u8) bool {
     return std.mem.indexOf(u8, list_json, needle) != null;
 }
 
+pub fn hasJsonString(list_json: []const u8, value: []const u8) bool {
+    return quotedStringContains(list_json, value);
+}
+
+pub fn intersectJsonStringLists(allocator: std.mem.Allocator, requested_json: []const u8, allowed_json: []const u8) ![]const u8 {
+    const requested = std.mem.trim(u8, requested_json, " \t\r\n");
+    if (requested.len == 0 or std.mem.eql(u8, requested, "[]")) return allocator.dupe(u8, "[]");
+    if (quotedStringContains(allowed_json, "admin")) return allocator.dupe(u8, requested);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    var first = true;
+    var cursor: usize = 0;
+    while (nextQuotedString(requested, &cursor)) |item| {
+        if (!std.mem.eql(u8, item, "public") and !quotedStringContains(allowed_json, item)) continue;
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try json.appendString(&out, allocator, item);
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
 fn nextQuotedString(list_json: []const u8, cursor: *usize) ?[]const u8 {
     while (cursor.* < list_json.len and list_json[cursor.*] != '"') : (cursor.* += 1) {}
     if (cursor.* >= list_json.len) return null;
@@ -321,6 +345,11 @@ fn nextQuotedString(list_json: []const u8, cursor: *usize) ?[]const u8 {
 
 pub fn hasActorScope(actor_scopes_json: []const u8, scope: []const u8) bool {
     return quotedStringContains(actor_scopes_json, scope);
+}
+
+pub fn hasCapability(actor_scopes_json: []const u8, actor_capabilities_json: []const u8, capability: []const u8) bool {
+    if (hasActorScope(actor_scopes_json, "admin")) return true;
+    return quotedStringContains(actor_capabilities_json, capability);
 }
 
 pub fn permissionsVisible(permissions_json: []const u8, actor_scopes_json: []const u8) bool {
@@ -382,4 +411,16 @@ test "scope and permission checks use exact grants" {
     try std.testing.expect(permissionsVisible("[\"public\"]", "[]"));
     try std.testing.expect(!permissionsWritable("[\"public\",\"project:secret\"]", "[\"public\"]"));
     try std.testing.expect(permissionsWritable("[\"public\",\"project:secret\"]", "[\"project:secret\"]"));
+}
+
+test "json string list intersection prevents escalation" {
+    const alloc = std.testing.allocator;
+    const filtered = try intersectJsonStringLists(alloc, "[\"public\",\"project:secret\",\"project:nullpantry\"]", "[\"public\",\"project:nullpantry\"]");
+    defer alloc.free(filtered);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "project:nullpantry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "project:secret") == null);
+
+    const admin_filtered = try intersectJsonStringLists(alloc, "[\"project:secret\"]", "[\"admin\"]");
+    defer alloc.free(admin_filtered);
+    try std.testing.expectEqualStrings("[\"project:secret\"]", admin_filtered);
 }

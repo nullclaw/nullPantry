@@ -16,6 +16,7 @@ const RuntimeConfig = struct {
     postgres_url: ?[]const u8 = null,
     token: ?[]const u8 = null,
     actor_scopes_json: []const u8 = "[\"admin\"]",
+    actor_capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -65,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
         const target = parts.next() orelse continue;
         const body = @import("json_util.zig").extractBody(raw);
 
-        var ctx = api.Context{ .allocator = req_alloc, .store = &store, .required_token = cfg.token, .actor_scopes_json = cfg.actor_scopes_json };
+        var ctx = api.Context{ .allocator = req_alloc, .store = &store, .required_token = cfg.token, .actor_scopes_json = cfg.actor_scopes_json, .actor_capabilities_json = cfg.actor_capabilities_json };
         const response = api.handleRequest(&ctx, method, target, body, raw);
 
         var header_buf: [512]u8 = undefined;
@@ -93,6 +94,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_SCOPES")) |scopes| {
         cfg.actor_scopes_json = scopes;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_CAPABILITIES")) |caps| {
+        cfg.actor_capabilities_json = caps;
     } else |_| {}
 
     var i: usize = 1;
@@ -127,6 +131,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--actor-scopes") and i + 1 < args.len) {
             i += 1;
             cfg.actor_scopes_json = args[i];
+        } else if (std.mem.eql(u8, arg, "--actor-capabilities") and i + 1 < args.len) {
+            i += 1;
+            cfg.actor_capabilities_json = args[i];
         }
     }
     return cfg;
@@ -134,13 +141,14 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
 
 fn printUsage() void {
     std.debug.print(
-        \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--actor-scopes JSON]
+        \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--actor-scopes JSON] [--actor-capabilities JSON]
         \\       nullpantry --backend postgres --postgres-url URL [--token TOKEN]
         \\
         \\Environment:
         \\  NULLPANTRY_TOKEN
         \\  NULLPANTRY_DATABASE_URL
         \\  NULLPANTRY_SCOPES
+        \\  NULLPANTRY_CAPABILITIES
         \\
     , .{});
 }
@@ -201,6 +209,10 @@ test {
     _ = @import("ids.zig");
     _ = @import("json_util.zig");
     _ = @import("domain.zig");
+    _ = @import("engines.zig");
+    _ = @import("vector.zig");
+    _ = @import("retrieval.zig");
+    _ = @import("lifecycle.zig");
     _ = @import("store.zig");
     _ = @import("api.zig");
 }

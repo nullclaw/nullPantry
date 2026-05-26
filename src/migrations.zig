@@ -1,6 +1,12 @@
 pub const sqlite_schema =
     \\PRAGMA journal_mode = WAL;
     \\PRAGMA foreign_keys = ON;
+    \\CREATE TABLE IF NOT EXISTS schema_migrations (
+    \\  version INTEGER PRIMARY KEY,
+    \\  name TEXT NOT NULL,
+    \\  applied_at_ms INTEGER NOT NULL
+    \\);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (1, 'core_primitives', strftime('%s','now') * 1000);
     \\CREATE TABLE IF NOT EXISTS sources (
     \\  id TEXT PRIMARY KEY,
     \\  type TEXT NOT NULL,
@@ -72,6 +78,34 @@ pub const sqlite_schema =
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_memory_atoms_scope_status ON memory_atoms(scope, status);
     \\CREATE VIRTUAL TABLE IF NOT EXISTS memory_atoms_fts USING fts5(id UNINDEXED, text, predicate, object);
+    \\CREATE TABLE IF NOT EXISTS vector_chunks (
+    \\  id TEXT PRIMARY KEY,
+    \\  object_type TEXT NOT NULL,
+    \\  object_id TEXT NOT NULL,
+    \\  chunk_ordinal INTEGER NOT NULL DEFAULT 0,
+    \\  text TEXT NOT NULL DEFAULT '',
+    \\  scope TEXT NOT NULL DEFAULT 'workspace',
+    \\  permissions_json TEXT NOT NULL DEFAULT '[]',
+    \\  embedding_json TEXT NOT NULL,
+    \\  model TEXT,
+    \\  dimensions INTEGER NOT NULL,
+    \\  created_at_ms INTEGER NOT NULL,
+    \\  updated_at_ms INTEGER NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_vector_chunks_object ON vector_chunks(object_type, object_id);
+    \\CREATE INDEX IF NOT EXISTS idx_vector_chunks_scope ON vector_chunks(scope);
+    \\CREATE TABLE IF NOT EXISTS vector_outbox (
+    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  action TEXT NOT NULL,
+    \\  object_type TEXT NOT NULL,
+    \\  object_id TEXT NOT NULL,
+    \\  status TEXT NOT NULL DEFAULT 'pending',
+    \\  attempts INTEGER NOT NULL DEFAULT 0,
+    \\  payload_json TEXT NOT NULL DEFAULT '{}',
+    \\  created_at_ms INTEGER NOT NULL,
+    \\  updated_at_ms INTEGER NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_vector_outbox_status ON vector_outbox(status, id);
     \\CREATE TABLE IF NOT EXISTS relations (
     \\  id TEXT PRIMARY KEY,
     \\  from_entity_id TEXT NOT NULL,
@@ -126,11 +160,50 @@ pub const sqlite_schema =
     \\  payload_json TEXT NOT NULL DEFAULT '{}',
     \\  created_at_ms INTEGER NOT NULL
     \\);
+    \\CREATE TABLE IF NOT EXISTS memory_feed_events (
+    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  event_type TEXT NOT NULL,
+    \\  object_type TEXT NOT NULL,
+    \\  object_id TEXT NOT NULL,
+    \\  scope TEXT NOT NULL DEFAULT 'workspace',
+    \\  dedupe_key TEXT,
+    \\  payload_json TEXT NOT NULL DEFAULT '{}',
+    \\  status TEXT NOT NULL DEFAULT 'pending',
+    \\  created_at_ms INTEGER NOT NULL,
+    \\  applied_at_ms INTEGER
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_memory_feed_events_scope_id ON memory_feed_events(scope, id);
+    \\CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_feed_events_dedupe_key ON memory_feed_events(dedupe_key) WHERE dedupe_key IS NOT NULL;
+    \\CREATE TABLE IF NOT EXISTS response_cache (
+    \\  cache_key TEXT PRIMARY KEY,
+    \\  value_json TEXT NOT NULL,
+    \\  created_at_ms INTEGER NOT NULL,
+    \\  ttl_ms INTEGER NOT NULL DEFAULT 0
+    \\);
+    \\CREATE TABLE IF NOT EXISTS semantic_cache (
+    \\  cache_key TEXT PRIMARY KEY,
+    \\  value_json TEXT NOT NULL,
+    \\  embedding_json TEXT NOT NULL,
+    \\  created_at_ms INTEGER NOT NULL,
+    \\  ttl_ms INTEGER NOT NULL DEFAULT 0
+    \\);
+    \\CREATE TABLE IF NOT EXISTS lifecycle_snapshots (
+    \\  id TEXT PRIMARY KEY,
+    \\  snapshot_type TEXT NOT NULL,
+    \\  summary_json TEXT NOT NULL DEFAULT '{}',
+    \\  created_at_ms INTEGER NOT NULL
+    \\);
 ;
 
 pub const postgres_schema =
     \\CREATE EXTENSION IF NOT EXISTS pg_trgm;
     \\CREATE EXTENSION IF NOT EXISTS vector;
+    \\CREATE TABLE IF NOT EXISTS schema_migrations (
+    \\  version bigint PRIMARY KEY,
+    \\  name text NOT NULL,
+    \\  applied_at_ms bigint NOT NULL
+    \\);
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (1, 'core_primitives', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\CREATE TABLE IF NOT EXISTS sources (
     \\  id text PRIMARY KEY,
     \\  type text NOT NULL,
@@ -204,6 +277,36 @@ pub const postgres_schema =
     \\);
     \\CREATE INDEX IF NOT EXISTS memory_atoms_search_idx ON memory_atoms USING gin(search_tsv);
     \\CREATE INDEX IF NOT EXISTS memory_atoms_scope_status_idx ON memory_atoms(scope, status);
+    \\CREATE TABLE IF NOT EXISTS vector_chunks (
+    \\  id text PRIMARY KEY,
+    \\  object_type text NOT NULL,
+    \\  object_id text NOT NULL,
+    \\  chunk_ordinal bigint NOT NULL DEFAULT 0,
+    \\  text text NOT NULL DEFAULT '',
+    \\  scope text NOT NULL DEFAULT 'workspace',
+    \\  permissions_json jsonb NOT NULL DEFAULT '[]',
+    \\  embedding_json jsonb NOT NULL,
+    \\  embedding vector(1536),
+    \\  model text,
+    \\  dimensions bigint NOT NULL,
+    \\  created_at_ms bigint NOT NULL,
+    \\  updated_at_ms bigint NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS vector_chunks_object_idx ON vector_chunks(object_type, object_id);
+    \\CREATE INDEX IF NOT EXISTS vector_chunks_scope_idx ON vector_chunks(scope);
+    \\CREATE INDEX IF NOT EXISTS vector_chunks_embedding_idx ON vector_chunks USING ivfflat (embedding vector_cosine_ops);
+    \\CREATE TABLE IF NOT EXISTS vector_outbox (
+    \\  id bigserial PRIMARY KEY,
+    \\  action text NOT NULL,
+    \\  object_type text NOT NULL,
+    \\  object_id text NOT NULL,
+    \\  status text NOT NULL DEFAULT 'pending',
+    \\  attempts bigint NOT NULL DEFAULT 0,
+    \\  payload_json jsonb NOT NULL DEFAULT '{}',
+    \\  created_at_ms bigint NOT NULL,
+    \\  updated_at_ms bigint NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS vector_outbox_status_idx ON vector_outbox(status, id);
     \\CREATE TABLE IF NOT EXISTS relations (
     \\  id text PRIMARY KEY,
     \\  from_entity_id text NOT NULL,
@@ -255,27 +358,71 @@ pub const postgres_schema =
     \\  payload_json jsonb NOT NULL DEFAULT '{}',
     \\  created_at_ms bigint NOT NULL
     \\);
+    \\CREATE TABLE IF NOT EXISTS memory_feed_events (
+    \\  id bigserial PRIMARY KEY,
+    \\  event_type text NOT NULL,
+    \\  object_type text NOT NULL,
+    \\  object_id text NOT NULL,
+    \\  scope text NOT NULL DEFAULT 'workspace',
+    \\  dedupe_key text,
+    \\  payload_json jsonb NOT NULL DEFAULT '{}',
+    \\  status text NOT NULL DEFAULT 'pending',
+    \\  created_at_ms bigint NOT NULL,
+    \\  applied_at_ms bigint
+    \\);
+    \\CREATE INDEX IF NOT EXISTS memory_feed_events_scope_id_idx ON memory_feed_events(scope, id);
+    \\CREATE UNIQUE INDEX IF NOT EXISTS memory_feed_events_dedupe_key_idx ON memory_feed_events(dedupe_key) WHERE dedupe_key IS NOT NULL;
+    \\CREATE TABLE IF NOT EXISTS response_cache (
+    \\  cache_key text PRIMARY KEY,
+    \\  value_json jsonb NOT NULL,
+    \\  created_at_ms bigint NOT NULL,
+    \\  ttl_ms bigint NOT NULL DEFAULT 0
+    \\);
+    \\CREATE TABLE IF NOT EXISTS semantic_cache (
+    \\  cache_key text PRIMARY KEY,
+    \\  value_json jsonb NOT NULL,
+    \\  embedding_json jsonb NOT NULL,
+    \\  embedding vector(1536),
+    \\  created_at_ms bigint NOT NULL,
+    \\  ttl_ms bigint NOT NULL DEFAULT 0
+    \\);
+    \\CREATE TABLE IF NOT EXISTS lifecycle_snapshots (
+    \\  id text PRIMARY KEY,
+    \\  snapshot_type text NOT NULL,
+    \\  summary_json jsonb NOT NULL DEFAULT '{}',
+    \\  created_at_ms bigint NOT NULL
+    \\);
 ;
 
 test "sqlite migration includes core primitive tables and indexes" {
     const std = @import("std");
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS sources") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS schema_migrations") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS artifacts") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS entities") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS relations") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS context_packs") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS memory_atoms") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS memory_atoms_fts USING fts5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS vector_chunks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "permissions_json TEXT NOT NULL DEFAULT '[]'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS vector_outbox") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS compat_memories") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS session_messages") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS session_usage") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS audit_events") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS memory_feed_events") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "idx_memory_feed_events_dedupe_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS response_cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS semantic_cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS lifecycle_snapshots") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE UNIQUE INDEX IF NOT EXISTS idx_compat_memories_key_session") != null);
 }
 
 test "postgres migration includes fts vector and expression indexes" {
     const std = @import("std");
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS sources") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS schema_migrations") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS artifacts") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS entities") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS relations") != null);
@@ -283,8 +430,16 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS compat_memories") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS session_messages") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS session_usage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS vector_chunks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS vector_outbox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS memory_feed_events") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "memory_feed_events_dedupe_key_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS response_cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS semantic_cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS lifecycle_snapshots") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE EXTENSION IF NOT EXISTS vector") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "embedding vector(1536)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "vector_cosine_ops") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "USING gin(search_tsv)") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS compat_memories_key_session_idx") != null);
