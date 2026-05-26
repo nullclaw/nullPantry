@@ -17,6 +17,7 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     store: *Store,
     required_token: ?[]const u8 = null,
+    token_principals_json: ?[]const u8 = null,
     actor_id: []const u8 = "local",
     actor_scopes_json: []const u8 = "[\"admin\"]",
     actor_capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
@@ -71,6 +72,8 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
 
     if (eql(seg1, "engines") and is_get) {
         return engineRegistry(ctx);
+    } else if ((eql(seg1, "openapi.json") or eql(seg1, "openapi")) and is_get) {
+        return openApi(ctx);
     } else if (eql(seg1, "capabilities") and is_get) {
         return capabilities(ctx);
     } else if (eql(seg1, "connectors") and is_get) {
@@ -137,6 +140,10 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return applyMemoryEvent(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "diagnostics") and is_get) {
         return lifecycleDiagnostics(ctx);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and eql(seg3, "export") and is_post) {
+        return lifecycleSnapshotExport(ctx, body);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and eql(seg3, "import") and is_post) {
+        return lifecycleSnapshotImport(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and is_post) {
         return lifecycleSnapshot(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "cache") and eql(seg3, "put") and is_post) {
@@ -297,15 +304,25 @@ fn nullclawDeleteAllowed(ctx: *Context) bool {
 }
 
 fn authorized(ctx: *Context, raw_request: []const u8) bool {
-    const required = ctx.required_token orelse return true;
-    if (required.len == 0) return true;
+    if (ctx.required_token == null and ctx.token_principals_json == null) return true;
+    if (ctx.token_principals_json == null) {
+        if (ctx.required_token) |required| {
+            if (required.len == 0) return true;
+        }
+    }
     const token = json.bearerToken(raw_request) orelse return false;
+    if (ctx.token_principals_json != null and principalRegistryHasToken(ctx, token)) return true;
+    const required = ctx.required_token orelse return false;
+    if (required.len == 0) return true;
     return std.mem.eql(u8, token, required);
 }
 
 fn applyRequestPrincipal(ctx: *Context, raw_request: []const u8) !void {
-    if (json.extractHeader(raw_request, "X-NullPantry-Actor-Id")) |actor_id| {
-        ctx.actor_id = std.mem.trim(u8, actor_id, " \t\r\n");
+    const principal_locked = try applyBearerPrincipal(ctx, raw_request);
+    if (!principal_locked) {
+        if (json.extractHeader(raw_request, "X-NullPantry-Actor-Id")) |actor_id| {
+            ctx.actor_id = std.mem.trim(u8, actor_id, " \t\r\n");
+        }
     }
 
     if (json.extractHeader(raw_request, "X-NullPantry-Actor-Scopes")) |raw_scopes| {
@@ -317,6 +334,35 @@ fn applyRequestPrincipal(ctx: *Context, raw_request: []const u8) !void {
         const caps = std.mem.trim(u8, raw_caps, " \t\r\n");
         ctx.actor_capabilities_json = try domain.intersectJsonStringLists(ctx.allocator, caps, ctx.actor_capabilities_json);
     }
+}
+
+fn principalRegistryHasToken(ctx: *Context, token: []const u8) bool {
+    const raw = ctx.token_principals_json orelse return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.get(token) != null;
+}
+
+fn applyBearerPrincipal(ctx: *Context, raw_request: []const u8) !bool {
+    const raw = ctx.token_principals_json orelse return false;
+    const token = json.bearerToken(raw_request) orelse return false;
+    const parsed = try std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPrincipalRegistry;
+    const value = parsed.value.object.get(token) orelse return false;
+    if (value != .object) return error.InvalidPrincipalRegistry;
+    const principal = value.object;
+    if (json.stringField(principal, "actor_id")) |actor_id| ctx.actor_id = actor_id;
+    if (principal.get("scopes")) |scopes| {
+        if (scopes != .array) return error.InvalidPrincipalRegistry;
+        ctx.actor_scopes_json = try json.jsonFromValue(ctx.allocator, scopes);
+    }
+    if (principal.get("capabilities")) |caps| {
+        if (caps != .array) return error.InvalidPrincipalRegistry;
+        ctx.actor_capabilities_json = try json.jsonFromValue(ctx.allocator, caps);
+    }
+    return true;
 }
 
 fn health(ctx: *Context) HttpResponse {
@@ -349,6 +395,7 @@ fn createSource(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn getSource(ctx: *Context, id: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const source = ctx.store.getSource(ctx.allocator, id) catch return serverError(ctx);
     if (source == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Source not found");
     if (!recordVisibleToActor(ctx, source.?.scope, source.?.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Source not found");
@@ -388,6 +435,7 @@ fn createArtifact(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn getArtifact(ctx: *Context, id: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const artifact = ctx.store.getArtifact(ctx.allocator, id) catch return serverError(ctx);
     if (artifact == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Artifact not found");
     if (!recordVisibleToActor(ctx, artifact.?.scope, artifact.?.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Artifact not found");
@@ -428,6 +476,8 @@ fn createRelation(ctx: *Context, body: []const u8) HttpResponse {
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
     if (!canWriteRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     if (!sourceIdsCanBackRecord(ctx, source_ids_json, scope, permissions_json)) return forbidden(ctx);
+    if (!entityCanBackRecord(ctx, from_entity_id, scope, permissions_json)) return forbidden(ctx);
+    if (!entityCanBackRecord(ctx, to_entity_id, scope, permissions_json)) return forbidden(ctx);
     const relation = ctx.store.createRelation(ctx.allocator, .{
         .from_entity_id = from_entity_id,
         .relation_type = json.stringField(obj, "relation_type") orelse "related_to",
@@ -439,6 +489,7 @@ fn createRelation(ctx: *Context, body: []const u8) HttpResponse {
         .status = json.stringField(obj, "status") orelse "proposed",
     }) catch |err| switch (err) {
         error.EntityNotFound => return json.errorResponse(ctx.allocator, 400, "bad_request", "Relation endpoints must reference existing entities"),
+        error.RelationAclBroaderThanEntity => return json.errorResponse(ctx.allocator, 400, "bad_request", "Relation ACL cannot be broader than endpoint entity ACL"),
         else => return serverError(ctx),
     };
     return objectResponse(ctx, "relation", relation);
@@ -452,9 +503,15 @@ fn engineRegistry(ctx: *Context) HttpResponse {
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
+fn openApi(ctx: *Context) HttpResponse {
+    return ok(ctx,
+        \\{"openapi":"3.1.0","info":{"title":"NullPantry API","version":"v1","description":"Headless agent-native knowledge base and central memory service for the Null ecosystem."},"servers":[{"url":"/v1"}],"security":[{"bearerAuth":[]}],"components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}}},"paths":{"/sources":{"post":{"operationId":"createSource"}},"/sources/{id}":{"get":{"operationId":"getSource"}},"/artifacts":{"post":{"operationId":"createArtifact"}},"/artifacts/{id}":{"get":{"operationId":"getArtifact"}},"/memory-atoms":{"post":{"operationId":"createMemoryAtom"}},"/memory-atoms/{id}":{"patch":{"operationId":"patchMemoryAtom"}},"/entities/resolve":{"post":{"operationId":"resolveEntity"}},"/relations":{"post":{"operationId":"createRelation"}},"/search":{"post":{"operationId":"search"}},"/ask":{"post":{"operationId":"ask"}},"/context-packs":{"post":{"operationId":"createContextPack"}},"/remember":{"post":{"operationId":"remember"}},"/forget":{"post":{"operationId":"forget"}},"/verify":{"post":{"operationId":"verify"}},"/mark-stale":{"post":{"operationId":"markStale"}},"/ingest":{"post":{"operationId":"ingest"}},"/jobs":{"get":{"operationId":"listJobs"},"post":{"operationId":"createJob"}},"/workers/run":{"post":{"operationId":"runWorkers"}},"/memory/feed":{"get":{"operationId":"listFeed"},"post":{"operationId":"appendFeed"}},"/memory/apply":{"post":{"operationId":"applyFeedEvent"}},"/vector/embed":{"post":{"operationId":"embed"}},"/vector/upsert":{"post":{"operationId":"upsertVectorChunk"}},"/vector/search":{"post":{"operationId":"vectorSearch"}},"/retrieval/search":{"post":{"operationId":"retrievalSearch"}},"/lifecycle/diagnostics":{"get":{"operationId":"diagnostics"}},"/lifecycle/snapshot":{"post":{"operationId":"createSnapshot"}},"/lifecycle/snapshot/export":{"post":{"operationId":"exportSnapshot"}},"/lifecycle/snapshot/import":{"post":{"operationId":"importSnapshot"}},"/nullclaw/memories/{key}":{"put":{"operationId":"nullclawPutMemory"},"get":{"operationId":"nullclawGetMemory"},"delete":{"operationId":"nullclawDeleteMemory"}},"/nullclaw/memories":{"get":{"operationId":"nullclawListMemories"}},"/nullclaw/memories/search":{"post":{"operationId":"nullclawSearchMemories"}},"/nullclaw/memories/count":{"get":{"operationId":"nullclawCountMemories"}},"/nullclaw/sessions/{id}/messages":{"get":{"operationId":"nullclawLoadMessages"},"post":{"operationId":"nullclawSaveMessage"},"delete":{"operationId":"nullclawClearMessages"}},"/nullclaw/sessions/{id}/usage":{"get":{"operationId":"nullclawLoadUsage"},"put":{"operationId":"nullclawSaveUsage"},"delete":{"operationId":"nullclawDeleteUsage"}},"/nullclaw/history":{"get":{"operationId":"nullclawListHistory"}},"/nullclaw/history/{id}":{"get":{"operationId":"nullclawShowHistory"}}}}
+    );
+}
+
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"storage":["sqlite","postgres-psql-runtime"],"apis":["remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","jobs","workers","conflicts"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat"],"retrieval":["acl","fts","vector","entity_graph","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"compatibility":["nullclaw-api-memory","nullclaw-kb-projection","session-history","cross-memory-feed"],"permissions":["read","write","propose","verify","delete","export","feed_apply"]}
+        \\{"service":"nullpantry","headless":true,"storage":["sqlite","postgres-psql-runtime"],"apis":["remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","jobs","workers","conflicts","snapshot_export","snapshot_import"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat"],"retrieval":["acl","fts","vector","entity_graph","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"compatibility":["nullclaw-api-memory","nullclaw-kb-projection","session-history","cross-memory-feed"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -493,6 +550,7 @@ fn createSpace(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn getSpace(ctx: *Context, id: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const space = ctx.store.getSpace(ctx.allocator, id) catch return serverError(ctx);
     if (space == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Space not found");
     if (!recordVisibleToActor(ctx, space.?.scope, space.?.permissions_json)) return forbidden(ctx);
@@ -500,6 +558,7 @@ fn getSpace(ctx: *Context, id: []const u8) HttpResponse {
 }
 
 fn listSpaces(ctx: *Context, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const spaces = ctx.store.listSpaces(ctx.allocator, ctx.actor_scopes_json, limit) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -532,6 +591,7 @@ fn upsertPolicyScope(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn getPolicyScope(ctx: *Context, scope: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const policy = ctx.store.getPolicyScope(ctx.allocator, scope) catch return serverError(ctx);
     if (policy == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Policy scope not found");
     if (!recordVisibleToActor(ctx, policy.?.scope, policy.?.permissions_json)) return forbidden(ctx);
@@ -539,6 +599,7 @@ fn getPolicyScope(ctx: *Context, scope: []const u8) HttpResponse {
 }
 
 fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const policies = ctx.store.listPolicyScopes(ctx.allocator, ctx.actor_scopes_json, limit) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -553,7 +614,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","feed":"GET|POST /v1/memory/feed","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_outbox_run":"POST /v1/vector/outbox/run"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","feed":"GET|POST /v1/memory/feed","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_outbox_run":"POST /v1/vector/outbox/run","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -590,6 +651,7 @@ fn ingest(ctx: *Context, body: []const u8) HttpResponse {
     const job = ctx.store.createJob(ctx.allocator, .{
         .job_type = "ingest",
         .scope = scope,
+        .permissions_json = permissions_json,
         .object_type = "source",
         .object_id = source.id,
         .input_json = body,
@@ -621,6 +683,7 @@ fn extractMemory(ctx: *Context, body: []const u8) HttpResponse {
     const job = ctx.store.createJob(ctx.allocator, .{
         .job_type = "extract_memory",
         .scope = source.scope,
+        .permissions_json = source.permissions_json,
         .object_type = "source",
         .object_id = source.id,
         .input_json = body,
@@ -788,10 +851,12 @@ fn createJob(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const scope = json.stringField(obj, "scope") orelse "workspace";
-    if (!canProposeRecord(ctx, scope, "[]")) return forbidden(ctx);
+    const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    if (!canProposeRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     const job = ctx.store.createJob(ctx.allocator, .{
         .job_type = json.stringField(obj, "type") orelse json.stringField(obj, "job_type") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing job type"),
         .scope = scope,
+        .permissions_json = permissions_json,
         .object_type = json.stringField(obj, "object_type") orelse "",
         .object_id = json.stringField(obj, "object_id") orelse "",
         .input_json = rawField(ctx.allocator, obj, "input", "{}") catch return serverError(ctx),
@@ -800,6 +865,7 @@ fn createJob(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn listJobs(ctx: *Context, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const status = json.queryParamDecoded(ctx.allocator, query, "status") catch return serverError(ctx);
     const effective_status = if (status != null and std.mem.eql(u8, status.?, "all")) null else status;
     const jobs = ctx.store.listJobs(ctx.allocator, .{
@@ -812,10 +878,11 @@ fn listJobs(ctx: *Context, query: []const u8) HttpResponse {
 
 fn runJob(ctx: *Context, id: []const u8) HttpResponse {
     const job = (ctx.store.getJob(ctx.allocator, id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Job not found");
-    if (!domain.scopeVisible(job.scope, ctx.actor_scopes_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Job not found");
-    if (!canProposeRecord(ctx, job.scope, "[]")) return forbidden(ctx);
+    if (!recordVisibleToActor(ctx, job.scope, job.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Job not found");
+    if (!canProposeRecord(ctx, job.scope, job.permissions_json)) return forbidden(ctx);
     const finished = worker.runJobById(ctx.allocator, ctx.store, id, .{
         .scopes_json = ctx.actor_scopes_json,
+        .capabilities_json = ctx.actor_capabilities_json,
         .embedding_base_url = ctx.embedding_base_url,
         .embedding_api_key = ctx.embedding_api_key,
         .embedding_model = ctx.embedding_model,
@@ -850,6 +917,7 @@ fn queuedExtractionResponse(ctx: *Context, job: store_mod.Job, source: domain.So
 }
 
 fn listConflicts(ctx: *Context, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const status = json.queryParamDecoded(ctx.allocator, query, "status") catch return serverError(ctx);
     const effective_status = if (status != null and std.mem.eql(u8, status.?, "all")) null else (status orelse "open");
     const conflicts = ctx.store.listConflicts(ctx.allocator, .{
@@ -949,6 +1017,7 @@ fn parseMemoryAtomInput(ctx: *Context, body: []const u8) !store_mod.MemoryAtomIn
 }
 
 fn search(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
@@ -1043,6 +1112,7 @@ fn vectorEmbed(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn vectorSearch(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
@@ -1082,6 +1152,7 @@ fn vectorOutboxRun(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn retrievalPlan(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
@@ -1103,6 +1174,7 @@ fn retrievalPlan(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn retrievalSearch(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
@@ -1146,6 +1218,7 @@ fn workersRun(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const result = worker.runOnce(ctx.allocator, ctx.store, .{
         .scopes_json = ctx.actor_scopes_json,
+        .capabilities_json = ctx.actor_capabilities_json,
         .job_limit = positiveLimit(json.intField(parsed.value.object, "job_limit"), 25),
         .outbox_limit = positiveLimit(json.intField(parsed.value.object, "outbox_limit"), 100),
         .embedding_base_url = ctx.embedding_base_url,
@@ -1160,6 +1233,7 @@ fn workersRun(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const since_id = if (json.queryParam(query, "since_id")) |raw| std.fmt.parseInt(i64, raw, 10) catch 0 else 0;
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const events = ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = ctx.actor_scopes_json }) catch return serverError(ctx);
@@ -1292,17 +1366,25 @@ fn buildAppliedMemoryAtomInput(ctx: *Context, payload_json: []const u8, fallback
 }
 
 fn lifecycleDiagnostics(ctx: *Context) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const store_diag = ctx.store.lifecycleDiagnostics() catch return serverError(ctx);
     const diagnostics = lifecycle.Diagnostics{
         .total_memory_atoms = store_diag.total_memory_atoms,
         .stale_memory_atoms = store_diag.stale_memory_atoms,
         .vector_outbox_pending = store_diag.vector_outbox_pending,
         .cache_entries = store_diag.cache_entries,
+        .queued_jobs = store_diag.queued_jobs,
+        .running_jobs = store_diag.running_jobs,
+        .failed_jobs = store_diag.failed_jobs,
+        .pending_feed_events = store_diag.pending_feed_events,
+        .open_conflicts = store_diag.open_conflicts,
+        .compat_memories = store_diag.compat_memories,
+        .sessions = store_diag.sessions,
     };
     const body = std.fmt.allocPrint(
         ctx.allocator,
-        "{{\"diagnostics\":{{\"health\":\"{s}\",\"total_memory_atoms\":{d},\"stale_memory_atoms\":{d},\"vector_outbox_pending\":{d},\"cache_entries\":{d}}}}}",
-        .{ diagnostics.health(), diagnostics.total_memory_atoms, diagnostics.stale_memory_atoms, diagnostics.vector_outbox_pending, diagnostics.cache_entries },
+        "{{\"diagnostics\":{{\"health\":\"{s}\",\"total_memory_atoms\":{d},\"stale_memory_atoms\":{d},\"vector_outbox_pending\":{d},\"cache_entries\":{d},\"queued_jobs\":{d},\"running_jobs\":{d},\"failed_jobs\":{d},\"pending_feed_events\":{d},\"open_conflicts\":{d},\"compat_memories\":{d},\"sessions\":{d}}}}}",
+        .{ diagnostics.health(), diagnostics.total_memory_atoms, diagnostics.stale_memory_atoms, diagnostics.vector_outbox_pending, diagnostics.cache_entries, diagnostics.queued_jobs, diagnostics.running_jobs, diagnostics.failed_jobs, diagnostics.pending_feed_events, diagnostics.open_conflicts, diagnostics.compat_memories, diagnostics.sessions },
     ) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = body };
 }
@@ -1323,6 +1405,134 @@ fn lifecycleSnapshot(ctx: *Context, body: []const u8) HttpResponse {
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
+fn lifecycleSnapshotExport(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read") or !hasCapability(ctx, "export")) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const query = json.stringField(obj, "query") orelse "";
+    var input = buildSearchInput(ctx, obj, query, positiveLimit(json.intField(obj, "limit"), 100), true) catch return serverError(ctx);
+    input.include_deprecated = json.boolField(obj, "include_deprecated") orelse true;
+    input.use_vector = json.boolField(obj, "use_vector") orelse false;
+    const results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
+    const summary_json = snapshotSummaryJson(ctx, input.scopes_json, query, results) catch return serverError(ctx);
+    const snapshot = ctx.store.createLifecycleSnapshot(ctx.allocator, json.stringField(obj, "type") orelse "export", summary_json) catch return serverError(ctx);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"snapshot\":{\"id\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, snapshot.id) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"type\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, snapshot.snapshot_type) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"scopes\":") catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, input.scopes_json, "[]") catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"created_at_ms\":{d},\"object_count\":{d},\"summary\":", .{ snapshot.created_at_ms, results.len }) catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, summary_json, "{}") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"objects\":") catch return serverError(ctx);
+    appendSearchArray(ctx, &out, results) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "write") and !hasCapability(ctx, "propose")) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const objects_value = obj.get("objects") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing objects");
+    const objects = switch (objects_value) {
+        .array => |a| a,
+        else => return badJson(ctx),
+    };
+    const default_scope = json.stringField(obj, "default_scope") orelse "workspace";
+    const default_permissions = rawField(ctx.allocator, obj, "default_permissions", "[]") catch return serverError(ctx);
+    const created_by = json.stringField(obj, "created_by") orelse "agent";
+
+    var imported_ids: std.ArrayListUnmanaged(u8) = .empty;
+    imported_ids.append(ctx.allocator, '[') catch return serverError(ctx);
+    var imported: usize = 0;
+    for (objects.items) |item| {
+        if (item != .object) continue;
+        const source_obj = item.object;
+        const text = json.stringField(source_obj, "text") orelse continue;
+        const title = json.stringField(source_obj, "title") orelse json.stringField(source_obj, "id") orelse "snapshot object";
+        const result_type = json.stringField(source_obj, "type") orelse json.stringField(source_obj, "result_type") orelse "snapshot";
+        const scope = json.stringField(source_obj, "scope") orelse default_scope;
+        const permissions_json = rawField(ctx.allocator, source_obj, "permissions", default_permissions) catch return serverError(ctx);
+        var source_ids_json = rawField(ctx.allocator, source_obj, "citations", "[]") catch return serverError(ctx);
+        if (!sourceIdsCanBackRecord(ctx, source_ids_json, scope, permissions_json)) source_ids_json = "[]";
+        const status = normalizedImportedMemoryStatus(json.stringField(source_obj, "status"));
+        const predicate = std.fmt.allocPrint(ctx.allocator, "imported:{s}", .{result_type}) catch return serverError(ctx);
+        var input = store_mod.MemoryAtomInput{
+            .predicate = predicate,
+            .object = title,
+            .text = text,
+            .scope = scope,
+            .confidence = json.floatField(source_obj, "confidence") orelse 0.55,
+            .status = status,
+            .source_ids_json = source_ids_json,
+            .created_by = created_by,
+            .permissions_json = permissions_json,
+            .tags_json = "[\"snapshot_import\"]",
+        };
+        if (!canCreateMemoryAtom(ctx, input)) return forbidden(ctx);
+        input = ensureMemoryProvenance(ctx, input) catch |err| switch (err) {
+            error.Forbidden => return forbidden(ctx),
+            else => return serverError(ctx),
+        };
+        const atom = ctx.store.createMemoryAtom(ctx.allocator, input) catch return serverError(ctx);
+        if (imported > 0) imported_ids.append(ctx.allocator, ',') catch return serverError(ctx);
+        json.appendString(&imported_ids, ctx.allocator, atom.id) catch return serverError(ctx);
+        imported += 1;
+    }
+    imported_ids.append(ctx.allocator, ']') catch return serverError(ctx);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.print(ctx.allocator, "{{\"imported\":{d},\"memory_atom_ids\":", .{imported}) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, imported_ids.items) catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn normalizedImportedMemoryStatus(status: ?[]const u8) ?[]const u8 {
+    const value = status orelse return null;
+    if (std.mem.eql(u8, value, "accepted")) return "verified";
+    if (std.mem.eql(u8, value, "verified") or
+        std.mem.eql(u8, value, "proposed") or
+        std.mem.eql(u8, value, "stale") or
+        std.mem.eql(u8, value, "deprecated") or
+        std.mem.eql(u8, value, "rejected") or
+        std.mem.eql(u8, value, "superseded"))
+    {
+        return value;
+    }
+    return null;
+}
+
+fn snapshotSummaryJson(ctx: *Context, scopes_json: []const u8, query: []const u8, results: []const domain.SearchResult) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.appendSlice(ctx.allocator, "{\"query\":");
+    try json.appendString(&out, ctx.allocator, query);
+    try out.appendSlice(ctx.allocator, ",\"scopes\":");
+    try json.appendRawJsonOr(&out, ctx.allocator, scopes_json, "[]");
+    try out.print(ctx.allocator, ",\"object_count\":{d},\"counts\":{{", .{results.len});
+    const types = [_][]const u8{ "memory_atom", "space", "policy_scope", "source", "artifact", "entity", "relation", "context_pack", "feed_event", "compat_memory", "session_message" };
+    for (types, 0..) |kind, i| {
+        if (i > 0) try out.append(ctx.allocator, ',');
+        try json.appendString(&out, ctx.allocator, kind);
+        try out.append(ctx.allocator, ':');
+        try out.print(ctx.allocator, "{d}", .{countSearchResultsOfType(results, kind)});
+    }
+    try out.appendSlice(ctx.allocator, "}}");
+    return out.toOwnedSlice(ctx.allocator);
+}
+
+fn countSearchResultsOfType(results: []const domain.SearchResult, result_type: []const u8) usize {
+    var count: usize = 0;
+    for (results) |result| {
+        if (std.mem.eql(u8, result.result_type, result_type)) count += 1;
+    }
+    return count;
+}
+
 fn responseCachePut(ctx: *Context, body: []const u8) HttpResponse {
     if (!hasCapability(ctx, "write")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
@@ -1341,6 +1551,7 @@ fn responseCachePut(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn responseCacheGet(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
@@ -1390,6 +1601,7 @@ fn semanticCachePut(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn semanticCacheSearch(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
@@ -1434,6 +1646,8 @@ fn lifecycleHygiene(ctx: *Context, body: []const u8) HttpResponse {
         .archive_after_ms = json.intField(obj, "archive_after_ms") orelse 90 * 24 * 60 * 60 * 1000,
         .purge_after_ms = json.intField(obj, "purge_after_ms") orelse 0,
         .hard_delete = json.boolField(obj, "hard_delete") orelse false,
+        .scopes_json = ctx.actor_scopes_json,
+        .capabilities_json = ctx.actor_capabilities_json,
     }) catch return serverError(ctx);
     const response = std.fmt.allocPrint(
         ctx.allocator,
@@ -1483,6 +1697,7 @@ fn lifecycleRollout(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn ask(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
@@ -1744,6 +1959,7 @@ fn appendConflictsArray(ctx: *Context, out: *std.ArrayListUnmanaged(u8), conflic
 }
 
 fn contextPack(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
@@ -2242,6 +2458,12 @@ fn sourceIdsCanBackRecord(ctx: *Context, source_ids_json: []const u8, target_sco
     return true;
 }
 
+fn entityCanBackRecord(ctx: *Context, entity_id: []const u8, target_scope: []const u8, target_permissions_json: []const u8) bool {
+    const entity = (ctx.store.getEntity(ctx.allocator, entity_id) catch return false) orelse return false;
+    if (!recordVisibleToActor(ctx, entity.scope, entity.permissions_json)) return false;
+    return sourceAclCoversTarget(ctx.allocator, entity.scope, entity.permissions_json, target_scope, target_permissions_json);
+}
+
 fn sourceAclCoversTarget(allocator: std.mem.Allocator, source_scope: []const u8, source_permissions_json: []const u8, target_scope: []const u8, target_permissions_json: []const u8) bool {
     if (!scopeNoBroader(source_scope, target_scope)) return false;
     return permissionsNoBroader(allocator, source_permissions_json, target_permissions_json);
@@ -2478,6 +2700,29 @@ test "api requires bearer token except health" {
 
     const authed = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"x\"}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer secret\r\n\r\n{\"query\":\"x\"}");
     try std.testing.expectEqualStrings("200 OK", authed.status);
+}
+
+test "api token principal registry maps per-token scopes and capabilities" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const principals =
+        \\{"reader-token":{"actor_id":"reader","scopes":["public"],"capabilities":["read"]},"writer-token":{"actor_id":"writer","scopes":["public","write:public"],"capabilities":["read","write","propose"]}}
+    ;
+    var ctx = Context{ .allocator = arena.allocator(), .store = &store, .token_principals_json = principals };
+
+    const reader_raw = "POST /v1/sources HTTP/1.1\r\nAuthorization: Bearer reader-token\r\nX-NullPantry-Actor-Scopes: [\"admin\"]\r\nX-NullPantry-Actor-Capabilities: [\"write\"]\r\n\r\n{}";
+    const reader_write = handleRequest(&ctx, "POST", "/v1/sources", "{\"title\":\"nope\",\"scope\":\"public\"}", reader_raw);
+    try std.testing.expectEqualStrings("403 Forbidden", reader_write.status);
+
+    const writer_raw = "POST /v1/sources HTTP/1.1\r\nAuthorization: Bearer writer-token\r\n\r\n{}";
+    const writer_write = handleRequest(&ctx, "POST", "/v1/sources", "{\"title\":\"ok\",\"scope\":\"public\",\"content\":\"visible\"}", writer_raw);
+    try std.testing.expectEqualStrings("200 OK", writer_write.status);
+
+    const unknown_raw = "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer missing-token\r\n\r\n{}";
+    const unknown = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"visible\"}", unknown_raw);
+    try std.testing.expectEqualStrings("401 Unauthorized", unknown.status);
 }
 
 test "api rejects writes outside actor scope or permissions" {
@@ -2877,6 +3122,10 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expectEqualStrings("200 OK", engines_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"lancedb\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"kg\"") != null);
+    const openapi_resp = handleRequest(&ctx, "GET", "/v1/openapi.json", "", "");
+    try std.testing.expectEqualStrings("200 OK", openapi_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"nullclawPutMemory\"") != null);
 
     const artifact_types = handleRequest(&ctx, "GET", "/v1/artifact-types", "", "");
     try std.testing.expectEqualStrings("200 OK", artifact_types.status);
@@ -2916,9 +3165,40 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const diagnostics = handleRequest(&ctx, "GET", "/v1/lifecycle/diagnostics", "", "");
     try std.testing.expectEqualStrings("200 OK", diagnostics.status);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"health\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"queued_jobs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"pending_feed_events\"") != null);
     const snapshot = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot", "{\"type\":\"manual\",\"summary\":{\"memory_atoms\":1}}", "");
     try std.testing.expectEqualStrings("200 OK", snapshot.status);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.body, "\"snap_") != null);
+}
+
+test "api lifecycle snapshot export and import are permission aware" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var admin_ctx = Context{ .allocator = alloc, .store = &store };
+    const public_source = try store.createSource(alloc, .{ .title = "Public source", .content = "visible source", .scope = "public" });
+    const public_citation = try std.fmt.allocPrint(alloc, "[\"{s}\"]", .{public_source.id});
+    _ = try store.createMemoryAtom(alloc, .{ .text = "exportable memory", .scope = "public", .created_by = "human", .status = "verified", .source_ids_json = public_citation });
+    _ = try store.createMemoryAtom(alloc, .{ .text = "secret memory", .scope = "project:secret", .permissions_json = "[\"project:secret\"]", .created_by = "human", .status = "verified" });
+
+    const export_resp = handleRequest(&admin_ctx, "POST", "/v1/lifecycle/snapshot/export", "{\"query\":\"memory\",\"scopes\":[\"public\"],\"limit\":20}", "");
+    try std.testing.expectEqualStrings("200 OK", export_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, export_resp.body, "exportable memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, export_resp.body, "secret memory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, export_resp.body, "\"object_count\"") != null);
+
+    var writer_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\",\"write:public\"]", .actor_capabilities_json = "[\"read\",\"write\",\"propose\",\"verify\"]" };
+    const import_resp = handleRequest(&writer_ctx, "POST", "/v1/lifecycle/snapshot/import", "{\"objects\":[{\"type\":\"memory_atom\",\"title\":\"Imported\",\"text\":\"imported snapshot memory\",\"scope\":\"public\",\"status\":\"verified\"}]}", "");
+    try std.testing.expectEqualStrings("200 OK", import_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, import_resp.body, "\"imported\":1") != null);
+
+    const search_resp = handleRequest(&writer_ctx, "POST", "/v1/search", "{\"query\":\"imported snapshot memory\",\"scopes\":[\"public\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", search_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "imported snapshot memory") != null);
 }
 
 test "api retrieval search fuses keyword and vector results" {
@@ -3171,6 +3451,42 @@ test "api graph and conflict mutations require write-like capabilities" {
 
     const scan_resp = handleRequest(&read_ctx, "POST", "/v1/conflicts/scan", "{\"scopes\":[\"public\"]}", "");
     try std.testing.expectEqualStrings("403 Forbidden", scan_resp.status);
+}
+
+test "api relation creation cannot publish private endpoint names" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const secret = try store.resolveEntity(alloc, .{ .entity_type = "service", .name = "PrivateEndpoint", .scope = "project:secret", .permissions_json = "[\"team:secret\"]" });
+    const public = try store.resolveEntity(alloc, .{ .entity_type = "project", .name = "PublicEndpoint", .scope = "public" });
+    var ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"project:secret\",\"write:project:secret\",\"team:secret\"]" };
+
+    const body = try std.fmt.allocPrint(alloc, "{{\"from_entity_id\":\"{s}\",\"to_entity_id\":\"{s}\",\"relation_type\":\"mentions\",\"scope\":\"public\"}}", .{ secret.id, public.id });
+    const resp = handleRequest(&ctx, "POST", "/v1/relations", body, "");
+    try std.testing.expectEqualStrings("403 Forbidden", resp.status);
+}
+
+test "api read endpoints require read capability" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createMemoryAtom(alloc, .{ .text = "Public read capability memory", .scope = "public", .created_by = "human" });
+    var ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\"]", .actor_capabilities_json = "[\"write\"]" };
+
+    const search_resp = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Public read\"}", "");
+    try std.testing.expectEqualStrings("403 Forbidden", search_resp.status);
+
+    const ask_resp = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"Public read\"}", "");
+    try std.testing.expectEqualStrings("403 Forbidden", ask_resp.status);
+
+    const pack_resp = handleRequest(&ctx, "POST", "/v1/context-packs", "{\"task\":\"Public read\"}", "");
+    try std.testing.expectEqualStrings("403 Forbidden", pack_resp.status);
 }
 
 test "api request principal headers can only narrow non-admin scopes" {

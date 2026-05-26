@@ -5,6 +5,7 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 BIN="${NULLPANTRY_BIN:-$ROOT_DIR/zig-out/bin/nullpantry}"
 PORT="${NULLPANTRY_CONTRACT_PORT:-18765}"
 TOKEN="${NULLPANTRY_CONTRACT_TOKEN:-contract-secret}"
+READ_TOKEN="${NULLPANTRY_CONTRACT_READ_TOKEN:-contract-read-secret}"
 DB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nullpantry-contract.XXXXXX")"
 DB_PATH="$DB_DIR/nullpantry.db"
 BASE_URL="http://127.0.0.1:$PORT/v1/nullclaw"
@@ -18,9 +19,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-NULLPANTRY_TOKEN="$TOKEN" \
-NULLPANTRY_SCOPES='["agent:nullclaw","session:*","write:session:*"]' \
-NULLPANTRY_CAPABILITIES='["read","write","delete"]' \
+NULLPANTRY_TOKEN_PRINCIPALS="{\"$TOKEN\":{\"actor_id\":\"nullclaw-contract\",\"scopes\":[\"agent:nullclaw\",\"session:*\",\"write:session:*\"],\"capabilities\":[\"read\",\"write\",\"delete\"]},\"$READ_TOKEN\":{\"actor_id\":\"nullclaw-contract-reader\",\"scopes\":[\"agent:nullclaw\",\"session:*\"],\"capabilities\":[\"read\"]}}" \
 NULLPANTRY_WORKER_INTERVAL_MS=0 \
 "$BIN" --host 127.0.0.1 --port "$PORT" --db "$DB_PATH" >/tmp/nullpantry-contract.log 2>&1 &
 SERVER_PID="$!"
@@ -35,6 +34,7 @@ while [ "$i" -lt 50 ]; do
 done
 
 auth_header="Authorization: Bearer $TOKEN"
+read_auth_header="Authorization: Bearer $READ_TOKEN"
 
 fail() {
   echo "$1" >&2
@@ -80,6 +80,13 @@ expect_status() {
 
 health_body="$(curl_ok "$BASE_URL/health")"
 expect_contains "$health_body" '"service":"nullpantry"'
+
+expect_status 403 \
+  --request PUT \
+  --header "$read_auth_header" \
+  --header "Content-Type: application/json" \
+  --data '{"content":"read token must not write","category":"core","session_id":null}' \
+  "$BASE_URL/memories/read.only"
 
 curl_ok \
   --request PUT \

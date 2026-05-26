@@ -7,6 +7,7 @@ const vector = @import("vector.zig");
 
 pub const RunOptions = struct {
     scopes_json: []const u8 = "[\"admin\"]",
+    capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
     job_limit: usize = 25,
     outbox_limit: usize = 100,
     embedding_base_url: ?[]const u8 = null,
@@ -67,11 +68,14 @@ pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job:
         return try std.fmt.allocPrint(allocator, "{{\"vector_outbox_processed\":{d},\"vector_outbox_failed\":{d}}}", .{ outbox.processed, outbox.failed });
     }
     if (std.mem.eql(u8, job.job_type, "hygiene")) {
-        const hygiene = try store.runHygiene(.{});
+        const hygiene = try store.runHygiene(.{
+            .scopes_json = options.scopes_json,
+            .capabilities_json = options.capabilities_json,
+        });
         return try std.fmt.allocPrint(allocator, "{{\"checked\":{d},\"marked_stale\":{d},\"archived\":{d},\"purged\":{d},\"expired_cache_entries\":{d}}}", .{ hygiene.checked, hygiene.marked_stale, hygiene.archived, hygiene.purged, hygiene.expired_cache_entries });
     }
     if (std.mem.eql(u8, job.job_type, "scan_conflicts")) {
-        const scopes_json = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{job.scope});
+        const scopes_json = try jobExecutionScopesJson(allocator, job);
         const conflicts = try store.scanConflicts(allocator, .{ .scopes_json = scopes_json, .limit = 100 });
         return try std.fmt.allocPrint(allocator, "{{\"conflict_count\":{d}}}", .{conflicts.len});
     }
@@ -86,6 +90,34 @@ pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job:
         return try std.fmt.allocPrint(allocator, "{{\"source_id\":\"{s}\",\"artifact_count\":{d},\"memory_atom_count\":{d},\"entity_count\":{d},\"vector_chunk_count\":{d}}}", .{ source.id, extracted.artifact_count, extracted.memory_atom_count, extracted.entity_count, extracted.vector_chunk_count });
     }
     return error.UnsupportedJob;
+}
+
+fn jobExecutionScopesJson(allocator: std.mem.Allocator, job: store_mod.Job) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.append(allocator, '[');
+    var count: usize = 0;
+    try appendUniqueScope(allocator, &out, &count, job.scope);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, job.permissions_json, .{}) catch {
+        try out.append(allocator, ']');
+        return out.toOwnedSlice(allocator);
+    };
+    defer parsed.deinit();
+    if (parsed.value == .array) {
+        for (parsed.value.array.items) |item| {
+            if (item == .string) try appendUniqueScope(allocator, &out, &count, item.string);
+        }
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendUniqueScope(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), count: *usize, scope: []const u8) !void {
+    const needle = try std.fmt.allocPrint(allocator, "\"{s}\"", .{scope});
+    defer allocator.free(needle);
+    if (std.mem.indexOf(u8, out.items, needle) != null) return;
+    if (count.* > 0) try out.append(allocator, ',');
+    try @import("json_util.zig").appendString(out, allocator, scope);
+    count.* += 1;
 }
 
 const ExtractionCounts = struct {

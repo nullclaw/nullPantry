@@ -22,6 +22,7 @@ const RuntimeConfig = struct {
     backend: store_mod.BackendKind = .sqlite,
     postgres_url: ?[]const u8 = null,
     token: ?[]const u8 = null,
+    token_principals_json: ?[]const u8 = null,
     actor_scopes_json: []const u8 = "[\"admin\"]",
     actor_capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
     embedding_base_url: ?[]const u8 = null,
@@ -123,6 +124,7 @@ fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
         .allocator = req_alloc,
         .store = state.store,
         .required_token = state.cfg.token,
+        .token_principals_json = state.cfg.token_principals_json,
         .actor_scopes_json = state.cfg.actor_scopes_json,
         .actor_capabilities_json = state.cfg.actor_capabilities_json,
         .embedding_base_url = state.cfg.embedding_base_url,
@@ -157,6 +159,7 @@ fn workerLoop(state: *ServerState) void {
         var arena = std.heap.ArenaAllocator.init(state.allocator);
         const result = worker.runOnce(arena.allocator(), state.store, .{
             .scopes_json = state.cfg.actor_scopes_json,
+            .capabilities_json = state.cfg.actor_capabilities_json,
             .job_limit = 25,
             .outbox_limit = 250,
             .embedding_base_url = state.cfg.embedding_base_url,
@@ -193,6 +196,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         cfg.token = token;
         cfg.actor_scopes_json = "[\"public\"]";
         cfg.actor_capabilities_json = "[\"read\"]";
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_TOKEN_PRINCIPALS")) |principals| {
+        cfg.token_principals_json = principals;
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_DATABASE_URL")) |url| {
         cfg.backend = .postgres;
@@ -263,6 +269,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
             cfg.token = args[i];
             cfg.actor_scopes_json = "[\"public\"]";
             cfg.actor_capabilities_json = "[\"read\"]";
+        } else if (std.mem.eql(u8, arg, "--token-principals") and i + 1 < args.len) {
+            i += 1;
+            cfg.token_principals_json = args[i];
         } else if (std.mem.eql(u8, arg, "--actor-scopes") and i + 1 < args.len) {
             i += 1;
             cfg.actor_scopes_json = args[i];
@@ -303,11 +312,12 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
 
 fn printUsage() void {
     std.debug.print(
-        \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--actor-scopes JSON] [--actor-capabilities JSON]
-        \\       nullpantry --backend postgres --postgres-url URL [--token TOKEN]
+        \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--token-principals JSON] [--actor-scopes JSON] [--actor-capabilities JSON]
+        \\       nullpantry --backend postgres --postgres-url URL [--token TOKEN|--token-principals JSON]
         \\
         \\Environment:
         \\  NULLPANTRY_TOKEN
+        \\  NULLPANTRY_TOKEN_PRINCIPALS
         \\  NULLPANTRY_DATABASE_URL
         \\  NULLPANTRY_SCOPES
         \\  NULLPANTRY_CAPABILITIES

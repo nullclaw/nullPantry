@@ -39,7 +39,7 @@ pub const descriptors = [_]EngineDescriptor{
     .{ .kind = .markdown, .role = "workspace bootstrap files", .durability = "filesystem", .nullpantry_strategy = "source/artifact import-export adapter", .remote_primary_supported = false },
     .{ .kind = .memory_lru, .role = "ephemeral process memory", .durability = "ephemeral", .nullpantry_strategy = "in-memory cache and tests only", .remote_primary_supported = false },
     .{ .kind = .lucid, .role = "local semantic memory engine", .durability = "durable", .nullpantry_strategy = "vector-capable projection adapter contract", .remote_primary_supported = false },
-    .{ .kind = .postgres, .role = "production relational memory target", .durability = "durable", .nullpantry_strategy = "psql-backed runtime adapter with pgvector schema; native client can replace transport later", .remote_primary_supported = true },
+    .{ .kind = .postgres, .role = "durable relational memory target", .durability = "durable", .nullpantry_strategy = "psql-backed runtime adapter with pgvector schema; native pooled client can replace transport later", .remote_primary_supported = true },
     .{ .kind = .redis, .role = "low-latency network memory", .durability = "configurable", .nullpantry_strategy = "external cache/backend adapter contract", .remote_primary_supported = false },
     .{ .kind = .clickhouse, .role = "analytics and high-volume history", .durability = "durable", .nullpantry_strategy = "event/audit export target contract", .remote_primary_supported = false },
     .{ .kind = .lancedb, .role = "local ANN vector database", .durability = "durable", .nullpantry_strategy = "vector index adapter contract", .remote_primary_supported = false },

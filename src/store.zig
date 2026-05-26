@@ -20,6 +20,85 @@ fn sessionVisibleForScopes(allocator: std.mem.Allocator, session_id: []const u8,
     return domain.scopeVisible(scope, scopes_json);
 }
 
+fn scopeNoBroader(source_scope: []const u8, target_scope: []const u8) bool {
+    if (std.mem.eql(u8, source_scope, "public")) return true;
+    return std.mem.eql(u8, source_scope, target_scope);
+}
+
+fn permissionsOpen(permissions_json: []const u8) bool {
+    const trimmed = std.mem.trim(u8, permissions_json, " \t\r\n");
+    return trimmed.len == 0 or std.mem.eql(u8, trimmed, "[]") or domain.hasJsonString(trimmed, "public");
+}
+
+fn permissionsNoBroader(allocator: std.mem.Allocator, source_permissions_json: []const u8, target_permissions_json: []const u8) bool {
+    if (permissionsOpen(source_permissions_json)) return true;
+    if (permissionsOpen(target_permissions_json)) return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, target_permissions_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .array) return false;
+    var saw = false;
+    for (parsed.value.array.items) |item| {
+        const permission = switch (item) {
+            .string => |s| s,
+            else => return false,
+        };
+        if (std.mem.eql(u8, permission, "public")) return false;
+        if (!domain.hasJsonString(source_permissions_json, permission)) return false;
+        saw = true;
+    }
+    return saw;
+}
+
+fn aclCoversTarget(allocator: std.mem.Allocator, source_scope: []const u8, source_permissions_json: []const u8, target_scope: []const u8, target_permissions_json: []const u8) bool {
+    return scopeNoBroader(source_scope, target_scope) and permissionsNoBroader(allocator, source_permissions_json, target_permissions_json);
+}
+
+fn requiredScopesVisible(required_scopes_json: []const u8, actor_scopes_json: []const u8) bool {
+    const trimmed = std.mem.trim(u8, required_scopes_json, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "[]")) return true;
+    return domain.scopeListVisible(trimmed, actor_scopes_json);
+}
+
+fn combinedPermissionsJson(allocator: std.mem.Allocator, a_json: []const u8, b_json: []const u8) ![]const u8 {
+    if (permissionsOpen(a_json)) return allocator.dupe(u8, b_json);
+    if (permissionsOpen(b_json)) return allocator.dupe(u8, a_json);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    var count: usize = 0;
+    try appendPermissionJsonItems(allocator, &out, &count, a_json);
+    try appendPermissionJsonItems(allocator, &out, &count, b_json);
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendPermissionJsonItems(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), count: *usize, permissions_json: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, permissions_json, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .array) return;
+    for (parsed.value.array.items) |item| {
+        if (item != .string) continue;
+        const needle = try std.fmt.allocPrint(allocator, "\"{s}\"", .{item.string});
+        defer allocator.free(needle);
+        if (std.mem.indexOf(u8, out.items, needle) != null) continue;
+        if (count.* > 0) try out.append(allocator, ',');
+        try json.appendString(out, allocator, item.string);
+        count.* += 1;
+    }
+}
+
+fn hygieneCanVerify(input: HygieneRunInput, scope: []const u8, permissions_json: []const u8) bool {
+    return domain.hasCapability(input.scopes_json, input.capabilities_json, "verify") and
+        domain.scopeVerifiable(scope, input.scopes_json) and
+        domain.permissionsWritable(permissions_json, input.scopes_json);
+}
+
+fn hygieneCanDelete(input: HygieneRunInput, scope: []const u8, permissions_json: []const u8) bool {
+    return domain.hasCapability(input.scopes_json, input.capabilities_json, "delete") and
+        domain.scopeDeletable(scope, input.scopes_json) and
+        domain.permissionsWritable(permissions_json, input.scopes_json);
+}
+
 pub const BackendKind = enum {
     sqlite,
     postgres,
@@ -135,6 +214,13 @@ pub const Store = struct {
         return switch (self.backend) {
             .sqlite => |*s| s.resolveEntity(allocator, input),
             .postgres => |*p| p.resolveEntity(allocator, input),
+        };
+    }
+
+    pub fn getEntity(self: *Store, allocator: std.mem.Allocator, id: []const u8) !?domain.Entity {
+        return switch (self.backend) {
+            .sqlite => |*s| s.getEntity(allocator, id),
+            .postgres => |*p| p.getEntity(allocator, id),
         };
     }
 
@@ -736,6 +822,13 @@ pub const LifecycleDiagnostics = struct {
     stale_memory_atoms: usize,
     vector_outbox_pending: usize,
     cache_entries: usize,
+    queued_jobs: usize = 0,
+    running_jobs: usize = 0,
+    failed_jobs: usize = 0,
+    pending_feed_events: usize = 0,
+    open_conflicts: usize = 0,
+    compat_memories: usize = 0,
+    sessions: usize = 0,
 };
 
 pub const ResponseCacheInput = struct {
@@ -791,6 +884,8 @@ pub const HygieneRunInput = struct {
     purge_after_ms: i64 = 0,
     hard_delete: bool = false,
     now_ms: ?i64 = null,
+    scopes_json: []const u8 = "[\"admin\"]",
+    capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
 };
 
 pub const HygieneRunResult = struct {
@@ -825,6 +920,7 @@ pub const ContextPackResult = struct {
     included_sources_json: []const u8,
     included_artifacts_json: []const u8,
     included_memory_atoms_json: []const u8,
+    required_scopes_json: []const u8 = "[\"admin\"]",
     token_budget: i64,
     created_at_ms: i64,
 };
@@ -862,6 +958,7 @@ pub const HistoryShow = struct {
 pub const JobInput = struct {
     job_type: []const u8,
     scope: []const u8 = "workspace",
+    permissions_json: []const u8 = "[]",
     object_type: []const u8 = "",
     object_id: []const u8 = "",
     input_json: []const u8 = "{}",
@@ -878,6 +975,7 @@ pub const Job = struct {
     job_type: []const u8,
     status: []const u8,
     scope: []const u8,
+    permissions_json: []const u8,
     object_type: []const u8,
     object_id: []const u8,
     input_json: []const u8,
@@ -896,12 +994,13 @@ pub const Job = struct {
         try @import("json_util.zig").appendString(out, allocator, self.status);
         try out.appendSlice(allocator, ",\"scope\":");
         try @import("json_util.zig").appendString(out, allocator, self.scope);
+        try out.appendSlice(allocator, ",\"permissions\":");
+        try @import("json_util.zig").appendRawJsonOr(out, allocator, self.permissions_json, "[]");
         try out.appendSlice(allocator, ",\"object_type\":");
         try @import("json_util.zig").appendString(out, allocator, self.object_type);
         try out.appendSlice(allocator, ",\"object_id\":");
         try @import("json_util.zig").appendString(out, allocator, self.object_id);
-        try out.appendSlice(allocator, ",\"input\":");
-        try @import("json_util.zig").appendRawJsonOr(out, allocator, self.input_json, "{}");
+        try out.appendSlice(allocator, ",\"input\":{\"redacted\":true},\"input_redacted\":true");
         try out.appendSlice(allocator, ",\"result\":");
         try @import("json_util.zig").appendRawJsonOr(out, allocator, self.result_json, "{}");
         try out.appendSlice(allocator, ",\"error\":");
@@ -924,6 +1023,7 @@ pub const KnowledgeConflict = struct {
     object_b_type: []const u8,
     object_b_id: []const u8,
     scope: []const u8,
+    permissions_json: []const u8,
     status: []const u8,
     summary: []const u8,
     created_at_ms: i64,
@@ -944,6 +1044,8 @@ pub const KnowledgeConflict = struct {
         try @import("json_util.zig").appendString(out, allocator, self.object_b_id);
         try out.appendSlice(allocator, ",\"scope\":");
         try @import("json_util.zig").appendString(out, allocator, self.scope);
+        try out.appendSlice(allocator, ",\"permissions\":");
+        try @import("json_util.zig").appendRawJsonOr(out, allocator, self.permissions_json, "[]");
         try out.appendSlice(allocator, ",\"status\":");
         try @import("json_util.zig").appendString(out, allocator, self.status);
         try out.appendSlice(allocator, ",\"summary\":");
@@ -1054,14 +1156,23 @@ pub const SQLiteStore = struct {
         if (!try self.columnExists("relations", "permissions_json")) {
             try self.exec("ALTER TABLE relations ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '[]'");
         }
+        if (!try self.columnExists("context_packs", "required_scopes_json")) {
+            try self.exec("ALTER TABLE context_packs ADD COLUMN required_scopes_json TEXT NOT NULL DEFAULT '[\"admin\"]'");
+        }
         try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_feed_events_dedupe_key ON memory_feed_events(dedupe_key) WHERE dedupe_key IS NOT NULL");
         try self.exec("DROP INDEX IF EXISTS idx_entities_type_name");
         try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_type_name_scope ON entities(type, lower(name), scope)");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (2, 'security_and_retrieval_hardening', strftime('%s','now') * 1000)");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (3, 'runtime_lifecycle_cache', strftime('%s','now') * 1000)");
-        try self.exec("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, job_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', scope TEXT NOT NULL DEFAULT 'workspace', object_type TEXT NOT NULL DEFAULT '', object_id TEXT NOT NULL DEFAULT '', input_json TEXT NOT NULL DEFAULT '{}', result_json TEXT NOT NULL DEFAULT '{}', error_text TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)");
+        try self.exec("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, job_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', scope TEXT NOT NULL DEFAULT 'workspace', permissions_json TEXT NOT NULL DEFAULT '[]', object_type TEXT NOT NULL DEFAULT '', object_id TEXT NOT NULL DEFAULT '', input_json TEXT NOT NULL DEFAULT '{}', result_json TEXT NOT NULL DEFAULT '{}', error_text TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)");
+        if (!try self.columnExists("jobs", "permissions_json")) {
+            try self.exec("ALTER TABLE jobs ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '[]'");
+        }
         try self.exec("CREATE INDEX IF NOT EXISTS idx_jobs_scope_status ON jobs(scope, status, created_at_ms)");
-        try self.exec("CREATE TABLE IF NOT EXISTS knowledge_conflicts (id TEXT PRIMARY KEY, conflict_type TEXT NOT NULL, object_a_type TEXT NOT NULL, object_a_id TEXT NOT NULL, object_b_type TEXT NOT NULL, object_b_id TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'workspace', status TEXT NOT NULL DEFAULT 'open', summary TEXT NOT NULL, created_at_ms INTEGER NOT NULL, resolved_at_ms INTEGER)");
+        try self.exec("CREATE TABLE IF NOT EXISTS knowledge_conflicts (id TEXT PRIMARY KEY, conflict_type TEXT NOT NULL, object_a_type TEXT NOT NULL, object_a_id TEXT NOT NULL, object_b_type TEXT NOT NULL, object_b_id TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'workspace', permissions_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'open', summary TEXT NOT NULL, created_at_ms INTEGER NOT NULL, resolved_at_ms INTEGER)");
+        if (!try self.columnExists("knowledge_conflicts", "permissions_json")) {
+            try self.exec("ALTER TABLE knowledge_conflicts ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '[\"admin\"]'");
+        }
         try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_conflicts_pair ON knowledge_conflicts(conflict_type, object_a_id, object_b_id)");
         try self.exec("CREATE TABLE IF NOT EXISTS connector_cursors (connector TEXT NOT NULL, scope TEXT NOT NULL, cursor TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '{}', updated_at_ms INTEGER NOT NULL, PRIMARY KEY (connector, scope))");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', strftime('%s','now') * 1000)");
@@ -1425,6 +1536,14 @@ pub const SQLiteStore = struct {
         return row;
     }
 
+    pub fn getEntity(self: *Self, allocator: std.mem.Allocator, id: []const u8) !?domain.Entity {
+        const stmt = try self.prepare("SELECT id,type,name,aliases_json,description,canonical_artifact_id,scope,permissions_json,metadata_json,created_at_ms,updated_at_ms FROM entities WHERE id = ?1 LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try readEntity(allocator, stmt);
+    }
+
     fn readEntity(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !domain.Entity {
         return .{
             .id = try columnText(allocator, stmt, 0),
@@ -1442,7 +1561,13 @@ pub const SQLiteStore = struct {
     }
 
     pub fn createRelation(self: *Self, allocator: std.mem.Allocator, input: RelationInput) !domain.Relation {
-        if (!try self.entityExists(input.from_entity_id) or !try self.entityExists(input.to_entity_id)) return error.EntityNotFound;
+        const from_entity = (try self.getEntity(allocator, input.from_entity_id)) orelse return error.EntityNotFound;
+        const to_entity = (try self.getEntity(allocator, input.to_entity_id)) orelse return error.EntityNotFound;
+        if (!aclCoversTarget(allocator, from_entity.scope, from_entity.permissions_json, input.scope, input.permissions_json) or
+            !aclCoversTarget(allocator, to_entity.scope, to_entity.permissions_json, input.scope, input.permissions_json))
+        {
+            return error.RelationAclBroaderThanEntity;
+        }
         const id = try ids.make(allocator, "rel_");
         const now = ids.nowMs();
         const stmt = try self.prepare("INSERT INTO relations (id,from_entity_id,relation_type,to_entity_id,source_ids_json,scope,permissions_json,confidence,status,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
@@ -1620,6 +1745,9 @@ pub const SQLiteStore = struct {
         if (plan.use_vector and input.query.len > 0) {
             try self.searchVectorCandidates(allocator, input, plan.expanded_query, &vector_results);
         }
+        if (plan.use_graph or keyword_results.items.len > 0) {
+            try self.expandGraphCandidates(allocator, input, &keyword_results);
+        }
 
         const final = try self.fuseSearchResults(allocator, input, keyword_results.items, vector_results.items, limit);
         return final;
@@ -1775,7 +1903,7 @@ pub const SQLiteStore = struct {
 
     fn searchRelations(self: *Self, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const stmt = try self.prepare(
-            "SELECT r.id,r.relation_type,r.status,r.confidence,r.source_ids_json,r.scope,r.permissions_json,fe.name,te.name,r.created_at_ms " ++
+            "SELECT r.id,r.relation_type,r.status,r.confidence,r.source_ids_json,r.scope,r.permissions_json,fe.name,te.name,r.created_at_ms,fe.scope,fe.permissions_json,te.scope,te.permissions_json " ++
                 "FROM relations r " ++
                 "LEFT JOIN entities fe ON fe.id = r.from_entity_id " ++
                 "LEFT JOIN entities te ON te.id = r.to_entity_id " ++
@@ -1793,8 +1921,14 @@ pub const SQLiteStore = struct {
             const from_name = try columnText(allocator, stmt, 7);
             const to_name = try columnText(allocator, stmt, 8);
             const created_at_ms = c.sqlite3_column_int64(stmt, 9);
+            const from_scope = try columnText(allocator, stmt, 10);
+            const from_permissions = try columnText(allocator, stmt, 11);
+            const to_scope = try columnText(allocator, stmt, 12);
+            const to_permissions = try columnText(allocator, stmt, 13);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicy(allocator, from_scope, from_permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicy(allocator, to_scope, to_permissions, input.scopes_json)) continue;
             const text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ from_name, relation_type, to_name });
             const relevance = scoreText(input.query, text) + scoreText(input.query, relation_type);
             if (relevance <= 0 and input.query.len > 0) continue;
@@ -1814,8 +1948,141 @@ pub const SQLiteStore = struct {
         }
     }
 
+    fn expandGraphCandidates(self: *Self, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const initial_len = results.items.len;
+        var i: usize = 0;
+        while (i < initial_len and results.items.len < 500) : (i += 1) {
+            const result = results.items[i];
+            if (std.mem.eql(u8, result.result_type, "entity")) {
+                try self.expandEntityContext(allocator, input, result.id, results);
+            }
+        }
+    }
+
+    fn expandEntityContext(self: *Self, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        try self.expandEntityMemoryAtoms(allocator, input, entity_id, results);
+        try self.expandEntityArtifacts(allocator, input, entity_id, results);
+        try self.expandEntitySources(allocator, input, entity_id, results);
+        try self.expandEntityRelations(allocator, input, entity_id, results);
+    }
+
+    fn expandEntityMemoryAtoms(self: *Self, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const stmt = try self.prepare("SELECT id,text,scope,status,confidence,source_ids_json,created_at_ms,permissions_json FROM memory_atoms WHERE subject_entity_id = ?1 ORDER BY created_at_ms DESC LIMIT 50");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, entity_id);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const status = try columnText(allocator, stmt, 3);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
+            const scope = try columnText(allocator, stmt, 2);
+            const permissions = try columnText(allocator, stmt, 7);
+            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            const source_ids = try columnText(allocator, stmt, 5);
+            const confidence = c.sqlite3_column_double(stmt, 4);
+            try results.append(allocator, .{
+                .id = try columnText(allocator, stmt, 0),
+                .result_type = "memory_atom",
+                .title = entity_id,
+                .text = try columnText(allocator, stmt, 1),
+                .scope = scope,
+                .status = status,
+                .score = 0.7 + confidence,
+                .source_ids_json = try self.sanitizeSourceIds(allocator, source_ids, input.scopes_json),
+                .created_at_ms = c.sqlite3_column_int64(stmt, 6),
+                .confidence = confidence,
+            });
+        }
+    }
+
+    fn expandEntityArtifacts(self: *Self, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const stmt = try self.prepare("SELECT id,title,body,status,scope,permissions_json,source_ids_json,updated_at_ms FROM artifacts WHERE instr(related_entities_json, ?1) > 0 ORDER BY updated_at_ms DESC LIMIT 50");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, entity_id);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const status = try columnText(allocator, stmt, 3);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
+            const scope = try columnText(allocator, stmt, 4);
+            const permissions = try columnText(allocator, stmt, 5);
+            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            try results.append(allocator, .{
+                .id = try columnText(allocator, stmt, 0),
+                .result_type = "artifact",
+                .title = try columnText(allocator, stmt, 1),
+                .text = try columnText(allocator, stmt, 2),
+                .scope = scope,
+                .status = status,
+                .score = 0.75,
+                .source_ids_json = try self.sanitizeSourceIds(allocator, try columnText(allocator, stmt, 6), input.scopes_json),
+                .created_at_ms = c.sqlite3_column_int64(stmt, 7),
+                .confidence = 0.7,
+            });
+        }
+    }
+
+    fn expandEntitySources(self: *Self, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const stmt = try self.prepare("SELECT id,title,content,scope,permissions_json,imported_at_ms FROM sources WHERE instr(related_entities_json, ?1) > 0 ORDER BY imported_at_ms DESC LIMIT 50");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, entity_id);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const scope = try columnText(allocator, stmt, 3);
+            const permissions = try columnText(allocator, stmt, 4);
+            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            const id_text = try columnText(allocator, stmt, 0);
+            try results.append(allocator, .{
+                .id = id_text,
+                .result_type = "source",
+                .title = try columnText(allocator, stmt, 1),
+                .text = try columnText(allocator, stmt, 2),
+                .scope = scope,
+                .status = "active",
+                .score = 0.65,
+                .source_ids_json = try singleJsonString(allocator, id_text),
+                .created_at_ms = c.sqlite3_column_int64(stmt, 5),
+                .confidence = 0.65,
+            });
+        }
+    }
+
+    fn expandEntityRelations(self: *Self, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const stmt = try self.prepare(
+            "SELECT r.id,r.relation_type,r.status,r.confidence,r.source_ids_json,r.scope,r.permissions_json,fe.name,te.name,r.created_at_ms,fe.scope,fe.permissions_json,te.scope,te.permissions_json " ++
+                "FROM relations r " ++
+                "LEFT JOIN entities fe ON fe.id = r.from_entity_id " ++
+                "LEFT JOIN entities te ON te.id = r.to_entity_id " ++
+                "WHERE r.from_entity_id = ?1 OR r.to_entity_id = ?1 ORDER BY r.created_at_ms DESC LIMIT 50",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, entity_id);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const status = try columnText(allocator, stmt, 2);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
+            const scope = try columnText(allocator, stmt, 5);
+            const permissions = try columnText(allocator, stmt, 6);
+            const from_scope = try columnText(allocator, stmt, 10);
+            const from_permissions = try columnText(allocator, stmt, 11);
+            const to_scope = try columnText(allocator, stmt, 12);
+            const to_permissions = try columnText(allocator, stmt, 13);
+            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicy(allocator, from_scope, from_permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicy(allocator, to_scope, to_permissions, input.scopes_json)) continue;
+            const relation_type = try columnText(allocator, stmt, 1);
+            const confidence = c.sqlite3_column_double(stmt, 3);
+            try results.append(allocator, .{
+                .id = try columnText(allocator, stmt, 0),
+                .result_type = "relation",
+                .title = relation_type,
+                .text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ try columnText(allocator, stmt, 7), relation_type, try columnText(allocator, stmt, 8) }),
+                .scope = scope,
+                .status = status,
+                .score = 0.8 + confidence,
+                .source_ids_json = try self.sanitizeSourceIds(allocator, try columnText(allocator, stmt, 4), input.scopes_json),
+                .created_at_ms = c.sqlite3_column_int64(stmt, 9),
+                .confidence = confidence,
+            });
+        }
+    }
+
     fn searchContextPacks(self: *Self, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const stmt = try self.prepare("SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,generated_summary,created_at_ms FROM context_packs ORDER BY created_at_ms DESC LIMIT 500");
+        const stmt = try self.prepare("SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,generated_summary,created_at_ms,required_scopes_json FROM context_packs ORDER BY created_at_ms DESC LIMIT 500");
         defer _ = c.sqlite3_finalize(stmt);
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const id_text = try columnText(allocator, stmt, 0);
@@ -1827,7 +2094,8 @@ pub const SQLiteStore = struct {
             const atom_ids = try columnText(allocator, stmt, 6);
             const summary = try columnText(allocator, stmt, 7);
             const created_at_ms = c.sqlite3_column_int64(stmt, 8);
-            if (!try self.contextPackVisible(allocator, source_ids, artifact_ids, atom_ids, input.scopes_json)) continue;
+            const required_scopes = try columnText(allocator, stmt, 9);
+            if (!try self.contextPackVisible(allocator, source_ids, artifact_ids, atom_ids, required_scopes, input.scopes_json)) continue;
             const relevance = scoreText(input.query, query_text) + scoreText(input.query, summary) + scoreText(input.query, purpose);
             if (relevance <= 0 and input.query.len > 0) continue;
             const title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ purpose, target });
@@ -2035,7 +2303,8 @@ pub const SQLiteStore = struct {
         };
     }
 
-    fn contextPackVisible(self: *Self, allocator: std.mem.Allocator, sources_json: []const u8, artifacts_json: []const u8, atoms_json: []const u8, scopes_json: []const u8) !bool {
+    fn contextPackVisible(self: *Self, allocator: std.mem.Allocator, sources_json: []const u8, artifacts_json: []const u8, atoms_json: []const u8, required_scopes_json: []const u8, scopes_json: []const u8) !bool {
+        if (!requiredScopesVisible(required_scopes_json, scopes_json)) return false;
         return (try self.allSourcesVisible(allocator, sources_json, scopes_json)) and
             (try self.allArtifactsVisible(allocator, artifacts_json, scopes_json)) and
             (try self.allMemoryAtomsVisible(allocator, atoms_json, scopes_json));
@@ -2439,6 +2708,13 @@ pub const SQLiteStore = struct {
             .stale_memory_atoms = @intCast(stale),
             .vector_outbox_pending = pending,
             .cache_entries = @intCast(response_cache + semantic_cache),
+            .queued_jobs = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE status = 'queued'")),
+            .running_jobs = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE status = 'running'")),
+            .failed_jobs = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE status = 'failed'")),
+            .pending_feed_events = @intCast(try self.countSql("SELECT COUNT(*) FROM memory_feed_events WHERE status = 'pending' OR status = 'applying'")),
+            .open_conflicts = @intCast(try self.countSql("SELECT COUNT(*) FROM knowledge_conflicts WHERE status = 'open'")),
+            .compat_memories = @intCast(try self.countSql("SELECT COUNT(*) FROM compat_memories")),
+            .sessions = @intCast(try self.countSql("SELECT COUNT(*) FROM (SELECT session_id FROM session_messages GROUP BY session_id)")),
         };
     }
 
@@ -2554,7 +2830,7 @@ pub const SQLiteStore = struct {
         if (c.sqlite3_step(semantic_stmt) != c.SQLITE_DONE) return error.DeleteFailed;
         result.expired_cache_entries += @intCast(c.sqlite3_changes(self.db));
 
-        const stmt = try self.prepare("SELECT id,status,last_verified_at_ms,created_at_ms FROM memory_atoms ORDER BY created_at_ms ASC LIMIT 5000");
+        const stmt = try self.prepare("SELECT id,status,last_verified_at_ms,created_at_ms,scope,permissions_json FROM memory_atoms ORDER BY created_at_ms ASC LIMIT 5000");
         defer _ = c.sqlite3_finalize(stmt);
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             result.checked += 1;
@@ -2564,24 +2840,32 @@ pub const SQLiteStore = struct {
             defer self.allocator.free(status);
             const last_verified = if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 2);
             const created = c.sqlite3_column_int64(stmt, 3);
+            const scope = try columnText(self.allocator, stmt, 4);
+            defer self.allocator.free(scope);
+            const permissions = try columnText(self.allocator, stmt, 5);
+            defer self.allocator.free(permissions);
             const base_seen = last_verified orelse created;
             const decision = lifecycle_mod.hygieneDecision(status, base_seen, now, input.stale_after_ms, input.archive_after_ms, input.purge_after_ms);
             switch (decision) {
                 .keep => {},
                 .mark_stale => {
+                    if (!hygieneCanVerify(input, scope, permissions)) continue;
                     if (!std.mem.eql(u8, status, "stale")) {
                         if (try self.patchMemoryAtomStatus(id_text, "stale", false)) result.marked_stale += 1;
                     }
                 },
                 .archive => {
+                    if (!hygieneCanVerify(input, scope, permissions)) continue;
                     if (!std.mem.eql(u8, status, "deprecated")) {
                         if (try self.patchMemoryAtomStatus(id_text, "deprecated", false)) result.archived += 1;
                     }
                 },
                 .purge => {
                     if (input.hard_delete) {
+                        if (!hygieneCanDelete(input, scope, permissions)) continue;
                         if (try self.hardDeleteMemoryAtom(id_text)) result.purged += 1;
                     } else if (!std.mem.eql(u8, status, "deprecated")) {
+                        if (!hygieneCanVerify(input, scope, permissions)) continue;
                         if (try self.patchMemoryAtomStatus(id_text, "deprecated", false)) result.archived += 1;
                     }
                 },
@@ -2648,7 +2932,7 @@ pub const SQLiteStore = struct {
         const summary_full = try buildContextSummary(allocator, input.query, budgeted_results);
         const summary = try trimContextSummaryToBudget(allocator, summary_full, input.token_budget);
         const sections = try buildContextSectionsJson(allocator, budgeted_results);
-        const stmt = try self.prepare("INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,generated_summary,token_budget,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
+        const stmt = try self.prepare("INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,required_scopes_json,generated_summary,token_budget,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         bindText(stmt, 2, input.purpose);
@@ -2657,12 +2941,13 @@ pub const SQLiteStore = struct {
         bindText(stmt, 5, sources);
         bindText(stmt, 6, artifacts);
         bindText(stmt, 7, atoms);
-        bindText(stmt, 8, summary);
-        _ = c.sqlite3_bind_int64(stmt, 9, input.token_budget);
-        _ = c.sqlite3_bind_int64(stmt, 10, now);
+        bindText(stmt, 8, input.scopes_json);
+        bindText(stmt, 9, summary);
+        _ = c.sqlite3_bind_int64(stmt, 10, input.token_budget);
+        _ = c.sqlite3_bind_int64(stmt, 11, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
         self.insertAudit("context_pack.created", "context_pack", id);
-        return .{ .id = id, .purpose = input.purpose, .target = input.target, .query = input.query, .generated_summary = summary, .sections_json = sections, .citations_json = sources, .forbidden_assumptions_json = context_forbidden_assumptions_json, .suggested_next_steps_json = context_suggested_next_steps_json, .included_sources_json = sources, .included_artifacts_json = artifacts, .included_memory_atoms_json = atoms, .token_budget = input.token_budget, .created_at_ms = now };
+        return .{ .id = id, .purpose = input.purpose, .target = input.target, .query = input.query, .generated_summary = summary, .sections_json = sections, .citations_json = sources, .forbidden_assumptions_json = context_forbidden_assumptions_json, .suggested_next_steps_json = context_suggested_next_steps_json, .included_sources_json = sources, .included_artifacts_json = artifacts, .included_memory_atoms_json = atoms, .required_scopes_json = input.scopes_json, .token_budget = input.token_budget, .created_at_ms = now };
     }
 
     fn appendUniqueJsonString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), count: *usize, value: []const u8) !void {
@@ -3021,16 +3306,17 @@ pub const SQLiteStore = struct {
     pub fn createJob(self: *Self, allocator: std.mem.Allocator, input: JobInput) !Job {
         const id = try ids.make(allocator, "job_");
         const now = ids.nowMs();
-        const stmt = try self.prepare("INSERT INTO jobs (id,job_type,status,scope,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms) VALUES (?1,?2,'queued',?3,?4,?5,?6,'{}',NULL,0,?7,?8)");
+        const stmt = try self.prepare("INSERT INTO jobs (id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms) VALUES (?1,?2,'queued',?3,?4,?5,?6,?7,'{}',NULL,0,?8,?9)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         bindText(stmt, 2, input.job_type);
         bindText(stmt, 3, input.scope);
-        bindText(stmt, 4, input.object_type);
-        bindText(stmt, 5, input.object_id);
-        bindText(stmt, 6, input.input_json);
-        _ = c.sqlite3_bind_int64(stmt, 7, now);
+        bindText(stmt, 4, input.permissions_json);
+        bindText(stmt, 5, input.object_type);
+        bindText(stmt, 6, input.object_id);
+        bindText(stmt, 7, input.input_json);
         _ = c.sqlite3_bind_int64(stmt, 8, now);
+        _ = c.sqlite3_bind_int64(stmt, 9, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
         self.insertAudit("job.created", "job", id);
         return .{
@@ -3038,6 +3324,7 @@ pub const SQLiteStore = struct {
             .job_type = input.job_type,
             .status = "queued",
             .scope = input.scope,
+            .permissions_json = input.permissions_json,
             .object_type = input.object_type,
             .object_id = input.object_id,
             .input_json = input.input_json,
@@ -3050,7 +3337,7 @@ pub const SQLiteStore = struct {
     }
 
     pub fn getJob(self: *Self, allocator: std.mem.Allocator, id: []const u8) !?Job {
-        const stmt = try self.prepare("SELECT id,job_type,status,scope,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms FROM jobs WHERE id = ?1 LIMIT 1");
+        const stmt = try self.prepare("SELECT id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms FROM jobs WHERE id = ?1 LIMIT 1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
@@ -3059,17 +3346,18 @@ pub const SQLiteStore = struct {
 
     pub fn listJobs(self: *Self, allocator: std.mem.Allocator, input: JobListInput) ![]Job {
         const stmt = if (input.status) |_|
-            try self.prepare("SELECT id,job_type,status,scope,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms FROM jobs WHERE status = ?1 ORDER BY created_at_ms DESC LIMIT ?2")
+            try self.prepare("SELECT id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms FROM jobs WHERE status = ?1 ORDER BY created_at_ms DESC LIMIT ?2")
         else
-            try self.prepare("SELECT id,job_type,status,scope,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms FROM jobs ORDER BY created_at_ms DESC LIMIT ?2");
+            try self.prepare("SELECT id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms FROM jobs ORDER BY created_at_ms DESC LIMIT ?2");
         defer _ = c.sqlite3_finalize(stmt);
         if (input.status) |status| bindText(stmt, 1, status);
         _ = c.sqlite3_bind_int64(stmt, 2, @intCast(@max(@as(usize, 1), @min(input.limit, 500))));
         var out: std.ArrayListUnmanaged(Job) = .empty;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const scope = try columnText(allocator, stmt, 3);
-            if (!domain.scopeVisible(scope, input.scopes_json)) continue;
-            try out.append(allocator, try readJobWithScope(allocator, stmt, scope));
+            const permissions = try columnText(allocator, stmt, 4);
+            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            try out.append(allocator, try readJobWithAcl(allocator, stmt, scope, permissions));
         }
         return out.toOwnedSlice(allocator);
     }
@@ -3101,39 +3389,43 @@ pub const SQLiteStore = struct {
 
     fn readJob(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !Job {
         const scope = try columnText(allocator, stmt, 3);
-        return readJobWithScope(allocator, stmt, scope);
+        const permissions = try columnText(allocator, stmt, 4);
+        return readJobWithAcl(allocator, stmt, scope, permissions);
     }
 
-    fn readJobWithScope(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, scope: []const u8) !Job {
+    fn readJobWithAcl(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, scope: []const u8, permissions_json: []const u8) !Job {
         return .{
             .id = try columnText(allocator, stmt, 0),
             .job_type = try columnText(allocator, stmt, 1),
             .status = try columnText(allocator, stmt, 2),
             .scope = scope,
-            .object_type = try columnText(allocator, stmt, 4),
-            .object_id = try columnText(allocator, stmt, 5),
-            .input_json = try columnText(allocator, stmt, 6),
-            .result_json = try columnText(allocator, stmt, 7),
-            .error_text = try columnTextNullable(allocator, stmt, 8),
-            .attempts = c.sqlite3_column_int64(stmt, 9),
-            .created_at_ms = c.sqlite3_column_int64(stmt, 10),
-            .updated_at_ms = c.sqlite3_column_int64(stmt, 11),
+            .permissions_json = permissions_json,
+            .object_type = try columnText(allocator, stmt, 5),
+            .object_id = try columnText(allocator, stmt, 6),
+            .input_json = try columnText(allocator, stmt, 7),
+            .result_json = try columnText(allocator, stmt, 8),
+            .error_text = try columnTextNullable(allocator, stmt, 9),
+            .attempts = c.sqlite3_column_int64(stmt, 10),
+            .created_at_ms = c.sqlite3_column_int64(stmt, 11),
+            .updated_at_ms = c.sqlite3_column_int64(stmt, 12),
         };
     }
 
     pub fn listConflicts(self: *Self, allocator: std.mem.Allocator, input: ConflictListInput) ![]KnowledgeConflict {
         const stmt = if (input.status) |_|
-            try self.prepare("SELECT id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,status,summary,created_at_ms,resolved_at_ms FROM knowledge_conflicts WHERE status = ?1 ORDER BY created_at_ms DESC LIMIT ?2")
+            try self.prepare("SELECT id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,permissions_json,status,summary,created_at_ms,resolved_at_ms FROM knowledge_conflicts WHERE status = ?1 ORDER BY created_at_ms DESC LIMIT ?2")
         else
-            try self.prepare("SELECT id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,status,summary,created_at_ms,resolved_at_ms FROM knowledge_conflicts ORDER BY created_at_ms DESC LIMIT ?2");
+            try self.prepare("SELECT id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,permissions_json,status,summary,created_at_ms,resolved_at_ms FROM knowledge_conflicts ORDER BY created_at_ms DESC LIMIT ?2");
         defer _ = c.sqlite3_finalize(stmt);
         if (input.status) |status| bindText(stmt, 1, status);
         _ = c.sqlite3_bind_int64(stmt, 2, @intCast(@max(@as(usize, 1), @min(input.limit, 500))));
         var out: std.ArrayListUnmanaged(KnowledgeConflict) = .empty;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const scope = try columnText(allocator, stmt, 6);
-            if (!domain.scopeVisible(scope, input.scopes_json)) continue;
-            try out.append(allocator, try readConflictWithScope(allocator, stmt, scope));
+            const permissions = try columnText(allocator, stmt, 7);
+            const conflict = try readConflictWithAcl(allocator, stmt, scope, permissions);
+            if (!try self.conflictVisible(allocator, conflict, input.scopes_json)) continue;
+            try out.append(allocator, conflict);
         }
         return out.toOwnedSlice(allocator);
     }
@@ -3176,21 +3468,23 @@ pub const SQLiteStore = struct {
         const a_id = if (std.mem.lessThan(u8, a.id, b.id)) a.id else b.id;
         const b_id = if (std.mem.lessThan(u8, a.id, b.id)) b.id else a.id;
         const summary = try std.fmt.allocPrint(allocator, "Potential conflicting {s}: {s} vs {s}", .{ a.predicate, a.object, b.object });
+        const permissions = try combinedPermissionsJson(allocator, a.permissions_json, b.permissions_json);
         const id = try ids.make(allocator, "cnf_");
         const now = ids.nowMs();
-        const stmt = try self.prepare("INSERT OR IGNORE INTO knowledge_conflicts (id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,status,summary,created_at_ms,resolved_at_ms) VALUES (?1,'memory_atom_conflict','memory_atom',?2,'memory_atom',?3,?4,'open',?5,?6,NULL)");
+        const stmt = try self.prepare("INSERT OR IGNORE INTO knowledge_conflicts (id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,permissions_json,status,summary,created_at_ms,resolved_at_ms) VALUES (?1,'memory_atom_conflict','memory_atom',?2,'memory_atom',?3,?4,?5,'open',?6,?7,NULL)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         bindText(stmt, 2, a_id);
         bindText(stmt, 3, b_id);
         bindText(stmt, 4, a.scope);
-        bindText(stmt, 5, summary);
-        _ = c.sqlite3_bind_int64(stmt, 6, now);
+        bindText(stmt, 5, permissions);
+        bindText(stmt, 6, summary);
+        _ = c.sqlite3_bind_int64(stmt, 7, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
         if (c.sqlite3_changes(self.db) > 0) self.insertAudit("conflict.detected", "knowledge_conflict", id);
     }
 
-    fn readConflictWithScope(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, scope: []const u8) !KnowledgeConflict {
+    fn readConflictWithAcl(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, scope: []const u8, permissions_json: []const u8) !KnowledgeConflict {
         return .{
             .id = try columnText(allocator, stmt, 0),
             .conflict_type = try columnText(allocator, stmt, 1),
@@ -3199,11 +3493,22 @@ pub const SQLiteStore = struct {
             .object_b_type = try columnText(allocator, stmt, 4),
             .object_b_id = try columnText(allocator, stmt, 5),
             .scope = scope,
-            .status = try columnText(allocator, stmt, 7),
-            .summary = try columnText(allocator, stmt, 8),
-            .created_at_ms = c.sqlite3_column_int64(stmt, 9),
-            .resolved_at_ms = if (c.sqlite3_column_type(stmt, 10) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 10),
+            .permissions_json = permissions_json,
+            .status = try columnText(allocator, stmt, 8),
+            .summary = try columnText(allocator, stmt, 9),
+            .created_at_ms = c.sqlite3_column_int64(stmt, 10),
+            .resolved_at_ms = if (c.sqlite3_column_type(stmt, 11) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 11),
         };
+    }
+
+    fn conflictVisible(self: *Self, allocator: std.mem.Allocator, conflict: KnowledgeConflict, scopes_json: []const u8) !bool {
+        if (std.mem.eql(u8, conflict.object_a_type, "memory_atom") and std.mem.eql(u8, conflict.object_b_type, "memory_atom")) {
+            const a = (try self.getMemoryAtom(allocator, conflict.object_a_id)) orelse return false;
+            const b = (try self.getMemoryAtom(allocator, conflict.object_b_id)) orelse return false;
+            return (try self.recordVisibleWithPolicy(allocator, a.scope, a.permissions_json, scopes_json)) and
+                (try self.recordVisibleWithPolicy(allocator, b.scope, b.permissions_json, scopes_json));
+        }
+        return try self.recordVisibleWithPolicy(allocator, conflict.scope, conflict.permissions_json, scopes_json);
     }
 
     fn countSql(self: *Self, sql: [*:0]const u8) !i64 {
@@ -3285,6 +3590,9 @@ pub const PostgresStore = struct {
             \\ALTER TABLE entities ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE relations ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'workspace';
             \\ALTER TABLE relations ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
+            \\ALTER TABLE context_packs ADD COLUMN IF NOT EXISTS required_scopes_json jsonb NOT NULL DEFAULT '["admin"]'::jsonb;
+            \\ALTER TABLE jobs ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
+            \\ALTER TABLE knowledge_conflicts ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '["admin"]'::jsonb;
             \\ALTER TABLE memory_feed_events ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS actor_id text NOT NULL DEFAULT '';
@@ -3479,8 +3787,22 @@ pub const PostgresStore = struct {
         return try readPgEntity(allocator, parsed.value.object);
     }
 
+    pub fn getEntity(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?domain.Entity {
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,type,name,aliases_json,description,canonical_artifact_id,scope,permissions_json,metadata_json,created_at_ms,updated_at_ms FROM entities WHERE id = {s} LIMIT 1", .{try sqlString(allocator, id)});
+        const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value == .null) return null;
+        return try readPgEntity(allocator, parsed.value.object);
+    }
+
     pub fn createRelation(self: *PostgresStore, allocator: std.mem.Allocator, input: RelationInput) !domain.Relation {
-        if (!try self.entityExists(allocator, input.from_entity_id) or !try self.entityExists(allocator, input.to_entity_id)) return error.EntityNotFound;
+        const from_entity = (try self.getEntity(allocator, input.from_entity_id)) orelse return error.EntityNotFound;
+        const to_entity = (try self.getEntity(allocator, input.to_entity_id)) orelse return error.EntityNotFound;
+        if (!aclCoversTarget(allocator, from_entity.scope, from_entity.permissions_json, input.scope, input.permissions_json) or
+            !aclCoversTarget(allocator, to_entity.scope, to_entity.permissions_json, input.scope, input.permissions_json))
+        {
+            return error.RelationAclBroaderThanEntity;
+        }
         const id = try ids.make(allocator, "rel_");
         const now = ids.nowMs();
         const sql = try std.fmt.allocPrint(allocator, "INSERT INTO relations (id,from_entity_id,relation_type,to_entity_id,source_ids_json,scope,permissions_json,confidence,status,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{d},{s},{d})", .{ try sqlString(allocator, id), try sqlString(allocator, input.from_entity_id), try sqlString(allocator, input.relation_type), try sqlString(allocator, input.to_entity_id), try sqlJsonb(allocator, input.source_ids_json), try sqlString(allocator, input.scope), try sqlJsonb(allocator, input.permissions_json), input.confidence, try sqlString(allocator, input.status), now });
@@ -3540,6 +3862,9 @@ pub const PostgresStore = struct {
         errdefer vector_results.deinit(allocator);
         if (plan.use_vector and input.query.len > 0) {
             try self.searchPgVectorCandidates(allocator, input, plan.expanded_query, &vector_results);
+        }
+        if (plan.use_graph or keyword_results.items.len > 0) {
+            try self.expandPgGraphCandidates(allocator, input, &keyword_results);
         }
 
         return try self.fusePgSearchResults(allocator, input, keyword_results.items, vector_results.items, limit);
@@ -3774,11 +4099,23 @@ pub const PostgresStore = struct {
     }
 
     pub fn lifecycleDiagnostics(self: *PostgresStore) !LifecycleDiagnostics {
-        const sql = "SELECT json_build_object('total_memory_atoms',(SELECT count(*) FROM memory_atoms),'stale_memory_atoms',(SELECT count(*) FROM memory_atoms WHERE status='stale'),'vector_outbox_pending',(SELECT count(*) FROM vector_outbox WHERE status='pending'),'cache_entries',(SELECT count(*) FROM response_cache)+(SELECT count(*) FROM semantic_cache))::text";
+        const sql = "SELECT json_build_object('total_memory_atoms',(SELECT count(*) FROM memory_atoms),'stale_memory_atoms',(SELECT count(*) FROM memory_atoms WHERE status='stale'),'vector_outbox_pending',(SELECT count(*) FROM vector_outbox WHERE status='pending'),'cache_entries',(SELECT count(*) FROM response_cache)+(SELECT count(*) FROM semantic_cache),'queued_jobs',(SELECT count(*) FROM jobs WHERE status='queued'),'running_jobs',(SELECT count(*) FROM jobs WHERE status='running'),'failed_jobs',(SELECT count(*) FROM jobs WHERE status='failed'),'pending_feed_events',(SELECT count(*) FROM memory_feed_events WHERE status='pending' OR status='applying'),'open_conflicts',(SELECT count(*) FROM knowledge_conflicts WHERE status='open'),'compat_memories',(SELECT count(*) FROM compat_memories),'sessions',(SELECT count(*) FROM (SELECT session_id FROM session_messages GROUP BY session_id) s))::text";
         const parsed = try self.queryJson(self.allocator, sql);
         defer parsed.deinit();
         const obj = parsed.value.object;
-        return .{ .total_memory_atoms = @intCast(json.intField(obj, "total_memory_atoms") orelse 0), .stale_memory_atoms = @intCast(json.intField(obj, "stale_memory_atoms") orelse 0), .vector_outbox_pending = @intCast(json.intField(obj, "vector_outbox_pending") orelse 0), .cache_entries = @intCast(json.intField(obj, "cache_entries") orelse 0) };
+        return .{
+            .total_memory_atoms = @intCast(json.intField(obj, "total_memory_atoms") orelse 0),
+            .stale_memory_atoms = @intCast(json.intField(obj, "stale_memory_atoms") orelse 0),
+            .vector_outbox_pending = @intCast(json.intField(obj, "vector_outbox_pending") orelse 0),
+            .cache_entries = @intCast(json.intField(obj, "cache_entries") orelse 0),
+            .queued_jobs = @intCast(json.intField(obj, "queued_jobs") orelse 0),
+            .running_jobs = @intCast(json.intField(obj, "running_jobs") orelse 0),
+            .failed_jobs = @intCast(json.intField(obj, "failed_jobs") orelse 0),
+            .pending_feed_events = @intCast(json.intField(obj, "pending_feed_events") orelse 0),
+            .open_conflicts = @intCast(json.intField(obj, "open_conflicts") orelse 0),
+            .compat_memories = @intCast(json.intField(obj, "compat_memories") orelse 0),
+            .sessions = @intCast(json.intField(obj, "sessions") orelse 0),
+        };
     }
 
     pub fn putResponseCache(self: *PostgresStore, input: ResponseCacheInput) !void {
@@ -3843,7 +4180,7 @@ pub const PostgresStore = struct {
         defer self.allocator.free(expired);
         result.expired_cache_entries = std.fmt.parseInt(usize, expired, 10) catch 0;
 
-        const parsed = try self.queryJson(self.allocator, try arrayJsonSql(self.allocator, "SELECT id,status,last_verified_at_ms,created_at_ms FROM memory_atoms ORDER BY created_at_ms ASC LIMIT 5000"));
+        const parsed = try self.queryJson(self.allocator, try arrayJsonSql(self.allocator, "SELECT id,status,last_verified_at_ms,created_at_ms,scope,permissions_json FROM memory_atoms ORDER BY created_at_ms ASC LIMIT 5000"));
         defer parsed.deinit();
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
             if (item != .object) continue;
@@ -3853,17 +4190,23 @@ pub const PostgresStore = struct {
             const base_seen = json.intField(obj, "last_verified_at_ms") orelse (json.intField(obj, "created_at_ms") orelse now);
             const decision = lifecycle_mod.hygieneDecision(status, base_seen, now, input.stale_after_ms, input.archive_after_ms, input.purge_after_ms);
             const id_text = json.stringField(obj, "id") orelse continue;
+            const scope = json.stringField(obj, "scope") orelse "workspace";
+            const permissions = try rawJsonField(self.allocator, obj, "permissions_json", "[]");
             switch (decision) {
                 .keep => {},
                 .mark_stale => {
+                    if (!hygieneCanVerify(input, scope, permissions)) continue;
                     if (!std.mem.eql(u8, status, "stale") and try self.patchMemoryAtomStatus(id_text, "stale", false)) result.marked_stale += 1;
                 },
                 .archive => {
+                    if (!hygieneCanVerify(input, scope, permissions)) continue;
                     if (!std.mem.eql(u8, status, "deprecated") and try self.patchMemoryAtomStatus(id_text, "deprecated", false)) result.archived += 1;
                 },
                 .purge => if (input.hard_delete) {
+                    if (!hygieneCanDelete(input, scope, permissions)) continue;
                     if (try self.hardDeleteMemoryAtom(id_text)) result.purged += 1;
                 } else {
+                    if (!hygieneCanVerify(input, scope, permissions)) continue;
                     if (!std.mem.eql(u8, status, "deprecated") and try self.patchMemoryAtomStatus(id_text, "deprecated", false)) result.archived += 1;
                 },
             }
@@ -3891,9 +4234,9 @@ pub const PostgresStore = struct {
         const summary_full = try pgBuildContextSummary(allocator, input.query, budgeted_results);
         const summary = try trimContextSummaryToBudget(allocator, summary_full, input.token_budget);
         const sections = try buildContextSectionsJson(allocator, budgeted_results);
-        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,generated_summary,token_budget,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{d},{d})", .{ try sqlString(allocator, id), try sqlString(allocator, input.purpose), try sqlString(allocator, input.target), try sqlString(allocator, input.query), try sqlJsonb(allocator, sources), try sqlJsonb(allocator, artifacts), try sqlJsonb(allocator, atoms), try sqlString(allocator, summary), input.token_budget, now });
+        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,required_scopes_json,generated_summary,token_budget,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{d})", .{ try sqlString(allocator, id), try sqlString(allocator, input.purpose), try sqlString(allocator, input.target), try sqlString(allocator, input.query), try sqlJsonb(allocator, sources), try sqlJsonb(allocator, artifacts), try sqlJsonb(allocator, atoms), try sqlJsonb(allocator, input.scopes_json), try sqlString(allocator, summary), input.token_budget, now });
         try self.runSql(sql);
-        return .{ .id = id, .purpose = input.purpose, .target = input.target, .query = input.query, .generated_summary = summary, .sections_json = sections, .citations_json = sources, .forbidden_assumptions_json = context_forbidden_assumptions_json, .suggested_next_steps_json = context_suggested_next_steps_json, .included_sources_json = sources, .included_artifacts_json = artifacts, .included_memory_atoms_json = atoms, .token_budget = input.token_budget, .created_at_ms = now };
+        return .{ .id = id, .purpose = input.purpose, .target = input.target, .query = input.query, .generated_summary = summary, .sections_json = sections, .citations_json = sources, .forbidden_assumptions_json = context_forbidden_assumptions_json, .suggested_next_steps_json = context_suggested_next_steps_json, .included_sources_json = sources, .included_artifacts_json = artifacts, .included_memory_atoms_json = atoms, .required_scopes_json = input.scopes_json, .token_budget = input.token_budget, .created_at_ms = now };
     }
 
     pub fn compatStore(self: *PostgresStore, allocator: std.mem.Allocator, input: CompatStoreInput) !void {
@@ -4091,13 +4434,13 @@ pub const PostgresStore = struct {
     pub fn createJob(self: *PostgresStore, allocator: std.mem.Allocator, input: JobInput) !Job {
         const id = try ids.make(allocator, "job_");
         const now = ids.nowMs();
-        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO jobs (id,job_type,status,scope,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms) VALUES ({s},{s},'queued',{s},{s},{s},{s},'{{}}'::jsonb,NULL,0,{d},{d})", .{ try sqlString(allocator, id), try sqlString(allocator, input.job_type), try sqlString(allocator, input.scope), try sqlString(allocator, input.object_type), try sqlString(allocator, input.object_id), try sqlJsonb(allocator, input.input_json), now, now });
+        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO jobs (id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms) VALUES ({s},{s},'queued',{s},{s},{s},{s},{s},'{{}}'::jsonb,NULL,0,{d},{d})", .{ try sqlString(allocator, id), try sqlString(allocator, input.job_type), try sqlString(allocator, input.scope), try sqlJsonb(allocator, input.permissions_json), try sqlString(allocator, input.object_type), try sqlString(allocator, input.object_id), try sqlJsonb(allocator, input.input_json), now, now });
         try self.runSql(sql);
-        return .{ .id = id, .job_type = input.job_type, .status = "queued", .scope = input.scope, .object_type = input.object_type, .object_id = input.object_id, .input_json = input.input_json, .result_json = "{}", .error_text = null, .attempts = 0, .created_at_ms = now, .updated_at_ms = now };
+        return .{ .id = id, .job_type = input.job_type, .status = "queued", .scope = input.scope, .permissions_json = input.permissions_json, .object_type = input.object_type, .object_id = input.object_id, .input_json = input.input_json, .result_json = "{}", .error_text = null, .attempts = 0, .created_at_ms = now, .updated_at_ms = now };
     }
 
     pub fn getJob(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?Job {
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,job_type,status,scope,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms FROM jobs WHERE id = {s} LIMIT 1", .{try sqlString(allocator, id)});
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms FROM jobs WHERE id = {s} LIMIT 1", .{try sqlString(allocator, id)});
         const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value == .null) return null;
@@ -4106,14 +4449,14 @@ pub const PostgresStore = struct {
 
     pub fn listJobs(self: *PostgresStore, allocator: std.mem.Allocator, input: JobListInput) ![]Job {
         const status_filter = if (input.status) |status| try std.fmt.allocPrint(allocator, "WHERE status = {s}", .{try sqlString(allocator, status)}) else "";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,job_type,status,scope,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms FROM jobs {s} ORDER BY created_at_ms DESC LIMIT {d}", .{ status_filter, @max(@as(usize, 1), @min(input.limit, 500)) });
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms FROM jobs {s} ORDER BY created_at_ms DESC LIMIT {d}", .{ status_filter, @max(@as(usize, 1), @min(input.limit, 500)) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(Job) = .empty;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
             if (item != .object) continue;
             const job = try readPgJob(allocator, item.object);
-            if (!domain.scopeVisible(job.scope, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicy(allocator, job.scope, job.permissions_json, input.scopes_json)) continue;
             try out.append(allocator, job);
         };
         return out.toOwnedSlice(allocator);
@@ -4135,14 +4478,14 @@ pub const PostgresStore = struct {
 
     pub fn listConflicts(self: *PostgresStore, allocator: std.mem.Allocator, input: ConflictListInput) ![]KnowledgeConflict {
         const status_filter = if (input.status) |status| try std.fmt.allocPrint(allocator, "WHERE status = {s}", .{try sqlString(allocator, status)}) else "";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,status,summary,created_at_ms,resolved_at_ms FROM knowledge_conflicts {s} ORDER BY created_at_ms DESC LIMIT {d}", .{ status_filter, @max(@as(usize, 1), @min(input.limit, 500)) });
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,permissions_json,status,summary,created_at_ms,resolved_at_ms FROM knowledge_conflicts {s} ORDER BY created_at_ms DESC LIMIT {d}", .{ status_filter, @max(@as(usize, 1), @min(input.limit, 500)) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(KnowledgeConflict) = .empty;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
             if (item != .object) continue;
             const conflict = try readPgConflict(allocator, item.object);
-            if (!domain.scopeVisible(conflict.scope, input.scopes_json)) continue;
+            if (!try self.conflictVisible(allocator, conflict, input.scopes_json)) continue;
             try out.append(allocator, conflict);
         };
         return out.toOwnedSlice(allocator);
@@ -4168,6 +4511,16 @@ pub const PostgresStore = struct {
             }
         }
         return try self.listConflicts(allocator, input);
+    }
+
+    fn conflictVisible(self: *PostgresStore, allocator: std.mem.Allocator, conflict: KnowledgeConflict, scopes_json: []const u8) !bool {
+        if (std.mem.eql(u8, conflict.object_a_type, "memory_atom") and std.mem.eql(u8, conflict.object_b_type, "memory_atom")) {
+            const a = (try self.getMemoryAtom(allocator, conflict.object_a_id)) orelse return false;
+            const b = (try self.getMemoryAtom(allocator, conflict.object_b_id)) orelse return false;
+            return (try self.recordVisibleWithPolicy(allocator, a.scope, a.permissions_json, scopes_json)) and
+                (try self.recordVisibleWithPolicy(allocator, b.scope, b.permissions_json, scopes_json));
+        }
+        return try self.recordVisibleWithPolicy(allocator, conflict.scope, conflict.permissions_json, scopes_json);
     }
 
     fn searchPgMemoryAtoms(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
@@ -4274,7 +4627,7 @@ pub const PostgresStore = struct {
     }
 
     fn searchPgRelations(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const inner = "SELECT r.id,r.from_entity_id,r.relation_type,r.to_entity_id,r.source_ids_json,r.scope,r.permissions_json,r.confidence,r.status,r.created_at_ms,coalesce(fe.name,'') AS from_name,coalesce(te.name,'') AS to_name FROM relations r LEFT JOIN entities fe ON fe.id = r.from_entity_id LEFT JOIN entities te ON te.id = r.to_entity_id ORDER BY r.created_at_ms DESC LIMIT 500";
+        const inner = "SELECT r.id,r.from_entity_id,r.relation_type,r.to_entity_id,r.source_ids_json,r.scope,r.permissions_json,r.confidence,r.status,r.created_at_ms,coalesce(fe.name,'') AS from_name,coalesce(te.name,'') AS to_name,coalesce(fe.scope,'') AS from_scope,coalesce(fe.permissions_json,'[]'::jsonb) AS from_permissions_json,coalesce(te.scope,'') AS to_scope,coalesce(te.permissions_json,'[]'::jsonb) AS to_permissions_json FROM relations r LEFT JOIN entities fe ON fe.id = r.from_entity_id LEFT JOIN entities te ON te.id = r.to_entity_id ORDER BY r.created_at_ms DESC LIMIT 500";
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value != .array) return;
@@ -4286,6 +4639,8 @@ pub const PostgresStore = struct {
             const scope = try dupStringField(allocator, obj, "scope", "workspace");
             const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
             if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicy(allocator, json.stringField(obj, "from_scope") orelse "", try rawJsonField(allocator, obj, "from_permissions_json", "[]"), input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicy(allocator, json.stringField(obj, "to_scope") orelse "", try rawJsonField(allocator, obj, "to_permissions_json", "[]"), input.scopes_json)) continue;
             const relation_type = try dupStringField(allocator, obj, "relation_type", "");
             const text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ json.stringField(obj, "from_name") orelse "", relation_type, json.stringField(obj, "to_name") orelse "" });
             const relevance = pgScoreText(input.query, text) + pgScoreText(input.query, relation_type);
@@ -4296,20 +4651,114 @@ pub const PostgresStore = struct {
     }
 
     fn searchPgContextPacks(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, "SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,generated_summary,token_budget,created_at_ms FROM context_packs ORDER BY created_at_ms DESC LIMIT 500"));
+        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, "SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,required_scopes_json,generated_summary,token_budget,created_at_ms FROM context_packs ORDER BY created_at_ms DESC LIMIT 500"));
         defer parsed.deinit();
         if (parsed.value != .array) return;
         for (parsed.value.array.items) |item| {
             if (item != .object) continue;
             const obj = item.object;
             const source_ids = try rawJsonField(allocator, obj, "included_sources_json", "[]");
-            if (!try self.contextPackVisible(allocator, source_ids, try rawJsonField(allocator, obj, "included_artifacts_json", "[]"), try rawJsonField(allocator, obj, "included_memory_atoms_json", "[]"), input.scopes_json)) continue;
+            if (!try self.contextPackVisible(allocator, source_ids, try rawJsonField(allocator, obj, "included_artifacts_json", "[]"), try rawJsonField(allocator, obj, "included_memory_atoms_json", "[]"), try rawJsonField(allocator, obj, "required_scopes_json", "[\"admin\"]"), input.scopes_json)) continue;
             const query_text = try dupStringField(allocator, obj, "query_text", "");
             const summary = try dupStringField(allocator, obj, "generated_summary", "");
             const purpose = try dupStringField(allocator, obj, "purpose", "");
             const relevance = pgScoreText(input.query, query_text) + pgScoreText(input.query, summary) + pgScoreText(input.query, purpose);
             if (relevance <= 0 and input.query.len > 0) continue;
             try results.append(allocator, .{ .id = try dupStringField(allocator, obj, "id", ""), .result_type = "context_pack", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ purpose, json.stringField(obj, "target") orelse "" }), .text = summary, .scope = "context", .status = "active", .score = relevance + 0.4, .source_ids_json = try self.sanitizeSourceIds(allocator, source_ids, input.scopes_json), .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .confidence = 0.65 });
+        }
+    }
+
+    fn expandPgGraphCandidates(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const initial_len = results.items.len;
+        var i: usize = 0;
+        while (i < initial_len and results.items.len < 500) : (i += 1) {
+            const result = results.items[i];
+            if (std.mem.eql(u8, result.result_type, "entity")) {
+                try self.expandPgEntityContext(allocator, input, result.id, results);
+            }
+        }
+    }
+
+    fn expandPgEntityContext(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        try self.expandPgEntityMemoryAtoms(allocator, input, entity_id, results);
+        try self.expandPgEntityArtifacts(allocator, input, entity_id, results);
+        try self.expandPgEntitySources(allocator, input, entity_id, results);
+        try self.expandPgEntityRelations(allocator, input, entity_id, results);
+    }
+
+    fn expandPgEntityMemoryAtoms(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,text,scope,status,confidence,source_ids_json,created_at_ms,permissions_json FROM memory_atoms WHERE subject_entity_id = {s} ORDER BY created_at_ms DESC LIMIT 50", .{try sqlString(allocator, entity_id)});
+        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value != .array) return;
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            const obj = item.object;
+            const status = try dupStringField(allocator, obj, "status", "proposed");
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
+            const scope = try dupStringField(allocator, obj, "scope", "workspace");
+            const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
+            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            const confidence = json.floatField(obj, "confidence") orelse 0.5;
+            try results.append(allocator, .{ .id = try dupStringField(allocator, obj, "id", ""), .result_type = "memory_atom", .title = entity_id, .text = try dupStringField(allocator, obj, "text", ""), .scope = scope, .status = status, .score = 0.7 + confidence, .source_ids_json = try self.sanitizeSourceIds(allocator, try rawJsonField(allocator, obj, "source_ids_json", "[]"), input.scopes_json), .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .confidence = confidence });
+        }
+    }
+
+    fn expandPgEntityArtifacts(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const entity_json = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{entity_id});
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,title,body,status,scope,permissions_json,source_ids_json,updated_at_ms FROM artifacts WHERE related_entities_json @> {s} ORDER BY updated_at_ms DESC LIMIT 50", .{try sqlJsonb(allocator, entity_json)});
+        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value != .array) return;
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            const obj = item.object;
+            const status = try dupStringField(allocator, obj, "status", "draft");
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
+            const scope = try dupStringField(allocator, obj, "scope", "workspace");
+            const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
+            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            try results.append(allocator, .{ .id = try dupStringField(allocator, obj, "id", ""), .result_type = "artifact", .title = try dupStringField(allocator, obj, "title", ""), .text = try dupStringField(allocator, obj, "body", ""), .scope = scope, .status = status, .score = 0.75, .source_ids_json = try self.sanitizeSourceIds(allocator, try rawJsonField(allocator, obj, "source_ids_json", "[]"), input.scopes_json), .created_at_ms = json.intField(obj, "updated_at_ms") orelse 0, .confidence = 0.7 });
+        }
+    }
+
+    fn expandPgEntitySources(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const entity_json = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{entity_id});
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,title,content,scope,permissions_json,imported_at_ms FROM sources WHERE related_entities_json @> {s} ORDER BY imported_at_ms DESC LIMIT 50", .{try sqlJsonb(allocator, entity_json)});
+        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value != .array) return;
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            const obj = item.object;
+            const scope = try dupStringField(allocator, obj, "scope", "workspace");
+            const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
+            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            const id_text = try dupStringField(allocator, obj, "id", "");
+            try results.append(allocator, .{ .id = id_text, .result_type = "source", .title = try dupStringField(allocator, obj, "title", ""), .text = try dupStringField(allocator, obj, "content", ""), .scope = scope, .status = "active", .score = 0.65, .source_ids_json = try singleJsonString(allocator, id_text), .created_at_ms = json.intField(obj, "imported_at_ms") orelse 0, .confidence = 0.65 });
+        }
+    }
+
+    fn expandPgEntityRelations(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const entity_sql = try sqlString(allocator, entity_id);
+        const inner = try std.fmt.allocPrint(allocator, "SELECT r.id,r.from_entity_id,r.relation_type,r.to_entity_id,r.source_ids_json,r.scope,r.permissions_json,r.confidence,r.status,r.created_at_ms,coalesce(fe.name,'') AS from_name,coalesce(te.name,'') AS to_name,coalesce(fe.scope,'') AS from_scope,coalesce(fe.permissions_json,'[]'::jsonb) AS from_permissions_json,coalesce(te.scope,'') AS to_scope,coalesce(te.permissions_json,'[]'::jsonb) AS to_permissions_json FROM relations r LEFT JOIN entities fe ON fe.id = r.from_entity_id LEFT JOIN entities te ON te.id = r.to_entity_id WHERE r.from_entity_id = {s} OR r.to_entity_id = {s} ORDER BY r.created_at_ms DESC LIMIT 50", .{ entity_sql, entity_sql });
+        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value != .array) return;
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            const obj = item.object;
+            const status = try dupStringField(allocator, obj, "status", "proposed");
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
+            const scope = try dupStringField(allocator, obj, "scope", "workspace");
+            const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
+            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicy(allocator, json.stringField(obj, "from_scope") orelse "", try rawJsonField(allocator, obj, "from_permissions_json", "[]"), input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicy(allocator, json.stringField(obj, "to_scope") orelse "", try rawJsonField(allocator, obj, "to_permissions_json", "[]"), input.scopes_json)) continue;
+            const relation_type = try dupStringField(allocator, obj, "relation_type", "");
+            const confidence = json.floatField(obj, "confidence") orelse 0.5;
+            const text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ json.stringField(obj, "from_name") orelse "", relation_type, json.stringField(obj, "to_name") orelse "" });
+            try results.append(allocator, .{ .id = try dupStringField(allocator, obj, "id", ""), .result_type = "relation", .title = relation_type, .text = text, .scope = scope, .status = status, .score = 0.8 + confidence, .source_ids_json = try self.sanitizeSourceIds(allocator, try rawJsonField(allocator, obj, "source_ids_json", "[]"), input.scopes_json), .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .confidence = confidence });
         }
     }
 
@@ -4420,7 +4869,8 @@ pub const PostgresStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    fn contextPackVisible(self: *PostgresStore, allocator: std.mem.Allocator, sources_json: []const u8, artifacts_json: []const u8, atoms_json: []const u8, scopes_json: []const u8) !bool {
+    fn contextPackVisible(self: *PostgresStore, allocator: std.mem.Allocator, sources_json: []const u8, artifacts_json: []const u8, atoms_json: []const u8, required_scopes_json: []const u8, scopes_json: []const u8) !bool {
+        if (!requiredScopesVisible(required_scopes_json, scopes_json)) return false;
         return try self.allPgSourcesVisible(allocator, sources_json, scopes_json) and try self.allPgArtifactsVisible(allocator, artifacts_json, scopes_json) and try self.allPgAtomsVisible(allocator, atoms_json, scopes_json);
     }
 
@@ -4464,8 +4914,9 @@ pub const PostgresStore = struct {
         const a_id = if (std.mem.lessThan(u8, a.id, b.id)) a.id else b.id;
         const b_id = if (std.mem.lessThan(u8, a.id, b.id)) b.id else a.id;
         const summary = try std.fmt.allocPrint(allocator, "Potential conflicting {s}: {s} vs {s}", .{ a.predicate, a.object, b.object });
+        const permissions = try combinedPermissionsJson(allocator, a.permissions_json, b.permissions_json);
         const id = try ids.make(allocator, "cnf_");
-        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO knowledge_conflicts (id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,status,summary,created_at_ms,resolved_at_ms) VALUES ({s},'memory_atom_conflict','memory_atom',{s},'memory_atom',{s},{s},'open',{s},{d},NULL) ON CONFLICT(conflict_type,object_a_id,object_b_id) DO NOTHING", .{ try sqlString(allocator, id), try sqlString(allocator, a_id), try sqlString(allocator, b_id), try sqlString(allocator, a.scope), try sqlString(allocator, summary), ids.nowMs() });
+        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO knowledge_conflicts (id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,permissions_json,status,summary,created_at_ms,resolved_at_ms) VALUES ({s},'memory_atom_conflict','memory_atom',{s},'memory_atom',{s},{s},{s},'open',{s},{d},NULL) ON CONFLICT(conflict_type,object_a_id,object_b_id) DO NOTHING", .{ try sqlString(allocator, id), try sqlString(allocator, a_id), try sqlString(allocator, b_id), try sqlString(allocator, a.scope), try sqlJsonb(allocator, permissions), try sqlString(allocator, summary), ids.nowMs() });
         try self.runSql(sql);
     }
 };
@@ -4638,6 +5089,7 @@ fn readPgJob(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !Job {
         .job_type = try dupStringField(allocator, obj, "job_type", ""),
         .status = try dupStringField(allocator, obj, "status", "queued"),
         .scope = try dupStringField(allocator, obj, "scope", "workspace"),
+        .permissions_json = try rawJsonField(allocator, obj, "permissions_json", "[]"),
         .object_type = try dupStringField(allocator, obj, "object_type", ""),
         .object_id = try dupStringField(allocator, obj, "object_id", ""),
         .input_json = try rawJsonField(allocator, obj, "input_json", "{}"),
@@ -4658,6 +5110,7 @@ fn readPgConflict(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !Knowle
         .object_b_type = try dupStringField(allocator, obj, "object_b_type", ""),
         .object_b_id = try dupStringField(allocator, obj, "object_b_id", ""),
         .scope = try dupStringField(allocator, obj, "scope", "workspace"),
+        .permissions_json = try rawJsonField(allocator, obj, "permissions_json", "[]"),
         .status = try dupStringField(allocator, obj, "status", "open"),
         .summary = try dupStringField(allocator, obj, "summary", ""),
         .created_at_ms = json.intField(obj, "created_at_ms") orelse 0,
@@ -5537,6 +5990,63 @@ test "sqlite graph results are scoped and do not leak relation text" {
     try std.testing.expect(secret_results.len > 0);
 }
 
+test "sqlite relation acl cannot be broader than endpoint entities" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const secret = try store.resolveEntity(alloc, .{ .entity_type = "service", .name = "SecretRelationService", .scope = "project:secret", .permissions_json = "[\"team:secret\"]" });
+    const public = try store.resolveEntity(alloc, .{ .entity_type = "project", .name = "PublicRelationProject", .scope = "public" });
+
+    try std.testing.expectError(error.RelationAclBroaderThanEntity, store.createRelation(alloc, .{
+        .from_entity_id = secret.id,
+        .relation_type = "documents",
+        .to_entity_id = public.id,
+        .scope = "public",
+    }));
+
+    _ = try store.createRelation(alloc, .{
+        .from_entity_id = secret.id,
+        .relation_type = "documents",
+        .to_entity_id = public.id,
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+    });
+}
+
+test "sqlite graph expansion pulls entity context without bypassing acl" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const entity = try store.resolveEntity(alloc, .{ .entity_type = "service", .name = "GraphExpansionService", .scope = "project:graph", .permissions_json = "[\"team:graph\"]" });
+    _ = try store.createMemoryAtom(alloc, .{
+        .subject_entity_id = entity.id,
+        .text = "Graph expansion should include this verified service decision.",
+        .predicate = "decision",
+        .object = "include graph context",
+        .scope = "project:graph",
+        .permissions_json = "[\"team:graph\"]",
+        .created_by = "human",
+    });
+
+    const denied = try store.search(alloc, .{ .query = "GraphExpansionService", .scopes_json = "[\"project:graph\"]", .limit = 20, .use_vector = false });
+    for (denied) |result| {
+        try std.testing.expect(std.mem.indexOf(u8, result.text, "include this verified service decision") == null);
+    }
+
+    const allowed = try store.search(alloc, .{ .query = "GraphExpansionService", .scopes_json = "[\"project:graph\",\"team:graph\"]", .limit = 20, .use_vector = false });
+    var saw_atom = false;
+    for (allowed) |result| {
+        if (std.mem.indexOf(u8, result.text, "include this verified service decision") != null) saw_atom = true;
+    }
+    try std.testing.expect(saw_atom);
+}
+
 test "sqlite context packs respect approximate token budget" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -5832,6 +6342,32 @@ test "sqlite jobs persist status transitions with scoped listing" {
     try std.testing.expectEqual(@as(usize, 0), hidden.len);
 }
 
+test "sqlite jobs are permission filtered and redact raw input in api json" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const job = try store.createJob(alloc, .{
+        .job_type = "ingest",
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+        .input_json = "{\"content\":\"sensitive transcript payload\"}",
+    });
+
+    const hidden = try store.listJobs(alloc, .{ .scopes_json = "[\"project:secret\"]", .status = "queued" });
+    try std.testing.expectEqual(@as(usize, 0), hidden.len);
+
+    const visible = try store.listJobs(alloc, .{ .scopes_json = "[\"project:secret\",\"team:secret\"]", .status = "queued" });
+    try std.testing.expectEqual(@as(usize, 1), visible.len);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try job.writeJson(alloc, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "sensitive transcript payload") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"input_redacted\":true") != null);
+}
+
 test "sqlite conflict scan records only visible contradictory atoms" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -5850,6 +6386,23 @@ test "sqlite conflict scan records only visible contradictory atoms" {
     try std.testing.expect(std.mem.indexOf(u8, conflicts[0].summary, "secret") == null);
 }
 
+test "sqlite conflicts require visibility to both conflicting atoms" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createMemoryAtom(alloc, .{ .predicate = "database", .object = "sqlite", .text = "Database is SQLite", .scope = "project:nullpantry", .permissions_json = "[\"team:a\"]", .created_by = "human" });
+    _ = try store.createMemoryAtom(alloc, .{ .predicate = "database", .object = "postgres", .text = "Database is Postgres", .scope = "project:nullpantry", .permissions_json = "[\"team:b\"]", .created_by = "human" });
+
+    const both = try store.scanConflicts(alloc, .{ .scopes_json = "[\"project:nullpantry\",\"team:a\",\"team:b\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), both.len);
+
+    const partial = try store.listConflicts(alloc, .{ .scopes_json = "[\"project:nullpantry\",\"team:a\"]", .status = "open", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 0), partial.len);
+}
+
 test "relation creation requires existing entities" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -5859,6 +6412,60 @@ test "relation creation requires existing entities" {
 
     const a = try store.resolveEntity(alloc, .{ .name = "NullPantry", .entity_type = "project" });
     try std.testing.expectError(error.EntityNotFound, store.createRelation(alloc, .{ .from_entity_id = a.id, .to_entity_id = "ent_missing", .relation_type = "depends_on" }));
+}
+
+test "sqlite persisted context packs require creator scopes before returning summaries" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createMemoryAtom(alloc, .{ .text = "Secret context pack summary should not leak.", .scope = "project:nullpantry", .permissions_json = "[\"team:secret\"]", .created_by = "human" });
+    _ = try store.createContextPack(alloc, .{ .query = "Secret context pack", .scopes_json = "[\"project:nullpantry\",\"team:secret\"]" });
+
+    const denied = try store.search(alloc, .{ .query = "Secret context pack", .scopes_json = "[\"project:nullpantry\"]", .limit = 20, .use_vector = false });
+    for (denied) |result| {
+        try std.testing.expect(!std.mem.eql(u8, result.result_type, "context_pack"));
+        try std.testing.expect(std.mem.indexOf(u8, result.text, "should not leak") == null);
+    }
+
+    const allowed = try store.search(alloc, .{ .query = "Secret context pack", .scopes_json = "[\"project:nullpantry\",\"team:secret\"]", .limit = 20, .use_vector = false });
+    var saw_pack = false;
+    for (allowed) |result| {
+        if (std.mem.eql(u8, result.result_type, "context_pack")) saw_pack = true;
+    }
+    try std.testing.expect(saw_pack);
+}
+
+test "sqlite hygiene requires scoped verify or delete rights per atom" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const atom = try store.createMemoryAtom(alloc, .{ .text = "Hygiene protected atom", .scope = "project:nullpantry", .permissions_json = "[\"team:platform\"]", .created_by = "human" });
+
+    const denied = try store.runHygiene(.{
+        .stale_after_ms = 1,
+        .archive_after_ms = 1000,
+        .now_ms = atom.created_at_ms + 10,
+        .scopes_json = "[\"project:nullpantry\",\"team:platform\"]",
+        .capabilities_json = "[\"verify\"]",
+    });
+    try std.testing.expectEqual(@as(usize, 0), denied.marked_stale);
+    try std.testing.expectEqualStrings("verified", (try store.getMemoryAtom(alloc, atom.id)).?.status);
+
+    const allowed = try store.runHygiene(.{
+        .stale_after_ms = 1,
+        .archive_after_ms = 1000,
+        .now_ms = atom.created_at_ms + 10,
+        .scopes_json = "[\"project:nullpantry\",\"verify:project:nullpantry\",\"team:platform\"]",
+        .capabilities_json = "[\"verify\"]",
+    });
+    try std.testing.expectEqual(@as(usize, 1), allowed.marked_stale);
+    try std.testing.expectEqualStrings("stale", (try store.getMemoryAtom(alloc, atom.id)).?.status);
 }
 
 test "context pack excludes inaccessible scopes" {
