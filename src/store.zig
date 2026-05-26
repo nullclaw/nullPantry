@@ -15,7 +15,7 @@ const c = @cImport({
 const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 
 fn sessionVisibleForScopes(allocator: std.mem.Allocator, session_id: []const u8, scopes_json: []const u8) bool {
-    if (domain.hasActorScope(scopes_json, "admin") or domain.hasActorScope(scopes_json, "agent:nullclaw")) return true;
+    if (domain.hasActorScope(scopes_json, "admin")) return true;
     const scope = std.fmt.allocPrint(allocator, "session:{s}", .{session_id}) catch return false;
     return domain.scopeVisible(scope, scopes_json);
 }
@@ -266,8 +266,15 @@ pub const Store = struct {
 
     pub fn getResponseCache(self: *Store, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64) !?ResponseCacheEntry {
         return switch (self.backend) {
-            .sqlite => |*s| s.getResponseCache(allocator, cache_key, now_ms),
-            .postgres => |*p| p.getResponseCache(allocator, cache_key, now_ms),
+            .sqlite => |*s| s.getResponseCache(allocator, cache_key, now_ms, "[\"admin\"]"),
+            .postgres => |*p| p.getResponseCache(allocator, cache_key, now_ms, "[\"admin\"]"),
+        };
+    }
+
+    pub fn getResponseCacheForScopes(self: *Store, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64, scopes_json: []const u8) !?ResponseCacheEntry {
+        return switch (self.backend) {
+            .sqlite => |*s| s.getResponseCache(allocator, cache_key, now_ms, scopes_json),
+            .postgres => |*p| p.getResponseCache(allocator, cache_key, now_ms, scopes_json),
         };
     }
 
@@ -606,7 +613,7 @@ pub const MemoryAtomInput = struct {
 pub const SearchInput = struct {
     query: []const u8,
     limit: usize = 10,
-    scopes_json: []const u8 = "[]",
+    scopes_json: []const u8 = "[\"admin\"]",
     include_deprecated: bool = false,
     include_sessions: bool = false,
     use_vector: bool = true,
@@ -648,7 +655,7 @@ pub const VectorChunk = struct {
 
 pub const VectorSearchInput = struct {
     embedding_json: []const u8,
-    scopes_json: []const u8 = "[]",
+    scopes_json: []const u8 = "[\"admin\"]",
     limit: usize = 10,
 };
 
@@ -677,7 +684,7 @@ pub const FeedEventInput = struct {
 pub const FeedListInput = struct {
     since_id: i64 = 0,
     limit: usize = 100,
-    scopes_json: []const u8 = "[]",
+    scopes_json: []const u8 = "[\"admin\"]",
 };
 
 pub const FeedEvent = struct {
@@ -730,6 +737,8 @@ pub const LifecycleDiagnostics = struct {
 pub const ResponseCacheInput = struct {
     cache_key: []const u8,
     response_json: []const u8,
+    scopes_json: []const u8 = "[\"admin\"]",
+    actor_id: []const u8 = "",
     ttl_ms: i64 = 0,
     now_ms: ?i64 = null,
 };
@@ -737,6 +746,8 @@ pub const ResponseCacheInput = struct {
 pub const ResponseCacheEntry = struct {
     cache_key: []const u8,
     response_json: []const u8,
+    scopes_json: []const u8,
+    actor_id: []const u8,
     created_at_ms: i64,
     expires_at_ms: i64,
 };
@@ -746,12 +757,15 @@ pub const SemanticCacheInput = struct {
     query: []const u8,
     response_json: []const u8,
     embedding_json: []const u8,
+    scopes_json: []const u8 = "[\"admin\"]",
+    actor_id: []const u8 = "",
     ttl_ms: i64 = 0,
     now_ms: ?i64 = null,
 };
 
 pub const SemanticCacheSearchInput = struct {
     embedding_json: []const u8,
+    scopes_json: []const u8 = "[\"admin\"]",
     min_score: f32 = 0.82,
     now_ms: ?i64 = null,
 };
@@ -760,6 +774,8 @@ pub const SemanticCacheMatch = struct {
     cache_key: []const u8,
     query: []const u8,
     response_json: []const u8,
+    scopes_json: []const u8,
+    actor_id: []const u8,
     score: f32,
     created_at_ms: i64,
     expires_at_ms: i64,
@@ -989,6 +1005,12 @@ pub const SQLiteStore = struct {
         if (!try self.columnExists("response_cache", "expires_at_ms")) {
             try self.exec("ALTER TABLE response_cache ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0");
         }
+        if (!try self.columnExists("response_cache", "scopes_json")) {
+            try self.exec("ALTER TABLE response_cache ADD COLUMN scopes_json TEXT NOT NULL DEFAULT '[]'");
+        }
+        if (!try self.columnExists("response_cache", "actor_id")) {
+            try self.exec("ALTER TABLE response_cache ADD COLUMN actor_id TEXT NOT NULL DEFAULT ''");
+        }
         if (!try self.columnExists("semantic_cache", "query")) {
             try self.exec("ALTER TABLE semantic_cache ADD COLUMN query TEXT NOT NULL DEFAULT ''");
         }
@@ -997,6 +1019,12 @@ pub const SQLiteStore = struct {
         }
         if (!try self.columnExists("semantic_cache", "expires_at_ms")) {
             try self.exec("ALTER TABLE semantic_cache ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!try self.columnExists("semantic_cache", "scopes_json")) {
+            try self.exec("ALTER TABLE semantic_cache ADD COLUMN scopes_json TEXT NOT NULL DEFAULT '[]'");
+        }
+        if (!try self.columnExists("semantic_cache", "actor_id")) {
+            try self.exec("ALTER TABLE semantic_cache ADD COLUMN actor_id TEXT NOT NULL DEFAULT ''");
         }
         if (!try self.columnExists("artifacts", "scope")) {
             try self.exec("ALTER TABLE artifacts ADD COLUMN scope TEXT NOT NULL DEFAULT 'workspace'");
@@ -2400,18 +2428,20 @@ pub const SQLiteStore = struct {
     pub fn putResponseCache(self: *Self, input: ResponseCacheInput) !void {
         const now = input.now_ms orelse ids.nowMs();
         const expires_at = if (input.ttl_ms > 0) now + input.ttl_ms else 0;
-        const stmt = try self.prepare("INSERT INTO response_cache (cache_key,response_json,created_at_ms,expires_at_ms) VALUES (?1,?2,?3,?4) ON CONFLICT(cache_key) DO UPDATE SET response_json=excluded.response_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms");
+        const stmt = try self.prepare("INSERT INTO response_cache (cache_key,response_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(cache_key) DO UPDATE SET response_json=excluded.response_json, scopes_json=excluded.scopes_json, actor_id=excluded.actor_id, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, input.cache_key);
         bindText(stmt, 2, input.response_json);
-        _ = c.sqlite3_bind_int64(stmt, 3, now);
-        _ = c.sqlite3_bind_int64(stmt, 4, expires_at);
+        bindText(stmt, 3, input.scopes_json);
+        bindText(stmt, 4, input.actor_id);
+        _ = c.sqlite3_bind_int64(stmt, 5, now);
+        _ = c.sqlite3_bind_int64(stmt, 6, expires_at);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
         self.insertAudit("cache.response.put", "response_cache", input.cache_key);
     }
 
-    pub fn getResponseCache(self: *Self, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64) !?ResponseCacheEntry {
-        const stmt = try self.prepare("SELECT cache_key,response_json,created_at_ms,expires_at_ms FROM response_cache WHERE cache_key = ?1 LIMIT 1");
+    pub fn getResponseCache(self: *Self, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64, scopes_json: []const u8) !?ResponseCacheEntry {
+        const stmt = try self.prepare("SELECT cache_key,response_json,created_at_ms,expires_at_ms,scopes_json,actor_id FROM response_cache WHERE cache_key = ?1 LIMIT 1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, cache_key);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
@@ -2420,9 +2450,13 @@ pub const SQLiteStore = struct {
             try self.deleteResponseCache(cache_key);
             return null;
         }
+        const entry_scopes = try columnText(allocator, stmt, 4);
+        if (!domain.scopeListVisible(entry_scopes, scopes_json)) return null;
         return .{
             .cache_key = try columnText(allocator, stmt, 0),
             .response_json = try columnText(allocator, stmt, 1),
+            .scopes_json = entry_scopes,
+            .actor_id = try columnText(allocator, stmt, 5),
             .created_at_ms = c.sqlite3_column_int64(stmt, 2),
             .expires_at_ms = expires,
         };
@@ -2440,14 +2474,16 @@ pub const SQLiteStore = struct {
         defer self.allocator.free(parsed_embedding);
         const now = input.now_ms orelse ids.nowMs();
         const expires_at = if (input.ttl_ms > 0) now + input.ttl_ms else 0;
-        const stmt = try self.prepare("INSERT INTO semantic_cache (cache_key,query,response_json,embedding_json,created_at_ms,expires_at_ms) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(cache_key) DO UPDATE SET query=excluded.query, response_json=excluded.response_json, embedding_json=excluded.embedding_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms");
+        const stmt = try self.prepare("INSERT INTO semantic_cache (cache_key,query,response_json,embedding_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(cache_key) DO UPDATE SET query=excluded.query, response_json=excluded.response_json, embedding_json=excluded.embedding_json, scopes_json=excluded.scopes_json, actor_id=excluded.actor_id, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, input.cache_key);
         bindText(stmt, 2, input.query);
         bindText(stmt, 3, input.response_json);
         bindText(stmt, 4, input.embedding_json);
-        _ = c.sqlite3_bind_int64(stmt, 5, now);
-        _ = c.sqlite3_bind_int64(stmt, 6, expires_at);
+        bindText(stmt, 5, input.scopes_json);
+        bindText(stmt, 6, input.actor_id);
+        _ = c.sqlite3_bind_int64(stmt, 7, now);
+        _ = c.sqlite3_bind_int64(stmt, 8, expires_at);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
         self.insertAudit("cache.semantic.put", "semantic_cache", input.cache_key);
     }
@@ -2456,13 +2492,15 @@ pub const SQLiteStore = struct {
         const query = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
         defer allocator.free(query);
         const now = input.now_ms orelse ids.nowMs();
-        const stmt = try self.prepare("SELECT cache_key,query,response_json,embedding_json,created_at_ms,expires_at_ms FROM semantic_cache");
+        const stmt = try self.prepare("SELECT cache_key,query,response_json,embedding_json,created_at_ms,expires_at_ms,scopes_json,actor_id FROM semantic_cache");
         defer _ = c.sqlite3_finalize(stmt);
         var best: ?SemanticCacheMatch = null;
         var best_score = input.min_score;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const expires = c.sqlite3_column_int64(stmt, 5);
             if (expires > 0 and expires <= now) continue;
+            const scopes_json = try columnText(allocator, stmt, 6);
+            if (!domain.scopeListVisible(scopes_json, input.scopes_json)) continue;
             const embedding_json = try columnText(allocator, stmt, 3);
             defer allocator.free(embedding_json);
             const embedding = vector_mod.embeddingFromJson(allocator, embedding_json) catch continue;
@@ -2474,6 +2512,8 @@ pub const SQLiteStore = struct {
                 .cache_key = try columnText(allocator, stmt, 0),
                 .query = try columnText(allocator, stmt, 1),
                 .response_json = try columnText(allocator, stmt, 2),
+                .scopes_json = scopes_json,
+                .actor_id = try columnText(allocator, stmt, 7),
                 .score = score,
                 .created_at_ms = c.sqlite3_column_int64(stmt, 4),
                 .expires_at_ms = expires,
@@ -2588,7 +2628,8 @@ pub const SQLiteStore = struct {
         const sources = try sources_json.toOwnedSlice(allocator);
         const artifacts = try artifacts_json.toOwnedSlice(allocator);
         const atoms = try atoms_json.toOwnedSlice(allocator);
-        const summary = try buildContextSummary(allocator, input.query, budgeted_results);
+        const summary_full = try buildContextSummary(allocator, input.query, budgeted_results);
+        const summary = try trimContextSummaryToBudget(allocator, summary_full, input.token_budget);
         const stmt = try self.prepare("INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,generated_summary,token_budget,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
@@ -2634,6 +2675,8 @@ pub const SQLiteStore = struct {
         try out.appendSlice(allocator, query);
         try appendContextSection(allocator, &out, "Verified decisions", results, "memory_atom", "decision");
         try appendContextSection(allocator, &out, "Constraints", results, "memory_atom", "constraint");
+        try appendContextSection(allocator, &out, "Runbooks", results, "artifact", "runbook");
+        try appendContextSection(allocator, &out, "Known risks", results, "memory_atom", "risk");
         try appendContextSection(allocator, &out, "Memory atoms", results, "memory_atom", "");
         try appendContextSection(allocator, &out, "Artifacts", results, "artifact", "");
         try appendContextSection(allocator, &out, "Sources", results, "source", "");
@@ -2643,6 +2686,18 @@ pub const SQLiteStore = struct {
         try appendContextSection(allocator, &out, "Graph relations", results, "relation", "");
         try appendContextSection(allocator, &out, "Compat memories", results, "compat_memory", "");
         try appendContextSection(allocator, &out, "Open questions", results, "memory_atom", "question");
+        try appendContextRecentChangesGlobal(allocator, &out, results);
+        try appendContextRelatedObjectsGlobal(allocator, &out, results);
+        try appendStaticContextBullets(allocator, &out, "Forbidden assumptions", &[_][]const u8{
+            "Do not treat uncited or inaccessible source content as verified context.",
+            "Do not use stale, deprecated, rejected, or superseded memory unless explicitly requested.",
+            "Do not infer hidden-source details from missing citations or permission-filtered gaps.",
+        });
+        try appendStaticContextBullets(allocator, &out, "Suggested next steps", &[_][]const u8{
+            "Apply verified decisions before proposed memory.",
+            "Review open questions and risks before changing implementation.",
+            "Cite source IDs or object IDs when using this context in agent output.",
+        });
         try out.appendSlice(allocator, "\nCitations:\n");
         var citation_count: usize = 0;
         for (results) |result| {
@@ -2685,11 +2740,12 @@ pub const SQLiteStore = struct {
         try self.exec("BEGIN IMMEDIATE");
         errdefer self.exec("ROLLBACK") catch {};
         const source_title = try std.fmt.allocPrint(allocator, "NullClaw memory: {s}", .{input.key});
+        const compat_scope = if (input.session_id) |sid| try std.fmt.allocPrint(allocator, "session:{s}", .{sid}) else "agent:nullclaw";
         const source = try self.createSource(allocator, .{
             .source_type = "agent_observation",
             .title = source_title,
             .content = input.content,
-            .scope = "agent:nullclaw",
+            .scope = compat_scope,
             .metadata_json = "{\"compat\":\"nullclaw\"}",
         });
         const source_ids = try singleJsonString(allocator, source.id);
@@ -2698,7 +2754,7 @@ pub const SQLiteStore = struct {
             .predicate = "compat.memory",
             .object = input.key,
             .text = input.content,
-            .scope = "agent:nullclaw",
+            .scope = compat_scope,
             .confidence = 0.75,
             .status = "verified",
             .source_ids_json = source_ids,
@@ -3178,6 +3234,10 @@ pub const PostgresStore = struct {
             \\ALTER TABLE entities ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE relations ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'workspace';
             \\ALTER TABLE relations ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
+            \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb;
+            \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS actor_id text NOT NULL DEFAULT '';
+            \\ALTER TABLE semantic_cache ADD COLUMN IF NOT EXISTS scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb;
+            \\ALTER TABLE semantic_cache ADD COLUMN IF NOT EXISTS actor_id text NOT NULL DEFAULT '';
             \\DROP INDEX IF EXISTS entities_type_name_idx;
             \\CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx ON entities(type, lower(name), scope);
         );
@@ -3622,12 +3682,12 @@ pub const PostgresStore = struct {
     pub fn putResponseCache(self: *PostgresStore, input: ResponseCacheInput) !void {
         const now = input.now_ms orelse ids.nowMs();
         const expires = if (input.ttl_ms > 0) now + input.ttl_ms else 0;
-        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO response_cache (cache_key,response_json,created_at_ms,expires_at_ms) VALUES ({s},{s},{d},{d}) ON CONFLICT(cache_key) DO UPDATE SET response_json=excluded.response_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms", .{ try sqlString(self.allocator, input.cache_key), try sqlJsonb(self.allocator, input.response_json), now, expires });
+        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO response_cache (cache_key,response_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES ({s},{s},{s},{s},{d},{d}) ON CONFLICT(cache_key) DO UPDATE SET response_json=excluded.response_json, scopes_json=excluded.scopes_json, actor_id=excluded.actor_id, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms", .{ try sqlString(self.allocator, input.cache_key), try sqlJsonb(self.allocator, input.response_json), try sqlJsonb(self.allocator, input.scopes_json), try sqlString(self.allocator, input.actor_id), now, expires });
         try self.runSql(sql);
     }
 
-    pub fn getResponseCache(self: *PostgresStore, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64) !?ResponseCacheEntry {
-        const inner = try std.fmt.allocPrint(allocator, "SELECT cache_key,response_json,created_at_ms,expires_at_ms FROM response_cache WHERE cache_key = {s} LIMIT 1", .{try sqlString(allocator, cache_key)});
+    pub fn getResponseCache(self: *PostgresStore, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64, scopes_json: []const u8) !?ResponseCacheEntry {
+        const inner = try std.fmt.allocPrint(allocator, "SELECT cache_key,response_json,created_at_ms,expires_at_ms,scopes_json,actor_id FROM response_cache WHERE cache_key = {s} LIMIT 1", .{try sqlString(allocator, cache_key)});
         const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value == .null) return null;
@@ -3637,21 +3697,23 @@ pub const PostgresStore = struct {
             try self.runSql(try std.fmt.allocPrint(allocator, "DELETE FROM response_cache WHERE cache_key = {s}", .{try sqlString(allocator, cache_key)}));
             return null;
         }
-        return .{ .cache_key = try dupStringField(allocator, obj, "cache_key", ""), .response_json = try rawJsonField(allocator, obj, "response_json", "{}"), .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .expires_at_ms = expires };
+        const entry_scopes = try rawJsonField(allocator, obj, "scopes_json", "[]");
+        if (!domain.scopeListVisible(entry_scopes, scopes_json)) return null;
+        return .{ .cache_key = try dupStringField(allocator, obj, "cache_key", ""), .response_json = try rawJsonField(allocator, obj, "response_json", "{}"), .scopes_json = entry_scopes, .actor_id = try dupStringField(allocator, obj, "actor_id", ""), .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .expires_at_ms = expires };
     }
 
     pub fn putSemanticCache(self: *PostgresStore, input: SemanticCacheInput) !void {
         _ = try vector_mod.embeddingFromJson(self.allocator, input.embedding_json);
         const now = input.now_ms orelse ids.nowMs();
         const expires = if (input.ttl_ms > 0) now + input.ttl_ms else 0;
-        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO semantic_cache (cache_key,query,response_json,embedding_json,created_at_ms,expires_at_ms) VALUES ({s},{s},{s},{s},{d},{d}) ON CONFLICT(cache_key) DO UPDATE SET query=excluded.query, response_json=excluded.response_json, embedding_json=excluded.embedding_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms", .{ try sqlString(self.allocator, input.cache_key), try sqlString(self.allocator, input.query), try sqlJsonb(self.allocator, input.response_json), try sqlJsonb(self.allocator, input.embedding_json), now, expires });
+        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO semantic_cache (cache_key,query,response_json,embedding_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{d},{d}) ON CONFLICT(cache_key) DO UPDATE SET query=excluded.query, response_json=excluded.response_json, embedding_json=excluded.embedding_json, scopes_json=excluded.scopes_json, actor_id=excluded.actor_id, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms", .{ try sqlString(self.allocator, input.cache_key), try sqlString(self.allocator, input.query), try sqlJsonb(self.allocator, input.response_json), try sqlJsonb(self.allocator, input.embedding_json), try sqlJsonb(self.allocator, input.scopes_json), try sqlString(self.allocator, input.actor_id), now, expires });
         try self.runSql(sql);
     }
 
     pub fn searchSemanticCache(self: *PostgresStore, allocator: std.mem.Allocator, input: SemanticCacheSearchInput) !?SemanticCacheMatch {
         const query = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
         const now = input.now_ms orelse ids.nowMs();
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, "SELECT cache_key,query,response_json,embedding_json,created_at_ms,expires_at_ms FROM semantic_cache ORDER BY created_at_ms DESC LIMIT 1000"));
+        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, "SELECT cache_key,query,response_json,embedding_json,created_at_ms,expires_at_ms,scopes_json,actor_id FROM semantic_cache ORDER BY created_at_ms DESC LIMIT 1000"));
         defer parsed.deinit();
         var best: ?SemanticCacheMatch = null;
         var best_score = input.min_score;
@@ -3660,11 +3722,13 @@ pub const PostgresStore = struct {
             const obj = item.object;
             const expires = json.intField(obj, "expires_at_ms") orelse 0;
             if (expires > 0 and expires <= now) continue;
+            const scopes_json = try rawJsonField(allocator, obj, "scopes_json", "[]");
+            if (!domain.scopeListVisible(scopes_json, input.scopes_json)) continue;
             const embedding = vector_mod.embeddingFromJson(allocator, try rawJsonField(allocator, obj, "embedding_json", "[]")) catch continue;
             const score = vector_mod.cosine(query, embedding);
             if (score < best_score) continue;
             best_score = score;
-            best = .{ .cache_key = try dupStringField(allocator, obj, "cache_key", ""), .query = try dupStringField(allocator, obj, "query", ""), .response_json = try rawJsonField(allocator, obj, "response_json", "{}"), .score = score, .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .expires_at_ms = expires };
+            best = .{ .cache_key = try dupStringField(allocator, obj, "cache_key", ""), .query = try dupStringField(allocator, obj, "query", ""), .response_json = try rawJsonField(allocator, obj, "response_json", "{}"), .scopes_json = scopes_json, .actor_id = try dupStringField(allocator, obj, "actor_id", ""), .score = score, .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .expires_at_ms = expires };
         };
         return best;
     }
@@ -3722,7 +3786,8 @@ pub const PostgresStore = struct {
         const sources = try pgCollectResultIds(allocator, budgeted_results, "source", true);
         const artifacts = try pgCollectResultIds(allocator, budgeted_results, "artifact", false);
         const atoms = try pgCollectResultIds(allocator, budgeted_results, "memory_atom", false);
-        const summary = try pgBuildContextSummary(allocator, input.query, budgeted_results);
+        const summary_full = try pgBuildContextSummary(allocator, input.query, budgeted_results);
+        const summary = try trimContextSummaryToBudget(allocator, summary_full, input.token_budget);
         const sql = try std.fmt.allocPrint(allocator, "INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,generated_summary,token_budget,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{d},{d})", .{ try sqlString(allocator, id), try sqlString(allocator, input.purpose), try sqlString(allocator, input.target), try sqlString(allocator, input.query), try sqlJsonb(allocator, sources), try sqlJsonb(allocator, artifacts), try sqlJsonb(allocator, atoms), try sqlString(allocator, summary), input.token_budget, now });
         try self.runSql(sql);
         return .{ .id = id, .purpose = input.purpose, .target = input.target, .query = input.query, .generated_summary = summary, .included_sources_json = sources, .included_artifacts_json = artifacts, .included_memory_atoms_json = atoms, .token_budget = input.token_budget, .created_at_ms = now };
@@ -3735,6 +3800,7 @@ pub const PostgresStore = struct {
         const source_ids = try singleJsonString(allocator, source_id);
         const evidence = try evidenceRangeJson(allocator, source_id, input.content.len, "nullclaw_compat");
         const now = ids.nowMs();
+        const compat_scope = if (input.session_id) |sid| try std.fmt.allocPrint(allocator, "session:{s}", .{sid}) else "agent:nullclaw";
         const session_filter = if (input.session_id) |sid|
             try std.fmt.allocPrint(allocator, "session_id = {s}", .{try sqlString(allocator, sid)})
         else
@@ -3744,8 +3810,8 @@ pub const PostgresStore = struct {
             "BEGIN; " ++
                 "UPDATE memory_atoms SET status = 'deprecated' WHERE id IN (SELECT memory_atom_id FROM compat_memories WHERE key = {s} AND {s}); " ++
                 "DELETE FROM compat_memories WHERE key = {s} AND {s}; " ++
-                "INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json) VALUES ({s},'agent_observation',{s},NULL,{s},NULL,'[]'::jsonb,'[]'::jsonb,'agent:nullclaw',{d},{d},NULL,NULL,'[]'::jsonb,'{{\"compat\":\"nullclaw\"}}'::jsonb); " ++
-                "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) VALUES ({s},NULL,'compat.memory',{s},{s},'agent:nullclaw',0.75,'verified',{s},{s},'agent',{d},NULL,NULL,NULL,NULL,'[]'::jsonb,'[\"nullclaw\"]'::jsonb); " ++
+                "INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json) VALUES ({s},'agent_observation',{s},NULL,{s},NULL,'[]'::jsonb,'[]'::jsonb,{s},{d},{d},NULL,NULL,'[]'::jsonb,'{{\"compat\":\"nullclaw\"}}'::jsonb); " ++
+                "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) VALUES ({s},NULL,'compat.memory',{s},{s},{s},0.75,'verified',{s},{s},'agent',{d},NULL,NULL,NULL,NULL,'[]'::jsonb,'[\"nullclaw\"]'::jsonb); " ++
                 "INSERT INTO compat_memories (key,session_id,memory_atom_id,category,timestamp_ms) VALUES ({s},{s},{s},{s},{d}); " ++
                 "COMMIT;",
             .{
@@ -3756,11 +3822,13 @@ pub const PostgresStore = struct {
                 try sqlString(allocator, source_id),
                 try sqlString(allocator, source_title),
                 try sqlString(allocator, input.content),
+                try sqlString(allocator, compat_scope),
                 now,
                 now,
                 try sqlString(allocator, atom_id),
                 try sqlString(allocator, input.key),
                 try sqlString(allocator, input.content),
+                try sqlString(allocator, compat_scope),
                 try sqlJsonb(allocator, source_ids),
                 try sqlJsonb(allocator, evidence),
                 now,
@@ -4737,6 +4805,20 @@ fn budgetContextPackResults(allocator: std.mem.Allocator, results: []const domai
     return out.toOwnedSlice(allocator);
 }
 
+fn trimContextSummaryToBudget(allocator: std.mem.Allocator, summary: []const u8, token_budget: i64) ![]u8 {
+    const budget_tokens: usize = @intCast(@max(@as(i64, 1), @min(token_budget, @as(i64, 200_000))));
+    const max_chars = @max(@as(usize, 512), budget_tokens * 4);
+    if (summary.len <= max_chars) return allocator.dupe(u8, summary);
+    const suffix = "\n[truncated to token_budget]\n";
+    const keep_len = if (max_chars > suffix.len) max_chars - suffix.len else max_chars;
+    var end = keep_len;
+    while (end > 0 and (summary[end] & 0b1100_0000) == 0b1000_0000) : (end -= 1) {}
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.appendSlice(allocator, summary[0..end]);
+    try out.appendSlice(allocator, suffix);
+    return out.toOwnedSlice(allocator);
+}
+
 fn singleJsonString(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.append(allocator, '[');
@@ -4763,6 +4845,8 @@ fn pgBuildContextSummary(allocator: std.mem.Allocator, query: []const u8, result
     try out.appendSlice(allocator, query);
     try appendContextSectionGlobal(allocator, &out, "Verified decisions", results, "memory_atom", "decision");
     try appendContextSectionGlobal(allocator, &out, "Constraints", results, "memory_atom", "constraint");
+    try appendContextSectionGlobal(allocator, &out, "Runbooks", results, "artifact", "runbook");
+    try appendContextSectionGlobal(allocator, &out, "Known risks", results, "memory_atom", "risk");
     try appendContextSectionGlobal(allocator, &out, "Memory atoms", results, "memory_atom", "");
     try appendContextSectionGlobal(allocator, &out, "Artifacts", results, "artifact", "");
     try appendContextSectionGlobal(allocator, &out, "Sources", results, "source", "");
@@ -4772,6 +4856,18 @@ fn pgBuildContextSummary(allocator: std.mem.Allocator, query: []const u8, result
     try appendContextSectionGlobal(allocator, &out, "Graph relations", results, "relation", "");
     try appendContextSectionGlobal(allocator, &out, "Compat memories", results, "compat_memory", "");
     try appendContextSectionGlobal(allocator, &out, "Open questions", results, "memory_atom", "question");
+    try appendContextRecentChangesGlobal(allocator, &out, results);
+    try appendContextRelatedObjectsGlobal(allocator, &out, results);
+    try appendStaticContextBullets(allocator, &out, "Forbidden assumptions", &[_][]const u8{
+        "Do not treat uncited or inaccessible source content as verified context.",
+        "Do not use stale, deprecated, rejected, or superseded memory unless explicitly requested.",
+        "Do not infer hidden-source details from missing citations or permission-filtered gaps.",
+    });
+    try appendStaticContextBullets(allocator, &out, "Suggested next steps", &[_][]const u8{
+        "Apply verified decisions before proposed memory.",
+        "Review open questions and risks before changing implementation.",
+        "Cite source IDs or object IDs when using this context in agent output.",
+    });
     try out.appendSlice(allocator, "\nCitations:\n");
     var citation_count: usize = 0;
     for (results) |result| {
@@ -4805,6 +4901,62 @@ fn appendContextSectionGlobal(allocator: std.mem.Allocator, out: *std.ArrayListU
         count += 1;
     }
     if (count == 0) try out.appendSlice(allocator, "- None found.\n");
+}
+
+fn appendContextRecentChangesGlobal(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), results: []const domain.SearchResult) !void {
+    try out.appendSlice(allocator, "\nRecent changes:\n");
+    var count: usize = 0;
+    for (results) |result| {
+        if (!std.mem.eql(u8, result.result_type, "feed_event") and
+            !std.mem.eql(u8, result.result_type, "session_message") and
+            !std.mem.eql(u8, result.result_type, "compat_memory"))
+        {
+            continue;
+        }
+        try out.appendSlice(allocator, "- ");
+        try out.appendSlice(allocator, result.title);
+        try out.appendSlice(allocator, ": ");
+        try out.appendSlice(allocator, result.text);
+        try out.append(allocator, '\n');
+        count += 1;
+    }
+    if (count == 0) try out.appendSlice(allocator, "- None found.\n");
+}
+
+fn appendContextRelatedObjectsGlobal(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), results: []const domain.SearchResult) !void {
+    try out.appendSlice(allocator, "\nRelated objects:\n");
+    var count: usize = 0;
+    for (results) |result| {
+        if (!std.mem.eql(u8, result.result_type, "artifact") and
+            !std.mem.eql(u8, result.result_type, "source") and
+            !std.mem.eql(u8, result.result_type, "entity") and
+            !std.mem.eql(u8, result.result_type, "relation") and
+            !std.mem.eql(u8, result.result_type, "space") and
+            !std.mem.eql(u8, result.result_type, "policy_scope"))
+        {
+            continue;
+        }
+        try out.appendSlice(allocator, "- ");
+        try out.appendSlice(allocator, result.result_type);
+        try out.appendSlice(allocator, ": ");
+        try out.appendSlice(allocator, result.title);
+        try out.appendSlice(allocator, " (");
+        try out.appendSlice(allocator, result.id);
+        try out.appendSlice(allocator, ")\n");
+        count += 1;
+    }
+    if (count == 0) try out.appendSlice(allocator, "- None found.\n");
+}
+
+fn appendStaticContextBullets(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), title: []const u8, items: []const []const u8) !void {
+    try out.appendSlice(allocator, "\n");
+    try out.appendSlice(allocator, title);
+    try out.appendSlice(allocator, ":\n");
+    for (items) |item| {
+        try out.appendSlice(allocator, "- ");
+        try out.appendSlice(allocator, item);
+        try out.append(allocator, '\n');
+    }
 }
 
 fn pgSameConflictSubject(a: domain.MemoryAtom, b: domain.MemoryAtom) bool {
@@ -5521,11 +5673,30 @@ test "context pack includes sanitized citations from memory atoms" {
         .created_by = "human",
         .source_ids_json = try std.fmt.allocPrint(alloc, "[\"{s}\",\"{s}\"]", .{ public_source.id, secret_source.id }),
     });
+    _ = try store.createMemoryAtom(alloc, .{
+        .text = "Risk: context packs can become noisy without section ordering.",
+        .scope = "public",
+        .created_by = "human",
+    });
+    _ = try store.createArtifact(alloc, .{
+        .artifact_type = "runbook",
+        .title = "Context packs runbook",
+        .body = "Runbook: assemble context packs with decisions, constraints, risks, and citations.",
+        .scope = "public",
+        .source_ids_json = try singleJsonString(alloc, public_source.id),
+    });
 
     const pack = try store.createContextPack(alloc, .{ .query = "context packs cite", .scopes_json = "[\"public\"]" });
     try std.testing.expect(std.mem.indexOf(u8, pack.included_sources_json, public_source.id) != null);
     try std.testing.expect(std.mem.indexOf(u8, pack.included_sources_json, secret_source.id) == null);
     try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "Verified decisions:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "Runbooks:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "Context packs runbook") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "Known risks:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "section ordering") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "Related objects:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "Forbidden assumptions:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "Suggested next steps:") != null);
     try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "Citations:") != null);
     try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, public_source.id) != null);
     try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, secret_source.id) == null);

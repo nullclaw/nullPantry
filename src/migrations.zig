@@ -205,6 +205,8 @@ pub const sqlite_schema =
     \\CREATE TABLE IF NOT EXISTS response_cache (
     \\  cache_key TEXT PRIMARY KEY,
     \\  response_json TEXT NOT NULL,
+    \\  scopes_json TEXT NOT NULL DEFAULT '[]',
+    \\  actor_id TEXT NOT NULL DEFAULT '',
     \\  created_at_ms INTEGER NOT NULL,
     \\  expires_at_ms INTEGER NOT NULL DEFAULT 0
     \\);
@@ -213,6 +215,8 @@ pub const sqlite_schema =
     \\  query TEXT NOT NULL DEFAULT '',
     \\  response_json TEXT NOT NULL,
     \\  embedding_json TEXT NOT NULL,
+    \\  scopes_json TEXT NOT NULL DEFAULT '[]',
+    \\  actor_id TEXT NOT NULL DEFAULT '',
     \\  created_at_ms INTEGER NOT NULL,
     \\  expires_at_ms INTEGER NOT NULL DEFAULT 0
     \\);
@@ -471,6 +475,8 @@ pub const postgres_schema =
     \\CREATE TABLE IF NOT EXISTS response_cache (
     \\  cache_key text PRIMARY KEY,
     \\  response_json jsonb NOT NULL,
+    \\  scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    \\  actor_id text NOT NULL DEFAULT '',
     \\  created_at_ms bigint NOT NULL,
     \\  expires_at_ms bigint NOT NULL DEFAULT 0
     \\);
@@ -479,6 +485,8 @@ pub const postgres_schema =
     \\  query text NOT NULL DEFAULT '',
     \\  response_json jsonb NOT NULL,
     \\  embedding_json jsonb NOT NULL,
+    \\  scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    \\  actor_id text NOT NULL DEFAULT '',
     \\  embedding vector(1536),
     \\  created_at_ms bigint NOT NULL,
     \\  expires_at_ms bigint NOT NULL DEFAULT 0
@@ -553,6 +561,7 @@ test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "idx_memory_feed_events_dedupe_key") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS response_cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS semantic_cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "scopes_json TEXT NOT NULL DEFAULT '[]'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS lifecycle_snapshots") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS jobs") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS knowledge_conflicts") != null);
@@ -581,6 +590,7 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "memory_feed_events_dedupe_key_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS response_cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS semantic_cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS lifecycle_snapshots") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS jobs") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS knowledge_conflicts") != null);

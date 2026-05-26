@@ -211,7 +211,7 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
         const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
         if (session_id) |sid| {
             if (!sessionWriteAllowed(ctx, sid)) return forbidden(ctx);
-        } else if (!domain.hasActorScope(ctx.actor_scopes_json, "admin") and !nullclawWriteAllowed(ctx)) {
+        } else if (!allSessionsWriteAllowed(ctx)) {
             return forbidden(ctx);
         }
         ctx.store.clearAutoSaved(session_id) catch return serverError(ctx);
@@ -238,7 +238,7 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
         }
     }
     if (eql(seg2, "history") and seg3 == null and is_get) {
-        if (!domain.hasActorScope(ctx.actor_scopes_json, "admin") and !nullclawReadAllowed(ctx)) return forbidden(ctx);
+        if (!allSessionsReadAllowed(ctx)) return forbidden(ctx);
         const limit = parseLimit(json.queryParam(query, "limit"), 50);
         const offset = parseLimit(json.queryParam(query, "offset"), 0);
         const result = ctx.store.listSessions(ctx.allocator, limit, offset) catch return serverError(ctx);
@@ -257,16 +257,28 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
 
 fn sessionReadAllowed(ctx: *Context, session_id: []const u8) bool {
     if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
-    if (nullclawReadAllowed(ctx)) return true;
+    if (!nullclawReadAllowed(ctx)) return false;
     const scope = std.fmt.allocPrint(ctx.allocator, "session:{s}", .{session_id}) catch return false;
     return domain.scopeVisible(scope, ctx.actor_scopes_json) and hasCapability(ctx, "read");
 }
 
 fn sessionWriteAllowed(ctx: *Context, session_id: []const u8) bool {
     if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
-    if (nullclawWriteAllowed(ctx)) return true;
+    if (!nullclawWriteAllowed(ctx)) return false;
     const scope = std.fmt.allocPrint(ctx.allocator, "session:{s}", .{session_id}) catch return false;
     return hasCapability(ctx, "write") and domain.scopeWritable(scope, ctx.actor_scopes_json);
+}
+
+fn allSessionsReadAllowed(ctx: *Context) bool {
+    if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
+    if (!nullclawReadAllowed(ctx)) return false;
+    return domain.scopeVisible("session:", ctx.actor_scopes_json);
+}
+
+fn allSessionsWriteAllowed(ctx: *Context) bool {
+    if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
+    if (!nullclawWriteAllowed(ctx)) return false;
+    return domain.scopeWritable("session:", ctx.actor_scopes_json);
 }
 
 fn nullclawReadAllowed(ctx: *Context) bool {
@@ -922,14 +934,14 @@ fn search(ctx: *Context, body: []const u8) HttpResponse {
     const cache_ttl_ms = json.intField(obj, "cache_ttl_ms") orelse 0;
     const cache_key = automaticCacheKey(ctx.allocator, "search", input.scopes_json, body) catch return serverError(ctx);
     if (use_cache) {
-        if (ctx.store.getResponseCache(ctx.allocator, cache_key, ids.nowMs()) catch return serverError(ctx)) |hit| {
+        if (ctx.store.getResponseCacheForScopes(ctx.allocator, cache_key, ids.nowMs(), input.scopes_json) catch return serverError(ctx)) |hit| {
             return .{ .status = "200 OK", .body = hit.response_json };
         }
     }
     const results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
     const response = searchResponse(ctx, results);
     if (cache_ttl_ms > 0 and hasCapability(ctx, "write")) {
-        ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response.body, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
+        ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response.body, .scopes_json = input.scopes_json, .actor_id = ctx.actor_id, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
     }
     return response;
 }
@@ -1290,6 +1302,8 @@ fn responseCachePut(ctx: *Context, body: []const u8) HttpResponse {
     ctx.store.putResponseCache(.{
         .cache_key = cache_key,
         .response_json = response_json,
+        .scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx),
+        .actor_id = ctx.actor_id,
         .ttl_ms = json.intField(obj, "ttl_ms") orelse 0,
     }) catch return serverError(ctx);
     return ok(ctx, "{\"ok\":true,\"cached\":true}");
@@ -1300,12 +1314,14 @@ fn responseCacheGet(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const cache_key = json.stringField(obj, "key") orelse json.stringField(obj, "cache_key") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing cache key");
-    const entry = ctx.store.getResponseCache(ctx.allocator, cache_key, ids.nowMs()) catch return serverError(ctx);
+    const entry = ctx.store.getResponseCacheForScopes(ctx.allocator, cache_key, ids.nowMs(), effectiveScopes(ctx, obj) catch return serverError(ctx)) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"hit\":") catch return serverError(ctx);
     if (entry) |hit| {
         out.appendSlice(ctx.allocator, "true,\"cache_key\":") catch return serverError(ctx);
         json.appendString(&out, ctx.allocator, hit.cache_key) catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, ",\"scopes\":") catch return serverError(ctx);
+        json.appendRawJsonOr(&out, ctx.allocator, hit.scopes_json, "[]") catch return serverError(ctx);
         out.appendSlice(ctx.allocator, ",\"response\":") catch return serverError(ctx);
         json.appendRawJsonOr(&out, ctx.allocator, hit.response_json, "{}") catch return serverError(ctx);
         out.print(ctx.allocator, ",\"created_at_ms\":{d},\"expires_at_ms\":{d}", .{ hit.created_at_ms, hit.expires_at_ms }) catch return serverError(ctx);
@@ -1335,6 +1351,8 @@ fn semanticCachePut(ctx: *Context, body: []const u8) HttpResponse {
         .query = query,
         .response_json = response_json,
         .embedding_json = embedding_json,
+        .scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx),
+        .actor_id = ctx.actor_id,
         .ttl_ms = json.intField(obj, "ttl_ms") orelse 0,
     }) catch return serverError(ctx);
     return ok(ctx, "{\"ok\":true,\"cached\":true}");
@@ -1353,6 +1371,7 @@ fn semanticCacheSearch(ctx: *Context, body: []const u8) HttpResponse {
     };
     const match = ctx.store.searchSemanticCache(ctx.allocator, .{
         .embedding_json = embedding_json,
+        .scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx),
         .min_score = @floatCast(json.floatField(obj, "min_score") orelse 0.82),
     }) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -1362,6 +1381,8 @@ fn semanticCacheSearch(ctx: *Context, body: []const u8) HttpResponse {
         json.appendString(&out, ctx.allocator, hit.cache_key) catch return serverError(ctx);
         out.appendSlice(ctx.allocator, ",\"query\":") catch return serverError(ctx);
         json.appendString(&out, ctx.allocator, hit.query) catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, ",\"scopes\":") catch return serverError(ctx);
+        json.appendRawJsonOr(&out, ctx.allocator, hit.scopes_json, "[]") catch return serverError(ctx);
         out.appendSlice(ctx.allocator, ",\"response\":") catch return serverError(ctx);
         json.appendRawJsonOr(&out, ctx.allocator, hit.response_json, "{}") catch return serverError(ctx);
         out.print(ctx.allocator, ",\"score\":{d},\"created_at_ms\":{d},\"expires_at_ms\":{d}", .{ hit.score, hit.created_at_ms, hit.expires_at_ms }) catch return serverError(ctx);
@@ -1449,12 +1470,12 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
     const cache_ttl_ms = json.intField(obj, "cache_ttl_ms") orelse 0;
     const cache_key = automaticCacheKey(ctx.allocator, "ask", scopes_json, body) catch return serverError(ctx);
     if (use_cache and !scan_conflicts) {
-        if (ctx.store.getResponseCache(ctx.allocator, cache_key, ids.nowMs()) catch return serverError(ctx)) |hit| {
+        if (ctx.store.getResponseCacheForScopes(ctx.allocator, cache_key, ids.nowMs(), scopes_json) catch return serverError(ctx)) |hit| {
             return .{ .status = "200 OK", .body = hit.response_json };
         }
         if (use_semantic_cache) {
             if (input.query_embedding_json) |embedding_json| {
-                if (ctx.store.searchSemanticCache(ctx.allocator, .{ .embedding_json = embedding_json, .min_score = @floatCast(json.floatField(obj, "semantic_cache_min_score") orelse 0.94) }) catch return serverError(ctx)) |hit| {
+                if (ctx.store.searchSemanticCache(ctx.allocator, .{ .embedding_json = embedding_json, .scopes_json = scopes_json, .min_score = @floatCast(json.floatField(obj, "semantic_cache_min_score") orelse 0.94) }) catch return serverError(ctx)) |hit| {
                     return .{ .status = "200 OK", .body = hit.response_json };
                 }
             }
@@ -1520,10 +1541,10 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
     out.append(ctx.allocator, '}') catch return serverError(ctx);
     const response_body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx);
     if (cache_ttl_ms > 0 and hasCapability(ctx, "write") and !scan_conflicts) {
-        ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response_body, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
+        ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response_body, .scopes_json = scopes_json, .actor_id = ctx.actor_id, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
         if (use_semantic_cache) {
             if (input.query_embedding_json) |embedding_json| {
-                ctx.store.putSemanticCache(.{ .cache_key = cache_key, .query = query, .response_json = response_body, .embedding_json = embedding_json, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
+                ctx.store.putSemanticCache(.{ .cache_key = cache_key, .query = query, .response_json = response_body, .embedding_json = embedding_json, .scopes_json = scopes_json, .actor_id = ctx.actor_id, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
             }
         }
     }
@@ -1649,17 +1670,24 @@ fn compatStore(ctx: *Context, key: []const u8, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const content = json.stringField(obj, "content") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing content");
+    const session_id = json.nullableStringField(obj, "session_id");
+    if (session_id) |sid| {
+        if (!sessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+    }
     ctx.store.compatStore(ctx.allocator, .{
         .key = key,
         .content = content,
         .category = json.stringField(obj, "category") orelse "core",
-        .session_id = json.nullableStringField(obj, "session_id"),
+        .session_id = session_id,
     }) catch return serverError(ctx);
     return ok(ctx, "{\"ok\":true}");
 }
 
 fn compatGet(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
     const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    if (session_id) |sid| {
+        if (!sessionReadAllowed(ctx, sid)) return forbidden(ctx);
+    }
     const entry = ctx.store.compatGet(ctx.allocator, key, session_id) catch return serverError(ctx);
     if (entry == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Memory entry not found");
     return compatEntryResponse(ctx, "entry", entry.?);
@@ -1668,6 +1696,9 @@ fn compatGet(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
 fn compatList(ctx: *Context, query: []const u8) HttpResponse {
     const category = json.queryParamDecoded(ctx.allocator, query, "category") catch return serverError(ctx);
     const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    if (session_id) |sid| {
+        if (!sessionReadAllowed(ctx, sid)) return forbidden(ctx);
+    }
     const entries = ctx.store.compatList(ctx.allocator, category, session_id) catch return serverError(ctx);
     return compatEntriesResponse(ctx, entries);
 }
@@ -1677,19 +1708,31 @@ fn compatSearch(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const query = json.stringField(obj, "query") orelse "";
-    const entries = ctx.store.compatSearch(ctx.allocator, query, positiveLimit(json.intField(obj, "limit"), 5), json.nullableStringField(obj, "session_id")) catch return serverError(ctx);
+    const session_id = json.nullableStringField(obj, "session_id");
+    if (session_id) |sid| {
+        if (!sessionReadAllowed(ctx, sid)) return forbidden(ctx);
+    }
+    const entries = ctx.store.compatSearch(ctx.allocator, query, positiveLimit(json.intField(obj, "limit"), 5), session_id) catch return serverError(ctx);
     return compatEntriesResponse(ctx, entries);
 }
 
 fn compatDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
     const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    if (session_id) |sid| {
+        if (!sessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+    }
     const deleted = ctx.store.compatDelete(key, session_id) catch return serverError(ctx);
     if (!deleted) return json.errorResponse(ctx.allocator, 404, "not_found", "Memory entry not found");
     return ok(ctx, "{\"ok\":true}");
 }
 
 fn compatCount(ctx: *Context) HttpResponse {
-    const count = ctx.store.compatCount() catch return serverError(ctx);
+    const count = if (allSessionsReadAllowed(ctx))
+        ctx.store.compatCount() catch return serverError(ctx)
+    else blk: {
+        const entries = ctx.store.compatList(ctx.allocator, null, null) catch return serverError(ctx);
+        break :blk entries.len;
+    };
     const body = std.fmt.allocPrint(ctx.allocator, "{{\"count\":{d}}}", .{count}) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = body };
 }
@@ -2439,7 +2482,7 @@ test "api nullclaw service token contract works without admin" {
         .allocator = arena.allocator(),
         .store = &store,
         .required_token = "dev-secret",
-        .actor_scopes_json = "[\"agent:nullclaw\"]",
+        .actor_scopes_json = "[\"agent:nullclaw\",\"session:*\",\"write:session:*\"]",
         .actor_capabilities_json = "[\"read\",\"write\",\"delete\"]",
     };
 
@@ -2525,7 +2568,7 @@ test "api nullclaw session history protocol shapes" {
     try std.testing.expectEqualStrings("404 Not Found", missing_usage.status);
 }
 
-test "api nullclaw service token can use session endpoints without admin" {
+test "api nullclaw session endpoints require session scopes without admin" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2535,12 +2578,19 @@ test "api nullclaw service token can use session endpoints without admin" {
     var admin_ctx = Context{ .allocator = alloc, .store = &store };
     const save = handleRequest(&admin_ctx, "POST", "/v1/nullclaw/sessions/sess_1/messages", "{\"role\":\"user\",\"content\":\"hello\"}", "");
     try std.testing.expectEqualStrings("200 OK", save.status);
+    const global_memory = handleRequest(&admin_ctx, "PUT", "/v1/nullclaw/memories/global.pref", "{\"content\":\"global\",\"category\":\"core\",\"session_id\":null}", "");
+    try std.testing.expectEqualStrings("200 OK", global_memory.status);
+    const session_memory = handleRequest(&admin_ctx, "PUT", "/v1/nullclaw/memories/session.pref", "{\"content\":\"scoped\",\"category\":\"core\",\"session_id\":\"sess_1\"}", "");
+    try std.testing.expectEqualStrings("200 OK", session_memory.status);
 
     var service_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"agent:nullclaw\"]", .actor_capabilities_json = "[\"read\",\"write\"]" };
     const service_read = handleRequest(&service_ctx, "GET", "/v1/nullclaw/sessions/sess_1/messages", "", "");
-    try std.testing.expectEqualStrings("200 OK", service_read.status);
+    try std.testing.expectEqualStrings("403 Forbidden", service_read.status);
     const service_write = handleRequest(&service_ctx, "POST", "/v1/nullclaw/sessions/sess_1/messages", "{\"role\":\"assistant\",\"content\":\"service\"}", "");
-    try std.testing.expectEqualStrings("200 OK", service_write.status);
+    try std.testing.expectEqualStrings("403 Forbidden", service_write.status);
+    const service_count = handleRequest(&service_ctx, "GET", "/v1/nullclaw/memories/count", "", "");
+    try std.testing.expectEqualStrings("200 OK", service_count.status);
+    try std.testing.expect(std.mem.indexOf(u8, service_count.body, "\"count\":1") != null);
 
     var read_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"agent:nullclaw\",\"session:sess_1\"]", .actor_capabilities_json = "[\"read\"]" };
     const allowed_read = handleRequest(&read_ctx, "GET", "/v1/nullclaw/sessions/sess_1/messages", "", "");
@@ -2549,6 +2599,12 @@ test "api nullclaw service token can use session endpoints without admin" {
     var write_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"agent:nullclaw\",\"write:session:sess_1\"]", .actor_capabilities_json = "[\"read\",\"write\"]" };
     const allowed_write = handleRequest(&write_ctx, "POST", "/v1/nullclaw/sessions/sess_1/messages", "{\"role\":\"assistant\",\"content\":\"world\"}", "");
     try std.testing.expectEqualStrings("200 OK", allowed_write.status);
+
+    var wildcard_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"agent:nullclaw\",\"session:*\",\"write:session:*\"]", .actor_capabilities_json = "[\"read\",\"write\"]" };
+    const history = handleRequest(&wildcard_ctx, "GET", "/v1/nullclaw/history?limit=10&offset=0", "", "");
+    try std.testing.expectEqualStrings("200 OK", history.status);
+    const wildcard_count = handleRequest(&wildcard_ctx, "GET", "/v1/nullclaw/memories/count", "", "");
+    try std.testing.expect(std.mem.indexOf(u8, wildcard_count.body, "\"count\":2") != null);
 }
 
 test "api exposes engine registry retrieval plan vector and lifecycle endpoints" {
@@ -2751,6 +2807,46 @@ test "api lifecycle cache semantic cache summarize rollout and hygiene endpoints
     const worker_run = handleRequest(&ctx, "POST", "/v1/workers/run", "{\"job_limit\":5,\"outbox_limit\":5}", "");
     try std.testing.expectEqualStrings("200 OK", worker_run.status);
     try std.testing.expect(std.mem.indexOf(u8, worker_run.body, "\"jobs_succeeded\":1") != null);
+}
+
+test "api response and semantic caches are scoped" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var secret_ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_scopes_json = "[\"project:secret\"]",
+        .actor_capabilities_json = "[\"read\",\"write\"]",
+    };
+    var public_ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_scopes_json = "[\"public\"]",
+        .actor_capabilities_json = "[\"read\"]",
+    };
+
+    const put_cache = handleRequest(&secret_ctx, "POST", "/v1/lifecycle/cache/put", "{\"key\":\"shared:key\",\"response\":{\"answer\":\"secret cached answer\"},\"ttl_ms\":10000}", "");
+    try std.testing.expectEqualStrings("200 OK", put_cache.status);
+    const public_cache = handleRequest(&public_ctx, "POST", "/v1/lifecycle/cache/get", "{\"key\":\"shared:key\"}", "");
+    try std.testing.expectEqualStrings("200 OK", public_cache.status);
+    try std.testing.expect(std.mem.indexOf(u8, public_cache.body, "\"hit\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_cache.body, "secret cached answer") == null);
+    const secret_cache = handleRequest(&secret_ctx, "POST", "/v1/lifecycle/cache/get", "{\"key\":\"shared:key\"}", "");
+    try std.testing.expect(std.mem.indexOf(u8, secret_cache.body, "\"hit\":true") != null);
+
+    _ = try store.createMemoryAtom(alloc, .{ .text = "secret semantic cached memory", .scope = "project:secret", .created_by = "human", .status = "verified" });
+    const secret_ask = handleRequest(&secret_ctx, "POST", "/v1/ask", "{\"query\":\"secret semantic cached memory\",\"scopes\":[\"project:secret\"],\"cache_ttl_ms\":10000,\"use_semantic_cache\":true}", "");
+    try std.testing.expectEqualStrings("200 OK", secret_ask.status);
+    try std.testing.expect(std.mem.indexOf(u8, secret_ask.body, "secret semantic cached memory") != null);
+
+    const public_ask = handleRequest(&public_ctx, "POST", "/v1/ask", "{\"query\":\"secret semantic cached memory\",\"scopes\":[\"public\"],\"use_semantic_cache\":true}", "");
+    try std.testing.expectEqualStrings("200 OK", public_ask.status);
+    try std.testing.expect(std.mem.indexOf(u8, public_ask.body, "secret semantic cached memory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public_ask.body, "I don't know") != null);
 }
 
 test "api memory feed and apply are permission aware" {

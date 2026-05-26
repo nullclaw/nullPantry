@@ -379,9 +379,13 @@ fn hasPrefixedActorScope(actor_scopes_json: []const u8, prefix: []const u8, scop
     var cursor: usize = 0;
     while (nextQuotedString(actor_scopes_json, &cursor)) |actor_scope| {
         if (actor_scope.len == prefix.len + 1 and std.mem.startsWith(u8, actor_scope, prefix) and actor_scope[actor_scope.len - 1] == '*') return true;
-        if (actor_scope.len != prefix.len + scope.len) continue;
         if (!std.mem.startsWith(u8, actor_scope, prefix)) continue;
-        if (std.mem.eql(u8, actor_scope[prefix.len..], scope)) return true;
+        const granted = actor_scope[prefix.len..];
+        if (granted.len > 0 and granted[granted.len - 1] == '*') {
+            if (std.mem.startsWith(u8, scope, granted[0 .. granted.len - 1])) return true;
+            continue;
+        }
+        if (std.mem.eql(u8, granted, scope)) return true;
     }
     return false;
 }
@@ -402,6 +406,21 @@ pub fn permissionsVisible(permissions_json: []const u8, actor_scopes_json: []con
         if (quotedStringContains(trimmed, scope)) return true;
     }
     return false;
+}
+
+pub fn scopeListVisible(required_scopes_json: []const u8, actor_scopes_json: []const u8) bool {
+    const trimmed = std.mem.trim(u8, required_scopes_json, " \t\r\n");
+    if (hasActorScope(actor_scopes_json, "admin")) return true;
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "[]")) return false;
+
+    var cursor: usize = 0;
+    var saw_scope = false;
+    while (nextQuotedString(trimmed, &cursor)) |scope| {
+        saw_scope = true;
+        if (std.mem.eql(u8, scope, "public")) continue;
+        if (!scopeVisible(scope, actor_scopes_json)) return false;
+    }
+    return saw_scope;
 }
 
 pub fn permissionsWritable(permissions_json: []const u8, actor_scopes_json: []const u8) bool {
@@ -460,6 +479,7 @@ test "scope and permission checks use exact grants" {
     try std.testing.expect(!scopeWritable("project:nullpantry", "[\"project:nullpantry\"]"));
     try std.testing.expect(scopeWritable("project:nullpantry", "[\"project:nullpantry\",\"write:project:nullpantry\"]"));
     try std.testing.expect(scopeWritable("project:nullpantry", "[\"write:*\"]"));
+    try std.testing.expect(scopeWritable("session:sess_1", "[\"write:session:*\"]"));
     try std.testing.expect(scopeVerifiable("project:nullpantry", "[\"verify:project:nullpantry\"]"));
     try std.testing.expect(scopeDeletable("project:nullpantry", "[\"delete:project:nullpantry\"]"));
     try std.testing.expect(recordVisible("project:nullpantry", "[\"team:platform\"]", "[\"project:nullpantry\",\"team:platform\"]"));
@@ -483,4 +503,14 @@ test "json string list intersection prevents escalation" {
     const admin_filtered = try intersectJsonStringLists(alloc, "[\"project:secret\"]", "[\"admin\"]");
     defer alloc.free(admin_filtered);
     try std.testing.expectEqualStrings("[\"project:secret\"]", admin_filtered);
+}
+
+test "scope list visibility prevents cache scope escalation" {
+    try std.testing.expect(scopeListVisible("[\"public\"]", "[\"public\"]"));
+    try std.testing.expect(scopeListVisible("[\"project:a\"]", "[\"project:a\"]"));
+    try std.testing.expect(scopeListVisible("[\"project:a\"]", "[\"project:*\"]"));
+    try std.testing.expect(!scopeListVisible("[\"project:a\",\"project:b\"]", "[\"project:a\"]"));
+    try std.testing.expect(!scopeListVisible("[\"admin\"]", "[\"public\"]"));
+    try std.testing.expect(scopeListVisible("[]", "[\"admin\"]"));
+    try std.testing.expect(!scopeListVisible("[]", "[\"public\"]"));
 }

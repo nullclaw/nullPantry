@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const json = @import("json_util.zig");
 const vector = @import("vector.zig");
@@ -81,7 +82,7 @@ fn callOpenAICompatibleEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingCon
     const body = try payload.toOwnedSlice(allocator);
     defer allocator.free(body);
 
-    const response = try curlPostJson(allocator, url, cfg.api_key, cfg.timeout_secs, body);
+    const response = try postJson(allocator, url, cfg.api_key, cfg.timeout_secs, body);
     defer allocator.free(response);
     return parseEmbeddingResponse(allocator, response);
 }
@@ -100,7 +101,7 @@ fn callOpenAICompatibleChat(allocator: std.mem.Allocator, cfg: CompletionConfig,
     const body = try payload.toOwnedSlice(allocator);
     defer allocator.free(body);
 
-    const response = try curlPostJson(allocator, url, cfg.api_key, cfg.timeout_secs, body);
+    const response = try postJson(allocator, url, cfg.api_key, cfg.timeout_secs, body);
     defer allocator.free(response);
     return parseChatResponse(allocator, response);
 }
@@ -113,68 +114,67 @@ fn providerUrl(allocator: std.mem.Allocator, base_url: []const u8, suffix: []con
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ trimmed, suffix });
 }
 
-fn curlPostJson(allocator: std.mem.Allocator, url: []const u8, api_key: ?[]const u8, timeout_secs: u32, payload: []const u8) ![]u8 {
+fn postJson(allocator: std.mem.Allocator, url: []const u8, api_key: ?[]const u8, timeout_secs: u32, payload: []const u8) ![]u8 {
     var auth_header: ?[]u8 = null;
     defer if (auth_header) |h| allocator.free(h);
 
-    var timeout_buf: [16]u8 = undefined;
-    const timeout_text = std.fmt.bufPrint(&timeout_buf, "{d}", .{@max(timeout_secs, 1)}) catch unreachable;
+    var extra_headers_buf: [1]std.http.Header = undefined;
+    var header_count: usize = 0;
 
-    var argv_buf: [22][]const u8 = undefined;
-    var argc: usize = 0;
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "--silent";
-    argc += 1;
-    argv_buf[argc] = "--show-error";
-    argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = timeout_text;
-    argc += 1;
-    argv_buf[argc] = "--request";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "--header";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
     if (api_key) |key| {
-        auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{key});
-        argv_buf[argc] = "--header";
-        argc += 1;
-        argv_buf[argc] = auth_header.?;
-        argc += 1;
+        auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{key});
+        extra_headers_buf[header_count] = .{ .name = "Authorization", .value = auth_header.? };
+        header_count += 1;
     }
-    argv_buf[argc] = "--data";
-    argc += 1;
-    argv_buf[argc] = payload;
-    argc += 1;
-    argv_buf[argc] = "--write-out";
-    argc += 1;
-    argv_buf[argc] = "\n%{http_code}";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
 
-    const result = std.process.run(allocator, compat.io(), .{
-        .argv = argv_buf[0..argc],
-        .stdout_limit = .limited(32 * 1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
+    var client: std.http.Client = .{ .allocator = allocator, .io = compat.io() };
+    defer client.deinit();
+
+    var response_buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer response_buffer.deinit();
+
+    const uri = std.Uri.parse(url) catch return error.ProviderUnavailable;
+    var req = client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .accept_encoding = .omit,
+            .connection = .{ .override = "close" },
+        },
+        .extra_headers = extra_headers_buf[0..header_count],
     }) catch return error.ProviderUnavailable;
-    defer allocator.free(result.stderr);
-    defer allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.ProviderUnavailable,
-        else => return error.ProviderUnavailable,
-    }
+    defer req.deinit();
 
-    const sep = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse return error.ProviderInvalidResponse;
-    const status_text = std.mem.trim(u8, result.stdout[sep + 1 ..], " \t\r\n");
-    const status = std.fmt.parseInt(u16, status_text, 10) catch return error.ProviderInvalidResponse;
-    if (status < 200 or status >= 300) return error.ProviderHttpError;
-    return allocator.dupe(u8, result.stdout[0..sep]);
+    applyProviderSocketTimeout(req.connection, timeout_secs);
+
+    req.transfer_encoding = .{ .content_length = payload.len };
+    var body_writer = req.sendBodyUnflushed(&.{}) catch return error.ProviderUnavailable;
+    body_writer.writer.writeAll(payload) catch return error.ProviderUnavailable;
+    body_writer.end() catch return error.ProviderUnavailable;
+    req.connection.?.flush() catch return error.ProviderUnavailable;
+
+    var response = req.receiveHead(&.{}) catch return error.ProviderUnavailable;
+    if (response.head.status != .ok) return error.ProviderHttpError;
+
+    const reader = response.reader(&.{});
+    _ = reader.streamRemaining(&response_buffer.writer) catch return error.ProviderUnavailable;
+    return allocator.dupe(u8, response_buffer.writer.buffer[0..response_buffer.writer.end]);
+}
+
+fn applyProviderSocketTimeout(connection: ?*std.http.Client.Connection, timeout_secs: u32) void {
+    if (timeout_secs == 0) return;
+    switch (builtin.target.os.tag) {
+        .windows => {},
+        else => {
+            const timeout = std.posix.timeval{ .sec = @intCast(@max(timeout_secs, 1)), .usec = 0 };
+            if (connection) |conn| {
+                const handle = conn.stream_reader.stream.socket.handle;
+                std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+                std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+            }
+        },
+    }
 }
 
 fn parseEmbeddingResponse(allocator: std.mem.Allocator, body: []const u8) ![]f32 {
