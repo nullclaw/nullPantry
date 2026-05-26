@@ -3,6 +3,7 @@ const json = @import("json_util.zig");
 
 pub const VectorRecord = struct {
     id: []const u8,
+    object_id: []const u8,
     object_type: []const u8 = "memory_atom",
     text: []const u8 = "",
     scope: []const u8 = "workspace",
@@ -11,6 +12,7 @@ pub const VectorRecord = struct {
 
 pub const VectorMatch = struct {
     id: []const u8,
+    object_id: []const u8,
     object_type: []const u8,
     text: []const u8,
     scope: []const u8,
@@ -19,6 +21,8 @@ pub const VectorMatch = struct {
     pub fn writeJson(self: VectorMatch, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
         try out.appendSlice(allocator, "{\"id\":");
         try json.appendString(out, allocator, self.id);
+        try out.appendSlice(allocator, ",\"object_id\":");
+        try json.appendString(out, allocator, self.object_id);
         try out.appendSlice(allocator, ",\"object_type\":");
         try json.appendString(out, allocator, self.object_type);
         try out.appendSlice(allocator, ",\"text\":");
@@ -108,6 +112,7 @@ pub fn bruteForceSearch(allocator: std.mem.Allocator, query: []const f32, record
         if (score <= 0) continue;
         try matches.append(allocator, .{
             .id = record.id,
+            .object_id = record.object_id,
             .object_type = record.object_type,
             .text = record.text,
             .scope = record.scope,
@@ -117,6 +122,38 @@ pub fn bruteForceSearch(allocator: std.mem.Allocator, query: []const f32, record
     sortMatches(matches.items);
     if (matches.items.len > limit) matches.shrinkRetainingCapacity(limit);
     return matches.toOwnedSlice(allocator);
+}
+
+pub fn annSearch(allocator: std.mem.Allocator, query: []const f32, records: []const VectorRecord, candidate_limit: usize, limit: usize) ![]VectorMatch {
+    if (records.len <= candidate_limit or query.len == 0) {
+        return bruteForceSearch(allocator, query, records, limit);
+    }
+
+    var candidates: std.ArrayListUnmanaged(VectorRecord) = .empty;
+    defer candidates.deinit(allocator);
+    const query_sig = signature(query);
+    const max_hamming: u6 = if (records.len > 1024) 12 else 16;
+    for (records) |record| {
+        const record_sig = signature(record.embedding);
+        if (@popCount(query_sig ^ record_sig) <= max_hamming) {
+            try candidates.append(allocator, record);
+            if (candidates.items.len >= candidate_limit) break;
+        }
+    }
+
+    if (candidates.items.len < @min(limit, records.len)) {
+        return bruteForceSearch(allocator, query, records, limit);
+    }
+    return bruteForceSearch(allocator, query, candidates.items, limit);
+}
+
+fn signature(values: []const f32) u64 {
+    var sig: u64 = 0;
+    const dims = @min(values.len, 64);
+    for (values[0..dims], 0..) |value, i| {
+        if (value > 0) sig |= (@as(u64, 1) << @intCast(i));
+    }
+    return sig;
 }
 
 fn sortMatches(items: []VectorMatch) void {
@@ -173,13 +210,25 @@ test "vector json round-trips embeddings" {
 test "vector brute force search ranks by cosine" {
     const alloc = std.testing.allocator;
     const records = [_]VectorRecord{
-        .{ .id = "a", .embedding = &[_]f32{ 1, 0 }, .text = "alpha" },
-        .{ .id = "b", .embedding = &[_]f32{ 0, 1 }, .text = "beta" },
+        .{ .id = "vec_a", .object_id = "a", .embedding = &[_]f32{ 1, 0 }, .text = "alpha" },
+        .{ .id = "vec_b", .object_id = "b", .embedding = &[_]f32{ 0, 1 }, .text = "beta" },
     };
     const matches = try bruteForceSearch(alloc, &[_]f32{ 1, 0 }, &records, 10);
     defer alloc.free(matches);
     try std.testing.expectEqual(@as(usize, 1), matches.len);
-    try std.testing.expectEqualStrings("a", matches[0].id);
+    try std.testing.expectEqualStrings("a", matches[0].object_id);
+}
+
+test "vector ANN prefilter falls back safely" {
+    const alloc = std.testing.allocator;
+    const records = [_]VectorRecord{
+        .{ .id = "vec_a", .object_id = "a", .embedding = &[_]f32{ 1, 0 }, .text = "alpha" },
+        .{ .id = "vec_b", .object_id = "b", .embedding = &[_]f32{ 0, 1 }, .text = "beta" },
+    };
+    const matches = try annSearch(alloc, &[_]f32{ 1, 0 }, &records, 1, 1);
+    defer alloc.free(matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("a", matches[0].object_id);
 }
 
 test "vector chunker uses overlap" {

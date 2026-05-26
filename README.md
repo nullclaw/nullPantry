@@ -41,14 +41,16 @@ NullClaw compatibility lives under `/v1/nullclaw` and supports remote API memory
 Additional agent-memory surfaces:
 
 - `GET /v1/engines` exposes the NullClaw memory engine registry: `sqlite`, `markdown`, `memory_lru`, `lucid`, `postgres`, `redis`, `clickhouse`, `lancedb`, and `kg`.
-- `POST /v1/vector/embed`, `POST /v1/vector/upsert`, `POST /v1/vector/search`, and `GET /v1/vector/outbox` provide the server-side vector layer with a deterministic local embedding fallback, permission-filtered brute-force local search today, and schema contracts for Qdrant/pgvector style adapters.
+- `POST /v1/vector/embed`, `POST /v1/vector/upsert`, `POST /v1/vector/search`, and `GET /v1/vector/outbox` provide the server-side vector layer with a deterministic local embedding fallback, permission-filtered SQLite vector chunks, ANN-style prefiltering, final cosine rerank, and schema contracts for Qdrant/pgvector style adapters.
 - `POST /v1/retrieval/plan` exposes retrieval planning primitives for keyword, vector, graph, query expansion, MMR/RRF, temporal decay, adaptive retrieval, and reranking.
+- `/v1/search`, `/v1/ask`, `/v1/context-packs`, and `POST /v1/retrieval/search` use the same hybrid retrieval path: ACL first, scoped keyword/global candidates, deterministic query expansion, vector ANN search, RRF fusion, citation-safe result assembly, and grouped results for memory atoms, sources, artifacts, entities, relations, context packs, feed events, compat memories, and guarded session messages.
 - `GET|POST /v1/memory/feed` and `POST /v1/memory/apply` provide cross-memory feed/apply events inspired by NullClaw PR #711, with scope checks before event visibility or apply.
-- `GET /v1/lifecycle/diagnostics` and `POST /v1/lifecycle/snapshot` expose lifecycle diagnostics and snapshot hooks.
+- `GET /v1/lifecycle/diagnostics`, `POST /v1/lifecycle/snapshot`, `POST /v1/lifecycle/hygiene`, `POST /v1/lifecycle/summarize`, and `POST /v1/lifecycle/rollout` expose lifecycle runtime operations.
+- `POST /v1/lifecycle/cache/put`, `POST /v1/lifecycle/cache/get`, `POST /v1/lifecycle/semantic-cache/put`, and `POST /v1/lifecycle/semantic-cache/search` expose response and semantic cache operations backed by SQLite tables.
 
 ## Storage Status
 
-SQLite is the working local/dev/test backend and includes relational tables, FTS5 indexes, lifecycle status, audit events, context packs, permission-filtered vector chunks, vector outbox, lifecycle snapshots, idempotent cross-memory feed events, and the NullClaw compatibility projection.
+SQLite is the working local/dev/test backend and includes relational tables, FTS5 indexes, lifecycle status, audit events, context packs, permission-filtered vector chunks, ANN-style local vector search, vector outbox, response/semantic caches, lifecycle snapshots/hygiene, idempotent cross-memory feed events, and the NullClaw compatibility projection.
 
 Postgres DDL is included as the production schema contract with relational tables, full-text `tsvector` indexes, vector outbox/feed tables, lifecycle tables, and `pgvector` storage. The runtime Postgres adapter is gated and returns `PostgresAdapterIncomplete` until the repo adds a native Postgres client or a deliberate `libpq` deployment contract. Until then, runnable deployments should use SQLite-backed service mode.
 

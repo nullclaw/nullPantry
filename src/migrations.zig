@@ -176,16 +176,17 @@ pub const sqlite_schema =
     \\CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_feed_events_dedupe_key ON memory_feed_events(dedupe_key) WHERE dedupe_key IS NOT NULL;
     \\CREATE TABLE IF NOT EXISTS response_cache (
     \\  cache_key TEXT PRIMARY KEY,
-    \\  value_json TEXT NOT NULL,
+    \\  response_json TEXT NOT NULL,
     \\  created_at_ms INTEGER NOT NULL,
-    \\  ttl_ms INTEGER NOT NULL DEFAULT 0
+    \\  expires_at_ms INTEGER NOT NULL DEFAULT 0
     \\);
     \\CREATE TABLE IF NOT EXISTS semantic_cache (
     \\  cache_key TEXT PRIMARY KEY,
-    \\  value_json TEXT NOT NULL,
+    \\  query TEXT NOT NULL DEFAULT '',
+    \\  response_json TEXT NOT NULL,
     \\  embedding_json TEXT NOT NULL,
     \\  created_at_ms INTEGER NOT NULL,
-    \\  ttl_ms INTEGER NOT NULL DEFAULT 0
+    \\  expires_at_ms INTEGER NOT NULL DEFAULT 0
     \\);
     \\CREATE TABLE IF NOT EXISTS lifecycle_snapshots (
     \\  id TEXT PRIMARY KEY,
@@ -374,17 +375,18 @@ pub const postgres_schema =
     \\CREATE UNIQUE INDEX IF NOT EXISTS memory_feed_events_dedupe_key_idx ON memory_feed_events(dedupe_key) WHERE dedupe_key IS NOT NULL;
     \\CREATE TABLE IF NOT EXISTS response_cache (
     \\  cache_key text PRIMARY KEY,
-    \\  value_json jsonb NOT NULL,
+    \\  response_json jsonb NOT NULL,
     \\  created_at_ms bigint NOT NULL,
-    \\  ttl_ms bigint NOT NULL DEFAULT 0
+    \\  expires_at_ms bigint NOT NULL DEFAULT 0
     \\);
     \\CREATE TABLE IF NOT EXISTS semantic_cache (
     \\  cache_key text PRIMARY KEY,
-    \\  value_json jsonb NOT NULL,
+    \\  query text NOT NULL DEFAULT '',
+    \\  response_json jsonb NOT NULL,
     \\  embedding_json jsonb NOT NULL,
     \\  embedding vector(1536),
     \\  created_at_ms bigint NOT NULL,
-    \\  ttl_ms bigint NOT NULL DEFAULT 0
+    \\  expires_at_ms bigint NOT NULL DEFAULT 0
     \\);
     \\CREATE TABLE IF NOT EXISTS lifecycle_snapshots (
     \\  id text PRIMARY KEY,
