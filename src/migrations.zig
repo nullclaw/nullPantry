@@ -194,6 +194,7 @@ pub const sqlite_schema =
     \\  object_type TEXT NOT NULL,
     \\  object_id TEXT NOT NULL,
     \\  scope TEXT NOT NULL DEFAULT 'workspace',
+    \\  permissions_json TEXT NOT NULL DEFAULT '[]',
     \\  dedupe_key TEXT,
     \\  payload_json TEXT NOT NULL DEFAULT '{}',
     \\  status TEXT NOT NULL DEFAULT 'pending',
@@ -370,7 +371,7 @@ pub const postgres_schema =
     \\  owner text,
     \\  permissions_json jsonb NOT NULL DEFAULT '[]',
     \\  tags_json jsonb NOT NULL DEFAULT '[]',
-    \\  embedding vector(1536),
+    \\  embedding vector,
     \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(text,'') || ' ' || coalesce(predicate,'') || ' ' || coalesce(object,''))) STORED
     \\);
     \\CREATE INDEX IF NOT EXISTS memory_atoms_search_idx ON memory_atoms USING gin(search_tsv);
@@ -384,7 +385,7 @@ pub const postgres_schema =
     \\  scope text NOT NULL DEFAULT 'workspace',
     \\  permissions_json jsonb NOT NULL DEFAULT '[]',
     \\  embedding_json jsonb NOT NULL,
-    \\  embedding vector(1536),
+    \\  embedding vector,
     \\  model text,
     \\  dimensions bigint NOT NULL,
     \\  created_at_ms bigint NOT NULL,
@@ -392,7 +393,7 @@ pub const postgres_schema =
     \\);
     \\CREATE INDEX IF NOT EXISTS vector_chunks_object_idx ON vector_chunks(object_type, object_id);
     \\CREATE INDEX IF NOT EXISTS vector_chunks_scope_idx ON vector_chunks(scope);
-    \\CREATE INDEX IF NOT EXISTS vector_chunks_embedding_idx ON vector_chunks USING ivfflat (embedding vector_cosine_ops);
+    \\CREATE INDEX IF NOT EXISTS vector_chunks_embedding_1536_idx ON vector_chunks USING ivfflat ((embedding::vector(1536)) vector_cosine_ops) WHERE dimensions = 1536;
     \\CREATE TABLE IF NOT EXISTS vector_outbox (
     \\  id bigserial PRIMARY KEY,
     \\  action text NOT NULL,
@@ -464,6 +465,7 @@ pub const postgres_schema =
     \\  object_type text NOT NULL,
     \\  object_id text NOT NULL,
     \\  scope text NOT NULL DEFAULT 'workspace',
+    \\  permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb,
     \\  dedupe_key text,
     \\  payload_json jsonb NOT NULL DEFAULT '{}',
     \\  status text NOT NULL DEFAULT 'pending',
@@ -487,7 +489,7 @@ pub const postgres_schema =
     \\  embedding_json jsonb NOT NULL,
     \\  scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb,
     \\  actor_id text NOT NULL DEFAULT '',
-    \\  embedding vector(1536),
+    \\  embedding vector,
     \\  created_at_ms bigint NOT NULL,
     \\  expires_at_ms bigint NOT NULL DEFAULT 0
     \\);
@@ -598,7 +600,8 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'ingest_jobs_conflicts'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'spaces_policy_scopes'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE EXTENSION IF NOT EXISTS vector") != null);
-    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "embedding vector(1536)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "embedding vector") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "dimensions = 1536") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "vector_cosine_ops") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "USING gin(search_tsv)") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx") != null);

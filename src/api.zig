@@ -369,7 +369,7 @@ fn createArtifact(ctx: *Context, body: []const u8) HttpResponse {
         return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid artifact status for this artifact type");
     }
     const source_ids_json = rawField(ctx.allocator, obj, "source_ids", "[]") catch return serverError(ctx);
-    if (!sourceIdsVisible(ctx, source_ids_json)) return forbidden(ctx);
+    if (!sourceIdsCanBackRecord(ctx, source_ids_json, scope, permissions_json)) return forbidden(ctx);
     const artifact = ctx.store.createArtifact(ctx.allocator, .{
         .artifact_type = artifact_type,
         .title = title,
@@ -427,7 +427,7 @@ fn createRelation(ctx: *Context, body: []const u8) HttpResponse {
     const scope = json.stringField(obj, "scope") orelse "workspace";
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
     if (!canWriteRecord(ctx, scope, permissions_json)) return forbidden(ctx);
-    if (!sourceIdsVisible(ctx, source_ids_json)) return forbidden(ctx);
+    if (!sourceIdsCanBackRecord(ctx, source_ids_json, scope, permissions_json)) return forbidden(ctx);
     const relation = ctx.store.createRelation(ctx.allocator, .{
         .from_entity_id = from_entity_id,
         .relation_type = json.stringField(obj, "relation_type") orelse "related_to",
@@ -454,7 +454,7 @@ fn engineRegistry(ctx: *Context) HttpResponse {
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"storage":["sqlite","postgres-psql-runtime"],"apis":["remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","jobs","workers","conflicts"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat"],"retrieval":["acl","fts","vector","entity_graph","rrf","temporal_decay","quality_rerank","embedding_mmr","citations","conflict_warnings"],"compatibility":["nullclaw-api-memory","session-history","cross-memory-feed"],"permissions":["read","write","propose","verify","delete","export","feed_apply"]}
+        \\{"service":"nullpantry","headless":true,"storage":["sqlite","postgres-psql-runtime"],"apis":["remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","jobs","workers","conflicts"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat"],"retrieval":["acl","fts","vector","entity_graph","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"compatibility":["nullclaw-api-memory","nullclaw-kb-projection","session-history","cross-memory-feed"],"permissions":["read","write","propose","verify","delete","export","feed_apply"]}
     );
 }
 
@@ -595,7 +595,14 @@ fn ingest(ctx: *Context, body: []const u8) HttpResponse {
         .input_json = body,
     }) catch return serverError(ctx);
 
-    const output = runExtraction(ctx, source, json.boolField(obj, "create_artifact") orelse true, json.boolField(obj, "extract_memory") orelse true) catch return serverError(ctx);
+    if (!(json.boolField(obj, "run_now") orelse false)) {
+        return queuedExtractionResponse(ctx, job, source);
+    }
+
+    const output = runExtraction(ctx, source, json.boolField(obj, "create_artifact") orelse true, json.boolField(obj, "extract_memory") orelse true) catch |err| {
+        _ = ctx.store.finishJob(job.id, "failed", "{}", @errorName(err)) catch {};
+        return serverError(ctx);
+    };
     const result_json = std.fmt.allocPrint(ctx.allocator, "{{\"source_id\":\"{s}\",\"artifact_count\":{d},\"memory_atom_count\":{d},\"entity_count\":{d},\"vector_chunk_count\":{d}}}", .{ source.id, if (output.artifact == null) @as(usize, 0) else 1, output.atoms.len, output.entities.len, output.vector_chunks }) catch return serverError(ctx);
     _ = ctx.store.finishJob(job.id, "succeeded", result_json, null) catch return serverError(ctx);
     const finished = (ctx.store.getJob(ctx.allocator, job.id) catch return serverError(ctx)) orelse job;
@@ -618,7 +625,14 @@ fn extractMemory(ctx: *Context, body: []const u8) HttpResponse {
         .object_id = source.id,
         .input_json = body,
     }) catch return serverError(ctx);
-    const output = runExtraction(ctx, source, json.boolField(obj, "create_artifact") orelse true, true) catch return serverError(ctx);
+    if (!(json.boolField(obj, "run_now") orelse false)) {
+        return queuedExtractionResponse(ctx, job, source);
+    }
+
+    const output = runExtraction(ctx, source, json.boolField(obj, "create_artifact") orelse true, true) catch |err| {
+        _ = ctx.store.finishJob(job.id, "failed", "{}", @errorName(err)) catch {};
+        return serverError(ctx);
+    };
     const result_json = std.fmt.allocPrint(ctx.allocator, "{{\"source_id\":\"{s}\",\"artifact_count\":{d},\"memory_atom_count\":{d},\"entity_count\":{d},\"vector_chunk_count\":{d}}}", .{ source.id, if (output.artifact == null) @as(usize, 0) else 1, output.atoms.len, output.entities.len, output.vector_chunks }) catch return serverError(ctx);
     _ = ctx.store.finishJob(job.id, "succeeded", result_json, null) catch return serverError(ctx);
     const finished = (ctx.store.getJob(ctx.allocator, job.id) catch return serverError(ctx)) orelse job;
@@ -825,6 +839,16 @@ fn jobsResponse(ctx: *Context, jobs: []store_mod.Job) HttpResponse {
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
+fn queuedExtractionResponse(ctx: *Context, job: store_mod.Job, source: domain.Source) HttpResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"queued\":true,\"job\":") catch return serverError(ctx);
+    job.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"source\":") catch return serverError(ctx);
+    source.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"run_endpoint\":\"/v1/workers/run\"}") catch return serverError(ctx);
+    return .{ .status = "202 Accepted", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
 fn listConflicts(ctx: *Context, query: []const u8) HttpResponse {
     const status = json.queryParamDecoded(ctx.allocator, query, "status") catch return serverError(ctx);
     const effective_status = if (status != null and std.mem.eql(u8, status.?, "all")) null else (status orelse "open");
@@ -938,7 +962,8 @@ fn search(ctx: *Context, body: []const u8) HttpResponse {
             return .{ .status = "200 OK", .body = hit.response_json };
         }
     }
-    const results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
+    var results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
+    results = maybeLlmRerankResults(ctx, query, results, input.allow_reranker) catch results;
     const response = searchResponse(ctx, results);
     if (cache_ttl_ms > 0 and hasCapability(ctx, "write")) {
         ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response.body, .scopes_json = input.scopes_json, .actor_id = ctx.actor_id, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
@@ -1041,7 +1066,7 @@ fn vectorOutboxStatus(ctx: *Context) HttpResponse {
     const pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
     const indexed_local = ctx.store.countVectorOutbox("indexed_local") catch return serverError(ctx);
     const total = ctx.store.countVectorOutbox(null) catch return serverError(ctx);
-    const body = std.fmt.allocPrint(ctx.allocator, "{{\"outbox\":{{\"pending\":{d},\"indexed_local\":{d},\"external_sink\":\"not_configured\",\"total\":{d}}}}}", .{ pending, indexed_local, total }) catch return serverError(ctx);
+    const body = std.fmt.allocPrint(ctx.allocator, "{{\"outbox\":{{\"pending\":{d},\"indexed_local\":{d},\"active_sink\":\"local_vector_index\",\"external_sinks\":[],\"total\":{d}}}}}", .{ pending, indexed_local, total }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = body };
 }
 
@@ -1052,7 +1077,7 @@ fn vectorOutboxRun(ctx: *Context, body: []const u8) HttpResponse {
     const limit = positiveLimit(json.intField(parsed.value.object, "limit"), 100);
     const result = ctx.store.runVectorOutbox(limit) catch return serverError(ctx);
     const pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
-    const response = std.fmt.allocPrint(ctx.allocator, "{{\"outbox_run\":{{\"processed\":{d},\"failed\":{d},\"pending\":{d},\"external_sink\":\"not_configured\"}}}}", .{ result.processed, result.failed, pending }) catch return serverError(ctx);
+    const response = std.fmt.allocPrint(ctx.allocator, "{{\"outbox_run\":{{\"processed\":{d},\"failed\":{d},\"pending\":{d},\"active_sink\":\"local_vector_index\",\"external_sinks\":[]}}}}", .{ result.processed, result.failed, pending }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
 }
 
@@ -1093,7 +1118,8 @@ fn retrievalSearch(ctx: *Context, body: []const u8) HttpResponse {
     input.include_deprecated = include_deprecated;
     input.use_vector = use_vector;
     input.allow_reranker = allow_reranker;
-    const results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
+    var results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
+    results = maybeLlmRerankResults(ctx, query, results, allow_reranker) catch results;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"plan\":{\"use_keyword\":") catch return serverError(ctx);
@@ -1106,7 +1132,7 @@ fn retrievalSearch(ctx: *Context, body: []const u8) HttpResponse {
     out.appendSlice(ctx.allocator, if (plan.use_reranker) "true" else "false") catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"expanded_query\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, plan.expanded_query) catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, ",\"stages\":[\"acl_filter\",\"query_expansion\",\"keyword\",\"vector_ann\",\"graph_expansion\",\"rrf\",\"temporal_decay\",\"quality_rerank\",\"mmr\",\"citation_assembly\"]},\"results\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"stages\":[\"acl_filter\",\"query_expansion\",\"keyword\",\"vector_ann\",\"graph_expansion\",\"rrf\",\"temporal_decay\",\"quality_rerank\",\"mmr\",\"llm_rerank\",\"citation_assembly\"]},\"results\":") catch return serverError(ctx);
     appendSearchArray(ctx, &out, results) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"groups\":") catch return serverError(ctx);
     appendSearchGroups(ctx, &out, results) catch return serverError(ctx);
@@ -1145,12 +1171,14 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const scope = json.stringField(obj, "scope") orelse "workspace";
-    if (!canProposeRecord(ctx, scope, "[]")) return forbidden(ctx);
+    const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    if (!canProposeRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     const id = ctx.store.appendFeedEvent(.{
         .event_type = json.stringField(obj, "event_type") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing event_type"),
         .object_type = json.stringField(obj, "object_type") orelse "memory_atom",
         .object_id = json.stringField(obj, "object_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing object_id"),
         .scope = scope,
+        .permissions_json = permissions_json,
         .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
         .payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx),
         .status = "pending",
@@ -1165,7 +1193,8 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     const obj = parsed.value.object;
     if (!canApplyFeed(ctx)) return forbidden(ctx);
     const scope = json.stringField(obj, "scope") orelse "workspace";
-    if (!canWriteRecord(ctx, scope, "[]")) return forbidden(ctx);
+    const event_permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    if (!canWriteRecord(ctx, scope, event_permissions_json)) return forbidden(ctx);
     const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
     var memory_input: ?store_mod.MemoryAtomInput = null;
@@ -1179,7 +1208,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     var reserved_event_id: ?i64 = null;
     if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| {
         if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key) catch return serverError(ctx)) |event| {
-            if (!domain.scopeVisible(event.scope, ctx.actor_scopes_json)) return forbidden(ctx);
+            if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return forbidden(ctx);
             if (!std.mem.eql(u8, event.status, "applied")) {
                 const stale_apply_ms: i64 = 5 * 60 * 1000;
                 if (std.mem.eql(u8, event.status, "applying") and ids.nowMs() - event.created_at_ms > stale_apply_ms) {
@@ -1197,6 +1226,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
             .object_type = object_type,
             .object_id = reservation_id,
             .scope = scope,
+            .permissions_json = event_permissions_json,
             .dedupe_key = dedupe_key,
             .payload_json = payload_json,
             .status = "applying",
@@ -1228,6 +1258,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
         .object_type = object_type,
         .object_id = memory_atom_id orelse (json.stringField(obj, "object_id") orelse "unknown"),
         .scope = scope,
+        .permissions_json = event_permissions_json,
         .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
         .payload_json = payload_json,
         .status = "applied",
@@ -1481,7 +1512,8 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
             }
         }
     }
-    const results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
+    var results = ctx.store.search(ctx.allocator, input) catch return serverError(ctx);
+    results = maybeLlmRerankResults(ctx, query, results, input.allow_reranker) catch results;
     const conflicts = if (include_conflicts)
         (if (scan_conflicts)
             ctx.store.scanConflicts(ctx.allocator, .{ .scopes_json = scopes_json, .status = "open", .limit = 10 }) catch return serverError(ctx)
@@ -1585,6 +1617,90 @@ fn buildAskPrompt(ctx: *Context, query: []const u8, results: []domain.SearchResu
     return out.toOwnedSlice(ctx.allocator);
 }
 
+fn maybeLlmRerankResults(ctx: *Context, query: []const u8, results: []domain.SearchResult, enabled: bool) ![]domain.SearchResult {
+    if (!enabled or results.len <= 1 or ctx.llm_base_url == null or ctx.llm_model == null) return results;
+    const prompt = try buildRerankPrompt(ctx.allocator, query, results);
+    const completion = providers.completeAnswer(ctx.allocator, .{
+        .base_url = ctx.llm_base_url,
+        .api_key = ctx.llm_api_key,
+        .model = ctx.llm_model,
+        .timeout_secs = ctx.provider_timeout_secs,
+    }, prompt) catch return results;
+    return parseRerankOrder(ctx.allocator, completion.content, results) catch results;
+}
+
+fn buildRerankPrompt(allocator: std.mem.Allocator, query: []const u8, results: []domain.SearchResult) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "Rerank these retrieval candidates for the query. Return only a JSON array of candidate ids, best first.\nQuery: ");
+    try out.appendSlice(allocator, query);
+    try out.appendSlice(allocator, "\nCandidates:\n");
+    const max_candidates = @min(results.len, @as(usize, 24));
+    for (results[0..max_candidates]) |result| {
+        try out.appendSlice(allocator, "- id=");
+        try out.appendSlice(allocator, result.id);
+        try out.appendSlice(allocator, " type=");
+        try out.appendSlice(allocator, result.result_type);
+        try out.appendSlice(allocator, " status=");
+        try out.appendSlice(allocator, result.status);
+        try out.appendSlice(allocator, " title=");
+        try out.appendSlice(allocator, result.title);
+        try out.appendSlice(allocator, "\n  ");
+        try out.appendSlice(allocator, result.text[0..@min(result.text.len, 512)]);
+        try out.appendSlice(allocator, "\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseRerankOrder(allocator: std.mem.Allocator, llm_output: []const u8, results: []const domain.SearchResult) ![]domain.SearchResult {
+    const selected = try allocator.alloc(bool, results.len);
+    errdefer allocator.free(selected);
+    @memset(selected, false);
+    var out: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
+    errdefer out.deinit(allocator);
+
+    if (std.json.parseFromSlice(std.json.Value, allocator, llm_output, .{})) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value == .array) {
+            for (parsed.value.array.items) |item| {
+                const id_text = switch (item) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                try appendRerankedResult(allocator, &out, results, selected, id_text);
+            }
+        }
+    } else |_| {
+        var it = std.mem.tokenizeAny(u8, llm_output, " \t\r\n,;[]{}()\"'");
+        while (it.next()) |token| {
+            try appendRerankedResult(allocator, &out, results, selected, token);
+        }
+    }
+
+    for (results, 0..) |result, i| {
+        if (selected[i]) continue;
+        try out.append(allocator, result);
+    }
+    allocator.free(selected);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendRerankedResult(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(domain.SearchResult),
+    results: []const domain.SearchResult,
+    selected: []bool,
+    id_text: []const u8,
+) !void {
+    for (results, 0..) |result, i| {
+        if (selected[i]) continue;
+        if (!std.mem.eql(u8, result.id, id_text)) continue;
+        selected[i] = true;
+        try out.append(allocator, result);
+        return;
+    }
+}
+
 fn citationLabel(ctx: *Context, result: domain.SearchResult) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, result.source_ids_json, .{}) catch return result.id;
     defer parsed.deinit();
@@ -1660,6 +1776,14 @@ fn contextPack(ctx: *Context, body: []const u8) HttpResponse {
     out.appendSlice(ctx.allocator, pack.included_memory_atoms_json) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"generated_summary\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, pack.generated_summary) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"sections\":") catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, pack.sections_json, "{}") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"citations\":") catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, pack.citations_json, "[]") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"forbidden_assumptions\":") catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, pack.forbidden_assumptions_json, "[]") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"suggested_next_steps\":") catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, pack.suggested_next_steps_json, "[]") catch return serverError(ctx);
     out.print(ctx.allocator, ",\"token_budget\":{d},\"created_at_ms\":{d}}}", .{ pack.token_budget, pack.created_at_ms }) catch return serverError(ctx);
     out.append(ctx.allocator, '}') catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
@@ -1712,7 +1836,7 @@ fn compatSearch(ctx: *Context, body: []const u8) HttpResponse {
     if (session_id) |sid| {
         if (!sessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
-    const entries = ctx.store.compatSearch(ctx.allocator, query, positiveLimit(json.intField(obj, "limit"), 5), session_id) catch return serverError(ctx);
+    const entries = ctx.store.compatSearch(ctx.allocator, query, positiveLimit(json.intField(obj, "limit"), 5), session_id, ctx.actor_scopes_json) catch return serverError(ctx);
     return compatEntriesResponse(ctx, entries);
 }
 
@@ -2000,7 +2124,7 @@ fn ensureMemoryProvenance(ctx: *Context, input: store_mod.MemoryAtomInput) !stor
     var out = input;
     const has_source = jsonArrayHasStringItems(ctx.allocator, out.source_ids_json);
     if (has_source) {
-        if (!sourceIdsVisible(ctx, out.source_ids_json)) return error.Forbidden;
+        if (!sourceIdsCanBackRecord(ctx, out.source_ids_json, out.scope, out.permissions_json)) return error.Forbidden;
         if (!jsonArrayHasStringItems(ctx.allocator, out.evidence_ranges_json) and !jsonArrayHasObjectItems(ctx.allocator, out.evidence_ranges_json)) {
             const first_source = try firstJsonStringDup(ctx.allocator, out.source_ids_json);
             out.evidence_ranges_json = try evidenceJson(ctx.allocator, first_source orelse "", out.text.len, "provided_source");
@@ -2097,6 +2221,59 @@ fn sourceIdsVisible(ctx: *Context, source_ids_json: []const u8) bool {
         if (!recordVisibleToActor(ctx, source.scope, source.permissions_json)) return false;
     }
     return true;
+}
+
+fn sourceIdsCanBackRecord(ctx: *Context, source_ids_json: []const u8, target_scope: []const u8, target_permissions_json: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, source_ids_json, .{}) catch return false;
+    defer parsed.deinit();
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return false,
+    };
+    for (arr.items) |item| {
+        const source_id = switch (item) {
+            .string => |s| s,
+            else => return false,
+        };
+        const source = (ctx.store.getSource(ctx.allocator, source_id) catch return false) orelse return false;
+        if (!recordVisibleToActor(ctx, source.scope, source.permissions_json)) return false;
+        if (!sourceAclCoversTarget(ctx.allocator, source.scope, source.permissions_json, target_scope, target_permissions_json)) return false;
+    }
+    return true;
+}
+
+fn sourceAclCoversTarget(allocator: std.mem.Allocator, source_scope: []const u8, source_permissions_json: []const u8, target_scope: []const u8, target_permissions_json: []const u8) bool {
+    if (!scopeNoBroader(source_scope, target_scope)) return false;
+    return permissionsNoBroader(allocator, source_permissions_json, target_permissions_json);
+}
+
+fn scopeNoBroader(source_scope: []const u8, target_scope: []const u8) bool {
+    if (std.mem.eql(u8, source_scope, "public")) return true;
+    return std.mem.eql(u8, source_scope, target_scope);
+}
+
+fn permissionsNoBroader(allocator: std.mem.Allocator, source_permissions_json: []const u8, target_permissions_json: []const u8) bool {
+    if (permissionsOpen(source_permissions_json)) return true;
+    if (permissionsOpen(target_permissions_json)) return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, target_permissions_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .array) return false;
+    var saw = false;
+    for (parsed.value.array.items) |item| {
+        const permission = switch (item) {
+            .string => |s| s,
+            else => return false,
+        };
+        if (std.mem.eql(u8, permission, "public")) return false;
+        if (!domain.hasJsonString(source_permissions_json, permission)) return false;
+        saw = true;
+    }
+    return saw;
+}
+
+fn permissionsOpen(permissions_json: []const u8) bool {
+    const trimmed = std.mem.trim(u8, permissions_json, " \t\r\n");
+    return trimmed.len == 0 or std.mem.eql(u8, trimmed, "[]") or domain.hasJsonString(trimmed, "public");
 }
 
 fn sanitizeSourceIdsForActor(ctx: *Context, source_ids_json: []const u8) ![]const u8 {
@@ -2376,6 +2553,55 @@ test "api memory atom response preserves request string lifetimes" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"evidence_ranges\":[{") != null);
 }
 
+test "api refuses memory provenance that is broader than its source acl" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const secret_source = try store.createSource(alloc, .{
+        .title = "Secret source",
+        .content = "secret evidence",
+        .scope = "project:secret",
+        .permissions_json = "[\"project:secret\"]",
+    });
+    var ctx = Context{ .allocator = alloc, .store = &store };
+
+    const bad_body = try std.fmt.allocPrint(alloc, "{{\"text\":\"Secret evidence as public memory\",\"scope\":\"public\",\"status\":\"verified\",\"source_ids\":[\"{s}\"]}}", .{secret_source.id});
+    const bad = handleRequest(&ctx, "POST", "/v1/memory-atoms", bad_body, "");
+    try std.testing.expectEqualStrings("403 Forbidden", bad.status);
+
+    const good_body = try std.fmt.allocPrint(alloc, "{{\"text\":\"Secret evidence remains secret\",\"scope\":\"project:secret\",\"permissions\":[\"project:secret\"],\"status\":\"verified\",\"source_ids\":[\"{s}\"]}}", .{secret_source.id});
+    const good = handleRequest(&ctx, "POST", "/v1/memory-atoms", good_body, "");
+    try std.testing.expectEqualStrings("200 OK", good.status);
+}
+
+test "api feed events are permission filtered in feed and search" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var admin_ctx = Context{ .allocator = alloc, .store = &store };
+    const append = handleRequest(&admin_ctx, "POST", "/v1/memory/feed", "{\"event_type\":\"memory.note\",\"object_type\":\"memory_atom\",\"object_id\":\"mem_secret\",\"scope\":\"public\",\"permissions\":[\"team:secret\"],\"payload\":{\"text\":\"feed-secret-payload\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", append.status);
+
+    var public_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\"]" };
+    const public_feed = handleRequest(&public_ctx, "GET", "/v1/memory/feed", "", "");
+    try std.testing.expectEqualStrings("200 OK", public_feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, public_feed.body, "feed-secret-payload") == null);
+    const public_search = handleRequest(&public_ctx, "POST", "/v1/search", "{\"query\":\"feed-secret-payload\",\"scopes\":[\"public\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", public_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, public_search.body, "feed-secret-payload") == null);
+
+    var secret_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\",\"team:secret\"]" };
+    const secret_feed = handleRequest(&secret_ctx, "GET", "/v1/memory/feed", "", "");
+    try std.testing.expectEqualStrings("200 OK", secret_feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, secret_feed.body, "feed-secret-payload") != null);
+}
+
 test "api nullclaw compatibility protocol" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -2459,6 +2685,39 @@ test "api nullclaw current ApiMemory contract shapes" {
     try std.testing.expectEqualStrings("200 OK", delete_global.status);
     const missing_global = handleRequest(&ctx, "GET", "/v1/nullclaw/memories/key%20with%20spaces", "", "");
     try std.testing.expectEqualStrings("404 Not Found", missing_global.status);
+}
+
+test "api nullclaw search projects accessible NullPantry knowledge" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createMemoryAtom(alloc, .{
+        .text = "NullPantry context packs are prepared agent context.",
+        .scope = "project:nullpantry",
+        .created_by = "human",
+        .status = "verified",
+    });
+    _ = try store.createMemoryAtom(alloc, .{
+        .text = "Secret project memory must not project into NullClaw.",
+        .scope = "project:secret",
+        .created_by = "human",
+        .status = "verified",
+    });
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_scopes_json = "[\"agent:nullclaw\",\"project:nullpantry\"]",
+        .actor_capabilities_json = "[\"read\"]",
+    };
+
+    const resp = handleRequest(&ctx, "POST", "/v1/nullclaw/memories/search", "{\"query\":\"context packs\",\"limit\":10}", "");
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"category\":\"nullpantry.memory_atom\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "NullPantry context packs are prepared agent context.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "Secret project memory") == null);
 }
 
 test "api nullclaw compatibility requires agent scope" {
@@ -2685,7 +2944,7 @@ test "api retrieval search fuses keyword and vector results" {
 
     const resp = handleRequest(&ctx, "POST", "/v1/retrieval/search", "{\"query\":\"hybrid vector\",\"scopes\":[\"public\"],\"limit\":5}", "");
     try std.testing.expectEqualStrings("200 OK", resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"stages\":[\"acl_filter\",\"query_expansion\",\"keyword\",\"vector_ann\",\"graph_expansion\",\"rrf\",\"temporal_decay\",\"quality_rerank\",\"mmr\",\"citation_assembly\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"stages\":[\"acl_filter\",\"query_expansion\",\"keyword\",\"vector_ann\",\"graph_expansion\",\"rrf\",\"temporal_decay\",\"quality_rerank\",\"mmr\",\"llm_rerank\",\"citation_assembly\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "semantic only context") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"groups\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, vector_atom.id) != null);
@@ -3021,6 +3280,22 @@ test "api ask and context pack do not leak requested inaccessible scopes" {
     const ctx_resp = handleRequest(&ctx, "POST", "/v1/context-packs", "{\"task\":\"secret\",\"scopes\":[\"project:secret\"]}", "");
     try std.testing.expectEqualStrings("200 OK", ctx_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, ctx_resp.body, "Secret incident detail") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx_resp.body, "\"sections\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx_resp.body, "\"forbidden_assumptions\":") != null);
+}
+
+test "api rerank parser reorders by returned ids and keeps omitted results" {
+    const alloc = std.testing.allocator;
+    const results = [_]domain.SearchResult{
+        .{ .id = "mem_a", .result_type = "memory_atom", .title = "A", .text = "alpha", .scope = "public", .status = "verified", .score = 0.4, .source_ids_json = "[]", .created_at_ms = 1, .confidence = 0.5 },
+        .{ .id = "mem_b", .result_type = "memory_atom", .title = "B", .text = "beta", .scope = "public", .status = "verified", .score = 0.9, .source_ids_json = "[]", .created_at_ms = 2, .confidence = 0.5 },
+        .{ .id = "mem_c", .result_type = "memory_atom", .title = "C", .text = "gamma", .scope = "public", .status = "verified", .score = 0.1, .source_ids_json = "[]", .created_at_ms = 3, .confidence = 0.5 },
+    };
+    const reranked = try parseRerankOrder(alloc, "[\"mem_b\",\"mem_a\"]", results[0..]);
+    defer alloc.free(reranked);
+    try std.testing.expectEqualStrings("mem_b", reranked[0].id);
+    try std.testing.expectEqualStrings("mem_a", reranked[1].id);
+    try std.testing.expectEqualStrings("mem_c", reranked[2].id);
 }
 
 test "api get source enforces server-side scope" {
@@ -3104,16 +3379,14 @@ test "api ingest creates source artifact extracted memory entities vectors and j
         \\{"title":"Planning","type":"transcript","scope":"project:nullpantry","content":"Decision: NullPantry uses ingestion jobs\nConstraint: every atom has citations\nRisk: stale memory"}
     ;
     const resp = handleRequest(&ctx, "POST", "/v1/ingest", body, "");
-    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expectEqualStrings("202 Accepted", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"queued\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"job\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"artifact\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"memory_atoms\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"predicate\":\"decision\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"name\":\"NullPantry\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"artifact\":{\"id\":\"art_") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"entities\":[{\"id\":\"ent_") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"scope\":\"project:nullpantry\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"vector_chunk_count\":5") != null);
+
+    const worker_resp = handleRequest(&ctx, "POST", "/v1/workers/run", "{\"job_limit\":5,\"outbox_limit\":5}", "");
+    try std.testing.expectEqualStrings("200 OK", worker_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, worker_resp.body, "\"jobs_succeeded\":1") != null);
 
     const search_resp = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"ingestion jobs\",\"scopes\":[\"project:nullpantry\"]}", "");
     try std.testing.expectEqualStrings("200 OK", search_resp.status);

@@ -78,7 +78,11 @@ pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job:
     if (std.mem.eql(u8, job.job_type, "extract_memory") or std.mem.eql(u8, job.job_type, "ingest_source") or std.mem.eql(u8, job.job_type, "ingest")) {
         if (job.object_id.len == 0 or !std.mem.eql(u8, job.object_type, "source")) return error.UnsupportedJob;
         const source = (try store.getSource(allocator, job.object_id)) orelse return error.SourceNotFound;
-        const extracted = try extractSource(allocator, store, source, options);
+        const job_options = ExtractionJobOptions{
+            .create_artifact = jobBoolOption(allocator, job.input_json, "create_artifact", true),
+            .extract_memory = if (std.mem.eql(u8, job.job_type, "extract_memory")) true else jobBoolOption(allocator, job.input_json, "extract_memory", true),
+        };
+        const extracted = try extractSource(allocator, store, source, options, job_options);
         return try std.fmt.allocPrint(allocator, "{{\"source_id\":\"{s}\",\"artifact_count\":{d},\"memory_atom_count\":{d},\"entity_count\":{d},\"vector_chunk_count\":{d}}}", .{ source.id, extracted.artifact_count, extracted.memory_atom_count, extracted.entity_count, extracted.vector_chunk_count });
     }
     return error.UnsupportedJob;
@@ -91,7 +95,23 @@ const ExtractionCounts = struct {
     vector_chunk_count: usize = 0,
 };
 
-fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: domain.Source, options: RunOptions) !ExtractionCounts {
+const ExtractionJobOptions = struct {
+    create_artifact: bool = true,
+    extract_memory: bool = true,
+};
+
+fn jobBoolOption(allocator: std.mem.Allocator, input_json: []const u8, name: []const u8, fallback: bool) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, input_json, .{}) catch return fallback;
+    defer parsed.deinit();
+    if (parsed.value != .object) return fallback;
+    const value = parsed.value.object.get(name) orelse return fallback;
+    return switch (value) {
+        .bool => |b| b,
+        else => fallback,
+    };
+}
+
+fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: domain.Source, options: RunOptions, job_options: ExtractionJobOptions) !ExtractionCounts {
     var counts = ExtractionCounts{};
     counts.vector_chunk_count += try upsertVector(allocator, store, options, "source", source.id, source.content, source.scope, source.permissions_json);
 
@@ -100,25 +120,28 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
     const entities = try resolveEntities(allocator, store, entity_names_json, source.scope, source.permissions_json);
     counts.entity_count = entities.len;
 
-    const artifact_title = try extraction.sourceTitleForArtifact(allocator, source.title, source.source_type);
-    const summary = try extraction.summarize(allocator, source.content, 512);
-    const agent_summary = try extraction.summarize(allocator, source.content, 1024);
-    const artifact = try store.createArtifact(allocator, .{
-        .artifact_type = extraction.artifactTypeForSource(source.source_type),
-        .title = artifact_title,
-        .body = source.content,
-        .status = "verified",
-        .owner = source.author,
-        .scope = source.scope,
-        .source_ids_json = source_ids_json,
-        .related_entities_json = entity_names_json,
-        .permissions_json = source.permissions_json,
-        .summary = summary,
-        .agent_summary = agent_summary,
-    });
-    counts.artifact_count = 1;
-    counts.vector_chunk_count += try upsertVector(allocator, store, options, "artifact", artifact.id, source.content, source.scope, source.permissions_json);
+    if (job_options.create_artifact) {
+        const artifact_title = try extraction.sourceTitleForArtifact(allocator, source.title, source.source_type);
+        const summary = try extraction.summarize(allocator, source.content, 512);
+        const agent_summary = try extraction.summarize(allocator, source.content, 1024);
+        const artifact = try store.createArtifact(allocator, .{
+            .artifact_type = extraction.artifactTypeForSource(source.source_type),
+            .title = artifact_title,
+            .body = source.content,
+            .status = "verified",
+            .owner = source.author,
+            .scope = source.scope,
+            .source_ids_json = source_ids_json,
+            .related_entities_json = entity_names_json,
+            .permissions_json = source.permissions_json,
+            .summary = summary,
+            .agent_summary = agent_summary,
+        });
+        counts.artifact_count = 1;
+        counts.vector_chunk_count += try upsertVector(allocator, store, options, "artifact", artifact.id, source.content, source.scope, source.permissions_json);
+    }
 
+    if (!job_options.extract_memory) return counts;
     var lines = std.mem.splitScalar(u8, source.content, '\n');
     var offset: usize = 0;
     var line_no: usize = 1;
