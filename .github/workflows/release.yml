@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    uses: nullclaw/nullbuilder/.github/workflows/zig-release.yml@v1
+    permissions:
+      contents: write
+    secrets: inherit
+    with:
+      binary_name: nullpantry
+      artifact_prefix: nullpantry
+      zig_version: "0.16.0"
+      targets_json: >-
+        [
+          {"os":"ubuntu-latest","target":"linux-x86_64","zig_target":"x86_64-linux-musl","zig_cpu":"","ext":""},
+          {"os":"ubuntu-latest","target":"linux-aarch64","zig_target":"aarch64-linux-musl","zig_cpu":"","ext":""},
+          {"os":"ubuntu-latest","target":"linux-riscv64","zig_target":"riscv64-linux-musl","zig_cpu":"","ext":""},
+          {"os":"macos-latest","target":"macos-aarch64","zig_target":"aarch64-macos","zig_cpu":"","ext":""},
+          {"os":"macos-latest","target":"macos-x86_64","zig_target":"x86_64-macos","zig_cpu":"","ext":""},
+          {"os":"windows-latest","target":"windows-x86_64","zig_target":"x86_64-windows","zig_cpu":"","ext":".exe"},
+          {"os":"windows-latest","target":"windows-aarch64","zig_target":"aarch64-windows","zig_cpu":"","ext":".exe"}
+        ]
+      source_archive: true
+      source_archive_name: nullpantry-source-${{ github.ref_name }}.tar.gz
+      source_archive_excludes: |
+        .git
+        .zig-cache
+        zig-out
+        .nullpantry

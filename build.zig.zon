@@ -1,0 +1,18 @@
+.{
+    .name = .nullpantry,
+    .version = "2026.5.26",
+    .fingerprint = 0x4e638826a4ccfab5,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .sqlite3 = .{
+            .path = "vendor/sqlite3",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "README.md",
+        "src",
+        "vendor",
+    },
+}

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  zig:
+    uses: nullclaw/nullbuilder/.github/workflows/zig-ci.yml@v1
+    permissions:
+      contents: read
+    with:
+      binary_name: nullpantry
+      artifact_prefix: nullpantry
+      zig_version: "0.16.0"
+      test_command: zig build test --summary all
+      targets_json: >-
+        [
+          {"os":"ubuntu-latest","target":"linux-x86_64","zig_target":"x86_64-linux-musl"},
+          {"os":"ubuntu-latest","target":"linux-aarch64","zig_target":"aarch64-linux-musl"},
+          {"os":"macos-latest","target":"macos-aarch64","zig_target":"aarch64-macos"},
+          {"os":"windows-latest","target":"windows-x86_64","zig_target":"x86_64-windows"}
+        ]
