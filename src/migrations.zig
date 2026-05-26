@@ -194,6 +194,44 @@ pub const sqlite_schema =
     \\  summary_json TEXT NOT NULL DEFAULT '{}',
     \\  created_at_ms INTEGER NOT NULL
     \\);
+    \\CREATE TABLE IF NOT EXISTS jobs (
+    \\  id TEXT PRIMARY KEY,
+    \\  job_type TEXT NOT NULL,
+    \\  status TEXT NOT NULL DEFAULT 'queued',
+    \\  scope TEXT NOT NULL DEFAULT 'workspace',
+    \\  object_type TEXT NOT NULL DEFAULT '',
+    \\  object_id TEXT NOT NULL DEFAULT '',
+    \\  input_json TEXT NOT NULL DEFAULT '{}',
+    \\  result_json TEXT NOT NULL DEFAULT '{}',
+    \\  error_text TEXT,
+    \\  attempts INTEGER NOT NULL DEFAULT 0,
+    \\  created_at_ms INTEGER NOT NULL,
+    \\  updated_at_ms INTEGER NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_jobs_scope_status ON jobs(scope, status, created_at_ms);
+    \\CREATE TABLE IF NOT EXISTS knowledge_conflicts (
+    \\  id TEXT PRIMARY KEY,
+    \\  conflict_type TEXT NOT NULL,
+    \\  object_a_type TEXT NOT NULL,
+    \\  object_a_id TEXT NOT NULL,
+    \\  object_b_type TEXT NOT NULL,
+    \\  object_b_id TEXT NOT NULL,
+    \\  scope TEXT NOT NULL DEFAULT 'workspace',
+    \\  status TEXT NOT NULL DEFAULT 'open',
+    \\  summary TEXT NOT NULL,
+    \\  created_at_ms INTEGER NOT NULL,
+    \\  resolved_at_ms INTEGER
+    \\);
+    \\CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_conflicts_pair ON knowledge_conflicts(conflict_type, object_a_id, object_b_id);
+    \\CREATE TABLE IF NOT EXISTS connector_cursors (
+    \\  connector TEXT NOT NULL,
+    \\  scope TEXT NOT NULL,
+    \\  cursor TEXT NOT NULL DEFAULT '',
+    \\  config_json TEXT NOT NULL DEFAULT '{}',
+    \\  updated_at_ms INTEGER NOT NULL,
+    \\  PRIMARY KEY (connector, scope)
+    \\);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', strftime('%s','now') * 1000);
 ;
 
 pub const postgres_schema =
@@ -394,6 +432,44 @@ pub const postgres_schema =
     \\  summary_json jsonb NOT NULL DEFAULT '{}',
     \\  created_at_ms bigint NOT NULL
     \\);
+    \\CREATE TABLE IF NOT EXISTS jobs (
+    \\  id text PRIMARY KEY,
+    \\  job_type text NOT NULL,
+    \\  status text NOT NULL DEFAULT 'queued',
+    \\  scope text NOT NULL DEFAULT 'workspace',
+    \\  object_type text NOT NULL DEFAULT '',
+    \\  object_id text NOT NULL DEFAULT '',
+    \\  input_json jsonb NOT NULL DEFAULT '{}',
+    \\  result_json jsonb NOT NULL DEFAULT '{}',
+    \\  error_text text,
+    \\  attempts bigint NOT NULL DEFAULT 0,
+    \\  created_at_ms bigint NOT NULL,
+    \\  updated_at_ms bigint NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS jobs_scope_status_idx ON jobs(scope, status, created_at_ms);
+    \\CREATE TABLE IF NOT EXISTS knowledge_conflicts (
+    \\  id text PRIMARY KEY,
+    \\  conflict_type text NOT NULL,
+    \\  object_a_type text NOT NULL,
+    \\  object_a_id text NOT NULL,
+    \\  object_b_type text NOT NULL,
+    \\  object_b_id text NOT NULL,
+    \\  scope text NOT NULL DEFAULT 'workspace',
+    \\  status text NOT NULL DEFAULT 'open',
+    \\  summary text NOT NULL,
+    \\  created_at_ms bigint NOT NULL,
+    \\  resolved_at_ms bigint
+    \\);
+    \\CREATE UNIQUE INDEX IF NOT EXISTS knowledge_conflicts_pair_idx ON knowledge_conflicts(conflict_type, object_a_id, object_b_id);
+    \\CREATE TABLE IF NOT EXISTS connector_cursors (
+    \\  connector text NOT NULL,
+    \\  scope text NOT NULL,
+    \\  cursor text NOT NULL DEFAULT '',
+    \\  config_json jsonb NOT NULL DEFAULT '{}',
+    \\  updated_at_ms bigint NOT NULL,
+    \\  PRIMARY KEY (connector, scope)
+    \\);
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
 ;
 
 test "sqlite migration includes core primitive tables and indexes" {
@@ -418,6 +494,10 @@ test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS response_cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS semantic_cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS lifecycle_snapshots") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS jobs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS knowledge_conflicts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS connector_cursors") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'ingest_jobs_conflicts'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE UNIQUE INDEX IF NOT EXISTS idx_compat_memories_key_session") != null);
 }
 
@@ -439,6 +519,10 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS response_cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS semantic_cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS lifecycle_snapshots") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS jobs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS knowledge_conflicts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS connector_cursors") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'ingest_jobs_conflicts'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE EXTENSION IF NOT EXISTS vector") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "embedding vector(1536)") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "vector_cosine_ops") != null);

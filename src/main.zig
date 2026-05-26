@@ -213,6 +213,7 @@ test {
     _ = @import("vector.zig");
     _ = @import("retrieval.zig");
     _ = @import("lifecycle.zig");
+    _ = @import("extraction.zig");
     _ = @import("store.zig");
     _ = @import("api.zig");
 }
