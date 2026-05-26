@@ -153,6 +153,13 @@ pub const Store = struct {
         };
     }
 
+    pub fn runVectorOutbox(self: *Store, limit: usize) !VectorOutboxRunResult {
+        return switch (self.backend) {
+            .sqlite => |*s| s.runVectorOutbox(limit),
+            .postgres => |*p| p.runVectorOutbox(limit),
+        };
+    }
+
     pub fn appendFeedEvent(self: *Store, input: FeedEventInput) !i64 {
         return switch (self.backend) {
             .sqlite => |*s| s.appendFeedEvent(input),
@@ -490,6 +497,11 @@ pub const VectorOutboxInput = struct {
     object_type: []const u8,
     object_id: []const u8,
     payload_json: []const u8 = "{}",
+};
+
+pub const VectorOutboxRunResult = struct {
+    processed: usize = 0,
+    failed: usize = 0,
 };
 
 pub const FeedEventInput = struct {
@@ -1824,6 +1836,18 @@ pub const SQLiteStore = struct {
         return @intCast(try self.countSql("SELECT COUNT(*) FROM vector_outbox"));
     }
 
+    pub fn runVectorOutbox(self: *Self, limit: usize) !VectorOutboxRunResult {
+        const capped = @max(@as(usize, 1), @min(limit, 1000));
+        const stmt = try self.prepare("UPDATE vector_outbox SET status = 'delivered_local', attempts = attempts + 1, updated_at_ms = ?1 WHERE id IN (SELECT id FROM vector_outbox WHERE status = 'pending' ORDER BY id LIMIT ?2)");
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, ids.nowMs());
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(capped));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+        const changed: usize = @intCast(c.sqlite3_changes(self.db));
+        if (changed > 0) self.insertAudit("vector_outbox.delivered_local", "vector_outbox", "batch");
+        return .{ .processed = changed, .failed = 0 };
+    }
+
     pub fn appendFeedEvent(self: *Self, input: FeedEventInput) !i64 {
         if (input.dedupe_key) |key| {
             if (try self.feedEventIdByDedupeKey(key)) |existing_id| return existing_id;
@@ -2889,6 +2913,15 @@ pub const PostgresStore = struct {
         const text = try self.queryText(self.allocator, sql);
         defer self.allocator.free(text);
         return std.fmt.parseInt(usize, text, 10) catch 0;
+    }
+
+    pub fn runVectorOutbox(self: *PostgresStore, limit: usize) !VectorOutboxRunResult {
+        const capped = @max(@as(usize, 1), @min(limit, 1000));
+        const now = ids.nowMs();
+        const sql = try std.fmt.allocPrint(self.allocator, "WITH updated AS (UPDATE vector_outbox SET status = 'delivered_local', attempts = attempts + 1, updated_at_ms = {d} WHERE id IN (SELECT id FROM vector_outbox WHERE status = 'pending' ORDER BY id LIMIT {d}) RETURNING id) SELECT count(*)::text FROM updated", .{ now, capped });
+        const text = try self.queryText(self.allocator, sql);
+        defer self.allocator.free(text);
+        return .{ .processed = std.fmt.parseInt(usize, text, 10) catch 0, .failed = 0 };
     }
 
     pub fn appendFeedEvent(self: *PostgresStore, input: FeedEventInput) !i64 {

@@ -4,6 +4,7 @@ const compat = @import("compat.zig");
 const api = @import("api.zig");
 const ids = @import("ids.zig");
 const store_mod = @import("store.zig");
+const worker = @import("worker.zig");
 
 const default_port: u16 = 8765;
 const max_request_size: usize = 2 * 1024 * 1024;
@@ -18,6 +19,15 @@ const RuntimeConfig = struct {
     token: ?[]const u8 = null,
     actor_scopes_json: []const u8 = "[\"admin\"]",
     actor_capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
+    embedding_base_url: ?[]const u8 = null,
+    embedding_api_key: ?[]const u8 = null,
+    embedding_model: ?[]const u8 = null,
+    embedding_dimensions: usize = 64,
+    llm_base_url: ?[]const u8 = null,
+    llm_api_key: ?[]const u8 = null,
+    llm_model: ?[]const u8 = null,
+    provider_timeout_secs: u32 = 30,
+    worker_interval_ms: u64 = 5000,
 };
 
 const ServerState = struct {
@@ -52,6 +62,11 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("storage backend: {s}\n", .{@tagName(cfg.backend)});
 
     var state = ServerState{ .allocator = allocator, .store = &store, .cfg = cfg };
+    if (cfg.worker_interval_ms > 0) {
+        const worker_thread = try std.Thread.spawn(.{}, workerLoop, .{&state});
+        worker_thread.detach();
+        std.debug.print("worker interval: {d}ms\n", .{cfg.worker_interval_ms});
+    }
     while (true) {
         const conn = server.accept(compat.io()) catch |err| {
             std.debug.print("accept error: {}\n", .{err});
@@ -88,7 +103,21 @@ fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
     const target = parts.next() orelse return;
     const body = @import("json_util.zig").extractBody(raw);
 
-    var ctx = api.Context{ .allocator = req_alloc, .store = state.store, .required_token = state.cfg.token, .actor_scopes_json = state.cfg.actor_scopes_json, .actor_capabilities_json = state.cfg.actor_capabilities_json };
+    var ctx = api.Context{
+        .allocator = req_alloc,
+        .store = state.store,
+        .required_token = state.cfg.token,
+        .actor_scopes_json = state.cfg.actor_scopes_json,
+        .actor_capabilities_json = state.cfg.actor_capabilities_json,
+        .embedding_base_url = state.cfg.embedding_base_url,
+        .embedding_api_key = state.cfg.embedding_api_key,
+        .embedding_model = state.cfg.embedding_model,
+        .embedding_dimensions = state.cfg.embedding_dimensions,
+        .llm_base_url = state.cfg.llm_base_url,
+        .llm_api_key = state.cfg.llm_api_key,
+        .llm_model = state.cfg.llm_model,
+        .provider_timeout_secs = state.cfg.provider_timeout_secs,
+    };
     state.store_mutex.lockUncancelable(compat.io());
     const response = api.handleRequest(&ctx, method, target, body, raw);
     state.store_mutex.unlock(compat.io());
@@ -108,6 +137,29 @@ fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
     writer.interface.flush() catch return;
 }
 
+fn workerLoop(state: *ServerState) void {
+    while (true) {
+        std.Io.sleep(compat.io(), .fromNanoseconds(@intCast(state.cfg.worker_interval_ms * std.time.ns_per_ms)), .awake) catch {};
+        var arena = std.heap.ArenaAllocator.init(state.allocator);
+        state.store_mutex.lockUncancelable(compat.io());
+        const result = worker.runOnce(arena.allocator(), state.store, .{
+            .scopes_json = state.cfg.actor_scopes_json,
+            .job_limit = 25,
+            .outbox_limit = 250,
+        }) catch |err| {
+            state.store_mutex.unlock(compat.io());
+            arena.deinit();
+            std.debug.print("event=worker_error error={}\n", .{err});
+            continue;
+        };
+        state.store_mutex.unlock(compat.io());
+        arena.deinit();
+        if (result.jobs_checked > 0 or result.vector_outbox_processed > 0 or result.vector_outbox_failed > 0) {
+            std.debug.print("event=worker_run jobs_checked={d} jobs_succeeded={d} jobs_failed={d} vector_outbox_processed={d} vector_outbox_failed={d}\n", .{ result.jobs_checked, result.jobs_succeeded, result.jobs_failed, result.vector_outbox_processed, result.vector_outbox_failed });
+        }
+    }
+}
+
 fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeConfig {
     var cfg = RuntimeConfig{};
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_TOKEN")) |token| {
@@ -122,6 +174,33 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_CAPABILITIES")) |caps| {
         cfg.actor_capabilities_json = caps;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_BASE_URL")) |url| {
+        cfg.embedding_base_url = url;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_API_KEY")) |key| {
+        cfg.embedding_api_key = key;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_MODEL")) |model| {
+        cfg.embedding_model = model;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_DIMENSIONS")) |dims| {
+        cfg.embedding_dimensions = std.fmt.parseInt(usize, dims, 10) catch cfg.embedding_dimensions;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LLM_BASE_URL")) |url| {
+        cfg.llm_base_url = url;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LLM_API_KEY")) |key| {
+        cfg.llm_api_key = key;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LLM_MODEL")) |model| {
+        cfg.llm_model = model;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_PROVIDER_TIMEOUT_SECS")) |secs| {
+        cfg.provider_timeout_secs = std.fmt.parseInt(u32, secs, 10) catch cfg.provider_timeout_secs;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_WORKER_INTERVAL_MS")) |interval| {
+        cfg.worker_interval_ms = std.fmt.parseInt(u64, interval, 10) catch cfg.worker_interval_ms;
     } else |_| {}
 
     var i: usize = 1;
@@ -159,6 +238,33 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--actor-capabilities") and i + 1 < args.len) {
             i += 1;
             cfg.actor_capabilities_json = args[i];
+        } else if (std.mem.eql(u8, arg, "--embedding-base-url") and i + 1 < args.len) {
+            i += 1;
+            cfg.embedding_base_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--embedding-api-key") and i + 1 < args.len) {
+            i += 1;
+            cfg.embedding_api_key = args[i];
+        } else if (std.mem.eql(u8, arg, "--embedding-model") and i + 1 < args.len) {
+            i += 1;
+            cfg.embedding_model = args[i];
+        } else if (std.mem.eql(u8, arg, "--embedding-dimensions") and i + 1 < args.len) {
+            i += 1;
+            cfg.embedding_dimensions = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--llm-base-url") and i + 1 < args.len) {
+            i += 1;
+            cfg.llm_base_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--llm-api-key") and i + 1 < args.len) {
+            i += 1;
+            cfg.llm_api_key = args[i];
+        } else if (std.mem.eql(u8, arg, "--llm-model") and i + 1 < args.len) {
+            i += 1;
+            cfg.llm_model = args[i];
+        } else if (std.mem.eql(u8, arg, "--provider-timeout-secs") and i + 1 < args.len) {
+            i += 1;
+            cfg.provider_timeout_secs = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--worker-interval-ms") and i + 1 < args.len) {
+            i += 1;
+            cfg.worker_interval_ms = try std.fmt.parseInt(u64, args[i], 10);
         }
     }
     return cfg;
@@ -174,6 +280,15 @@ fn printUsage() void {
         \\  NULLPANTRY_DATABASE_URL
         \\  NULLPANTRY_SCOPES
         \\  NULLPANTRY_CAPABILITIES
+        \\  NULLPANTRY_EMBEDDING_BASE_URL
+        \\  NULLPANTRY_EMBEDDING_API_KEY
+        \\  NULLPANTRY_EMBEDDING_MODEL
+        \\  NULLPANTRY_EMBEDDING_DIMENSIONS
+        \\  NULLPANTRY_LLM_BASE_URL
+        \\  NULLPANTRY_LLM_API_KEY
+        \\  NULLPANTRY_LLM_MODEL
+        \\  NULLPANTRY_PROVIDER_TIMEOUT_SECS
+        \\  NULLPANTRY_WORKER_INTERVAL_MS
         \\
     , .{});
 }
@@ -238,7 +353,10 @@ test {
     _ = @import("vector.zig");
     _ = @import("retrieval.zig");
     _ = @import("lifecycle.zig");
+    _ = @import("providers.zig");
+    _ = @import("artifacts.zig");
     _ = @import("extraction.zig");
+    _ = @import("worker.zig");
     _ = @import("store.zig");
     _ = @import("api.zig");
 }
