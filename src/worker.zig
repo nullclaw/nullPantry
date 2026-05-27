@@ -173,7 +173,7 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
             .artifact_type = extraction.artifactTypeForSource(source.source_type),
             .title = artifact_title,
             .body = source.content,
-            .status = "verified",
+            .status = "draft",
             .owner = source.author,
             .scope = source.scope,
             .source_ids_json = source_ids_json,

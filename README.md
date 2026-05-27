@@ -48,7 +48,7 @@ For NullClaw remote memory, `agent:nullclaw` grants access to the compatibility 
 
 Reverse proxies can pass `X-NullPantry-Actor-Id`, `X-NullPantry-Actor-Scopes`, and `X-NullPantry-Actor-Capabilities`. Non-admin tokens can only narrow their configured scopes/capabilities; they cannot escalate through headers or request bodies.
 
-Provider-backed embeddings and Ask generation are optional. Without these variables, NullPantry uses the local deterministic embedding fallback and extractive citation-backed answers:
+Provider-backed embeddings, Ask generation, and LLM reranking are optional. Without these variables, NullPantry uses the local deterministic embedding fallback and extractive citation-backed answers:
 
 ```sh
 export NULLPANTRY_EMBEDDING_BASE_URL="https://api.example.com/v1"
@@ -61,7 +61,7 @@ export NULLPANTRY_LLM_MODEL="chat-model"
 export NULLPANTRY_LLM_API_KEY="..."
 ```
 
-Provider endpoints and API keys are server-side configuration only; request bodies cannot override provider `base_url`, `api_key`, model, or timeout fields. If no embedding provider is configured, NullPantry uses deterministic local embeddings. Explicit embedding/indexing operations fail closed when the configured provider fails. Retrieval endpoints degrade to permission-filtered keyword/global/entity search by default so `/v1/search`, `/v1/ask`, and `/v1/context-packs` remain usable during provider outages; pass `"strict_vector": true` to fail the request instead. `GET /v1/providers` exposes the concrete and compatible provider contracts for agents and deployment tooling.
+Provider endpoints and API keys are server-side configuration only; request bodies cannot override provider `base_url`, `api_key`, model, or timeout fields. If no embedding provider is configured, NullPantry uses deterministic local embeddings. Explicit embedding/indexing operations fail closed when the configured provider fails. Retrieval endpoints degrade to permission-filtered keyword/global/entity search by default so `/v1/search`, `/v1/ask`, and `/v1/context-packs` remain usable during provider outages; pass `"strict_vector": true` to fail the request instead. `/v1/ask` remains extractive by default even when an LLM provider is configured; callers must pass `"use_llm": true` to send retrieved evidence to the provider. `GET /v1/providers` exposes the concrete and compatible provider contracts for agents and deployment tooling.
 
 The built-in worker loop runs every 5 seconds by default. Set `NULLPANTRY_WORKER_INTERVAL_MS=0` to disable it, or call `POST /v1/workers/run` manually.
 
@@ -69,7 +69,7 @@ NullClaw can use the compatibility surface with:
 
 ```sh
 export NULLPANTRY_TOKEN="dev-secret"
-export NULLPANTRY_SCOPES='["agent:nullclaw"]'
+export NULLPANTRY_SCOPES='["agent:nullclaw","session:*","write:session:*"]'
 export NULLPANTRY_CAPABILITIES='["read","write","delete"]'
 ```
 
@@ -90,7 +90,7 @@ export NULLPANTRY_CAPABILITIES='["read","write","delete"]'
 
 Native API lives under `/v1`: spaces, policy scopes, sources, artifacts, memory atoms, entities, relations, search, ask, context packs, remember, forget, verify, and mark-stale.
 
-NullClaw compatibility lives under `/v1/nullclaw` and supports remote API memory, session messages, usage, history, and health endpoints. `POST /v1/nullclaw/memories/search` preserves the current NullClaw JSON protocol while also returning a synthetic `nullpantry.context_pack` `MemoryEntry` plus projected first-class NullPantry knowledge, so a NullClaw `memory.backend = "api"` token can retrieve project/team/public Pantry context without a NullClaw runtime change. Session-scoped recalls filter compatibility context to the requested session so global NullClaw memories do not bleed into session results. `zig build nullclaw-runtime-contract` checks the current NullClaw `src/memory/engines/api.zig` source contract, using `NULLCLAW_REPO` when it points at a checkout and otherwise cloning `nullclaw/nullclaw`; set `NULLPANTRY_RUN_NULLCLAW_TESTS=1` to also run NullClaw's Zig test suite against a live NullPantry service.
+NullClaw compatibility lives under `/v1/nullclaw` and supports remote API memory, session messages, usage, history, and health endpoints. `POST /v1/nullclaw/memories/search` preserves the current NullClaw JSON protocol while also returning a synthetic `nullpantry.context_pack` `MemoryEntry` plus projected first-class NullPantry knowledge, so a NullClaw `memory.backend = "api"` token can retrieve project/team/public Pantry context without a NullClaw runtime change. Session-scoped recalls filter compatibility context to the requested session so global NullClaw memories do not bleed into session results. `zig build nullclaw-runtime-contract` checks the current NullClaw `src/memory/engines/api.zig` source contract and runs a live NullPantry compatibility smoke for memory, search, count, session, usage, history, and health endpoints. It uses `NULLCLAW_REPO` when it points at a checkout, detects common nested workspace checkouts such as `../nullclaw/nullclaw`, and otherwise clones `nullclaw/nullclaw`; set `NULLPANTRY_RUN_NULLCLAW_TESTS=1` to also run NullClaw's Zig test suite against a live NullPantry service.
 
 Native memory writes always end with provenance. If a caller omits `source_ids` or `evidence_ranges`, NullPantry creates an internal `Source` with the same scope/permissions and attaches an evidence range for the saved text. NullClaw compatibility writes do the same through `agent_observation` sources.
 
@@ -99,7 +99,7 @@ Additional agent-memory surfaces:
 - `GET /v1/capabilities`, `GET /v1/openapi.json`, `GET /v1/providers`, `GET /v1/connectors`, `GET /v1/artifact-types`, and `GET /v1/sdk/manifest` describe the headless service contract for agents and NullHub/NullDesk consumers.
 - `GET|POST /v1/spaces` and `GET|POST /v1/policy-scopes` make Shelves/Spaces and scope policy first-class records instead of plain strings, with the same ACL filtering used by retrieval.
 - `POST /v1/ingest` and `POST /v1/extract-memory` are durable-first: they create a source plus queued job by default, and workers derive artifacts, extract structured memory lines such as `Decision:`, `Constraint:`, `Action:`, `Question:`, `Risk:`, ticket fields, PR/commit links, dependencies, incident symptoms, root causes, and mitigations, resolve Null ecosystem entities, and apply the extracted artifact/entities/atoms as one storage operation before indexing rebuildable vector chunks. Pass `run_now:true` only for tests or controlled one-shot imports.
-- `POST /v1/connectors/:name/ingest` and `GET|POST /v1/connectors/:name/cursor` provide built-in push connector contracts for NullTickets, NullWatch, tickets, incidents, transcripts, git/PR imports, and manual sources. Connector cursors are permission-filtered first-class records, so sync state cannot leak across projects/teams and connector ingests can atomically advance `next_cursor` with the imported sources.
+- `POST /v1/connectors/:name/ingest` and `GET|POST /v1/connectors/:name/cursor` provide built-in push connector contracts for NullTickets, NullWatch, tickets, incidents, transcripts, git/PR imports, and manual sources. Connector cursors are permission-filtered first-class records, so sync state cannot leak across projects/teams, and connector ingests advance `next_cursor` only after every submitted item has imported successfully.
 - Transcript extraction accepts timestamp/speaker-prefixed lines such as `[00:01:04] Alice: Decision: ...`, records evidence ranges, and chunks long source/artifact text into multiple permission-filtered vector chunks instead of indexing only one whole-document vector.
 - `GET|POST /v1/jobs`, `POST /v1/jobs/:id/run`, and `POST /v1/workers/run` persist and execute extraction, hygiene, conflict scan, and vector-outbox jobs with scoped visibility.
 - `GET /v1/conflicts` and `POST /v1/conflicts/scan` detect contradictory visible memory atoms, keeping inaccessible scopes out of conflict summaries.

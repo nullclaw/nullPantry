@@ -691,10 +691,9 @@ fn connectorIngest(ctx: *Context, connector: []const u8, body: []const u8) HttpR
     const default_scope = json.stringField(obj, "scope") orelse "workspace";
     const default_permissions = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
     const run_now = json.boolField(obj, "run_now") orelse false;
-    const updated_cursor = connectorCursorFromIngest(ctx, connector, obj, default_scope, default_permissions) catch |err| switch (err) {
+    const cursor_input = connectorCursorInputFromIngest(ctx, connector, obj, default_scope, default_permissions) catch |err| switch (err) {
         error.Forbidden => return forbidden(ctx),
         error.InvalidPayload => return badJson(ctx),
-        else => return serverError(ctx),
     };
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -738,7 +737,8 @@ fn connectorIngest(ctx: *Context, connector: []const u8, body: []const u8) HttpR
 
     out.print(ctx.allocator, "],\"count\":{d},\"run_now\":", .{count}) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, if (run_now) "true" else "false") catch return serverError(ctx);
-    if (updated_cursor) |cursor| {
+    if (cursor_input) |input| {
+        const cursor = ctx.store.upsertConnectorCursor(ctx.allocator, input) catch return serverError(ctx);
         out.appendSlice(ctx.allocator, ",\"cursor\":") catch return serverError(ctx);
         cursor.writeJson(ctx.allocator, &out) catch return serverError(ctx);
     }
@@ -746,19 +746,19 @@ fn connectorIngest(ctx: *Context, connector: []const u8, body: []const u8) HttpR
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
-fn connectorCursorFromIngest(ctx: *Context, connector: []const u8, obj: std.json.ObjectMap, default_scope: []const u8, default_permissions: []const u8) !?store_mod.ConnectorCursor {
+fn connectorCursorInputFromIngest(ctx: *Context, connector: []const u8, obj: std.json.ObjectMap, default_scope: []const u8, default_permissions: []const u8) !?store_mod.ConnectorCursorInput {
     const cursor_value = json.stringField(obj, "next_cursor") orelse json.stringField(obj, "cursor") orelse return null;
     const scope = json.stringField(obj, "cursor_scope") orelse default_scope;
     const permissions_json = rawField(ctx.allocator, obj, "cursor_permissions", default_permissions) catch return error.InvalidPayload;
     if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
-    return try ctx.store.upsertConnectorCursor(ctx.allocator, .{
+    return .{
         .connector = connector,
         .scope = scope,
         .cursor = cursor_value,
         .config_json = rawField(ctx.allocator, obj, "config", "{}") catch return error.InvalidPayload,
         .permissions_json = permissions_json,
         .actor_id = ctx.actor_id,
-    });
+    };
 }
 
 fn connectorIngestOne(ctx: *Context, connector: []const u8, obj: std.json.ObjectMap, default_scope: []const u8, default_permissions: []const u8) !domain.Source {
@@ -1001,7 +1001,7 @@ fn runExtraction(ctx: *Context, source: domain.Source, create_artifact: bool, ex
             .artifact_type = extraction.artifactTypeForSource(source.source_type),
             .title = artifact_title,
             .body = source.content,
-            .status = "verified",
+            .status = "draft",
             .owner = source.author,
             .scope = source.scope,
             .source_ids_json = source_ids_json,
@@ -1374,7 +1374,10 @@ fn vectorUpsert(ctx: *Context, body: []const u8) HttpResponse {
         .model = json.nullableStringField(obj, "model"),
         .dimensions = dims,
         .actor_id = ctx.actor_id,
-    }) catch return serverError(ctx);
+    }) catch |err| switch (err) {
+        error.InvalidVectorTarget => return json.errorResponse(ctx.allocator, 404, "not_found", "Vector target object not found"),
+        else => return serverError(ctx),
+    };
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"vector_chunk\":{\"id\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, chunk.id) catch return serverError(ctx);
@@ -1592,6 +1595,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     const scope = json.stringField(obj, "scope") orelse "workspace";
     const event_permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
     if (!canWriteRecord(ctx, scope, event_permissions_json)) return forbidden(ctx);
+    const event_type = json.stringField(obj, "event_type") orelse "memory_atom.upsert";
     const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
     var memory_input: ?store_mod.MemoryAtomInput = null;
@@ -1619,7 +1623,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
         }
         const reservation_id = ids.make(ctx.allocator, "apply_") catch return serverError(ctx);
         reserved_event_id = ctx.store.appendFeedEvent(.{
-            .event_type = json.stringField(obj, "event_type") orelse "memory_atom.upsert",
+            .event_type = event_type,
             .object_type = object_type,
             .object_id = reservation_id,
             .scope = scope,
@@ -1635,16 +1639,42 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
             return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying");
         }
     }
-    var memory_atom_id: ?[]const u8 = null;
+    const memory_atom_id: ?[]const u8 = null;
     if (memory_input) |input| {
-        const with_provenance = ensureMemoryProvenance(ctx, input) catch |err| switch (err) {
+        var prepared = prepareAppliedMemoryProvenance(ctx, input) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             else => return serverError(ctx),
         };
-        var auditable = with_provenance;
-        auditable.actor_id = ctx.actor_id;
-        const atom = ctx.store.createMemoryAtom(ctx.allocator, auditable) catch return serverError(ctx);
-        memory_atom_id = atom.id;
+        prepared.atom.actor_id = ctx.actor_id;
+        if (prepared.generated_source) |source_input| {
+            var auditable_source = source_input;
+            auditable_source.actor_id = ctx.actor_id;
+            prepared.generated_source = auditable_source;
+        }
+        const applied = ctx.store.applyFeedMemoryAtomAtomic(ctx.allocator, .{
+            .reserved_event_id = reserved_event_id,
+            .event = .{
+                .event_type = event_type,
+                .object_type = object_type,
+                .object_id = "pending",
+                .scope = scope,
+                .permissions_json = event_permissions_json,
+                .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+                .payload_json = payload_json,
+                .status = "applied",
+                .actor_id = ctx.actor_id,
+            },
+            .prepared = prepared,
+        }) catch |err| {
+            if (reserved_event_id) |event_id| {
+                _ = ctx.store.releaseFeedEventReservation(event_id) catch {};
+            }
+            return switch (err) {
+                error.FeedReservationConsumed => json.errorResponse(ctx.allocator, 409, "conflict", "Feed event reservation was already consumed"),
+                else => serverError(ctx),
+            };
+        };
+        return appliedFeedResponse(ctx, applied.event_id, applied.atom.id);
     }
     if (reserved_event_id) |event_id| {
         const object_id = memory_atom_id orelse (json.stringField(obj, "object_id") orelse "unknown");
@@ -1654,7 +1684,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
         return appliedFeedResponse(ctx, event_id, memory_atom_id);
     }
     const id = ctx.store.appendFeedEvent(.{
-        .event_type = json.stringField(obj, "event_type") orelse "memory_atom.upsert",
+        .event_type = event_type,
         .object_type = object_type,
         .object_id = memory_atom_id orelse (json.stringField(obj, "object_id") orelse "unknown"),
         .scope = scope,
@@ -2106,7 +2136,7 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
             }
         }
     } else {
-        const use_llm = json.boolField(obj, "use_llm") orelse (ctx.llm_base_url != null and ctx.llm_model != null);
+        const use_llm = json.boolField(obj, "use_llm") orelse false;
         if (use_llm) {
             const prompt = buildAskPrompt(ctx, query, results) catch return serverError(ctx);
             if (providers.completeAnswer(ctx.allocator, .{
@@ -2807,6 +2837,34 @@ fn ensureMemoryProvenance(ctx: *Context, input: store_mod.MemoryAtomInput) !stor
     return out;
 }
 
+fn prepareAppliedMemoryProvenance(ctx: *Context, input: store_mod.MemoryAtomInput) !store_mod.PreparedMemoryImport {
+    var out = input;
+    const has_source = jsonArrayHasStringItems(ctx.allocator, out.source_ids_json);
+    if (has_source) {
+        if (!sourceIdsCanBackRecord(ctx, out.source_ids_json, out.scope, out.permissions_json)) return error.Forbidden;
+        if (!jsonArrayHasStringItems(ctx.allocator, out.evidence_ranges_json) and !jsonArrayHasObjectItems(ctx.allocator, out.evidence_ranges_json)) {
+            const first_source = try firstJsonStringDup(ctx.allocator, out.source_ids_json);
+            out.evidence_ranges_json = try evidenceJson(ctx.allocator, first_source orelse "", out.text.len, "provided_source");
+        }
+        return .{ .atom = out };
+    }
+
+    const source_type: []const u8 = if (std.mem.eql(u8, input.created_by, "agent")) "agent_observation" else "manual";
+    return .{
+        .atom = out,
+        .generated_source = .{
+            .source_type = source_type,
+            .title = try memorySourceTitle(ctx.allocator, input.text),
+            .content = input.text,
+            .author = input.owner,
+            .permissions_json = input.permissions_json,
+            .scope = input.scope,
+            .metadata_json = "{\"generated_for\":\"memory_feed_apply\"}",
+            .actor_id = ctx.actor_id,
+        },
+    };
+}
+
 fn jsonArrayHasStringItems(allocator: std.mem.Allocator, value: []const u8) bool {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, value, .{}) catch return false;
     defer parsed.deinit();
@@ -3056,8 +3114,9 @@ fn resolveVectorAcl(ctx: *Context, object_type: []const u8, object_id: []const u
         if (!canWriteRecord(ctx, artifact.scope, artifact.permissions_json)) return error.Forbidden;
         return .{ .scope = artifact.scope, .permissions_json = artifact.permissions_json };
     }
-    if (!canWriteRecord(ctx, requested_scope, requested_permissions)) return error.Forbidden;
-    return .{ .scope = requested_scope, .permissions_json = requested_permissions };
+    _ = requested_scope;
+    _ = requested_permissions;
+    return error.NotFound;
 }
 
 fn positiveLimit(value: ?i64, default_value: usize) usize {
@@ -3142,7 +3201,7 @@ test "api requires bearer token except health" {
     const health_resp = handleRequest(&ctx, "GET", "/health", "", "");
     try std.testing.expectEqualStrings("200 OK", health_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"schema_ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"expected_schema_version\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"expected_schema_version\":7") != null);
 
     const missing = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"x\"}", "");
     try std.testing.expectEqualStrings("401 Unauthorized", missing.status);
@@ -3609,6 +3668,8 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const vector_body = try std.fmt.allocPrint(arena.allocator(), "{{\"object_id\":\"{s}\",\"text\":\"agent memory\",\"scope\":\"public\",\"embedding\":[1,0],\"dimensions\":2}}", .{created_atom_id});
     const upsert_resp = handleRequest(&ctx, "POST", "/v1/vector/upsert", vector_body, "");
     try std.testing.expectEqualStrings("200 OK", upsert_resp.status);
+    const orphan_upsert = handleRequest(&ctx, "POST", "/v1/vector/upsert", "{\"object_id\":\"mem_missing\",\"text\":\"orphan\",\"scope\":\"public\",\"embedding\":[1,0],\"dimensions\":2}", "");
+    try std.testing.expectEqualStrings("404 Not Found", orphan_upsert.status);
     const vector_resp = handleRequest(&ctx, "POST", "/v1/vector/search", "{\"embedding\":[1,0],\"scopes\":[\"public\"],\"limit\":5}", "");
     try std.testing.expectEqualStrings("200 OK", vector_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, vector_resp.body, "vec_mem_") != null);
@@ -3724,6 +3785,27 @@ test "api search falls back to keyword when embedding provider fails" {
 
     const strict = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"provider fallback\",\"scopes\":[\"public\"],\"use_vector\":true,\"strict_vector\":true}", "");
     try std.testing.expectEqualStrings("500 Internal Server Error", strict.status);
+}
+
+test "api search and ask do not return unrelated fallback evidence on zero hit" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createMemoryAtom(alloc, .{ .text = "alpha pantry memory", .scope = "public", .created_by = "human", .status = "verified" });
+    var ctx = Context{ .allocator = alloc, .store = &store };
+
+    const search_resp = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"zzzznomatch\",\"scopes\":[\"public\"],\"use_vector\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", search_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "\"results\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "alpha pantry memory") == null);
+
+    const ask_resp = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"zzzznomatch\",\"scopes\":[\"public\"],\"use_vector\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", ask_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ask_resp.body, "I don't know") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ask_resp.body, "alpha pantry memory") == null);
 }
 
 test "api ask returns citation ids and conflict warnings" {
@@ -4094,6 +4176,22 @@ test "api vector upsert inherits artifact acl instead of requested scope" {
     try std.testing.expect(std.mem.indexOf(u8, public_search.body, "artifact vector leak") == null);
 }
 
+test "api vector upsert requires a backed primitive object" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ctx = Context{ .allocator = alloc, .store = &store };
+    const missing = handleRequest(&ctx, "POST", "/v1/vector/upsert", "{\"object_type\":\"raw\",\"object_id\":\"raw_1\",\"scope\":\"public\",\"embedding\":[1,0],\"text\":\"orphan vector text\"}", "");
+    try std.testing.expectEqualStrings("404 Not Found", missing.status);
+
+    const search_resp = handleRequest(&ctx, "POST", "/v1/vector/search", "{\"embedding\":[1,0],\"scopes\":[\"public\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", search_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "orphan vector text") == null);
+}
+
 test "api search does not trust requested scopes from body" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -4304,6 +4402,8 @@ test "api ingest creates source artifact extracted memory entities vectors and j
     const search_resp = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"ingestion jobs\",\"scopes\":[\"project:nullpantry\"]}", "");
     try std.testing.expectEqualStrings("200 OK", search_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "NullPantry uses ingestion jobs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "\"type\":\"artifact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "\"status\":\"draft\"") != null);
 
     const jobs = handleRequest(&ctx, "GET", "/v1/jobs?status=succeeded", "", "");
     try std.testing.expectEqualStrings("200 OK", jobs.status);
@@ -4380,6 +4480,30 @@ test "api manifest and connector endpoints describe headless service contracts" 
     try std.testing.expectEqualStrings("200 OK", manifest.status);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "X-NullPantry-Actor-Scopes") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/remember") != null);
+}
+
+test "api connector ingest only advances cursor after all items succeed" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = Context{ .allocator = arena.allocator(), .store = &store };
+
+    const failed = handleRequest(&ctx, "POST", "/v1/connectors/ticket/ingest",
+        \\{"scope":"public","next_cursor":"ticket-bad","items":[{"title":"ok","content":"ok"},1]}
+    , "");
+    try std.testing.expectEqualStrings("400 Bad Request", failed.status);
+
+    const cursor_get = handleRequest(&ctx, "GET", "/v1/connectors/ticket/cursor?scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", cursor_get.status);
+
+    const ok_ingest = handleRequest(&ctx, "POST", "/v1/connectors/ticket/ingest",
+        \\{"scope":"public","next_cursor":"ticket-good","items":[{"title":"ok","content":"ok"}]}
+    , "");
+    try std.testing.expectEqualStrings("200 OK", ok_ingest.status);
+    const ok_cursor = handleRequest(&ctx, "GET", "/v1/connectors/ticket/cursor?scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", ok_cursor.status);
+    try std.testing.expect(std.mem.indexOf(u8, ok_cursor.body, "\"ticket-good\"") != null);
 }
 
 test "api spaces and policy scopes are first-class permission-filtered records" {

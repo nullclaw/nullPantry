@@ -1,4 +1,29 @@
-pub const expected_schema_version: i64 = 6;
+const std = @import("std");
+
+pub const expected_schema_version: i64 = 7;
+
+pub const Migration = struct {
+    version: i64,
+    name: []const u8,
+    checksum: []const u8,
+};
+
+pub const migration_manifest = [_]Migration{
+    .{ .version = 1, .name = "core_primitives", .checksum = "np-001-core-primitives" },
+    .{ .version = 2, .name = "security_and_retrieval_hardening", .checksum = "np-002-security-retrieval" },
+    .{ .version = 3, .name = "runtime_lifecycle_cache", .checksum = "np-003-runtime-lifecycle-cache" },
+    .{ .version = 4, .name = "ingest_jobs_conflicts", .checksum = "np-004-ingest-jobs-conflicts" },
+    .{ .version = 5, .name = "spaces_policy_scopes", .checksum = "np-005-spaces-policy-scopes" },
+    .{ .version = 6, .name = "connector_cursor_permissions", .checksum = "np-006-connector-cursor-permissions" },
+    .{ .version = 7, .name = "vector_backing_invariant", .checksum = "np-007-vector-backing-invariant" },
+};
+
+pub fn expectedMigration(version: i64) ?Migration {
+    for (migration_manifest) |migration| {
+        if (migration.version == version) return migration;
+    }
+    return null;
+}
 
 pub const sqlite_schema =
     \\PRAGMA journal_mode = WAL;
@@ -6,6 +31,7 @@ pub const sqlite_schema =
     \\CREATE TABLE IF NOT EXISTS schema_migrations (
     \\  version INTEGER PRIMARY KEY,
     \\  name TEXT NOT NULL,
+    \\  checksum TEXT NOT NULL DEFAULT '',
     \\  applied_at_ms INTEGER NOT NULL
     \\);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (1, 'core_primitives', strftime('%s','now') * 1000);
@@ -108,7 +134,7 @@ pub const sqlite_schema =
     \\CREATE VIRTUAL TABLE IF NOT EXISTS memory_atoms_fts USING fts5(id UNINDEXED, text, predicate, object);
     \\CREATE TABLE IF NOT EXISTS vector_chunks (
     \\  id TEXT PRIMARY KEY,
-    \\  object_type TEXT NOT NULL,
+    \\  object_type TEXT NOT NULL CHECK (object_type IN ('memory_atom','source','artifact')),
     \\  object_id TEXT NOT NULL,
     \\  chunk_ordinal INTEGER NOT NULL DEFAULT 0,
     \\  text TEXT NOT NULL DEFAULT '',
@@ -273,6 +299,11 @@ pub const sqlite_schema =
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (5, 'spaces_policy_scopes', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (6, 'connector_cursor_permissions', strftime('%s','now') * 1000);
+    \\DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact');
+    \\DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND NOT EXISTS (SELECT 1 FROM memory_atoms WHERE memory_atoms.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'source' AND NOT EXISTS (SELECT 1 FROM sources WHERE sources.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'artifact' AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.id = vector_chunks.object_id);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (7, 'vector_backing_invariant', strftime('%s','now') * 1000);
 ;
 
 pub const postgres_schema =
@@ -281,6 +312,7 @@ pub const postgres_schema =
     \\CREATE TABLE IF NOT EXISTS schema_migrations (
     \\  version bigint PRIMARY KEY,
     \\  name text NOT NULL,
+    \\  checksum text NOT NULL DEFAULT '',
     \\  applied_at_ms bigint NOT NULL
     \\);
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (1, 'core_primitives', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
@@ -385,7 +417,7 @@ pub const postgres_schema =
     \\CREATE INDEX IF NOT EXISTS memory_atoms_scope_status_idx ON memory_atoms(scope, status);
     \\CREATE TABLE IF NOT EXISTS vector_chunks (
     \\  id text PRIMARY KEY,
-    \\  object_type text NOT NULL,
+    \\  object_type text NOT NULL CHECK (object_type IN ('memory_atom','source','artifact')),
     \\  object_id text NOT NULL,
     \\  chunk_ordinal bigint NOT NULL DEFAULT 0,
     \\  text text NOT NULL DEFAULT '',
@@ -550,10 +582,14 @@ pub const postgres_schema =
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (5, 'spaces_policy_scopes', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (6, 'connector_cursor_permissions', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+    \\DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact');
+    \\DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND NOT EXISTS (SELECT 1 FROM memory_atoms WHERE memory_atoms.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'source' AND NOT EXISTS (SELECT 1 FROM sources WHERE sources.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'artifact' AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.id = vector_chunks.object_id);
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (7, 'vector_backing_invariant', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
 ;
 
 test "sqlite migration includes core primitive tables and indexes" {
-    const std = @import("std");
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS sources") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS schema_migrations") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS spaces") != null);
@@ -581,13 +617,15 @@ test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS knowledge_conflicts") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS connector_cursors") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'connector_cursor_permissions'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'vector_backing_invariant'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "checksum TEXT NOT NULL DEFAULT ''") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "object_type TEXT NOT NULL CHECK") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'ingest_jobs_conflicts'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'spaces_policy_scopes'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE UNIQUE INDEX IF NOT EXISTS idx_compat_memories_key_session") != null);
 }
 
 test "postgres migration includes fts vector and expression indexes" {
-    const std = @import("std");
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS sources") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS schema_migrations") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS spaces") != null);
@@ -611,6 +649,9 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS knowledge_conflicts") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS connector_cursors") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'connector_cursor_permissions'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'vector_backing_invariant'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "checksum text NOT NULL DEFAULT ''") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "object_type text NOT NULL CHECK") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'ingest_jobs_conflicts'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'spaces_policy_scopes'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE EXTENSION IF NOT EXISTS vector") != null);
@@ -621,4 +662,17 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS compat_memories_key_session_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "UNIQUE(type, lower(name))") == null);
+}
+
+test "migration manifest is ordered and current" {
+    try std.testing.expectEqual(@as(i64, expected_schema_version), migration_manifest[migration_manifest.len - 1].version);
+    var expected: i64 = 1;
+    for (migration_manifest) |migration| {
+        try std.testing.expectEqual(expected, migration.version);
+        try std.testing.expect(migration.name.len > 0);
+        try std.testing.expect(migration.checksum.len > 0);
+        expected += 1;
+    }
+    try std.testing.expect(expectedMigration(7) != null);
+    try std.testing.expect(expectedMigration(99) == null);
 }

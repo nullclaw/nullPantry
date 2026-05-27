@@ -438,6 +438,13 @@ pub const Store = struct {
         };
     }
 
+    pub fn applyFeedMemoryAtomAtomic(self: *Store, allocator: std.mem.Allocator, input: FeedMemoryApplyInput) !FeedMemoryApplyResult {
+        return switch (self.backend) {
+            .sqlite => |*s| s.applyFeedMemoryAtomAtomic(allocator, input),
+            .postgres => |*p| p.applyFeedMemoryAtomAtomic(allocator, input),
+        };
+    }
+
     pub fn applyExtractedKnowledge(self: *Store, allocator: std.mem.Allocator, input: ExtractedKnowledgeInput) !ExtractedKnowledgeResult {
         return switch (self.backend) {
             .sqlite => |*s| s.applyExtractedKnowledge(allocator, input),
@@ -1071,6 +1078,17 @@ pub const PreparedMemoryImport = struct {
     generated_source: ?SourceInput = null,
 };
 
+pub const FeedMemoryApplyInput = struct {
+    reserved_event_id: ?i64 = null,
+    event: FeedEventInput,
+    prepared: PreparedMemoryImport,
+};
+
+pub const FeedMemoryApplyResult = struct {
+    event_id: i64,
+    atom: domain.MemoryAtom,
+};
+
 pub const ExtractedKnowledgeInput = struct {
     source: domain.Source,
     source_ids_json: []const u8,
@@ -1301,10 +1319,16 @@ pub const SQLiteStore = struct {
     }
 
     fn schemaMigrationPresent(self: *Self, version: i64) !bool {
-        const stmt = try self.prepare("SELECT 1 FROM schema_migrations WHERE version = ?1 LIMIT 1");
+        const expected = migrations.expectedMigration(version) orelse return false;
+        const stmt = try self.prepare("SELECT name, checksum FROM schema_migrations WHERE version = ?1 LIMIT 1");
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, version);
-        return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+        const name = try columnText(self.allocator, stmt, 0);
+        defer self.allocator.free(name);
+        const checksum = try columnText(self.allocator, stmt, 1);
+        defer self.allocator.free(checksum);
+        return std.mem.eql(u8, name, expected.name) and std.mem.eql(u8, checksum, expected.checksum);
     }
 
     fn exec(self: *Self, sql: [*:0]const u8) !void {
@@ -1326,6 +1350,10 @@ pub const SQLiteStore = struct {
     }
 
     fn applyCompatibilityMigrations(self: *Self) !void {
+        if (!try self.columnExists("schema_migrations", "checksum")) {
+            try self.exec("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT NOT NULL DEFAULT ''");
+        }
+        try self.exec("UPDATE schema_migrations SET name = 'core_primitives', checksum = 'np-001-core-primitives' WHERE version = 1");
         if (!try self.columnExists("vector_chunks", "permissions_json")) {
             try self.exec("ALTER TABLE vector_chunks ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '[]'");
         }
@@ -1383,8 +1411,8 @@ pub const SQLiteStore = struct {
         try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_feed_events_dedupe_key ON memory_feed_events(dedupe_key) WHERE dedupe_key IS NOT NULL");
         try self.exec("DROP INDEX IF EXISTS idx_entities_type_name");
         try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_type_name_scope ON entities(type, lower(name), scope)");
-        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (2, 'security_and_retrieval_hardening', strftime('%s','now') * 1000)");
-        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (3, 'runtime_lifecycle_cache', strftime('%s','now') * 1000)");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (2, 'security_and_retrieval_hardening', 'np-002-security-retrieval', strftime('%s','now') * 1000)");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (3, 'runtime_lifecycle_cache', 'np-003-runtime-lifecycle-cache', strftime('%s','now') * 1000)");
         try self.exec("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, job_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', scope TEXT NOT NULL DEFAULT 'workspace', permissions_json TEXT NOT NULL DEFAULT '[]', object_type TEXT NOT NULL DEFAULT '', object_id TEXT NOT NULL DEFAULT '', input_json TEXT NOT NULL DEFAULT '{}', result_json TEXT NOT NULL DEFAULT '{}', error_text TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)");
         if (!try self.columnExists("jobs", "permissions_json")) {
             try self.exec("ALTER TABLE jobs ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '[]'");
@@ -1399,12 +1427,23 @@ pub const SQLiteStore = struct {
         if (!try self.columnExists("connector_cursors", "permissions_json")) {
             try self.exec("ALTER TABLE connector_cursors ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '[]'");
         }
-        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', strftime('%s','now') * 1000)");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', 'np-004-ingest-jobs-conflicts', strftime('%s','now') * 1000)");
         try self.exec("CREATE TABLE IF NOT EXISTS spaces (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, title TEXT NOT NULL, description TEXT, scope TEXT NOT NULL DEFAULT 'workspace', permissions_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}', created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_spaces_scope ON spaces(scope)");
         try self.exec("CREATE TABLE IF NOT EXISTS policy_scopes (scope TEXT PRIMARY KEY, visibility TEXT NOT NULL DEFAULT 'workspace', permissions_json TEXT NOT NULL DEFAULT '[]', owner TEXT, ttl_ms INTEGER, review_after_ms INTEGER, metadata_json TEXT NOT NULL DEFAULT '{}', created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)");
-        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (5, 'spaces_policy_scopes', strftime('%s','now') * 1000)");
-        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (6, 'connector_cursor_permissions', strftime('%s','now') * 1000)");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (5, 'spaces_policy_scopes', 'np-005-spaces-policy-scopes', strftime('%s','now') * 1000)");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (6, 'connector_cursor_permissions', 'np-006-connector-cursor-permissions', strftime('%s','now') * 1000)");
+        try self.exec("UPDATE schema_migrations SET name = 'security_and_retrieval_hardening', checksum = 'np-002-security-retrieval' WHERE version = 2");
+        try self.exec("UPDATE schema_migrations SET name = 'runtime_lifecycle_cache', checksum = 'np-003-runtime-lifecycle-cache' WHERE version = 3");
+        try self.exec("UPDATE schema_migrations SET name = 'ingest_jobs_conflicts', checksum = 'np-004-ingest-jobs-conflicts' WHERE version = 4");
+        try self.exec("UPDATE schema_migrations SET name = 'spaces_policy_scopes', checksum = 'np-005-spaces-policy-scopes' WHERE version = 5");
+        try self.exec("UPDATE schema_migrations SET name = 'connector_cursor_permissions', checksum = 'np-006-connector-cursor-permissions' WHERE version = 6");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact')");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND NOT EXISTS (SELECT 1 FROM memory_atoms WHERE memory_atoms.id = vector_chunks.object_id)");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'source' AND NOT EXISTS (SELECT 1 FROM sources WHERE sources.id = vector_chunks.object_id)");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'artifact' AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.id = vector_chunks.object_id)");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (7, 'vector_backing_invariant', 'np-007-vector-backing-invariant', strftime('%s','now') * 1000)");
+        try self.exec("UPDATE schema_migrations SET name = 'vector_backing_invariant', checksum = 'np-007-vector-backing-invariant' WHERE version = 7");
     }
 
     fn columnExists(self: *Self, comptime table: []const u8, column: []const u8) !bool {
@@ -1905,6 +1944,40 @@ pub const SQLiteStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    pub fn applyFeedMemoryAtomAtomic(self: *Self, allocator: std.mem.Allocator, input: FeedMemoryApplyInput) !FeedMemoryApplyResult {
+        self.tx_mutex.lockUncancelable(compat.io());
+        defer self.tx_mutex.unlock(compat.io());
+
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+
+        var atom_input = input.prepared.atom;
+        if (input.prepared.generated_source) |source_input| {
+            const source = try self.createSource(allocator, source_input);
+            atom_input.source_ids_json = try singleJsonString(allocator, source.id);
+            atom_input.evidence_ranges_json = try evidenceRangeJson(allocator, source.id, atom_input.text.len, "generated_source");
+        }
+
+        const atom = try self.createMemoryAtom(allocator, atom_input);
+        const event_id = if (input.reserved_event_id) |reserved| blk: {
+            if (!try self.markFeedEventApplied(reserved, input.event.object_type, atom.id, input.event.payload_json)) return error.FeedReservationConsumed;
+            break :blk reserved;
+        } else try self.appendFeedEvent(.{
+            .event_type = input.event.event_type,
+            .object_type = input.event.object_type,
+            .object_id = atom.id,
+            .scope = input.event.scope,
+            .permissions_json = input.event.permissions_json,
+            .dedupe_key = input.event.dedupe_key,
+            .payload_json = input.event.payload_json,
+            .status = "applied",
+            .actor_id = input.event.actor_id,
+        });
+
+        try self.exec("COMMIT");
+        return .{ .event_id = event_id, .atom = atom };
+    }
+
     pub fn applyExtractedKnowledge(self: *Self, allocator: std.mem.Allocator, input: ExtractedKnowledgeInput) !ExtractedKnowledgeResult {
         self.tx_mutex.lockUncancelable(compat.io());
         defer self.tx_mutex.unlock(compat.io());
@@ -2044,18 +2117,8 @@ pub const SQLiteStore = struct {
         }
         if (keyword_results.items.len == 0 and use_fts) {
             try self.searchMemoryAtoms(allocator, input, "", false, &keyword_results);
-            try self.searchSpaces(allocator, input, &keyword_results);
-            try self.searchPolicyScopes(allocator, input, &keyword_results);
             try self.searchSources(allocator, input, "", false, &keyword_results);
             try self.searchArtifacts(allocator, input, "", false, &keyword_results);
-            try self.searchEntities(allocator, input, &keyword_results);
-            try self.searchRelations(allocator, input, &keyword_results);
-            try self.searchContextPacks(allocator, input, &keyword_results);
-            try self.searchFeedEvents(allocator, input, &keyword_results);
-            try self.searchCompatMemories(allocator, input, &keyword_results);
-            if (input.include_sessions) {
-                try self.searchSessionMessages(allocator, input, &keyword_results);
-            }
         }
 
         sortSearchResults(keyword_results.items);
@@ -2617,16 +2680,7 @@ pub const SQLiteStore = struct {
                 .confidence = if (std.mem.eql(u8, artifact.status, "accepted") or std.mem.eql(u8, artifact.status, "verified")) 0.85 else 0.55,
             };
         }
-        return .{
-            .id = match.object_id,
-            .result_type = match.object_type,
-            .title = match.object_id,
-            .text = match.text,
-            .scope = match.scope,
-            .status = "active",
-            .score = match.score,
-            .source_ids_json = "[]",
-        };
+        return null;
     }
 
     fn contextPackVisible(self: *Self, allocator: std.mem.Allocator, sources_json: []const u8, artifacts_json: []const u8, atoms_json: []const u8, required_scopes_json: []const u8, scopes_json: []const u8) !bool {
@@ -2791,6 +2845,7 @@ pub const SQLiteStore = struct {
 
     pub fn upsertVectorChunk(self: *Self, allocator: std.mem.Allocator, input: VectorChunkInput) !VectorChunk {
         _ = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
+        if (!try self.vectorBackingObjectExists(allocator, input.object_type, input.object_id)) return error.InvalidVectorTarget;
         const id = try std.fmt.allocPrint(allocator, "vec_{s}_{d}", .{ input.object_id, input.chunk_ordinal });
         const now = ids.nowMs();
         const stmt = try self.prepare("INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(id) DO UPDATE SET text=excluded.text, scope=excluded.scope, permissions_json=excluded.permissions_json, embedding_json=excluded.embedding_json, model=excluded.model, dimensions=excluded.dimensions, updated_at_ms=excluded.updated_at_ms");
@@ -2856,6 +2911,8 @@ pub const SQLiteStore = struct {
     }
 
     fn vectorChunkObjectVisible(self: *Self, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_scope: []const u8, chunk_permissions: []const u8, scopes_json: []const u8) !bool {
+        _ = chunk_scope;
+        _ = chunk_permissions;
         if (std.mem.eql(u8, object_type, "memory_atom")) {
             const atom = (try self.getMemoryAtom(allocator, object_id)) orelse return false;
             return try self.recordVisibleWithPolicy(allocator, atom.scope, atom.permissions_json, scopes_json);
@@ -2868,7 +2925,14 @@ pub const SQLiteStore = struct {
             const artifact = (try self.getArtifact(allocator, object_id)) orelse return false;
             return try self.recordVisibleWithPolicy(allocator, artifact.scope, artifact.permissions_json, scopes_json);
         }
-        return try self.recordVisibleWithPolicy(allocator, chunk_scope, chunk_permissions, scopes_json);
+        return false;
+    }
+
+    fn vectorBackingObjectExists(self: *Self, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8) !bool {
+        if (std.mem.eql(u8, object_type, "memory_atom")) return (try self.getMemoryAtom(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "source")) return (try self.getSource(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "artifact")) return (try self.getArtifact(allocator, object_id)) != null;
+        return false;
     }
 
     pub fn enqueueVectorOutbox(self: *Self, input: VectorOutboxInput) !i64 {
@@ -4069,7 +4133,8 @@ pub const PostgresStore = struct {
     }
 
     fn schemaMigrationPresent(self: *PostgresStore, version: i64) !bool {
-        const sql = try std.fmt.allocPrint(self.allocator, "SELECT CASE WHEN EXISTS (SELECT 1 FROM schema_migrations WHERE version = {d}) THEN 'true' ELSE 'false' END", .{version});
+        const expected = migrations.expectedMigration(version) orelse return false;
+        const sql = try std.fmt.allocPrint(self.allocator, "SELECT CASE WHEN EXISTS (SELECT 1 FROM schema_migrations WHERE version = {d} AND name = {s} AND checksum = {s}) THEN 'true' ELSE 'false' END", .{ version, try sqlString(self.allocator, expected.name), try sqlString(self.allocator, expected.checksum) });
         const text = try self.queryText(self.allocator, sql);
         defer self.allocator.free(text);
         return std.mem.eql(u8, text, "true");
@@ -4085,9 +4150,20 @@ pub const PostgresStore = struct {
         defer self.query_mutex.unlock(compat.io());
         const guarded_sql = try std.fmt.allocPrint(allocator, "SET statement_timeout = '30000ms';\n{s}", .{sql});
         defer allocator.free(guarded_sql);
-        const argv = [_][]const u8{ self.psql_bin, self.url, "-X", "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A", "-c", guarded_sql };
+        var env_map = std.process.Environ.Map.init(allocator);
+        defer env_map.deinit();
+        const inherited_env = [_][]const u8{ "PATH", "HOME", "USER", "LANG", "LC_ALL", "PGSSLMODE", "PGSSLROOTCERT", "PGSERVICE", "PGSERVICEFILE", "PGPASSFILE" };
+        inline for (inherited_env) |name| {
+            if (compat.process.getEnvVarOwned(allocator, name)) |value| {
+                defer allocator.free(value);
+                try env_map.put(name, value);
+            } else |_| {}
+        }
+        try env_map.put("PGDATABASE", self.url);
+        const argv = [_][]const u8{ self.psql_bin, "-X", "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A", "-c", guarded_sql };
         const result = try std.process.run(allocator, compat.io(), .{
             .argv = &argv,
+            .environ_map = &env_map,
             .stdout_limit = .limited(32 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
         });
@@ -4116,6 +4192,7 @@ pub const PostgresStore = struct {
     fn applyCompatibilityMigrations(self: *PostgresStore) !void {
         try self.runSql(
             \\ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'workspace';
+            \\ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum text NOT NULL DEFAULT '';
             \\ALTER TABLE entities ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'workspace';
             \\ALTER TABLE entities ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE relations ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'workspace';
@@ -4131,11 +4208,24 @@ pub const PostgresStore = struct {
             \\ALTER TABLE connector_cursors ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\DROP INDEX IF EXISTS entities_type_name_idx;
             \\CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx ON entities(type, lower(name), scope);
-            \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (2, 'security_and_retrieval_hardening', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
-            \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (3, 'runtime_lifecycle_cache', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
-            \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
-            \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (5, 'spaces_policy_scopes', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
-            \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (6, 'connector_cursor_permissions', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\UPDATE schema_migrations SET name = 'core_primitives', checksum = 'np-001-core-primitives' WHERE version = 1;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (2, 'security_and_retrieval_hardening', 'np-002-security-retrieval', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (3, 'runtime_lifecycle_cache', 'np-003-runtime-lifecycle-cache', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', 'np-004-ingest-jobs-conflicts', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (5, 'spaces_policy_scopes', 'np-005-spaces-policy-scopes', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (6, 'connector_cursor_permissions', 'np-006-connector-cursor-permissions', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\UPDATE schema_migrations SET name = 'security_and_retrieval_hardening', checksum = 'np-002-security-retrieval' WHERE version = 2;
+            \\UPDATE schema_migrations SET name = 'runtime_lifecycle_cache', checksum = 'np-003-runtime-lifecycle-cache' WHERE version = 3;
+            \\UPDATE schema_migrations SET name = 'ingest_jobs_conflicts', checksum = 'np-004-ingest-jobs-conflicts' WHERE version = 4;
+            \\UPDATE schema_migrations SET name = 'spaces_policy_scopes', checksum = 'np-005-spaces-policy-scopes' WHERE version = 5;
+            \\UPDATE schema_migrations SET name = 'connector_cursor_permissions', checksum = 'np-006-connector-cursor-permissions' WHERE version = 6;
+            \\DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact');
+            \\DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND NOT EXISTS (SELECT 1 FROM memory_atoms WHERE memory_atoms.id = vector_chunks.object_id);
+            \\DELETE FROM vector_chunks WHERE object_type = 'source' AND NOT EXISTS (SELECT 1 FROM sources WHERE sources.id = vector_chunks.object_id);
+            \\DELETE FROM vector_chunks WHERE object_type = 'artifact' AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.id = vector_chunks.object_id);
+            \\DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'vector_chunks_object_type_chk') THEN ALTER TABLE vector_chunks ADD CONSTRAINT vector_chunks_object_type_chk CHECK (object_type IN ('memory_atom','source','artifact')); END IF; END $$;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (7, 'vector_backing_invariant', 'np-007-vector-backing-invariant', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\UPDATE schema_migrations SET name = 'vector_backing_invariant', checksum = 'np-007-vector-backing-invariant' WHERE version = 7;
         );
     }
 
@@ -4440,6 +4530,65 @@ pub const PostgresStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    pub fn applyFeedMemoryAtomAtomic(self: *PostgresStore, allocator: std.mem.Allocator, input: FeedMemoryApplyInput) !FeedMemoryApplyResult {
+        const event_id = if (input.reserved_event_id) |reserved| reserved else blk: {
+            const text = try self.queryText(allocator, "SELECT nextval(pg_get_serial_sequence('memory_feed_events','id'))::text");
+            defer allocator.free(text);
+            break :blk try std.fmt.parseInt(i64, text, 10);
+        };
+
+        var atom_input = input.prepared.atom;
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer sql.deinit(allocator);
+        try sql.appendSlice(allocator, "BEGIN;\n");
+
+        if (input.prepared.generated_source) |source_input| {
+            const source_id = try ids.make(allocator, "src_");
+            const source_now = ids.nowMs();
+            atom_input.source_ids_json = try singleJsonString(allocator, source_id);
+            atom_input.evidence_ranges_json = try evidenceRangeJson(allocator, source_id, atom_input.text.len, "generated_source");
+            try sql.print(
+                allocator,
+                "INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{d},{s},{s},{s},{s});\n",
+                .{ try sqlString(allocator, source_id), try sqlString(allocator, source_input.source_type), try sqlString(allocator, source_input.title), try sqlNullableString(allocator, source_input.raw_content_uri), try sqlString(allocator, source_input.content), try sqlNullableString(allocator, source_input.author), try sqlJsonb(allocator, source_input.participants_json), try sqlJsonb(allocator, source_input.permissions_json), try sqlString(allocator, source_input.scope), source_now, source_now, try sqlNullableString(allocator, source_input.checksum), try sqlNullableString(allocator, source_input.language), try sqlJsonb(allocator, source_input.related_entities_json), try sqlJsonb(allocator, source_input.metadata_json) },
+            );
+            try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('source.created',{s},'source',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, source_input.actor_id), try sqlString(allocator, source_id), source_now });
+        }
+
+        const atom_id = try ids.make(allocator, "mem_");
+        const atom_now = ids.nowMs();
+        const atom_status = atom_input.status orelse domain.defaultMemoryStatus(atom_input.created_by, atom_input.scope);
+        try sql.print(
+            allocator,
+            "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) VALUES ({s},{s},{s},{s},{s},{s},{d},{s},{s},{s},{s},{d},{s},{s},NULL,{s},{s},{s});\n",
+            .{ try sqlString(allocator, atom_id), try sqlNullableString(allocator, atom_input.subject_entity_id), try sqlString(allocator, atom_input.predicate), try sqlString(allocator, atom_input.object), try sqlString(allocator, atom_input.text), try sqlString(allocator, atom_input.scope), atom_input.confidence, try sqlString(allocator, atom_status), try sqlJsonb(allocator, atom_input.source_ids_json), try sqlJsonb(allocator, atom_input.evidence_ranges_json), try sqlString(allocator, atom_input.created_by), atom_now, try sqlNullableInt(allocator, atom_input.valid_from_ms), try sqlNullableInt(allocator, atom_input.valid_until_ms), try sqlNullableString(allocator, atom_input.owner), try sqlJsonb(allocator, atom_input.permissions_json), try sqlJsonb(allocator, atom_input.tags_json) },
+        );
+        try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_atom.created',{s},'memory_atom',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, atom_input.actor_id), try sqlString(allocator, atom_id), atom_now });
+
+        const event_now = ids.nowMs();
+        if (input.reserved_event_id != null) {
+            try sql.print(
+                allocator,
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM memory_feed_events WHERE id = {d} AND status = 'applying') THEN RAISE EXCEPTION 'feed reservation consumed'; END IF; END $$;\nUPDATE memory_feed_events SET object_type = {s}, object_id = {s}, payload_json = {s}, status = 'applied', applied_at_ms = {d} WHERE id = {d} AND status = 'applying';\n",
+                .{ event_id, try sqlString(allocator, input.event.object_type), try sqlString(allocator, atom_id), try sqlJsonb(allocator, input.event.payload_json), event_now, event_id },
+            );
+        } else {
+            try sql.print(
+                allocator,
+                "INSERT INTO memory_feed_events (id,event_type,object_type,object_id,scope,permissions_json,dedupe_key,payload_json,status,created_at_ms,applied_at_ms) VALUES ({d},{s},{s},{s},{s},{s},{s},{s},'applied',{d},{d});\n",
+                .{ event_id, try sqlString(allocator, input.event.event_type), try sqlString(allocator, input.event.object_type), try sqlString(allocator, atom_id), try sqlString(allocator, input.event.scope), try sqlJsonb(allocator, input.event.permissions_json), try sqlNullableString(allocator, input.event.dedupe_key), try sqlJsonb(allocator, input.event.payload_json), event_now, event_now },
+            );
+        }
+        try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_feed.applied',{s},'memory_feed_event',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, input.event.actor_id), try sqlString(allocator, atom_id), event_now });
+        try sql.appendSlice(allocator, "COMMIT;\n");
+        try self.runSql(sql.items);
+
+        return .{
+            .event_id = event_id,
+            .atom = .{ .id = atom_id, .subject_entity_id = atom_input.subject_entity_id, .predicate = atom_input.predicate, .object = atom_input.object, .text = atom_input.text, .scope = atom_input.scope, .confidence = atom_input.confidence, .status = atom_status, .source_ids_json = atom_input.source_ids_json, .evidence_ranges_json = atom_input.evidence_ranges_json, .created_by = atom_input.created_by, .created_at_ms = atom_now, .valid_from_ms = atom_input.valid_from_ms, .valid_until_ms = atom_input.valid_until_ms, .last_verified_at_ms = null, .owner = atom_input.owner, .permissions_json = atom_input.permissions_json, .tags_json = atom_input.tags_json },
+        };
+    }
+
     pub fn applyExtractedKnowledge(self: *PostgresStore, allocator: std.mem.Allocator, input: ExtractedKnowledgeInput) !ExtractedKnowledgeResult {
         const entities = try self.resolveExtractedEntitiesPg(allocator, input.entity_names_json, input.source.scope, input.source.permissions_json, input.actor_id);
         const related_entity_ids_json = try entityIdsJson(allocator, entities);
@@ -4536,11 +4685,6 @@ pub const PostgresStore = struct {
         errdefer keyword_results.deinit(allocator);
 
         try self.searchPgKeywordCandidates(allocator, input, &keyword_results);
-        if (keyword_results.items.len == 0 and input.query.len > 0) {
-            var fallback = input;
-            fallback.query = "";
-            try self.searchPgKeywordCandidates(allocator, fallback, &keyword_results);
-        }
         pgSortSearchResults(keyword_results.items);
 
         var vector_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
@@ -4611,6 +4755,7 @@ pub const PostgresStore = struct {
 
     pub fn upsertVectorChunk(self: *PostgresStore, allocator: std.mem.Allocator, input: VectorChunkInput) !VectorChunk {
         _ = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
+        if (!try self.vectorBackingObjectExists(allocator, input.object_type, input.object_id)) return error.InvalidVectorTarget;
         const id = try std.fmt.allocPrint(allocator, "vec_{s}_{d}", .{ input.object_id, input.chunk_ordinal });
         const now = ids.nowMs();
         const embedding_sql = try std.fmt.allocPrint(allocator, "{s}::vector", .{try sqlString(allocator, input.embedding_json)});
@@ -4660,6 +4805,8 @@ pub const PostgresStore = struct {
     }
 
     fn vectorChunkObjectVisible(self: *PostgresStore, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_scope: []const u8, chunk_permissions: []const u8, scopes_json: []const u8) !bool {
+        _ = chunk_scope;
+        _ = chunk_permissions;
         if (std.mem.eql(u8, object_type, "memory_atom")) {
             const atom = (try self.getMemoryAtom(allocator, object_id)) orelse return false;
             return try self.recordVisibleWithPolicy(allocator, atom.scope, atom.permissions_json, scopes_json);
@@ -4672,7 +4819,14 @@ pub const PostgresStore = struct {
             const artifact = (try self.getArtifact(allocator, object_id)) orelse return false;
             return try self.recordVisibleWithPolicy(allocator, artifact.scope, artifact.permissions_json, scopes_json);
         }
-        return try self.recordVisibleWithPolicy(allocator, chunk_scope, chunk_permissions, scopes_json);
+        return false;
+    }
+
+    fn vectorBackingObjectExists(self: *PostgresStore, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8) !bool {
+        if (std.mem.eql(u8, object_type, "memory_atom")) return (try self.getMemoryAtom(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "source")) return (try self.getSource(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "artifact")) return (try self.getArtifact(allocator, object_id)) != null;
+        return false;
     }
 
     pub fn enqueueVectorOutbox(self: *PostgresStore, input: VectorOutboxInput) !i64 {
@@ -5648,7 +5802,7 @@ pub const PostgresStore = struct {
             if (!try self.recordVisibleWithPolicy(allocator, artifact.scope, artifact.permissions_json, input.scopes_json)) return null;
             return .{ .id = artifact.id, .result_type = "artifact", .title = artifact.title, .text = artifact.body, .scope = artifact.scope, .status = artifact.status, .score = match.score, .source_ids_json = try self.sanitizeSourceIds(allocator, artifact.source_ids_json, input.scopes_json), .created_at_ms = artifact.updated_at_ms, .confidence = if (std.mem.eql(u8, artifact.status, "accepted") or std.mem.eql(u8, artifact.status, "verified")) 0.85 else 0.55 };
         }
-        return .{ .id = match.object_id, .result_type = match.object_type, .title = match.object_id, .text = match.text, .scope = match.scope, .status = "active", .score = match.score, .source_ids_json = "[]" };
+        return null;
     }
 
     fn sanitizeSourceIds(self: *PostgresStore, allocator: std.mem.Allocator, source_ids_json: []const u8, scopes_json: []const u8) ![]const u8 {
@@ -6544,6 +6698,15 @@ fn testingSqliteExec(store: *Store, sql: [*:0]const u8) !void {
     };
 }
 
+fn testingRawSqliteExec(db: *c.sqlite3, sql: [*:0]const u8) !void {
+    var err_msg: [*c]u8 = null;
+    const rc = c.sqlite3_exec(db, sql, null, null, &err_msg);
+    if (rc != c.SQLITE_OK) {
+        if (err_msg) |msg| c.sqlite3_free(msg);
+        return error.SqlExecFailed;
+    }
+}
+
 test "sqlite storage creates and searches memory atoms" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -6624,7 +6787,49 @@ test "sqlite storage contract covers primitives lifecycle and audit events" {
     try std.testing.expect(verified.last_verified_at_ms != null);
 
     try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM audit_events")) >= 7);
-    try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1,2,3,4,5,6)")) == 6);
+    try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1,2,3,4,5,6,7)")) == 7);
+    try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE checksum <> ''")) == 7);
+}
+
+test "sqlite compatibility migration adds manifest checksums and purges legacy orphan vectors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const db_path = try std.fs.path.joinZ(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "legacy.db" });
+
+    var db: ?*c.sqlite3 = null;
+    const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX;
+    if (c.sqlite3_open_v2(db_path.ptr, &db, flags, null) != c.SQLITE_OK) return error.OpenDatabaseFailed;
+    try testingRawSqliteExec(db.?,
+        \\CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at_ms INTEGER NOT NULL);
+        \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (1, 'core_primitives', 1);
+        \\CREATE TABLE vector_chunks (
+        \\  id TEXT PRIMARY KEY,
+        \\  object_type TEXT NOT NULL,
+        \\  object_id TEXT NOT NULL,
+        \\  chunk_ordinal INTEGER NOT NULL DEFAULT 0,
+        \\  text TEXT NOT NULL DEFAULT '',
+        \\  scope TEXT NOT NULL DEFAULT 'workspace',
+        \\  permissions_json TEXT NOT NULL DEFAULT '[]',
+        \\  embedding_json TEXT NOT NULL,
+        \\  model TEXT,
+        \\  dimensions INTEGER NOT NULL,
+        \\  created_at_ms INTEGER NOT NULL,
+        \\  updated_at_ms INTEGER NOT NULL
+        \\);
+        \\INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms)
+        \\VALUES ('vec_raw_0','raw','raw_1',0,'orphan vector text','public','[]','[1,0]',NULL,2,1,1);
+        \\INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms)
+        \\VALUES ('vec_mem_missing_0','memory_atom','mem_missing',0,'missing memory vector','public','[]','[1,0]',NULL,2,1,1);
+    );
+    _ = c.sqlite3_close(db.?);
+
+    var store = try Store.initSQLite(std.testing.allocator, db_path);
+    defer store.deinit();
+    try std.testing.expectEqual(@as(i64, 7), try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE checksum <> ''"));
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM vector_chunks WHERE object_type = 'raw' OR object_id = 'mem_missing'"));
 }
 
 test "sqlite search excludes deprecated and superseded memory by default" {
@@ -6775,6 +6980,53 @@ test "sqlite vector search revalidates referenced object acl" {
 
     const secret_results = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"project:secret\"]", .limit = 10 });
     try std.testing.expectEqual(@as(usize, 1), secret_results.len);
+}
+
+test "sqlite vector chunks require backed primitive objects" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    try std.testing.expectError(error.InvalidVectorTarget, store.upsertVectorChunk(alloc, .{
+        .object_type = "raw",
+        .object_id = "raw_1",
+        .text = "orphan vector text",
+        .scope = "public",
+        .embedding_json = embedding,
+        .dimensions = 2,
+    }));
+    try std.testing.expectError(error.InvalidVectorTarget, store.upsertVectorChunk(alloc, .{
+        .object_type = "memory_atom",
+        .object_id = "mem_missing",
+        .text = "missing memory vector",
+        .scope = "public",
+        .embedding_json = embedding,
+        .dimensions = 2,
+    }));
+}
+
+test "sqlite vector search ignores legacy orphan chunks" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    try testingSqliteExec(&store,
+        \\PRAGMA ignore_check_constraints = ON;
+        \\INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms)
+        \\VALUES ('vec_raw_0','raw','raw_1',0,'orphan vector text','public','[]','[1,0]',NULL,2,1,1);
+        \\INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms)
+        \\VALUES ('vec_mem_missing_0','memory_atom','mem_missing',0,'missing memory vector','public','[]','[1,0]',NULL,2,1,1);
+        \\PRAGMA ignore_check_constraints = OFF;
+    );
+
+    const matches = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 0), matches.len);
 }
 
 test "sqlite vector search applies policy scope restrictions" {
