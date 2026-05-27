@@ -7,6 +7,7 @@ const compat = @import("compat.zig");
 const vector_mod = @import("vector.zig");
 const lifecycle_mod = @import("lifecycle.zig");
 const retrieval_mod = @import("retrieval.zig");
+const postgres_transport = @import("postgres.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -4081,28 +4082,15 @@ pub const SQLiteStore = struct {
     }
 };
 
-fn postgresUrlWithConnectTimeout(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-    if (!std.mem.startsWith(u8, url, "postgres://") and !std.mem.startsWith(u8, url, "postgresql://")) {
-        return allocator.dupe(u8, url);
-    }
-    if (std.mem.indexOf(u8, url, "connect_timeout=") != null) {
-        return allocator.dupe(u8, url);
-    }
-    const sep: []const u8 = if (std.mem.indexOfScalar(u8, url, '?') == null) "?" else "&";
-    return std.fmt.allocPrint(allocator, "{s}{s}connect_timeout=10", .{ url, sep });
-}
-
 pub const PostgresStore = struct {
     allocator: std.mem.Allocator,
-    url: []const u8,
-    psql_bin: []const u8,
+    transport: postgres_transport.QueryTransport,
 
     pub fn init(allocator: std.mem.Allocator, url: []const u8) !PostgresStore {
-        const owned = try postgresUrlWithConnectTimeout(allocator, url);
-        const psql_bin = compat.process.getEnvVarOwned(allocator, "NULLPANTRY_PSQL_BIN") catch blk: {
-            break :blk try allocator.dupe(u8, "psql");
-        };
-        var self = PostgresStore{ .allocator = allocator, .url = owned, .psql_bin = psql_bin };
+        const owned = try postgres_transport.withConnectTimeout(allocator, url);
+        defer allocator.free(owned);
+        var self = PostgresStore{ .allocator = allocator, .transport = try postgres_transport.QueryTransport.init(allocator, owned) };
+        errdefer self.deinit();
         try self.runSql(migrations.postgres_schema);
         try self.applyCompatibilityMigrations();
         try self.assertSchemaCurrent();
@@ -4110,8 +4098,7 @@ pub const PostgresStore = struct {
     }
 
     pub fn deinit(self: *PostgresStore) void {
-        self.allocator.free(self.url);
-        self.allocator.free(self.psql_bin);
+        self.transport.deinit();
     }
 
     pub fn health(self: *PostgresStore) bool {
@@ -4147,32 +4134,7 @@ pub const PostgresStore = struct {
     }
 
     fn queryRaw(self: *PostgresStore, allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
-        const guarded_sql = try std.fmt.allocPrint(allocator, "SET statement_timeout = '30000ms';\n{s}", .{sql});
-        defer allocator.free(guarded_sql);
-        var env_map = std.process.Environ.Map.init(allocator);
-        defer env_map.deinit();
-        const inherited_env = [_][]const u8{ "PATH", "HOME", "USER", "LANG", "LC_ALL", "PGSSLMODE", "PGSSLROOTCERT", "PGSERVICE", "PGSERVICEFILE", "PGPASSFILE" };
-        inline for (inherited_env) |name| {
-            if (compat.process.getEnvVarOwned(allocator, name)) |value| {
-                defer allocator.free(value);
-                try env_map.put(name, value);
-            } else |_| {}
-        }
-        try env_map.put("PGDATABASE", self.url);
-        const argv = [_][]const u8{ self.psql_bin, "-X", "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A", "-c", guarded_sql };
-        const result = try std.process.run(allocator, compat.io(), .{
-            .argv = &argv,
-            .environ_map = &env_map,
-            .stdout_limit = .limited(32 * 1024 * 1024),
-            .stderr_limit = .limited(4 * 1024 * 1024),
-        });
-        defer allocator.free(result.stderr);
-        defer allocator.free(result.stdout);
-        switch (result.term) {
-            .exited => |code| if (code != 0) return error.PostgresCommandFailed,
-            else => return error.PostgresCommandFailed,
-        }
-        return allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
+        return self.transport.queryRaw(allocator, sql);
     }
 
     fn queryText(self: *PostgresStore, allocator: std.mem.Allocator, sql: []const u8) ![]u8 {

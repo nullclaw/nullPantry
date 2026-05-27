@@ -15,13 +15,13 @@ zig build run -- --db .nullpantry/nullpantry.db
 
 CI, nightly, and release builds are delegated to `nullclaw/nullbuilder`.
 
-Postgres mode requires a Postgres database with `pgvector` available and a `psql` binary in `PATH`:
+Postgres mode requires a Postgres database with `pgvector` available and `libpq` available at runtime:
 
 ```sh
 NULLPANTRY_DATABASE_URL='postgres://user:pass@host:5432/nullpantry' NULLPANTRY_TOKEN=prod-secret NULLPANTRY_SCOPES='["admin"]' NULLPANTRY_CAPABILITIES='["read","write","propose","verify","delete","export","feed_apply"]' zig build run -- --backend postgres
 ```
 
-Set `NULLPANTRY_PSQL_BIN=/path/to/psql` when `psql` is not on `PATH`.
+The default Postgres transport is native `libpq`, loaded dynamically so nullbuilder release builds do not need a link-time libpq dependency. Set `NULLPANTRY_LIBPQ_PATH=/path/to/libpq` when the runtime library is not in a standard loader path, and `NULLPANTRY_POSTGRES_POOL_SIZE=16` to tune the idle libpq connection pool. `NULLPANTRY_POSTGRES_TRANSPORT=psql` plus `NULLPANTRY_PSQL_BIN=/path/to/psql` is retained as an explicit dev fallback, not the production path.
 
 Run the required production storage contract against a real Postgres/pgvector database with:
 
@@ -122,7 +122,7 @@ Additional agent-memory surfaces:
 
 SQLite is the working local/dev/test backend and includes relational tables, FTS5 indexes, schema version checks, first-class spaces/policy scopes, lifecycle status, audit events, first-class artifact type contracts, context packs, permission-filtered vector chunks, ANN-style local vector search, executable vector outbox, response/semantic caches, lifecycle snapshots/hygiene, idempotent cross-memory feed events, connector cursors, ingestion/extraction jobs, conflict records, and the NullClaw compatibility projection.
 
-Postgres is implemented through a hardened `psql`-backed runtime adapter. On startup it applies the Postgres DDL, adds `connect_timeout` to Postgres URLs that do not already define one, then storage operations execute SQL with server-side `statement_timeout` and consume JSON results through concurrent `psql` subprocess calls: primitives, hybrid search, dynamic-dimension pgvector, lifecycle/cache, NullClaw compatibility, sessions/history, jobs, connector cursors, and conflicts. Multi-step compatibility writes and snapshot imports run as single Postgres transaction scripts. Postgres vector search uses pgvector candidates and no longer silently falls back to an in-process 5000-row scan. This avoids silently falling back to SQLite and keeps the deployment dependency explicit; a native Zig/libpq adapter with connection pooling is still the expected transport for very high-concurrency deployments and can replace this transport later without changing the `Store` contract.
+Postgres is implemented through a native `libpq` runtime adapter behind a narrow transport boundary. On startup it applies the Postgres DDL, adds `connect_timeout` to Postgres URLs that do not already define one, then storage operations execute SQL with server-side `statement_timeout` through pooled libpq connections: primitives, hybrid search, dynamic-dimension pgvector, lifecycle/cache, NullClaw compatibility, sessions/history, jobs, connector cursors, and conflicts. Multi-step compatibility writes and snapshot imports run as single Postgres transaction scripts. Postgres vector search uses pgvector candidates and no longer silently falls back to an in-process 5000-row scan. The older `psql` subprocess transport is only available when explicitly requested with `NULLPANTRY_POSTGRES_TRANSPORT=psql`, which keeps production deployments honest while leaving a local fallback for constrained dev machines.
 
 ## Build System
 
