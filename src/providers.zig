@@ -39,6 +39,42 @@ pub const CompletionResult = struct {
     content: []const u8,
 };
 
+pub const ProviderDescriptor = struct {
+    name: []const u8,
+    role: []const u8,
+    status: []const u8,
+    protocol: []const u8,
+    env_prefix: []const u8,
+};
+
+pub const provider_descriptors = [_]ProviderDescriptor{
+    .{ .name = "local-deterministic", .role = "offline deterministic embeddings and fallback retrieval", .status = "built_in", .protocol = "none", .env_prefix = "" },
+    .{ .name = "openai-compatible-embeddings", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
+    .{ .name = "openai-compatible-chat", .role = "ask synthesis and optional reranking", .status = "built_in", .protocol = "POST /chat/completions", .env_prefix = "NULLPANTRY_LLM_" },
+    .{ .name = "ollama", .role = "local provider via OpenAI-compatible endpoint", .status = "compatible", .protocol = "configure Ollama OpenAI compatibility base URL", .env_prefix = "NULLPANTRY_EMBEDDING_|NULLPANTRY_LLM_" },
+    .{ .name = "voyage", .role = "embedding provider via OpenAI-compatible response shape", .status = "compatible", .protocol = "POST /embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
+    .{ .name = "gemini", .role = "external model provider adapter target", .status = "contract", .protocol = "provider adapter", .env_prefix = "NULLPANTRY_PROVIDER_" },
+};
+
+pub fn appendProvidersJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    try out.append(allocator, '[');
+    for (provider_descriptors, 0..) |descriptor, i| {
+        if (i > 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, "{\"name\":");
+        try json.appendString(out, allocator, descriptor.name);
+        try out.appendSlice(allocator, ",\"role\":");
+        try json.appendString(out, allocator, descriptor.role);
+        try out.appendSlice(allocator, ",\"status\":");
+        try json.appendString(out, allocator, descriptor.status);
+        try out.appendSlice(allocator, ",\"protocol\":");
+        try json.appendString(out, allocator, descriptor.protocol);
+        try out.appendSlice(allocator, ",\"env_prefix\":");
+        try json.appendString(out, allocator, descriptor.env_prefix);
+        try out.append(allocator, '}');
+    }
+    try out.append(allocator, ']');
+}
+
 pub fn embedText(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []const u8, fallback_dimensions: usize) !EmbeddingResult {
     if (cfg.enabled()) {
         const embedding = try callOpenAICompatibleEmbedding(allocator, cfg, text);
@@ -262,4 +298,12 @@ test "providers append endpoint suffixes safely" {
     const b = try providerUrl(std.testing.allocator, "https://example.test/v1/embeddings", "/embeddings");
     defer std.testing.allocator.free(b);
     try std.testing.expectEqualStrings("https://example.test/v1/embeddings", b);
+}
+
+test "providers manifest includes concrete and compatible providers" {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try appendProvidersJson(std.testing.allocator, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "openai-compatible-embeddings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "ollama") != null);
 }

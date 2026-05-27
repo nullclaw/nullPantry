@@ -15,6 +15,7 @@ pub const RunOptions = struct {
     embedding_model: ?[]const u8 = null,
     embedding_dimensions: usize = 64,
     provider_timeout_secs: u32 = 30,
+    actor_id: []const u8 = "system:worker",
 };
 
 pub const RunResult = struct {
@@ -145,18 +146,16 @@ fn jobBoolOption(allocator: std.mem.Allocator, input_json: []const u8, name: []c
 
 fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: domain.Source, options: RunOptions, job_options: ExtractionJobOptions) !ExtractionCounts {
     var counts = ExtractionCounts{};
-    counts.vector_chunk_count += try upsertVector(allocator, store, options, "source", source.id, source.content, source.scope, source.permissions_json);
 
     const source_ids_json = try extraction.sourceIdsJson(allocator, source.id);
     const entity_names_json = try extraction.extractEntityNamesJson(allocator, source.content);
-    const entities = try resolveEntities(allocator, store, entity_names_json, source.scope, source.permissions_json);
-    counts.entity_count = entities.len;
 
+    var artifact_input: ?store_mod.ArtifactInput = null;
     if (job_options.create_artifact) {
         const artifact_title = try extraction.sourceTitleForArtifact(allocator, source.title, source.source_type);
         const summary = try extraction.summarize(allocator, source.content, 512);
         const agent_summary = try extraction.summarize(allocator, source.content, 1024);
-        const artifact = try store.createArtifact(allocator, .{
+        artifact_input = .{
             .artifact_type = extraction.artifactTypeForSource(source.source_type),
             .title = artifact_title,
             .body = source.content,
@@ -168,36 +167,56 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
             .permissions_json = source.permissions_json,
             .summary = summary,
             .agent_summary = agent_summary,
-        });
-        counts.artifact_count = 1;
-        counts.vector_chunk_count += try upsertVector(allocator, store, options, "artifact", artifact.id, source.content, source.scope, source.permissions_json);
+            .actor_id = options.actor_id,
+        };
     }
 
-    if (!job_options.extract_memory) return counts;
-    var lines = std.mem.splitScalar(u8, source.content, '\n');
-    var offset: usize = 0;
-    var line_no: usize = 1;
-    while (lines.next()) |line| : ({
-        offset += line.len + 1;
-        line_no += 1;
-    }) {
-        const parsed = extraction.parseMemoryLine(line) orelse continue;
-        const evidence_ranges_json = try extraction.evidenceRangeJson(allocator, source.id, offset, offset + line.len, line_no);
-        const atom = try store.createMemoryAtom(allocator, .{
-            .subject_entity_id = if (entities.len > 0) entities[0].id else null,
-            .predicate = parsed.predicate,
-            .object = parsed.object,
-            .text = parsed.text,
-            .scope = source.scope,
-            .confidence = parsed.confidence,
-            .source_ids_json = source_ids_json,
-            .evidence_ranges_json = evidence_ranges_json,
-            .created_by = "agent",
-            .permissions_json = source.permissions_json,
-            .tags_json = parsed.tags_json,
-        });
+    var atom_inputs: std.ArrayListUnmanaged(store_mod.MemoryAtomInput) = .empty;
+    if (job_options.extract_memory) {
+        var lines = std.mem.splitScalar(u8, source.content, '\n');
+        var offset: usize = 0;
+        var line_no: usize = 1;
+        while (lines.next()) |line| : ({
+            offset += line.len + 1;
+            line_no += 1;
+        }) {
+            const parsed = extraction.parseMemoryLine(line) orelse continue;
+            const evidence_ranges_json = try extraction.evidenceRangeJson(allocator, source.id, offset, offset + line.len, line_no);
+            try atom_inputs.append(allocator, .{
+                .subject_entity_id = null,
+                .predicate = parsed.predicate,
+                .object = parsed.object,
+                .text = parsed.text,
+                .scope = source.scope,
+                .confidence = parsed.confidence,
+                .source_ids_json = source_ids_json,
+                .evidence_ranges_json = evidence_ranges_json,
+                .created_by = "agent",
+                .permissions_json = source.permissions_json,
+                .tags_json = parsed.tags_json,
+                .actor_id = options.actor_id,
+            });
+        }
+    }
+
+    const applied = try store.applyExtractedKnowledge(allocator, .{
+        .source = source,
+        .source_ids_json = source_ids_json,
+        .entity_names_json = entity_names_json,
+        .artifact = artifact_input,
+        .atoms = atom_inputs.items,
+        .actor_id = options.actor_id,
+    });
+    counts.entity_count = applied.entities.len;
+    counts.artifact_count = if (applied.artifact != null) 1 else 0;
+    counts.memory_atom_count = applied.atoms.len;
+
+    counts.vector_chunk_count += try upsertVector(allocator, store, options, "source", source.id, source.content, source.scope, source.permissions_json);
+    if (applied.artifact) |artifact| {
+        counts.vector_chunk_count += try upsertVector(allocator, store, options, "artifact", artifact.id, artifact.body, artifact.scope, artifact.permissions_json);
+    }
+    for (applied.atoms) |atom| {
         counts.vector_chunk_count += try upsertVector(allocator, store, options, "memory_atom", atom.id, atom.text, atom.scope, atom.permissions_json);
-        counts.memory_atom_count += 1;
     }
     return counts;
 }
@@ -212,7 +231,7 @@ fn resolveEntities(allocator: std.mem.Allocator, store: *store_mod.Store, names_
             .string => |s| s,
             else => continue,
         };
-        try out.append(allocator, try store.resolveEntity(allocator, .{ .entity_type = "project", .name = name, .scope = scope, .permissions_json = permissions_json }));
+        try out.append(allocator, try store.resolveEntity(allocator, .{ .entity_type = "project", .name = name, .scope = scope, .permissions_json = permissions_json, .actor_id = "system:worker" }));
     }
     return out.toOwnedSlice(allocator);
 }
@@ -225,13 +244,13 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
         const end = vectorChunkEnd(text, start);
         const chunk_text = std.mem.trim(u8, text[start..end], " \t\r\n");
         if (chunk_text.len > 0) {
-            const embedding_result = try providers.embedText(allocator, .{
+            const embedding_result = providers.embedText(allocator, .{
                 .base_url = options.embedding_base_url,
                 .api_key = options.embedding_api_key,
                 .model = options.embedding_model,
                 .dimensions = options.embedding_dimensions,
                 .timeout_secs = options.provider_timeout_secs,
-            }, chunk_text, options.embedding_dimensions);
+            }, chunk_text, options.embedding_dimensions) catch return count;
             const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
             _ = try store.upsertVectorChunk(allocator, .{
                 .object_type = object_type,
@@ -243,6 +262,7 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
                 .embedding_json = embedding_json,
                 .model = embedding_result.model,
                 .dimensions = @intCast(embedding_result.embedding.len),
+                .actor_id = options.actor_id,
             });
             count += 1;
         }

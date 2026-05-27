@@ -139,7 +139,54 @@ fn has_vectorIndexWorthy(query: []const u8) bool {
 }
 
 fn hasEntityHint(query: []const u8) bool {
-    return std.mem.indexOf(u8, query, "Null") != null or std.mem.indexOf(u8, query, "NP-") != null;
+    var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n.,;()[]{}<>!?\"'");
+    while (tokens.next()) |token| {
+        if (token.len < 3) continue;
+        if (std.mem.indexOfScalar(u8, token, ':') != null or std.mem.indexOfScalar(u8, token, '/') != null) return true;
+        if (ticketLike(token) or camelOrAcronymLike(token)) return true;
+    }
+    return containsAsciiIgnoreCase(query, "service") or
+        containsAsciiIgnoreCase(query, "repo") or
+        containsAsciiIgnoreCase(query, "ticket") or
+        containsAsciiIgnoreCase(query, "incident") or
+        containsAsciiIgnoreCase(query, "owner") or
+        containsAsciiIgnoreCase(query, "api");
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn ticketLike(token: []const u8) bool {
+    const dash = std.mem.indexOfScalar(u8, token, '-') orelse return false;
+    if (dash == 0 or dash + 1 >= token.len) return false;
+    var saw_alpha = false;
+    for (token[0..dash]) |ch| {
+        if (!std.ascii.isAlphabetic(ch)) return false;
+        saw_alpha = true;
+    }
+    var saw_digit = false;
+    for (token[dash + 1 ..]) |ch| {
+        if (!std.ascii.isDigit(ch)) return false;
+        saw_digit = true;
+    }
+    return saw_alpha and saw_digit;
+}
+
+fn camelOrAcronymLike(token: []const u8) bool {
+    var upper: usize = 0;
+    var lower: usize = 0;
+    var digit: usize = 0;
+    for (token) |ch| {
+        if (std.ascii.isUpper(ch)) upper += 1 else if (std.ascii.isLower(ch)) lower += 1 else if (std.ascii.isDigit(ch)) digit += 1 else return false;
+    }
+    return (upper >= 2 and lower > 0) or (upper >= 2 and digit > 0) or (upper >= 3 and token.len <= 12);
 }
 
 fn sortRanked(items: []RankedItem) void {
@@ -190,4 +237,14 @@ test "retrieval query expansion and plan expose stages" {
     try std.testing.expect(plan.use_graph);
     try std.testing.expect(plan.use_reranker);
     try std.testing.expect(std.mem.indexOf(u8, plan.expanded_query, "adr") != null);
+}
+
+test "retrieval plan enables graph for tickets repos and service-like names" {
+    const a = try buildPlan(std.testing.allocator, "ABC-123 owner", true, false);
+    defer std.testing.allocator.free(a.expanded_query);
+    try std.testing.expect(a.use_graph);
+
+    const b = try buildPlan(std.testing.allocator, "AuthService incident", true, false);
+    defer std.testing.allocator.free(b.expanded_query);
+    try std.testing.expect(b.use_graph);
 }

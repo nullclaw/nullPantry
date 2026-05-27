@@ -451,7 +451,7 @@ pub fn scopeWritable(scope: []const u8, actor_scopes_json: []const u8) bool {
 
 pub fn scopeVerifiable(scope: []const u8, actor_scopes_json: []const u8) bool {
     if (hasActorScope(actor_scopes_json, "admin")) return true;
-    return hasPrefixedActorScope(actor_scopes_json, "verify:", scope) or scopeWritable(scope, actor_scopes_json);
+    return hasPrefixedActorScope(actor_scopes_json, "verify:", scope);
 }
 
 pub fn scopeDeletable(scope: []const u8, actor_scopes_json: []const u8) bool {
@@ -513,4 +513,28 @@ test "scope list visibility prevents cache scope escalation" {
     try std.testing.expect(!scopeListVisible("[\"admin\"]", "[\"public\"]"));
     try std.testing.expect(scopeListVisible("[]", "[\"admin\"]"));
     try std.testing.expect(!scopeListVisible("[]", "[\"public\"]"));
+}
+
+test "relation json has a single source_ids field" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    try (Relation{
+        .id = "rel_test",
+        .from_entity_id = "ent_a",
+        .relation_type = "documents",
+        .to_entity_id = "ent_b",
+        .source_ids_json = "[\"src_a\"]",
+        .scope = "public",
+        .permissions_json = "[]",
+        .confidence = 0.9,
+        .status = "verified",
+        .created_at_ms = 1,
+    }).writeJson(alloc, &out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("source_ids") != null);
+    try std.testing.expectEqualStrings("public", parsed.value.object.get("scope").?.string);
 }

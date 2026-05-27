@@ -1,3 +1,5 @@
+pub const expected_schema_version: i64 = 5;
+
 pub const sqlite_schema =
     \\PRAGMA journal_mode = WAL;
     \\PRAGMA foreign_keys = ON;

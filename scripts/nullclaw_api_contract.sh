@@ -127,6 +127,8 @@ scoped_search="$(curl_ok \
   --data '{"query":"Scoped remote","limit":10,"session_id":"sess id=1"}' \
   "$BASE_URL/memories/search")"
 expect_contains "$scoped_search" '"entries"'
+expect_contains "$scoped_search" '"category":"nullpantry.context_pack"'
+expect_contains "$scoped_search" 'Context Pack'
 expect_contains "$scoped_search" '"content":"Scoped remote memory"'
 expect_not_contains "$scoped_search" 'Global remote memory'
 

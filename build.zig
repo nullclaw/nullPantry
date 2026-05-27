@@ -51,4 +51,9 @@ pub fn build(b: *std.Build) void {
     nullclaw_contract_cmd.step.dependOn(b.getInstallStep());
     const nullclaw_contract_step = b.step("nullclaw-contract", "Run live NullClaw API compatibility contract against the installed service");
     nullclaw_contract_step.dependOn(&nullclaw_contract_cmd.step);
+
+    const nullclaw_runtime_contract_cmd = b.addSystemCommand(&.{ "sh", "scripts/nullclaw_runtime_contract.sh" });
+    nullclaw_runtime_contract_cmd.step.dependOn(b.getInstallStep());
+    const nullclaw_runtime_contract_step = b.step("nullclaw-runtime-contract", "Check current NullClaw api memory engine and optionally run its tests against NullPantry");
+    nullclaw_runtime_contract_step.dependOn(&nullclaw_runtime_contract_cmd.step);
 }
