@@ -56,4 +56,9 @@ pub fn build(b: *std.Build) void {
     nullclaw_runtime_contract_cmd.step.dependOn(b.getInstallStep());
     const nullclaw_runtime_contract_step = b.step("nullclaw-runtime-contract", "Check current NullClaw api memory engine and optionally run its tests against NullPantry");
     nullclaw_runtime_contract_step.dependOn(&nullclaw_runtime_contract_cmd.step);
+
+    const postgres_contract_cmd = b.addRunArtifact(tests);
+    postgres_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_POSTGRES_TEST", "1");
+    const postgres_contract_step = b.step("postgres-contract", "Run the required Postgres/pgvector storage contract with NULLPANTRY_TEST_POSTGRES_URL");
+    postgres_contract_step.dependOn(&postgres_contract_cmd.step);
 }

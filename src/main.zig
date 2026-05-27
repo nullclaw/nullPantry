@@ -25,6 +25,8 @@ const RuntimeConfig = struct {
     token_principals_json: ?[]const u8 = null,
     actor_scopes_json: []const u8 = "[\"admin\"]",
     actor_capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
+    worker_scopes_json: []const u8 = "[\"admin\"]",
+    worker_capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
     embedding_base_url: ?[]const u8 = null,
     embedding_api_key: ?[]const u8 = null,
     embedding_model: ?[]const u8 = null,
@@ -158,8 +160,8 @@ fn workerLoop(state: *ServerState) void {
         std.Io.sleep(compat.io(), .fromNanoseconds(@intCast(state.cfg.worker_interval_ms * std.time.ns_per_ms)), .awake) catch {};
         var arena = std.heap.ArenaAllocator.init(state.allocator);
         const result = worker.runOnce(arena.allocator(), state.store, .{
-            .scopes_json = state.cfg.actor_scopes_json,
-            .capabilities_json = state.cfg.actor_capabilities_json,
+            .scopes_json = state.cfg.worker_scopes_json,
+            .capabilities_json = state.cfg.worker_capabilities_json,
             .job_limit = 25,
             .outbox_limit = 250,
             .embedding_base_url = state.cfg.embedding_base_url,
@@ -209,6 +211,12 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_CAPABILITIES")) |caps| {
         cfg.actor_capabilities_json = caps;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_WORKER_SCOPES")) |scopes| {
+        cfg.worker_scopes_json = scopes;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_WORKER_CAPABILITIES")) |caps| {
+        cfg.worker_capabilities_json = caps;
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_BASE_URL")) |url| {
         cfg.embedding_base_url = url;
@@ -278,6 +286,12 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--actor-capabilities") and i + 1 < args.len) {
             i += 1;
             cfg.actor_capabilities_json = args[i];
+        } else if (std.mem.eql(u8, arg, "--worker-scopes") and i + 1 < args.len) {
+            i += 1;
+            cfg.worker_scopes_json = args[i];
+        } else if (std.mem.eql(u8, arg, "--worker-capabilities") and i + 1 < args.len) {
+            i += 1;
+            cfg.worker_capabilities_json = args[i];
         } else if (std.mem.eql(u8, arg, "--embedding-base-url") and i + 1 < args.len) {
             i += 1;
             cfg.embedding_base_url = args[i];
@@ -312,7 +326,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
 
 fn printUsage() void {
     std.debug.print(
-        \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--token-principals JSON] [--actor-scopes JSON] [--actor-capabilities JSON]
+        \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--token-principals JSON] [--actor-scopes JSON] [--actor-capabilities JSON] [--worker-scopes JSON] [--worker-capabilities JSON]
         \\       nullpantry --backend postgres --postgres-url URL [--token TOKEN|--token-principals JSON]
         \\
         \\Environment:
@@ -321,6 +335,8 @@ fn printUsage() void {
         \\  NULLPANTRY_DATABASE_URL
         \\  NULLPANTRY_SCOPES
         \\  NULLPANTRY_CAPABILITIES
+        \\  NULLPANTRY_WORKER_SCOPES
+        \\  NULLPANTRY_WORKER_CAPABILITIES
         \\  NULLPANTRY_EMBEDDING_BASE_URL
         \\  NULLPANTRY_EMBEDDING_API_KEY
         \\  NULLPANTRY_EMBEDDING_MODEL
@@ -346,6 +362,30 @@ fn ensureParentDirForFile(path: []const u8) !void {
         else => return err,
     }
     try std.Io.Dir.cwd().createDirPath(compat.io(), parent);
+}
+
+test "token auth does not downgrade background worker principal" {
+    const args = [_][:0]const u8{ "nullpantry", "--token", "test-token" };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+
+    try std.testing.expectEqualStrings("[\"public\"]", cfg.actor_scopes_json);
+    try std.testing.expectEqualStrings("[\"read\"]", cfg.actor_capabilities_json);
+    try std.testing.expectEqualStrings("[\"admin\"]", cfg.worker_scopes_json);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.worker_capabilities_json, "\"write\"") != null);
+}
+
+test "worker principal can be narrowed explicitly" {
+    const args = [_][:0]const u8{
+        "nullpantry",
+        "--worker-scopes",
+        "[\"project:nullpantry\"]",
+        "--worker-capabilities",
+        "[\"read\",\"write\",\"verify\"]",
+    };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+
+    try std.testing.expectEqualStrings("[\"project:nullpantry\"]", cfg.worker_scopes_json);
+    try std.testing.expectEqualStrings("[\"read\",\"write\",\"verify\"]", cfg.worker_capabilities_json);
 }
 
 fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max_bytes: usize) !?[]u8 {
