@@ -4,6 +4,7 @@ const domain = @import("domain.zig");
 const extraction = @import("extraction.zig");
 const providers = @import("providers.zig");
 const vector = @import("vector.zig");
+const json = @import("json_util.zig");
 
 pub const RunOptions = struct {
     scopes_json: []const u8 = "[\"admin\"]",
@@ -28,9 +29,9 @@ pub const RunResult = struct {
 
 pub fn runOnce(allocator: std.mem.Allocator, store: *store_mod.Store, options: RunOptions) !RunResult {
     var result = RunResult{};
-    const outbox = try store.runVectorOutbox(options.outbox_limit);
-    result.vector_outbox_processed = outbox.processed;
-    result.vector_outbox_failed = outbox.failed;
+    const outbox = try runVectorOutboxOnce(allocator, store, options);
+    result.vector_outbox_processed += outbox.processed;
+    result.vector_outbox_failed += outbox.failed;
 
     const jobs = try store.listJobs(allocator, .{
         .status = "queued",
@@ -65,7 +66,9 @@ pub fn runJobById(allocator: std.mem.Allocator, store: *store_mod.Store, id: []c
 
 pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job: store_mod.Job, options: RunOptions) ![]const u8 {
     if (std.mem.eql(u8, job.job_type, "vector_outbox")) {
-        const outbox = try store.runVectorOutbox(1000);
+        var job_options = options;
+        job_options.outbox_limit = @max(job_options.outbox_limit, 1000);
+        const outbox = try runVectorOutboxOnce(allocator, store, job_options);
         return try std.fmt.allocPrint(allocator, "{{\"vector_outbox_processed\":{d},\"vector_outbox_failed\":{d}}}", .{ outbox.processed, outbox.failed });
     }
     if (std.mem.eql(u8, job.job_type, "hygiene")) {
@@ -91,6 +94,17 @@ pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job:
         return try std.fmt.allocPrint(allocator, "{{\"source_id\":\"{s}\",\"artifact_count\":{d},\"memory_atom_count\":{d},\"entity_count\":{d},\"vector_chunk_count\":{d}}}", .{ source.id, extracted.artifact_count, extracted.memory_atom_count, extracted.entity_count, extracted.vector_chunk_count });
     }
     return error.UnsupportedJob;
+}
+
+pub fn runVectorOutboxOnce(allocator: std.mem.Allocator, store: *store_mod.Store, options: RunOptions) !store_mod.VectorOutboxRunResult {
+    var result = store_mod.VectorOutboxRunResult{};
+    const embedded = try runEmbeddingOutbox(allocator, store, options);
+    result.processed += embedded.processed;
+    result.failed += embedded.failed;
+    const indexed = try store.runVectorOutbox(options.outbox_limit);
+    result.processed += indexed.processed;
+    result.failed += indexed.failed;
+    return result;
 }
 
 fn jobExecutionScopesJson(allocator: std.mem.Allocator, job: store_mod.Job) ![]const u8 {
@@ -244,6 +258,8 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
         const end = vectorChunkEnd(text, start);
         const chunk_text = std.mem.trim(u8, text[start..end], " \t\r\n");
         if (chunk_text.len > 0) {
+            const payload = try store_mod.vectorEmbedPayloadJson(allocator, @intCast(count), chunk_text, scope, permissions_json, options.embedding_model, options.embedding_dimensions);
+            const outbox_id = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
             const embedding_result = providers.embedText(allocator, .{
                 .base_url = options.embedding_base_url,
                 .api_key = options.embedding_api_key,
@@ -264,11 +280,66 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
                 .dimensions = @intCast(embedding_result.embedding.len),
                 .actor_id = options.actor_id,
             });
+            _ = try store.finishVectorOutbox(outbox_id, "embedded");
             count += 1;
         }
         start = end;
     }
     return count;
+}
+
+fn runEmbeddingOutbox(allocator: std.mem.Allocator, store: *store_mod.Store, options: RunOptions) !store_mod.VectorOutboxRunResult {
+    const entries = try store.listVectorOutbox(allocator, .{ .action = "embed", .status = "pending", .limit = options.outbox_limit });
+    var result = store_mod.VectorOutboxRunResult{};
+    for (entries) |entry| {
+        if (!try store.claimVectorOutbox(entry.id)) continue;
+        processEmbeddingOutboxEntry(allocator, store, options, entry) catch {
+            _ = try store.finishVectorOutbox(entry.id, "failed_embedding");
+            result.failed += 1;
+            continue;
+        };
+        _ = try store.finishVectorOutbox(entry.id, "embedded");
+        result.processed += 1;
+    }
+    return result;
+}
+
+fn processEmbeddingOutboxEntry(allocator: std.mem.Allocator, store: *store_mod.Store, options: RunOptions, entry: store_mod.VectorOutboxEntry) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.payload_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidVectorOutboxPayload;
+    const obj = parsed.value.object;
+    const text = json.stringField(obj, "text") orelse return error.InvalidVectorOutboxPayload;
+    const scope = json.stringField(obj, "scope") orelse "workspace";
+    const permissions_json = try rawJsonField(allocator, obj, "permissions", "[]");
+    const chunk_ordinal = json.intField(obj, "chunk_ordinal") orelse 0;
+    const dimensions: usize = @intCast(@max(@as(i64, 1), json.intField(obj, "dimensions") orelse @as(i64, @intCast(options.embedding_dimensions))));
+    const embedding_result = try providers.embedText(allocator, .{
+        .base_url = options.embedding_base_url,
+        .api_key = options.embedding_api_key,
+        .model = options.embedding_model,
+        .dimensions = dimensions,
+        .timeout_secs = options.provider_timeout_secs,
+    }, text, dimensions);
+    const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
+    _ = try store.upsertVectorChunk(allocator, .{
+        .object_type = entry.object_type,
+        .object_id = entry.object_id,
+        .chunk_ordinal = chunk_ordinal,
+        .text = text,
+        .scope = scope,
+        .permissions_json = permissions_json,
+        .embedding_json = embedding_json,
+        .model = embedding_result.model,
+        .dimensions = @intCast(embedding_result.embedding.len),
+        .actor_id = options.actor_id,
+    });
+}
+
+fn rawJsonField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, name: []const u8, fallback: []const u8) ![]const u8 {
+    const value = obj.get(name) orelse return allocator.dupe(u8, fallback);
+    if (value == .null) return allocator.dupe(u8, fallback);
+    return try json.jsonFromValue(allocator, value);
 }
 
 fn vectorChunkEnd(text: []const u8, start: usize) usize {
@@ -297,4 +368,44 @@ test "worker processes vector outbox and queued hygiene job" {
     const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]" });
     try std.testing.expect(result.vector_outbox_processed >= 1);
     try std.testing.expectEqual(@as(usize, 1), result.jobs_succeeded);
+}
+
+test "worker persists embed outbox before provider call and replays locally" {
+    var store = try store_mod.Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = try store.createSource(alloc, .{
+        .source_type = "transcript",
+        .title = "Provider outage transcript",
+        .content = "Decision: NullPantry must preserve vector work while embedding providers are unavailable",
+        .scope = "public",
+    });
+    const counts = try extractSource(alloc, &store, source, .{
+        .embedding_base_url = "bad://embedding",
+        .embedding_model = "unavailable",
+        .provider_timeout_secs = 1,
+    }, .{});
+    try std.testing.expectEqual(@as(usize, 0), counts.vector_chunk_count);
+
+    const pending = try store.listVectorOutbox(alloc, .{ .action = "embed", .status = "pending", .limit = 20 });
+    try std.testing.expect(pending.len > 0);
+
+    const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]", .outbox_limit = 50 });
+    try std.testing.expect(result.vector_outbox_processed >= pending.len);
+    const still_pending = try store.listVectorOutbox(alloc, .{ .action = "embed", .status = "pending", .limit = 20 });
+    try std.testing.expectEqual(@as(usize, 0), still_pending.len);
+    const indexed = try store.search(alloc, .{
+        .query = "embedding providers unavailable",
+        .scopes_json = "[\"public\"]",
+        .limit = 10,
+        .use_vector = true,
+    });
+    var saw_source = false;
+    for (indexed) |result_item| {
+        if (std.mem.eql(u8, result_item.id, source.id)) saw_source = true;
+    }
+    try std.testing.expect(saw_source);
 }

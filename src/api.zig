@@ -74,13 +74,16 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
     if (eql(seg1, "engines") and is_get) {
         return engineRegistry(ctx);
     } else if ((eql(seg1, "openapi.json") or eql(seg1, "openapi")) and is_get) {
-        return openApi(ctx);
+        return openApiDocument(ctx);
     } else if (eql(seg1, "capabilities") and is_get) {
         return capabilities(ctx);
     } else if (eql(seg1, "providers") and is_get) {
         return providerRegistry(ctx);
-    } else if (eql(seg1, "connectors") and is_get) {
-        return connectors(ctx);
+    } else if (eql(seg1, "connectors")) {
+        if (is_get and seg2 == null) return connectors(ctx);
+        if (is_get and seg2 != null and eql(seg3, "cursor")) return connectorCursorGet(ctx, seg2.?, parsed.query);
+        if (is_post and seg2 != null and eql(seg3, "cursor")) return connectorCursorUpsert(ctx, seg2.?, body);
+        if (is_post and seg2 != null and eql(seg3, "ingest")) return connectorIngest(ctx, seg2.?, body);
     } else if (eql(seg1, "artifact-types") and is_get) {
         return artifactTypes(ctx);
     } else if (eql(seg1, "spaces")) {
@@ -515,15 +518,118 @@ fn engineRegistry(ctx: *Context) HttpResponse {
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
-fn openApi(ctx: *Context) HttpResponse {
-    return ok(ctx,
-        \\{"openapi":"3.1.0","info":{"title":"NullPantry API","version":"v1","description":"Headless agent-native knowledge base and central memory service for the Null ecosystem."},"servers":[{"url":"/v1"}],"security":[{"bearerAuth":[]}],"components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}}},"paths":{"/sources":{"post":{"operationId":"createSource"}},"/sources/{id}":{"get":{"operationId":"getSource"}},"/artifacts":{"post":{"operationId":"createArtifact"}},"/artifacts/{id}":{"get":{"operationId":"getArtifact"}},"/memory-atoms":{"post":{"operationId":"createMemoryAtom"}},"/memory-atoms/{id}":{"patch":{"operationId":"patchMemoryAtom"}},"/entities/resolve":{"post":{"operationId":"resolveEntity"}},"/relations":{"post":{"operationId":"createRelation"}},"/search":{"post":{"operationId":"search"}},"/ask":{"post":{"operationId":"ask"}},"/context-packs":{"post":{"operationId":"createContextPack"}},"/remember":{"post":{"operationId":"remember"}},"/forget":{"post":{"operationId":"forget"}},"/verify":{"post":{"operationId":"verify"}},"/mark-stale":{"post":{"operationId":"markStale"}},"/ingest":{"post":{"operationId":"ingest"}},"/jobs":{"get":{"operationId":"listJobs"},"post":{"operationId":"createJob"}},"/workers/run":{"post":{"operationId":"runWorkers"}},"/memory/feed":{"get":{"operationId":"listFeed"},"post":{"operationId":"appendFeed"}},"/memory/apply":{"post":{"operationId":"applyFeedEvent"}},"/vector/embed":{"post":{"operationId":"embed"}},"/vector/upsert":{"post":{"operationId":"upsertVectorChunk"}},"/vector/search":{"post":{"operationId":"vectorSearch"}},"/retrieval/search":{"post":{"operationId":"retrievalSearch"}},"/lifecycle/diagnostics":{"get":{"operationId":"diagnostics"}},"/lifecycle/snapshot":{"post":{"operationId":"createSnapshot"}},"/lifecycle/snapshot/export":{"post":{"operationId":"exportSnapshot"}},"/lifecycle/snapshot/import":{"post":{"operationId":"importSnapshot"}},"/nullclaw/memories/{key}":{"put":{"operationId":"nullclawPutMemory"},"get":{"operationId":"nullclawGetMemory"},"delete":{"operationId":"nullclawDeleteMemory"}},"/nullclaw/memories":{"get":{"operationId":"nullclawListMemories"}},"/nullclaw/memories/search":{"post":{"operationId":"nullclawSearchMemories"}},"/nullclaw/memories/count":{"get":{"operationId":"nullclawCountMemories"}},"/nullclaw/sessions/{id}/messages":{"get":{"operationId":"nullclawLoadMessages"},"post":{"operationId":"nullclawSaveMessage"},"delete":{"operationId":"nullclawClearMessages"}},"/nullclaw/sessions/{id}/usage":{"get":{"operationId":"nullclawLoadUsage"},"put":{"operationId":"nullclawSaveUsage"},"delete":{"operationId":"nullclawDeleteUsage"}},"/nullclaw/history":{"get":{"operationId":"nullclawListHistory"}},"/nullclaw/history/{id}":{"get":{"operationId":"nullclawShowHistory"}}}}
-    );
+const OpenApiPath = struct {
+    path: []const u8,
+    get: ?[]const u8 = null,
+    post: ?[]const u8 = null,
+    put: ?[]const u8 = null,
+    patch: ?[]const u8 = null,
+    delete: ?[]const u8 = null,
+};
+
+fn openApiDocument(ctx: *Context) HttpResponse {
+    const paths = [_]OpenApiPath{
+        .{ .path = "/engines", .get = "listEngines" },
+        .{ .path = "/providers", .get = "listProviders" },
+        .{ .path = "/connectors", .get = "listConnectors" },
+        .{ .path = "/connectors/{name}/cursor", .get = "connectorGetCursor", .post = "connectorUpsertCursor" },
+        .{ .path = "/connectors/{name}/ingest", .post = "connectorIngest" },
+        .{ .path = "/artifact-types", .get = "listArtifactTypes" },
+        .{ .path = "/sdk/manifest", .get = "sdkManifest" },
+        .{ .path = "/spaces", .get = "listSpaces", .post = "createSpace" },
+        .{ .path = "/spaces/{id}", .get = "getSpace" },
+        .{ .path = "/policy-scopes", .get = "listPolicyScopes", .post = "upsertPolicyScope" },
+        .{ .path = "/policy-scopes/{scope}", .get = "getPolicyScope" },
+        .{ .path = "/sources", .post = "createSource" },
+        .{ .path = "/sources/{id}", .get = "getSource" },
+        .{ .path = "/artifacts", .post = "createArtifact" },
+        .{ .path = "/artifacts/{id}", .get = "getArtifact" },
+        .{ .path = "/memory-atoms", .post = "createMemoryAtom" },
+        .{ .path = "/memory-atoms/{id}", .patch = "patchMemoryAtom" },
+        .{ .path = "/entities/resolve", .post = "resolveEntity" },
+        .{ .path = "/relations", .post = "createRelation" },
+        .{ .path = "/ingest", .post = "ingest" },
+        .{ .path = "/extract-memory", .post = "extractMemory" },
+        .{ .path = "/search", .post = "search" },
+        .{ .path = "/ask", .post = "ask" },
+        .{ .path = "/context-packs", .post = "createContextPack" },
+        .{ .path = "/remember", .post = "remember" },
+        .{ .path = "/forget", .post = "forget" },
+        .{ .path = "/verify", .post = "verify" },
+        .{ .path = "/mark-stale", .post = "markStale" },
+        .{ .path = "/jobs", .get = "listJobs", .post = "createJob" },
+        .{ .path = "/jobs/{id}/run", .post = "runJob" },
+        .{ .path = "/workers/run", .post = "runWorkers" },
+        .{ .path = "/memory/feed", .get = "listFeed", .post = "appendFeed" },
+        .{ .path = "/memory/apply", .post = "applyFeedEvent" },
+        .{ .path = "/vector/embed", .post = "embed" },
+        .{ .path = "/vector/upsert", .post = "upsertVectorChunk" },
+        .{ .path = "/vector/search", .post = "vectorSearch" },
+        .{ .path = "/vector/outbox", .get = "vectorOutboxStatus" },
+        .{ .path = "/vector/outbox/run", .post = "runVectorOutbox" },
+        .{ .path = "/retrieval/plan", .post = "retrievalPlan" },
+        .{ .path = "/retrieval/search", .post = "retrievalSearch" },
+        .{ .path = "/conflicts", .get = "listConflicts" },
+        .{ .path = "/conflicts/scan", .post = "scanConflicts" },
+        .{ .path = "/lifecycle/diagnostics", .get = "diagnostics" },
+        .{ .path = "/lifecycle/snapshot", .post = "createSnapshot" },
+        .{ .path = "/lifecycle/snapshot/export", .post = "exportSnapshot" },
+        .{ .path = "/lifecycle/snapshot/import", .post = "importSnapshot" },
+        .{ .path = "/lifecycle/cache/put", .post = "putResponseCache" },
+        .{ .path = "/lifecycle/cache/get", .post = "getResponseCache" },
+        .{ .path = "/lifecycle/semantic-cache/put", .post = "putSemanticCache" },
+        .{ .path = "/lifecycle/semantic-cache/search", .post = "searchSemanticCache" },
+        .{ .path = "/lifecycle/hygiene", .post = "runHygiene" },
+        .{ .path = "/lifecycle/summarize", .post = "summarize" },
+        .{ .path = "/lifecycle/rollout", .post = "rollout" },
+        .{ .path = "/nullclaw/health", .get = "nullclawHealth" },
+        .{ .path = "/nullclaw/memories", .get = "nullclawListMemories" },
+        .{ .path = "/nullclaw/memories/{key}", .get = "nullclawGetMemory", .put = "nullclawPutMemory", .delete = "nullclawDeleteMemory" },
+        .{ .path = "/nullclaw/memories/search", .post = "nullclawSearchMemories" },
+        .{ .path = "/nullclaw/memories/count", .get = "nullclawCountMemories" },
+        .{ .path = "/nullclaw/sessions/{id}/messages", .get = "nullclawLoadMessages", .post = "nullclawSaveMessage", .delete = "nullclawClearMessages" },
+        .{ .path = "/nullclaw/sessions/{id}/usage", .get = "nullclawLoadUsage", .put = "nullclawSaveUsage", .delete = "nullclawDeleteUsage" },
+        .{ .path = "/nullclaw/history", .get = "nullclawListHistory" },
+        .{ .path = "/nullclaw/history/{id}", .get = "nullclawShowHistory" },
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator,
+        \\{"openapi":"3.1.0","info":{"title":"NullPantry API","version":"v1","description":"Headless agent-native knowledge base and central memory service for the Null ecosystem."},"servers":[{"url":"/v1"}],"security":[{"bearerAuth":[]}],"components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}},"schemas":{"Error":{"type":"object","required":["error"],"properties":{"error":{"type":"string"},"message":{"type":"string"}}},"SourceCreate":{"type":"object","required":["title"],"properties":{"type":{"type":"string","default":"manual"},"title":{"type":"string"},"content":{"type":"string"},"scope":{"type":"string","default":"workspace"},"permissions":{"type":"array","items":{"type":"string"}},"metadata":{"type":"object"}}},"MemoryAtomCreate":{"type":"object","required":["text"],"properties":{"text":{"type":"string"},"scope":{"type":"string"},"confidence":{"type":"number"},"status":{"enum":["proposed","verified","rejected","stale","deprecated","superseded"]},"source_ids":{"type":"array","items":{"type":"string"}},"evidence_ranges":{"type":"array","items":{"type":"object"}}}},"SearchRequest":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"scopes":{"type":"array","items":{"type":"string"}},"include_deprecated":{"type":"boolean"},"use_vector":{"type":"boolean"},"allow_reranker":{"type":"boolean"}}},"ConnectorCursor":{"type":"object","required":["connector","scope","cursor"],"properties":{"connector":{"type":"string"},"scope":{"type":"string"},"cursor":{"type":"string"},"config":{"type":"object"},"permissions":{"type":"array","items":{"type":"string"}},"updated_at_ms":{"type":"integer"}}},"ConnectorIngestRequest":{"type":"object","properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/SourceCreate"}},"run_now":{"type":"boolean"},"scope":{"type":"string"},"permissions":{"type":"array","items":{"type":"string"}},"next_cursor":{"type":"string"},"cursor":{"type":"string"},"config":{"type":"object"}}},"NullClawMemoryEntry":{"type":"object","required":["key","content"],"properties":{"key":{"type":"string"},"content":{"type":"string"},"category":{"type":"string"},"session_id":{"type":["string","null"]},"timestamp":{"type":"string"},"score":{"type":"number"}}}}},"paths":{
+    ) catch return serverError(ctx);
+    for (paths, 0..) |path, i| {
+        if (i > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
+        appendOpenApiPath(ctx.allocator, &out, path) catch return serverError(ctx);
+    }
+    out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn appendOpenApiPath(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), path: OpenApiPath) !void {
+    try json.appendString(out, allocator, path.path);
+    try out.appendSlice(allocator, ":{");
+    var count: usize = 0;
+    try appendOpenApiOperation(allocator, out, &count, "get", path.get);
+    try appendOpenApiOperation(allocator, out, &count, "post", path.post);
+    try appendOpenApiOperation(allocator, out, &count, "put", path.put);
+    try appendOpenApiOperation(allocator, out, &count, "patch", path.patch);
+    try appendOpenApiOperation(allocator, out, &count, "delete", path.delete);
+    try out.append(allocator, '}');
+}
+
+fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), count: *usize, method: []const u8, operation_id: ?[]const u8) !void {
+    const op = operation_id orelse return;
+    if (count.* > 0) try out.append(allocator, ',');
+    try json.appendString(out, allocator, method);
+    try out.appendSlice(allocator, ":{\"operationId\":");
+    try json.appendString(out, allocator, op);
+    try out.appendSlice(allocator, ",\"responses\":{\"200\":{\"description\":\"OK\"}}}");
+    count.* += 1;
 }
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"storage":["sqlite","postgres-psql-runtime"],"apis":["remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","jobs","workers","conflicts","snapshot_export","snapshot_import"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"compatibility":["nullclaw-api-memory","nullclaw-kb-projection","nullclaw-context-pack-entry","session-history","cross-memory-feed"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"storage":["sqlite","postgres-psql-runtime"],"apis":["remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","jobs","workers","conflicts","snapshot_export","snapshot_import"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"compatibility":["nullclaw-api-memory","nullclaw-kb-projection","nullclaw-context-pack-entry","session-history","cross-memory-feed"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -537,8 +643,163 @@ fn providerRegistry(ctx: *Context) HttpResponse {
 
 fn connectors(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"connectors":[{"name":"manual","status":"built_in","source_types":["manual","text"]},{"name":"transcript","status":"built_in","source_types":["transcript","chat"]},{"name":"ticket","status":"contract","source_types":["ticket","issue"]},{"name":"git","status":"contract","source_types":["pr","commit","repo"]},{"name":"incident","status":"contract","source_types":["incident"]},{"name":"nullclaw","status":"built_in","api":"/v1/nullclaw"},{"name":"nulltickets","status":"contract"},{"name":"nullwatch","status":"contract"},{"name":"nullhub","status":"consumer"}]}
+        \\{"connectors":[{"name":"manual","status":"built_in","source_types":["manual","text"],"ingest":"POST /v1/connectors/manual/ingest","cursor":"GET|POST /v1/connectors/manual/cursor"},{"name":"transcript","status":"built_in","source_types":["transcript","chat"],"ingest":"POST /v1/connectors/transcript/ingest","cursor":"GET|POST /v1/connectors/transcript/cursor"},{"name":"ticket","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/ticket/ingest","cursor":"GET|POST /v1/connectors/ticket/cursor"},{"name":"git","status":"built_in_push","source_types":["pr","commit","repo"],"ingest":"POST /v1/connectors/git/ingest","cursor":"GET|POST /v1/connectors/git/cursor"},{"name":"incident","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/incident/ingest","cursor":"GET|POST /v1/connectors/incident/cursor"},{"name":"nullclaw","status":"built_in","api":"/v1/nullclaw"},{"name":"nulltickets","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/nulltickets/ingest","cursor":"GET|POST /v1/connectors/nulltickets/cursor"},{"name":"nullwatch","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/nullwatch/ingest","cursor":"GET|POST /v1/connectors/nullwatch/cursor"},{"name":"nullhub","status":"consumer"}]}
     );
+}
+
+fn connectorCursorGet(ctx: *Context, connector: []const u8, query: []const u8) HttpResponse {
+    const decoded_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
+    const scope = if (decoded_scope) |value| value else "workspace";
+    const cursor = ctx.store.getConnectorCursor(ctx.allocator, connector, scope) catch return serverError(ctx);
+    const loaded = cursor orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Connector cursor not found");
+    if (!recordVisibleToActor(ctx, loaded.scope, loaded.permissions_json)) return forbidden(ctx);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"cursor\":") catch return serverError(ctx);
+    loaded.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn connectorCursorUpsert(ctx: *Context, connector: []const u8, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const scope = json.stringField(obj, "scope") orelse "workspace";
+    const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return badJson(ctx);
+    if (!canWriteRecord(ctx, scope, permissions_json)) return forbidden(ctx);
+    const cursor_value = json.stringField(obj, "cursor") orelse json.stringField(obj, "next_cursor") orelse "";
+    const config_json = rawField(ctx.allocator, obj, "config", "{}") catch return badJson(ctx);
+    const cursor = ctx.store.upsertConnectorCursor(ctx.allocator, .{
+        .connector = connector,
+        .scope = scope,
+        .cursor = cursor_value,
+        .config_json = config_json,
+        .permissions_json = permissions_json,
+        .actor_id = ctx.actor_id,
+    }) catch return serverError(ctx);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"cursor\":") catch return serverError(ctx);
+    cursor.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn connectorIngest(ctx: *Context, connector: []const u8, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const default_scope = json.stringField(obj, "scope") orelse "workspace";
+    const default_permissions = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    const run_now = json.boolField(obj, "run_now") orelse false;
+    const updated_cursor = connectorCursorFromIngest(ctx, connector, obj, default_scope, default_permissions) catch |err| switch (err) {
+        error.Forbidden => return forbidden(ctx),
+        error.InvalidPayload => return badJson(ctx),
+        else => return serverError(ctx),
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"connector\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, connector) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"sources\":[") catch return serverError(ctx);
+
+    var count: usize = 0;
+    if (obj.get("items")) |items_value| {
+        if (items_value != .array) return json.errorResponse(ctx.allocator, 400, "bad_request", "items must be an array");
+        for (items_value.array.items) |item| {
+            if (item != .object) return json.errorResponse(ctx.allocator, 400, "bad_request", "connector item must be an object");
+            const source = connectorIngestOne(ctx, connector, item.object, default_scope, default_permissions) catch |err| switch (err) {
+                error.Forbidden => return forbidden(ctx),
+                error.InvalidPayload => return badJson(ctx),
+                else => return serverError(ctx),
+            };
+            if (count > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
+            source.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+            if (run_now) {
+                _ = runExtraction(ctx, source, true, true) catch return serverError(ctx);
+            } else {
+                _ = ctx.store.createJob(ctx.allocator, .{ .job_type = "ingest", .scope = source.scope, .permissions_json = source.permissions_json, .object_type = "source", .object_id = source.id, .input_json = body, .actor_id = ctx.actor_id }) catch return serverError(ctx);
+            }
+            count += 1;
+        }
+    } else {
+        const source = connectorIngestOne(ctx, connector, obj, default_scope, default_permissions) catch |err| switch (err) {
+            error.Forbidden => return forbidden(ctx),
+            error.InvalidPayload => return badJson(ctx),
+            else => return serverError(ctx),
+        };
+        source.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+        if (run_now) {
+            _ = runExtraction(ctx, source, true, true) catch return serverError(ctx);
+        } else {
+            _ = ctx.store.createJob(ctx.allocator, .{ .job_type = "ingest", .scope = source.scope, .permissions_json = source.permissions_json, .object_type = "source", .object_id = source.id, .input_json = body, .actor_id = ctx.actor_id }) catch return serverError(ctx);
+        }
+        count = 1;
+    }
+
+    out.print(ctx.allocator, "],\"count\":{d},\"run_now\":", .{count}) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (run_now) "true" else "false") catch return serverError(ctx);
+    if (updated_cursor) |cursor| {
+        out.appendSlice(ctx.allocator, ",\"cursor\":") catch return serverError(ctx);
+        cursor.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+    }
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn connectorCursorFromIngest(ctx: *Context, connector: []const u8, obj: std.json.ObjectMap, default_scope: []const u8, default_permissions: []const u8) !?store_mod.ConnectorCursor {
+    const cursor_value = json.stringField(obj, "next_cursor") orelse json.stringField(obj, "cursor") orelse return null;
+    const scope = json.stringField(obj, "cursor_scope") orelse default_scope;
+    const permissions_json = rawField(ctx.allocator, obj, "cursor_permissions", default_permissions) catch return error.InvalidPayload;
+    if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
+    return try ctx.store.upsertConnectorCursor(ctx.allocator, .{
+        .connector = connector,
+        .scope = scope,
+        .cursor = cursor_value,
+        .config_json = rawField(ctx.allocator, obj, "config", "{}") catch return error.InvalidPayload,
+        .permissions_json = permissions_json,
+        .actor_id = ctx.actor_id,
+    });
+}
+
+fn connectorIngestOne(ctx: *Context, connector: []const u8, obj: std.json.ObjectMap, default_scope: []const u8, default_permissions: []const u8) !domain.Source {
+    const scope = json.stringField(obj, "scope") orelse default_scope;
+    const permissions_json = rawField(ctx.allocator, obj, "permissions", default_permissions) catch return error.InvalidPayload;
+    if (!canProposeRecord(ctx, scope, permissions_json)) return error.Forbidden;
+    const title = json.stringField(obj, "title") orelse json.stringField(obj, "key") orelse connector;
+    const metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch return error.InvalidPayload;
+    return try ctx.store.createSource(ctx.allocator, .{
+        .source_type = json.stringField(obj, "type") orelse connectorDefaultSourceType(connector),
+        .title = title,
+        .raw_content_uri = json.nullableStringField(obj, "raw_content_uri"),
+        .content = json.stringField(obj, "content") orelse json.stringField(obj, "body") orelse "",
+        .author = json.nullableStringField(obj, "author"),
+        .participants_json = rawField(ctx.allocator, obj, "participants", "[]") catch return error.InvalidPayload,
+        .permissions_json = permissions_json,
+        .scope = scope,
+        .checksum = json.nullableStringField(obj, "checksum"),
+        .language = json.nullableStringField(obj, "language"),
+        .related_entities_json = rawField(ctx.allocator, obj, "related_entities", "[]") catch return error.InvalidPayload,
+        .metadata_json = try connectorMetadataJson(ctx.allocator, connector, metadata_json),
+        .actor_id = ctx.actor_id,
+    });
+}
+
+fn connectorDefaultSourceType(connector: []const u8) []const u8 {
+    if (std.mem.eql(u8, connector, "ticket") or std.mem.eql(u8, connector, "nulltickets")) return "ticket";
+    if (std.mem.eql(u8, connector, "git")) return "pr";
+    if (std.mem.eql(u8, connector, "incident") or std.mem.eql(u8, connector, "nullwatch")) return "incident";
+    if (std.mem.eql(u8, connector, "transcript")) return "transcript";
+    return "manual";
+}
+
+fn connectorMetadataJson(allocator: std.mem.Allocator, connector: []const u8, metadata_json: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.appendSlice(allocator, "{\"connector\":");
+    try json.appendString(&out, allocator, connector);
+    try out.appendSlice(allocator, ",\"metadata\":");
+    try json.appendRawJsonOr(&out, allocator, metadata_json, "{}");
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
 }
 
 fn artifactTypes(ctx: *Context) HttpResponse {
@@ -636,7 +897,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_outbox_run":"POST /v1/vector/outbox/run","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_outbox_run":"POST /v1/vector/outbox/run","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -824,6 +1085,8 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
         const end = vectorChunkEnd(text, start);
         const chunk_text = std.mem.trim(u8, text[start..end], " \t\r\n");
         if (chunk_text.len > 0) {
+            const payload = try store_mod.vectorEmbedPayloadJson(ctx.allocator, @intCast(count), chunk_text, scope, permissions_json, ctx.embedding_model, ctx.embedding_dimensions);
+            const outbox_id = try ctx.store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
             const embedding_result = providers.embedText(ctx.allocator, .{
                 .base_url = ctx.embedding_base_url,
                 .api_key = ctx.embedding_api_key,
@@ -844,6 +1107,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
                 .dimensions = @intCast(embedding_result.embedding.len),
                 .actor_id = ctx.actor_id,
             });
+            _ = try ctx.store.finishVectorOutbox(outbox_id, "embedded");
             count += 1;
         }
         start = end;
@@ -1178,9 +1442,12 @@ fn vectorSearch(ctx: *Context, body: []const u8) HttpResponse {
 fn vectorOutboxStatus(ctx: *Context) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
+    const running = ctx.store.countVectorOutbox("running") catch return serverError(ctx);
+    const embedded = ctx.store.countVectorOutbox("embedded") catch return serverError(ctx);
+    const failed_embedding = ctx.store.countVectorOutbox("failed_embedding") catch return serverError(ctx);
     const indexed_local = ctx.store.countVectorOutbox("indexed_local") catch return serverError(ctx);
     const total = ctx.store.countVectorOutbox(null) catch return serverError(ctx);
-    const body = std.fmt.allocPrint(ctx.allocator, "{{\"outbox\":{{\"pending\":{d},\"indexed_local\":{d},\"active_sink\":\"local_vector_index\",\"external_sinks\":[],\"total\":{d}}}}}", .{ pending, indexed_local, total }) catch return serverError(ctx);
+    const body = std.fmt.allocPrint(ctx.allocator, "{{\"outbox\":{{\"pending\":{d},\"running\":{d},\"embedded\":{d},\"failed_embedding\":{d},\"indexed_local\":{d},\"active_sink\":\"local_vector_index\",\"external_sinks\":[],\"total\":{d}}}}}", .{ pending, running, embedded, failed_embedding, indexed_local, total }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = body };
 }
 
@@ -1189,9 +1456,20 @@ fn vectorOutboxRun(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const limit = positiveLimit(json.intField(parsed.value.object, "limit"), 100);
-    const result = ctx.store.runVectorOutbox(limit) catch return serverError(ctx);
+    const result = worker.runVectorOutboxOnce(ctx.allocator, ctx.store, .{
+        .scopes_json = ctx.actor_scopes_json,
+        .capabilities_json = ctx.actor_capabilities_json,
+        .outbox_limit = limit,
+        .embedding_base_url = ctx.embedding_base_url,
+        .embedding_api_key = ctx.embedding_api_key,
+        .embedding_model = ctx.embedding_model,
+        .embedding_dimensions = ctx.embedding_dimensions,
+        .provider_timeout_secs = ctx.provider_timeout_secs,
+    }) catch return serverError(ctx);
     const pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
-    const response = std.fmt.allocPrint(ctx.allocator, "{{\"outbox_run\":{{\"processed\":{d},\"failed\":{d},\"pending\":{d},\"active_sink\":\"local_vector_index\",\"external_sinks\":[]}}}}", .{ result.processed, result.failed, pending }) catch return serverError(ctx);
+    const embedded = ctx.store.countVectorOutbox("embedded") catch return serverError(ctx);
+    const indexed_local = ctx.store.countVectorOutbox("indexed_local") catch return serverError(ctx);
+    const response = std.fmt.allocPrint(ctx.allocator, "{{\"outbox_run\":{{\"processed\":{d},\"failed\":{d},\"pending\":{d},\"embedded\":{d},\"indexed_local\":{d},\"active_sink\":\"local_vector_index\",\"external_sinks\":[]}}}}", .{ result.processed, result.failed, pending, embedded, indexed_local }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
 }
 
@@ -2864,7 +3142,7 @@ test "api requires bearer token except health" {
     const health_resp = handleRequest(&ctx, "GET", "/health", "", "");
     try std.testing.expectEqualStrings("200 OK", health_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"schema_ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"expected_schema_version\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"expected_schema_version\":6") != null);
 
     const missing = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"x\"}", "");
     try std.testing.expectEqualStrings("401 Unauthorized", missing.status);
@@ -3298,6 +3576,8 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const openapi_resp = handleRequest(&ctx, "GET", "/v1/openapi.json", "", "");
     try std.testing.expectEqualStrings("200 OK", openapi_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"createArtifact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"runVectorOutbox\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"nullclawPutMemory\"") != null);
 
     const artifact_types = handleRequest(&ctx, "GET", "/v1/artifact-types", "", "");
@@ -3338,6 +3618,13 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const outbox_run = handleRequest(&ctx, "POST", "/v1/vector/outbox/run", "{\"limit\":10}", "");
     try std.testing.expectEqualStrings("200 OK", outbox_run.status);
     try std.testing.expect(std.mem.indexOf(u8, outbox_run.body, "\"processed\":1") != null);
+
+    const embed_payload = try store_mod.vectorEmbedPayloadJson(arena.allocator(), 1, "agent memory replay", "public", "[]", null, 4);
+    _ = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = "memory_atom", .object_id = created_atom_id, .payload_json = embed_payload });
+    const embed_outbox_run = handleRequest(&ctx, "POST", "/v1/vector/outbox/run", "{\"limit\":10}", "");
+    try std.testing.expectEqualStrings("200 OK", embed_outbox_run.status);
+    try std.testing.expect(std.mem.indexOf(u8, embed_outbox_run.body, "\"embedded\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, embed_outbox_run.body, "\"indexed_local\":2") != null);
 
     const diagnostics = handleRequest(&ctx, "GET", "/v1/lifecycle/diagnostics", "", "");
     try std.testing.expectEqualStrings("200 OK", diagnostics.status);
@@ -4063,6 +4350,31 @@ test "api manifest and connector endpoints describe headless service contracts" 
     try std.testing.expectEqualStrings("200 OK", connector_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, connector_resp.body, "\"name\":\"nullclaw\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, connector_resp.body, "\"name\":\"nullwatch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connector_resp.body, "\"built_in_push\"") != null);
+
+    const connector_ingest = handleRequest(&ctx, "POST", "/v1/connectors/ticket/ingest",
+        \\{"title":"NP-42 Transcript ingestion","content":"Decision: ticket connectors should create first-class sources","scope":"public","next_cursor":"ticket-42","config":{"project":"NP"}}
+    , "");
+    try std.testing.expectEqualStrings("200 OK", connector_ingest.status);
+    try std.testing.expect(std.mem.indexOf(u8, connector_ingest.body, "\"count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connector_ingest.body, "\"type\":\"ticket\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connector_ingest.body, "\"cursor\":\"ticket-42\"") != null);
+
+    const cursor_get = handleRequest(&ctx, "GET", "/v1/connectors/ticket/cursor?scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", cursor_get.status);
+    try std.testing.expect(std.mem.indexOf(u8, cursor_get.body, "\"connector\":\"ticket\"") != null);
+
+    const cursor_post = handleRequest(&ctx, "POST", "/v1/connectors/nullwatch/cursor",
+        \\{"scope":"public","cursor":"incident-9","config":{"stream":"incidents"}}
+    , "");
+    try std.testing.expectEqualStrings("200 OK", cursor_post.status);
+    try std.testing.expect(std.mem.indexOf(u8, cursor_post.body, "\"incident-9\"") != null);
+
+    const openapi = handleRequest(&ctx, "GET", "/v1/openapi.json", "", "");
+    try std.testing.expectEqualStrings("200 OK", openapi.status);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "ConnectorIngestRequest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "connectorIngest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "connectorUpsertCursor") != null);
 
     const manifest = handleRequest(&ctx, "GET", "/v1/sdk/manifest", "", "");
     try std.testing.expectEqualStrings("200 OK", manifest.status);

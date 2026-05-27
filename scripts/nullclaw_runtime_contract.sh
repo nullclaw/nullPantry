@@ -3,10 +3,37 @@ set -eu
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 NULLCLAW_REPO="${NULLCLAW_REPO:-$ROOT_DIR/../nullclaw}"
+CLONED_NULLCLAW_DIR=""
+SERVER_PID=""
+DB_DIR=""
+
+cleanup() {
+  if [ "${SERVER_PID:-}" ]; then
+    kill "$SERVER_PID" >/dev/null 2>&1 || true
+    wait "$SERVER_PID" >/dev/null 2>&1 || true
+  fi
+  if [ "${DB_DIR:-}" ]; then
+    rm -rf "$DB_DIR"
+  fi
+  if [ "$CLONED_NULLCLAW_DIR" ]; then
+    rm -rf "$CLONED_NULLCLAW_DIR"
+  fi
+}
+trap cleanup EXIT INT TERM
 
 if ! git -C "$NULLCLAW_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "NullClaw runtime contract skipped: set NULLCLAW_REPO to a git checkout of nullclaw." >&2
-  exit 0
+  if [ "${NULLPANTRY_ALLOW_NULLCLAW_RUNTIME_SKIP:-0}" = "1" ]; then
+    echo "NullClaw runtime contract skipped by NULLPANTRY_ALLOW_NULLCLAW_RUNTIME_SKIP=1." >&2
+    exit 0
+  fi
+  CLONED_NULLCLAW_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nullclaw-runtime-contract.XXXXXX")"
+  git clone --depth 1 "${NULLCLAW_GIT_URL:-https://github.com/nullclaw/nullclaw.git}" "$CLONED_NULLCLAW_DIR" >/dev/null 2>&1
+  NULLCLAW_REPO="$CLONED_NULLCLAW_DIR"
+fi
+
+if [ "${NULLCLAW_REF:-}" ]; then
+  git -C "$NULLCLAW_REPO" fetch --depth 1 origin "$NULLCLAW_REF" >/dev/null 2>&1 || true
+  git -C "$NULLCLAW_REPO" checkout "$NULLCLAW_REF" >/dev/null 2>&1
 fi
 
 API_ENGINE="$NULLCLAW_REPO/src/memory/engines/api.zig"
@@ -42,15 +69,6 @@ DB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nullpantry-nullclaw-runtime.XXXXXX")"
 DB_PATH="$DB_DIR/nullpantry.db"
 BASE_URL="http://127.0.0.1:$PORT/v1/nullclaw"
 
-cleanup() {
-  if [ "${SERVER_PID:-}" ]; then
-    kill "$SERVER_PID" >/dev/null 2>&1 || true
-    wait "$SERVER_PID" >/dev/null 2>&1 || true
-  fi
-  rm -rf "$DB_DIR"
-}
-trap cleanup EXIT INT TERM
-
 NULLPANTRY_TOKEN_PRINCIPALS="{\"$TOKEN\":{\"actor_id\":\"nullclaw-runtime-contract\",\"scopes\":[\"agent:nullclaw\",\"session:*\",\"write:session:*\"],\"capabilities\":[\"read\",\"write\",\"delete\"]}}" \
 NULLPANTRY_WORKER_INTERVAL_MS=0 \
 "$BIN" --host 127.0.0.1 --port "$PORT" --db "$DB_PATH" >/tmp/nullpantry-nullclaw-runtime.log 2>&1 &
@@ -73,11 +91,26 @@ fi
 
 (
   cd "$NULLCLAW_REPO"
-  NULLCLAW_MEMORY_BACKEND=api \
-  NULLCLAW_MEMORY_API_URL="$BASE_URL" \
-  NULLCLAW_MEMORY_API_BASE_URL="$BASE_URL" \
-  NULLCLAW_MEMORY_API_TOKEN="$TOKEN" \
-  NULLCLAW_API_MEMORY_URL="$BASE_URL" \
-  NULLCLAW_API_MEMORY_TOKEN="$TOKEN" \
-  zig build test --summary all
+  env \
+    NULLCLAW_MEMORY_BACKEND=api \
+    NULLCLAW_MEMORY_API_URL="$BASE_URL" \
+    NULLCLAW_MEMORY_API_BASE_URL="$BASE_URL" \
+    NULLCLAW_MEMORY_API_TOKEN="$TOKEN" \
+    NULLCLAW_API_MEMORY_URL="$BASE_URL" \
+    NULLCLAW_API_MEMORY_TOKEN="$TOKEN" \
+    zig build test --summary all &
+  TEST_PID="$!"
+  elapsed=0
+  timeout_secs="${NULLPANTRY_NULLCLAW_TEST_TIMEOUT_SECS:-180}"
+  while kill -0 "$TEST_PID" >/dev/null 2>&1; do
+    if [ "$elapsed" -ge "$timeout_secs" ]; then
+      kill "$TEST_PID" >/dev/null 2>&1 || true
+      wait "$TEST_PID" >/dev/null 2>&1 || true
+      echo "NullClaw runtime contract failed: nullclaw test suite timed out after ${timeout_secs}s. Set NULLPANTRY_RUN_NULLCLAW_TESTS=0 for source-shape mode." >&2
+      exit 1
+    fi
+    elapsed=$((elapsed + 1))
+    sleep 1
+  done
+  wait "$TEST_PID"
 )
