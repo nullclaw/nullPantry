@@ -624,6 +624,13 @@ pub const Store = struct {
         };
     }
 
+    pub fn findSourceByRawContentUri(self: *Store, allocator: std.mem.Allocator, raw_content_uri: []const u8, scope: []const u8) !?domain.Source {
+        return switch (self.backend) {
+            .sqlite => |*s| s.findSourceByRawContentUri(allocator, raw_content_uri, scope),
+            .postgres => |*p| p.findSourceByRawContentUri(allocator, raw_content_uri, scope),
+        };
+    }
+
     pub fn createArtifact(self: *Store, allocator: std.mem.Allocator, input: ArtifactInput) !domain.Artifact {
         try self.ensureKnowledgePrimitiveMirrorRoute(input.storage_route);
         const artifact = try switch (self.backend) {
@@ -4046,6 +4053,15 @@ pub const SQLiteStore = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         const row = try readSource(allocator, stmt);
         return row;
+    }
+
+    pub fn findSourceByRawContentUri(self: *Self, allocator: std.mem.Allocator, raw_content_uri: []const u8, scope: []const u8) !?domain.Source {
+        const stmt = try self.prepare("SELECT id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json FROM sources WHERE raw_content_uri = ?1 AND scope = ?2 ORDER BY imported_at_ms DESC LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, raw_content_uri);
+        bindText(stmt, 2, scope);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try readSource(allocator, stmt);
     }
 
     fn readSource(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !domain.Source {
@@ -7847,6 +7863,14 @@ pub const PostgresStore = struct {
 
     pub fn getSource(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?domain.Source {
         const inner = try std.fmt.allocPrint(allocator, "SELECT id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json FROM sources WHERE id = {s} LIMIT 1", .{try sqlString(allocator, id)});
+        const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value == .null) return null;
+        return try readPgSource(allocator, parsed.value.object);
+    }
+
+    pub fn findSourceByRawContentUri(self: *PostgresStore, allocator: std.mem.Allocator, raw_content_uri: []const u8, scope: []const u8) !?domain.Source {
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json FROM sources WHERE raw_content_uri = {s} AND scope = {s} ORDER BY imported_at_ms DESC LIMIT 1", .{ try sqlString(allocator, raw_content_uri), try sqlString(allocator, scope) });
         const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value == .null) return null;

@@ -984,6 +984,7 @@ test {
     _ = @import("redis.zig");
     _ = @import("agent_memory_runtime.zig");
     _ = @import("markdown_adapter.zig");
+    _ = @import("markdown_filesystem.zig");
     _ = @import("artifacts.zig");
     _ = @import("extraction.zig");
     _ = @import("worker.zig");

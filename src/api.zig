@@ -16,6 +16,8 @@ const migrations = @import("migrations.zig");
 const access = @import("access.zig");
 const auth = @import("auth.zig");
 const markdown_adapter = @import("markdown_adapter.zig");
+const markdown_filesystem = @import("markdown_filesystem.zig");
+const compat = @import("compat.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -85,7 +87,9 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         if (is_post and seg2 != null and eql(seg3, "ingest")) return connectorIngest(ctx, seg2.?, body);
     } else if (eql(seg1, "markdown")) {
         if (is_post and eql(seg2, "import")) return markdownImport(ctx, body);
+        if (is_post and eql(seg2, "import-directory")) return markdownImportDirectory(ctx, body);
         if (is_post and eql(seg2, "export")) return markdownExport(ctx, body);
+        if (is_post and eql(seg2, "export-directory")) return markdownExportDirectory(ctx, body);
     } else if (eql(seg1, "artifact-types") and is_get) {
         return artifactTypes(ctx);
     } else if (eql(seg1, "spaces")) {
@@ -811,7 +815,9 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/connectors/{name}/cursor", .get = "connectorGetCursor", .post = "connectorUpsertCursor" },
         .{ .path = "/connectors/{name}/ingest", .post = "connectorIngest" },
         .{ .path = "/markdown/import", .post = "importMarkdown" },
+        .{ .path = "/markdown/import-directory", .post = "importMarkdownDirectory" },
         .{ .path = "/markdown/export", .post = "exportMarkdown" },
+        .{ .path = "/markdown/export-directory", .post = "exportMarkdownDirectory" },
         .{ .path = "/artifact-types", .get = "listArtifactTypes" },
         .{ .path = "/sdk/manifest", .get = "sdkManifest" },
         .{ .path = "/spaces", .get = "listSpaces", .post = "createSpace" },
@@ -919,7 +925,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_export","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","analytics_export"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","analytics_export"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -933,7 +939,7 @@ fn providerRegistry(ctx: *Context) HttpResponse {
 
 fn connectors(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"connectors":[{"name":"manual","status":"built_in","source_types":["manual","text"],"ingest":"POST /v1/connectors/manual/ingest","cursor":"GET|POST /v1/connectors/manual/cursor"},{"name":"markdown","status":"built_in_import_export","source_types":["markdown","md"],"ingest":"POST /v1/connectors/markdown/ingest","import":"POST /v1/markdown/import","export":"POST /v1/markdown/export","cursor":"GET|POST /v1/connectors/markdown/cursor"},{"name":"transcript","status":"built_in","source_types":["transcript","chat"],"ingest":"POST /v1/connectors/transcript/ingest","cursor":"GET|POST /v1/connectors/transcript/cursor"},{"name":"ticket","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/ticket/ingest","cursor":"GET|POST /v1/connectors/ticket/cursor"},{"name":"git","status":"built_in_push","source_types":["pr","commit","repo"],"ingest":"POST /v1/connectors/git/ingest","cursor":"GET|POST /v1/connectors/git/cursor"},{"name":"incident","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/incident/ingest","cursor":"GET|POST /v1/connectors/incident/cursor"},{"name":"nulltickets","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/nulltickets/ingest","cursor":"GET|POST /v1/connectors/nulltickets/cursor"},{"name":"nullwatch","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/nullwatch/ingest","cursor":"GET|POST /v1/connectors/nullwatch/cursor"},{"name":"nullhub","status":"consumer"}]}
+        \\{"connectors":[{"name":"manual","status":"built_in","source_types":["manual","text"],"ingest":"POST /v1/connectors/manual/ingest","cursor":"GET|POST /v1/connectors/manual/cursor"},{"name":"markdown","status":"built_in_filesystem_import_export","source_types":["markdown","md"],"ingest":"POST /v1/connectors/markdown/ingest","import":"POST /v1/markdown/import","import_directory":"POST /v1/markdown/import-directory","export":"POST /v1/markdown/export","export_directory":"POST /v1/markdown/export-directory","cursor":"GET|POST /v1/connectors/markdown/cursor"},{"name":"transcript","status":"built_in","source_types":["transcript","chat"],"ingest":"POST /v1/connectors/transcript/ingest","cursor":"GET|POST /v1/connectors/transcript/cursor"},{"name":"ticket","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/ticket/ingest","cursor":"GET|POST /v1/connectors/ticket/cursor"},{"name":"git","status":"built_in_push","source_types":["pr","commit","repo"],"ingest":"POST /v1/connectors/git/ingest","cursor":"GET|POST /v1/connectors/git/cursor"},{"name":"incident","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/incident/ingest","cursor":"GET|POST /v1/connectors/incident/cursor"},{"name":"nulltickets","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/nulltickets/ingest","cursor":"GET|POST /v1/connectors/nulltickets/cursor"},{"name":"nullwatch","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/nullwatch/ingest","cursor":"GET|POST /v1/connectors/nullwatch/cursor"},{"name":"nullhub","status":"consumer"}]}
     );
 }
 
@@ -1104,51 +1110,15 @@ fn markdownImport(ctx: *Context, body: []const u8) HttpResponse {
     const fallback_title = json.stringField(obj, "title") orelse "Markdown import";
 
     const imported = markdown_adapter.parseImport(ctx.allocator, content, fallback_title, default_scope, default_permissions) catch return badJson(ctx);
-    if (!artifacts.validStatus(imported.artifact_type, imported.status)) return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid artifact status for this artifact type");
-    if (!canProposeRecord(ctx, imported.scope, imported.permissions_json)) return forbidden(ctx);
-    if (!markdownStatusCanBeProposed(imported.status) and !canWriteRecord(ctx, imported.scope, imported.permissions_json)) return forbidden(ctx);
-
-    const source = ctx.store.createSource(ctx.allocator, .{
-        .source_type = imported.source_type,
-        .title = imported.title,
-        .raw_content_uri = firstNonNullString(imported.raw_content_uri, json.nullableStringField(obj, "raw_content_uri")),
-        .content = content,
-        .author = firstNonNullString(imported.author, json.nullableStringField(obj, "author")),
-        .participants_json = rawField(ctx.allocator, obj, "participants", "[]") catch return serverError(ctx),
-        .permissions_json = imported.permissions_json,
-        .scope = imported.scope,
-        .checksum = json.nullableStringField(obj, "checksum"),
-        .language = json.nullableStringField(obj, "language") orelse "markdown",
-        .related_entities_json = extraction.extractEntityNamesJson(ctx.allocator, imported.body) catch return serverError(ctx),
-        .metadata_json = markdownImportMetadataJson(ctx.allocator, imported.metadata_json) catch return serverError(ctx),
-        .actor_id = ctx.actor_id,
-        .storage_route = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx),
-    }) catch |err| switch (err) {
+    defer imported.deinit(ctx.allocator);
+    const created = createMarkdownObjects(ctx, obj, imported, content, imported.path, firstNonNullString(json.nullableStringField(obj, "checksum"), imported.checksum)) catch |err| switch (err) {
+        error.InvalidArtifactStatus => return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid artifact status for this artifact type"),
+        error.Forbidden => return forbidden(ctx),
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
-
-    const actual_source_ids_json = extraction.sourceIdsJson(ctx.allocator, source.id) catch return serverError(ctx);
-    const artifact = ctx.store.createArtifact(ctx.allocator, .{
-        .artifact_type = imported.artifact_type,
-        .title = imported.title,
-        .body = imported.body,
-        .status = imported.status,
-        .owner = firstNonNullString(imported.author, firstNonNullString(json.nullableStringField(obj, "owner"), json.nullableStringField(obj, "author"))),
-        .space_id = json.nullableStringField(obj, "space_id"),
-        .scope = imported.scope,
-        .source_ids_json = actual_source_ids_json,
-        .related_entities_json = extraction.extractEntityNamesJson(ctx.allocator, imported.body) catch return serverError(ctx),
-        .permissions_json = imported.permissions_json,
-        .fields_json = imported.fields_json,
-        .summary = extraction.summarize(ctx.allocator, imported.body, 512) catch return serverError(ctx),
-        .agent_summary = extraction.summarize(ctx.allocator, imported.body, 1024) catch return serverError(ctx),
-        .actor_id = ctx.actor_id,
-        .storage_route = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx),
-    }) catch |err| switch (err) {
-        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
-        else => return serverError(ctx),
-    };
+    const source = created.source;
+    const artifact = created.artifact;
 
     const run_now = json.boolField(obj, "run_now") orelse false;
     if (!run_now) {
@@ -1209,6 +1179,220 @@ fn markdownExport(ctx: *Context, body: []const u8) HttpResponse {
     return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing artifact_id or source_id");
 }
 
+fn markdownImportDirectory(ctx: *Context, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const root_path = json.stringField(obj, "path") orelse json.stringField(obj, "directory") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing path");
+    if (root_path.len == 0) return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing path");
+
+    const default_scope = json.stringField(obj, "scope") orelse "workspace";
+    const default_permissions = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    const max_files = positiveBounded(json.intField(obj, "max_files"), 1000, 10000);
+    const max_file_bytes = positiveBounded(json.intField(obj, "max_file_bytes"), 20 * 1024 * 1024, 100 * 1024 * 1024);
+    const queue_extraction = json.boolField(obj, "queue_extraction") orelse true;
+    const run_now = json.boolField(obj, "run_now") orelse false;
+    const extract_memory = json.boolField(obj, "extract_memory") orelse true;
+    const skip_unchanged = json.boolField(obj, "skip_unchanged") orelse true;
+
+    const discovered = markdown_filesystem.readDirectory(ctx.allocator, root_path, max_files, max_file_bytes) catch |err| switch (err) {
+        error.FileNotFound => return json.errorResponse(ctx.allocator, 404, "not_found", "Markdown directory not found"),
+        error.NotDir => return json.errorResponse(ctx.allocator, 400, "bad_request", "Path is not a directory"),
+        error.StreamTooLong => return json.errorResponse(ctx.allocator, 413, "payload_too_large", "Markdown file exceeds max_file_bytes"),
+        else => return serverError(ctx),
+    };
+    defer markdown_filesystem.deinitDirectoryReadResult(ctx.allocator, discovered);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"path\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, root_path) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"files\":[") catch return serverError(ctx);
+
+    var imported_count: usize = 0;
+    const skipped_count: usize = discovered.skipped;
+    var jobs_queued: usize = 0;
+    var atoms_extracted: usize = 0;
+    var vector_chunks: usize = 0;
+    var unchanged_count: usize = 0;
+    var first_file = true;
+    for (discovered.files) |file| {
+        const imported = markdown_adapter.parseImport(ctx.allocator, file.content, file.fallback_title, default_scope, default_permissions) catch return badJson(ctx);
+        defer imported.deinit(ctx.allocator);
+
+        if (skip_unchanged) {
+            if (ctx.store.findSourceByRawContentUri(ctx.allocator, file.path, imported.scope) catch return serverError(ctx)) |existing| {
+                if (stringMatchesOptional(existing.checksum, file.checksum)) {
+                    unchanged_count += 1;
+                    continue;
+                }
+            }
+        }
+
+        const created = createMarkdownObjects(ctx, obj, imported, file.content, file.path, file.checksum) catch |err| switch (err) {
+            error.InvalidArtifactStatus => return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid artifact status for this artifact type"),
+            error.Forbidden => return forbidden(ctx),
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+
+        var file_atoms: usize = 0;
+        var file_vector_chunks: usize = 0;
+        var queued = false;
+        if (run_now) {
+            var output = runExtraction(ctx, created.source, extractionOptionsFromObject(ctx, obj, false, extract_memory) catch return serverError(ctx)) catch |err| {
+                return json.errorResponse(ctx.allocator, 500, "internal_error", @errorName(err));
+            };
+            output.artifact = created.artifact;
+            file_atoms = output.atoms.len;
+            file_vector_chunks = upsertAutoVector(ctx, "artifact", created.artifact.id, created.artifact.body, created.artifact.scope, created.artifact.permissions_json) catch 0;
+            atoms_extracted += file_atoms;
+            vector_chunks += file_vector_chunks;
+        } else if (queue_extraction and extract_memory) {
+            queueMarkdownExtractionJob(ctx, obj, created.source) catch return serverError(ctx);
+            jobs_queued += 1;
+            queued = true;
+        }
+
+        if (!first_file) out.append(ctx.allocator, ',') catch return serverError(ctx);
+        first_file = false;
+        appendMarkdownDirectoryImportFile(ctx, &out, file.path, created.source, created.artifact, queued, file_atoms, file_vector_chunks) catch return serverError(ctx);
+        imported_count += 1;
+    }
+
+    out.print(ctx.allocator, "],\"imported\":{d},\"unchanged\":{d},\"skipped\":{d},\"jobs_queued\":{d},\"atoms_extracted\":{d},\"vector_chunks\":{d}}}", .{ imported_count, unchanged_count, skipped_count, jobs_queued, atoms_extracted, vector_chunks }) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn markdownExportDirectory(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "export")) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const root_path = json.stringField(obj, "path") orelse json.stringField(obj, "directory") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing path");
+    if (root_path.len == 0) return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing path");
+    const overwrite = json.boolField(obj, "overwrite") orelse false;
+
+    std.Io.Dir.cwd().createDirPath(compat.io(), root_path) catch return serverError(ctx);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"path\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, root_path) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"files\":[") catch return serverError(ctx);
+
+    var exported_count: usize = 0;
+    var first_file = true;
+    if (obj.get("artifact_ids")) |value| {
+        if (value != .array) return json.errorResponse(ctx.allocator, 400, "bad_request", "artifact_ids must be an array");
+        for (value.array.items) |id_value| {
+            if (id_value != .string) continue;
+            const artifact = (ctx.store.getArtifact(ctx.allocator, id_value.string) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Artifact not found");
+            if (!recordVisibleToActor(ctx, artifact.scope, artifact.permissions_json)) return forbidden(ctx);
+            var markdown: std.ArrayListUnmanaged(u8) = .empty;
+            markdown_adapter.appendArtifactMarkdown(ctx.allocator, &markdown, artifact) catch return serverError(ctx);
+            const filename = markdown_adapter.exportFileName(ctx.allocator, artifact.title, artifact.id, "artifact") catch return serverError(ctx);
+            const file_path = std.fs.path.join(ctx.allocator, &.{ root_path, filename }) catch return serverError(ctx);
+            markdown_filesystem.writeFile(file_path, markdown.items, overwrite) catch |err| switch (err) {
+                error.PathAlreadyExists => return json.errorResponse(ctx.allocator, 409, "conflict", "Markdown export target already exists"),
+                else => return serverError(ctx),
+            };
+            if (!first_file) out.append(ctx.allocator, ',') catch return serverError(ctx);
+            first_file = false;
+            appendMarkdownDirectoryExportFile(ctx, &out, file_path, "artifact", artifact.id) catch return serverError(ctx);
+            exported_count += 1;
+        }
+    }
+
+    if (obj.get("source_ids")) |value| {
+        if (value != .array) return json.errorResponse(ctx.allocator, 400, "bad_request", "source_ids must be an array");
+        for (value.array.items) |id_value| {
+            if (id_value != .string) continue;
+            const source = (ctx.store.getSource(ctx.allocator, id_value.string) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Source not found");
+            if (!recordVisibleToActor(ctx, source.scope, source.permissions_json)) return forbidden(ctx);
+            var markdown: std.ArrayListUnmanaged(u8) = .empty;
+            markdown_adapter.appendSourceMarkdown(ctx.allocator, &markdown, source) catch return serverError(ctx);
+            const filename = markdown_adapter.exportFileName(ctx.allocator, source.title, source.id, "source") catch return serverError(ctx);
+            const file_path = std.fs.path.join(ctx.allocator, &.{ root_path, filename }) catch return serverError(ctx);
+            markdown_filesystem.writeFile(file_path, markdown.items, overwrite) catch |err| switch (err) {
+                error.PathAlreadyExists => return json.errorResponse(ctx.allocator, 409, "conflict", "Markdown export target already exists"),
+                else => return serverError(ctx),
+            };
+            if (!first_file) out.append(ctx.allocator, ',') catch return serverError(ctx);
+            first_file = false;
+            appendMarkdownDirectoryExportFile(ctx, &out, file_path, "source", source.id) catch return serverError(ctx);
+            exported_count += 1;
+        }
+    }
+
+    if (exported_count == 0) return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing artifact_ids or source_ids");
+    out.print(ctx.allocator, "],\"exported\":{d},\"overwrite\":{s}}}", .{ exported_count, if (overwrite) "true" else "false" }) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+const MarkdownCreated = struct {
+    source: domain.Source,
+    artifact: domain.Artifact,
+};
+
+fn createMarkdownObjects(
+    ctx: *Context,
+    obj: std.json.ObjectMap,
+    imported: markdown_adapter.ParsedMarkdown,
+    content: []const u8,
+    file_path: ?[]const u8,
+    checksum: ?[]const u8,
+) !MarkdownCreated {
+    if (!artifacts.validStatus(imported.artifact_type, imported.status)) return error.InvalidArtifactStatus;
+    if (!canProposeRecord(ctx, imported.scope, imported.permissions_json)) return error.Forbidden;
+    if (!markdownStatusCanBeProposed(imported.status) and !canWriteRecord(ctx, imported.scope, imported.permissions_json)) return error.Forbidden;
+
+    const storage_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    const related_entities_json = if (jsonArrayIsEmpty(imported.related_entities_json))
+        try extraction.extractEntityNamesJson(ctx.allocator, imported.body)
+    else
+        imported.related_entities_json;
+    const source_checksum = firstNonNullString(checksum, imported.checksum);
+    const source_path = firstNonNullString(file_path, imported.path);
+    const metadata_json = try markdownImportMetadataJson(ctx.allocator, imported.metadata_json, source_path, source_checksum);
+
+    const source = try ctx.store.createSource(ctx.allocator, .{
+        .source_type = imported.source_type,
+        .title = imported.title,
+        .raw_content_uri = firstNonNullString(source_path, firstNonNullString(imported.raw_content_uri, json.nullableStringField(obj, "raw_content_uri"))),
+        .content = content,
+        .author = firstNonNullString(imported.author, json.nullableStringField(obj, "author")),
+        .participants_json = try rawField(ctx.allocator, obj, "participants", "[]"),
+        .permissions_json = imported.permissions_json,
+        .scope = imported.scope,
+        .checksum = source_checksum,
+        .language = json.nullableStringField(obj, "language") orelse "markdown",
+        .related_entities_json = related_entities_json,
+        .metadata_json = metadata_json,
+        .actor_id = ctx.actor_id,
+        .storage_route = storage_route,
+    });
+
+    const actual_source_ids_json = try extraction.sourceIdsJson(ctx.allocator, source.id);
+    const artifact = try ctx.store.createArtifact(ctx.allocator, .{
+        .artifact_type = imported.artifact_type,
+        .title = imported.title,
+        .body = imported.body,
+        .status = imported.status,
+        .owner = firstNonNullString(imported.owner, firstNonNullString(imported.author, firstNonNullString(json.nullableStringField(obj, "owner"), json.nullableStringField(obj, "author")))),
+        .space_id = firstNonNullString(imported.space_id, json.nullableStringField(obj, "space_id")),
+        .scope = imported.scope,
+        .source_ids_json = actual_source_ids_json,
+        .related_entities_json = related_entities_json,
+        .permissions_json = imported.permissions_json,
+        .fields_json = imported.fields_json,
+        .summary = try extraction.summarize(ctx.allocator, imported.body, 512),
+        .agent_summary = try extraction.summarize(ctx.allocator, imported.body, 1024),
+        .actor_id = ctx.actor_id,
+        .storage_route = storage_route,
+    });
+
+    return .{ .source = source, .artifact = artifact };
+}
+
 fn markdownStatusCanBeProposed(status: []const u8) bool {
     return std.mem.eql(u8, status, "draft") or std.mem.eql(u8, status, "proposed");
 }
@@ -1218,12 +1402,93 @@ fn firstNonNullString(primary: ?[]const u8, fallback: ?[]const u8) ?[]const u8 {
     return fallback;
 }
 
-fn markdownImportMetadataJson(allocator: std.mem.Allocator, metadata_json: []const u8) ![]const u8 {
+fn stringMatchesOptional(value: ?[]const u8, expected: []const u8) bool {
+    return if (value) |actual| std.mem.eql(u8, actual, expected) else false;
+}
+
+fn markdownImportMetadataJson(allocator: std.mem.Allocator, metadata_json: []const u8, file_path: ?[]const u8, checksum: ?[]const u8) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(allocator, "{\"connector\":\"markdown\",\"metadata\":");
     try json.appendRawJsonOr(&out, allocator, metadata_json, "{}");
+    if (file_path) |value| {
+        try out.appendSlice(allocator, ",\"path\":");
+        try json.appendString(&out, allocator, value);
+    }
+    if (checksum) |value| {
+        try out.appendSlice(allocator, ",\"checksum\":");
+        try json.appendString(&out, allocator, value);
+    }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
+}
+
+fn jsonArrayIsEmpty(raw: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return trimmed.len == 0 or std.mem.eql(u8, trimmed, "[]");
+}
+
+fn appendMarkdownDirectoryImportFile(
+    ctx: *Context,
+    out: *std.ArrayListUnmanaged(u8),
+    path: []const u8,
+    source: domain.Source,
+    artifact: domain.Artifact,
+    job_queued: bool,
+    atoms_extracted: usize,
+    vector_chunks: usize,
+) !void {
+    try out.appendSlice(ctx.allocator, "{\"path\":");
+    try json.appendString(out, ctx.allocator, path);
+    try out.appendSlice(ctx.allocator, ",\"source_id\":");
+    try json.appendString(out, ctx.allocator, source.id);
+    try out.appendSlice(ctx.allocator, ",\"artifact_id\":");
+    try json.appendString(out, ctx.allocator, artifact.id);
+    try out.appendSlice(ctx.allocator, ",\"artifact_type\":");
+    try json.appendString(out, ctx.allocator, artifact.artifact_type);
+    try out.appendSlice(ctx.allocator, ",\"scope\":");
+    try json.appendString(out, ctx.allocator, artifact.scope);
+    try out.print(ctx.allocator, ",\"job_queued\":{s},\"atoms_extracted\":{d},\"vector_chunks\":{d}}}", .{ if (job_queued) "true" else "false", atoms_extracted, vector_chunks });
+}
+
+fn appendMarkdownDirectoryExportFile(
+    ctx: *Context,
+    out: *std.ArrayListUnmanaged(u8),
+    path: []const u8,
+    object_type: []const u8,
+    object_id: []const u8,
+) !void {
+    try out.appendSlice(ctx.allocator, "{\"path\":");
+    try json.appendString(out, ctx.allocator, path);
+    try out.appendSlice(ctx.allocator, ",\"object_type\":");
+    try json.appendString(out, ctx.allocator, object_type);
+    try out.appendSlice(ctx.allocator, ",\"object_id\":");
+    try json.appendString(out, ctx.allocator, object_id);
+    try out.append(ctx.allocator, '}');
+}
+
+fn queueMarkdownExtractionJob(ctx: *Context, obj: std.json.ObjectMap, source: domain.Source) !void {
+    const job_input = try markdownExtractionJobInputJson(
+        ctx.allocator,
+        json.boolField(obj, "extract_memory") orelse true,
+        json.boolField(obj, "use_llm_extraction") orelse json.boolField(obj, "structured_extraction") orelse false,
+        json.boolField(obj, "strict_llm_extraction") orelse false,
+        try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+    );
+    _ = try ctx.store.createJob(ctx.allocator, .{
+        .job_type = "extract_memory",
+        .scope = source.scope,
+        .permissions_json = source.permissions_json,
+        .object_type = "source",
+        .object_id = source.id,
+        .input_json = job_input,
+        .actor_id = ctx.actor_id,
+    });
+}
+
+fn positiveBounded(value: ?i64, default_value: usize, max_value: usize) usize {
+    const raw = value orelse return default_value;
+    if (raw <= 0) return default_value;
+    return @intCast(@min(raw, @as(i64, @intCast(max_value))));
 }
 
 fn markdownExtractionJobInputJson(allocator: std.mem.Allocator, extract_memory: bool, use_llm_extraction: bool, strict_llm_extraction: bool, route: store_mod.AgentMemoryStorageRoute) ![]const u8 {
@@ -1398,7 +1663,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","markdown_import":"POST /v1/markdown/import","markdown_export":"POST /v1/markdown/export","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -7259,6 +7524,86 @@ test "api markdown export emits permission-aware artifact markdown" {
     try std.testing.expectEqualStrings("200 OK", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "artifact_type: \\\"runbook\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "Step 2") != null);
+}
+
+test "api markdown import directory recursively creates source artifacts" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const root_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/markdown-import", .{tmp.sub_path});
+    const nested_path = try std.fs.path.join(alloc, &.{ root_path, "ops" });
+    try std.Io.Dir.cwd().createDirPath(compat.io(), nested_path);
+    const adr_path = try std.fs.path.join(alloc, &.{ root_path, "adr.md" });
+    const runbook_path = try std.fs.path.join(alloc, &.{ nested_path, "runbook.markdown" });
+    const ignored_path = try std.fs.path.join(alloc, &.{ root_path, "ignore.txt" });
+    try std.Io.Dir.cwd().writeFile(compat.io(), .{ .sub_path = adr_path, .data = "---\ntitle: Directory ADR\nartifact_type: decision\nstatus: accepted\nrelated_entities: NullPantry, NullClaw\n---\n\n# Directory ADR\n\nDecision: import markdown directories.\n" });
+    try std.Io.Dir.cwd().writeFile(compat.io(), .{ .sub_path = runbook_path, .data = "# Release Runbook\n\nStep 1\n" });
+    try std.Io.Dir.cwd().writeFile(compat.io(), .{ .sub_path = ignored_path, .data = "ignore" });
+
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_scopes_json = "[\"project:nullpantry\",\"write:project:nullpantry\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"propose\",\"export\"]",
+    };
+    const body = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\",\"scope\":\"project:nullpantry\",\"permissions\":[\"project:nullpantry\"],\"queue_extraction\":false}}", .{root_path});
+    const resp = handleRequest(&ctx, "POST", "/v1/markdown/import-directory", body, "");
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"imported\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "adr.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "runbook.markdown") != null);
+
+    const second_resp = handleRequest(&ctx, "POST", "/v1/markdown/import-directory", body, "");
+    try std.testing.expectEqualStrings("200 OK", second_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, second_resp.body, "\"imported\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_resp.body, "\"unchanged\":2") != null);
+
+    const search_resp = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"markdown directories\",\"scopes\":[\"project:nullpantry\"],\"use_vector\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", search_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "Directory ADR") != null);
+}
+
+test "api markdown export directory writes artifact files" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const artifact = try store.createArtifact(alloc, .{
+        .artifact_type = "runbook",
+        .title = "Release NullPantry",
+        .body = "Step 1\nStep 2",
+        .status = "verified",
+        .scope = "project:nullpantry",
+        .permissions_json = "[\"project:nullpantry\"]",
+        .fields_json = "{\"procedure\":\"release\"}",
+    });
+
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_scopes_json = "[\"project:nullpantry\"]",
+        .actor_capabilities_json = "[\"read\",\"export\"]",
+    };
+    const root_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/markdown-export", .{tmp.sub_path});
+    const body = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\",\"artifact_ids\":[\"{s}\"],\"overwrite\":true}}", .{ root_path, artifact.id });
+    const resp = handleRequest(&ctx, "POST", "/v1/markdown/export-directory", body, "");
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"exported\":1") != null);
+
+    const exported_name = try markdown_adapter.exportFileName(alloc, artifact.title, artifact.id, "artifact");
+    const exported_path = try std.fs.path.join(alloc, &.{ root_path, exported_name });
+    const exported = try std.Io.Dir.cwd().readFileAlloc(compat.io(), exported_path, alloc, .limited(64 * 1024));
+    try std.testing.expect(std.mem.indexOf(u8, exported, "artifact_type: \"runbook\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "Step 2") != null);
 }
 
 test "api graph neighbors and path are acl aware" {
