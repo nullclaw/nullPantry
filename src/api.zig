@@ -564,7 +564,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["native","redis-resp-runtime"],"apis":["agent_memory","agent_sessions","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","snapshot_export","snapshot_import"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["native","redis-resp-runtime"],"apis":["agent_memory","agent_sessions","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","snapshot_export","snapshot_import"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -4702,6 +4702,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const artifact_types = handleRequest(&ctx, "GET", "/v1/artifact-types", "", "");
     try std.testing.expectEqualStrings("200 OK", artifact_types.status);
     try std.testing.expect(std.mem.indexOf(u8, artifact_types.body, "\"type\":\"decision\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact_types.body, "\"type\":\"memory_item\"") != null);
     const providers_resp = handleRequest(&ctx, "GET", "/v1/providers", "", "");
     try std.testing.expectEqualStrings("200 OK", providers_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, providers_resp.body, "openai-compatible-embeddings") != null);
@@ -5784,6 +5785,8 @@ test "api manifest and connector endpoints describe headless service contracts" 
     const caps = handleRequest(&ctx, "GET", "/v1/capabilities", "", "");
     try std.testing.expectEqualStrings("200 OK", caps.status);
     try std.testing.expect(std.mem.indexOf(u8, caps.body, "\"headless\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, caps.body, "knowledge_graph") != null);
+    try std.testing.expect(std.mem.indexOf(u8, caps.body, "context_serving_api") != null);
     try std.testing.expect(std.mem.indexOf(u8, caps.body, "agent_memory") != null);
     try std.testing.expect(std.mem.indexOf(u8, caps.body, "agent_sessions") != null);
     try std.testing.expect(std.mem.indexOf(u8, caps.body, "get_context_pack") != null);

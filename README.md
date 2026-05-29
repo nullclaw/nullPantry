@@ -4,6 +4,8 @@ NullPantry is the headless, agent-native knowledge base for the Null ecosystem.
 
 It stores sources, artifacts, memory atoms, entities, relations, context packs, and isolated native agent memory. UI belongs in NullHub/NullDesk; this repository exposes storage, retrieval, lifecycle, and API primitives.
 
+The product architecture is documented in [docs/product-architecture.md](docs/product-architecture.md): NullPantry is a Confluence-like knowledge base, long-term memory, RAG system, knowledge graph, and context serving API for people and agents.
+
 ## Product Boundary
 
 NullClaw should stay small: `none`, in-process `memory`, local `sqlite`, and `markdown` are enough for standalone/runtime-local usage. Anything that implies shared state, central policy, indexing, lifecycle, graph traversal, vector databases, analytics, cross-agent sync, or production storage belongs in NullPantry.
