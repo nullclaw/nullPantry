@@ -489,19 +489,7 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max
         if (std.mem.endsWith(u8, buffer.items, "\r\n\r\n")) break;
     }
 
-    const header_text = buffer.items;
-    var content_length: usize = 0;
-    var lines = std.mem.splitSequence(u8, header_text, "\r\n");
-    _ = lines.next();
-    while (lines.next()) |line| {
-        if (line.len == 0) break;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const key = std.mem.trim(u8, line[0..colon], " \t");
-        if (std.ascii.eqlIgnoreCase(key, "Content-Length")) {
-            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-            content_length = std.fmt.parseInt(usize, value, 10) catch 0;
-        }
-    }
+    const content_length = try parseContentLength(buffer.items);
     if (buffer.items.len + content_length > max_bytes) return error.RequestTooLarge;
     if (content_length > 0) {
         const body = try allocator.alloc(u8, content_length);
@@ -509,6 +497,35 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max
         try buffer.appendSlice(allocator, body);
     }
     return try buffer.toOwnedSlice(allocator);
+}
+
+fn parseContentLength(header_text: []const u8) !usize {
+    var content_length: usize = 0;
+    var saw_content_length = false;
+    var lines = std.mem.splitSequence(u8, header_text, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(key, "Content-Length")) {
+            if (saw_content_length) return error.DuplicateContentLength;
+            if (value.len == 0) return error.InvalidContentLength;
+            content_length = std.fmt.parseInt(usize, value, 10) catch return error.InvalidContentLength;
+            saw_content_length = true;
+        } else if (std.ascii.eqlIgnoreCase(key, "Transfer-Encoding")) {
+            if (!std.ascii.eqlIgnoreCase(value, "identity")) return error.UnsupportedTransferEncoding;
+        }
+    }
+    return content_length;
+}
+
+test "http header parser rejects ambiguous body framing" {
+    try std.testing.expectEqual(@as(usize, 5), try parseContentLength("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n"));
+    try std.testing.expectError(error.InvalidContentLength, parseContentLength("POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"));
+    try std.testing.expectError(error.DuplicateContentLength, parseContentLength("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n"));
+    try std.testing.expectError(error.UnsupportedTransferEncoding, parseContentLength("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"));
 }
 
 test {

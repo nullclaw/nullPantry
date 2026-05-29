@@ -56,14 +56,6 @@ fn hygieneCanDelete(input: HygieneRunInput, scope: []const u8, permissions_json:
         domain.permissionsWritable(permissions_json, input.scopes_json);
 }
 
-fn allowIrreversibleMigrations(allocator: std.mem.Allocator) bool {
-    const raw = compat.process.getEnvVarOwned(allocator, "NULLPANTRY_ALLOW_IRREVERSIBLE_MIGRATIONS") catch return false;
-    defer allocator.free(raw);
-    return std.mem.eql(u8, raw, "1") or
-        std.ascii.eqlIgnoreCase(raw, "true") or
-        std.ascii.eqlIgnoreCase(raw, "yes");
-}
-
 pub const BackendKind = enum {
     sqlite,
     postgres,
@@ -1624,21 +1616,20 @@ pub const SQLiteStore = struct {
         if (!try self.columnExists("semantic_cache", "actor_id")) {
             try self.exec("ALTER TABLE semantic_cache ADD COLUMN actor_id TEXT NOT NULL DEFAULT ''");
         }
-        if (allowIrreversibleMigrations(self.allocator)) {
-            if (try self.tableExists("compat_memories")) {
-                try self.exec("DELETE FROM memory_atoms_fts WHERE id IN (SELECT memory_atom_id FROM compat_memories)");
-                try self.exec("DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND object_id IN (SELECT memory_atom_id FROM compat_memories)");
-                try self.exec("DELETE FROM memory_atoms WHERE id IN (SELECT memory_atom_id FROM compat_memories)");
-            }
-            try self.exec("DELETE FROM memory_atoms_fts WHERE id IN (SELECT id FROM memory_atoms WHERE predicate = 'compat.memory')");
-            try self.exec("DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND object_id IN (SELECT id FROM memory_atoms WHERE predicate = 'compat.memory')");
-            try self.exec("DELETE FROM memory_atoms WHERE predicate = 'compat.memory'");
-            try self.exec("DELETE FROM vector_chunks WHERE object_type = 'source' AND object_id IN (SELECT id FROM sources WHERE metadata_json LIKE '%\"compat\"%nullclaw%')");
-            try self.exec("DELETE FROM sources WHERE metadata_json LIKE '%\"compat\"%nullclaw%'");
-            try self.exec("DROP INDEX IF EXISTS idx_compat_memories_key_session");
-            try self.exec("DROP INDEX IF EXISTS idx_compat_memories_key_session_actor");
-            try self.exec("DROP TABLE IF EXISTS compat_memories");
+        if (try self.tableExists("compat_memories")) {
+            try self.exec("DELETE FROM memory_atoms_fts WHERE id IN (SELECT memory_atom_id FROM compat_memories)");
+            try self.exec("DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND object_id IN (SELECT memory_atom_id FROM compat_memories)");
+            try self.exec("DELETE FROM memory_atoms WHERE id IN (SELECT memory_atom_id FROM compat_memories)");
         }
+        try self.exec("DELETE FROM memory_atoms_fts WHERE id IN (SELECT id FROM memory_atoms WHERE predicate = 'compat.memory')");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND object_id IN (SELECT id FROM memory_atoms WHERE predicate = 'compat.memory')");
+        try self.exec("DELETE FROM memory_atoms WHERE predicate = 'compat.memory'");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'source' AND object_id IN (SELECT id FROM sources WHERE metadata_json LIKE '%\"compat\"%nullclaw%')");
+        try self.exec("DELETE FROM sources_fts WHERE id IN (SELECT id FROM sources WHERE metadata_json LIKE '%\"compat\"%nullclaw%')");
+        try self.exec("DELETE FROM sources WHERE metadata_json LIKE '%\"compat\"%nullclaw%'");
+        try self.exec("DROP INDEX IF EXISTS idx_compat_memories_key_session");
+        try self.exec("DROP INDEX IF EXISTS idx_compat_memories_key_session_actor");
+        try self.exec("DROP TABLE IF EXISTS compat_memories");
         if (!try self.columnExists("session_messages", "actor_id")) {
             try self.exec("ALTER TABLE session_messages ADD COLUMN actor_id TEXT");
         }
@@ -1651,14 +1642,12 @@ pub const SQLiteStore = struct {
                 \\  updated_at_ms INTEGER NOT NULL,
                 \\  PRIMARY KEY (session_id, actor_id)
                 \\);
-                \\INSERT OR REPLACE INTO session_usage_actor_migration (session_id, actor_id, total_tokens, updated_at_ms)
-                \\  SELECT session_id, 'legacy:unknown', total_tokens, updated_at_ms FROM session_usage;
                 \\DROP TABLE session_usage;
                 \\ALTER TABLE session_usage_actor_migration RENAME TO session_usage;
             );
         }
-        try self.exec("UPDATE session_messages SET actor_id = 'legacy:unknown' WHERE actor_id IS NULL OR actor_id = ''");
-        try self.exec("UPDATE session_usage SET actor_id = 'legacy:unknown' WHERE actor_id IS NULL OR actor_id = ''");
+        try self.exec("DELETE FROM session_messages WHERE actor_id IS NULL OR actor_id = ''");
+        try self.exec("DELETE FROM session_usage WHERE actor_id IS NULL OR actor_id = ''");
         try self.exec(
             \\DROP TABLE IF EXISTS session_messages_strict_actor_migration;
             \\DROP TABLE IF EXISTS session_usage_strict_actor_migration;
@@ -5012,8 +5001,8 @@ pub const PostgresStore = struct {
             \\END $$;
             \\ALTER TABLE session_messages ADD COLUMN IF NOT EXISTS actor_id text;
             \\ALTER TABLE session_usage ADD COLUMN IF NOT EXISTS actor_id text;
-            \\UPDATE session_messages SET actor_id = 'legacy:unknown' WHERE actor_id IS NULL OR actor_id = '';
-            \\UPDATE session_usage SET actor_id = 'legacy:unknown' WHERE actor_id IS NULL OR actor_id = '';
+            \\DELETE FROM session_messages WHERE actor_id IS NULL OR actor_id = '';
+            \\DELETE FROM session_usage WHERE actor_id IS NULL OR actor_id = '';
             \\ALTER TABLE session_messages ALTER COLUMN actor_id SET NOT NULL;
             \\ALTER TABLE session_usage ALTER COLUMN actor_id SET NOT NULL;
             \\ALTER TABLE session_messages ALTER COLUMN actor_id DROP DEFAULT;
@@ -5083,26 +5072,24 @@ pub const PostgresStore = struct {
             \\UPDATE schema_migrations SET name = 'vector_outbox_leases', checksum = 'np-017-vector-outbox-leases' WHERE version = 17;
             \\COMMIT;
         );
-        if (allowIrreversibleMigrations(self.allocator)) {
-            try self.runSql(
-                \\BEGIN;
-                \\DO $$
-                \\BEGIN
-                \\  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'compat_memories') THEN
-                \\    DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND object_id IN (SELECT memory_atom_id FROM compat_memories);
-                \\    DELETE FROM memory_atoms WHERE id IN (SELECT memory_atom_id FROM compat_memories);
-                \\  END IF;
-                \\END $$;
-                \\DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND object_id IN (SELECT id FROM memory_atoms WHERE predicate = 'compat.memory');
-                \\DELETE FROM memory_atoms WHERE predicate = 'compat.memory';
-                \\DELETE FROM vector_chunks WHERE object_type = 'source' AND object_id IN (SELECT id FROM sources WHERE metadata_json::text LIKE '%"compat"%nullclaw%');
-                \\DELETE FROM sources WHERE metadata_json::text LIKE '%"compat"%nullclaw%';
-                \\DROP INDEX IF EXISTS compat_memories_key_session_idx;
-                \\DROP INDEX IF EXISTS compat_memories_key_session_actor_idx;
-                \\DROP TABLE IF EXISTS compat_memories;
-                \\COMMIT;
-            );
-        }
+        try self.runSql(
+            \\BEGIN;
+            \\DO $$
+            \\BEGIN
+            \\  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'compat_memories') THEN
+            \\    EXECUTE 'DELETE FROM vector_chunks WHERE object_type = ''memory_atom'' AND object_id IN (SELECT memory_atom_id FROM compat_memories)';
+            \\    EXECUTE 'DELETE FROM memory_atoms WHERE id IN (SELECT memory_atom_id FROM compat_memories)';
+            \\  END IF;
+            \\END $$;
+            \\DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND object_id IN (SELECT id FROM memory_atoms WHERE predicate = 'compat.memory');
+            \\DELETE FROM memory_atoms WHERE predicate = 'compat.memory';
+            \\DELETE FROM vector_chunks WHERE object_type = 'source' AND object_id IN (SELECT id FROM sources WHERE metadata_json::text LIKE '%"compat"%nullclaw%');
+            \\DELETE FROM sources WHERE metadata_json::text LIKE '%"compat"%nullclaw%';
+            \\DROP INDEX IF EXISTS compat_memories_key_session_idx;
+            \\DROP INDEX IF EXISTS compat_memories_key_session_actor_idx;
+            \\DROP TABLE IF EXISTS compat_memories;
+            \\COMMIT;
+        );
     }
 
     fn queryJson(self: *PostgresStore, allocator: std.mem.Allocator, sql: []const u8) !std.json.Parsed(std.json.Value) {
@@ -8014,7 +8001,7 @@ test "sqlite storage contract covers primitives lifecycle and audit events" {
     try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'compat_memories'"));
 }
 
-test "sqlite schema migration adds manifest checksums and preserves irreversible legacy data by default" {
+test "sqlite schema migration removes obsolete compatibility and actorless session data" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -8078,9 +8065,26 @@ test "sqlite schema migration adds manifest checksums and preserves irreversible
     defer store.deinit();
     try std.testing.expectEqual(@as(i64, migrations.expected_schema_version), try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE checksum <> ''"));
     try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM vector_chunks WHERE object_type = 'raw' OR object_id = 'mem_missing'"));
-    try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'compat_memories'"));
-    try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM session_messages WHERE actor_id = 'legacy:unknown'"));
-    try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM session_usage WHERE actor_id = 'legacy:unknown'"));
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'compat_memories'"));
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM session_messages"));
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM session_usage"));
+}
+
+test "sqlite schema cleanup removes compat source fts rows" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+
+    try testingSqliteExec(&store,
+        \\INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json)
+        \\VALUES ('src_compat','manual','Compat source',NULL,'compat source body',NULL,'[]','[]','public',1,1,NULL,NULL,'[]','{"compat":"nullclaw"}');
+        \\INSERT INTO sources_fts (id,title,content) VALUES ('src_compat','Compat source','compat source body');
+    );
+    switch (store.backend) {
+        .sqlite => |*s| try s.applySchemaMigrations(),
+        .postgres => unreachable,
+    }
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM sources WHERE id = 'src_compat'"));
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM sources_fts WHERE id = 'src_compat'"));
 }
 
 test "sqlite search excludes deprecated and superseded memory by default" {

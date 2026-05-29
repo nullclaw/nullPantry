@@ -56,7 +56,7 @@ Run the Redis agent-memory/session contract against a real Redis with:
 NULLPANTRY_TEST_REDIS_URL='redis://:password@localhost:6379/0' zig build redis-contract --summary all
 ```
 
-Startup migrations are conservative by default: they add missing columns/indexes and preserve legacy session rows under `legacy:unknown` instead of deleting data. Set `NULLPANTRY_ALLOW_IRREVERSIBLE_MIGRATIONS=1` only for an explicit one-time cleanup of obsolete legacy tables and projections.
+Startup migrations target the current native NullPantry schema. Because this product is not in production yet and backward compatibility is intentionally not supported, obsolete compatibility tables, old `compat.memory` projections, and actorless legacy session rows are removed instead of being preserved under synthetic actors.
 
 `--actor-scopes` / `NULLPANTRY_SCOPES` defines the server-side scopes granted to the configured token. `--actor-capabilities` / `NULLPANTRY_CAPABILITIES` defines what that token can do: `read`, `propose`, `write`, `verify`, `delete`, `export`, and `feed_apply`. Read scopes and write scopes are separate: `["project:nullpantry"]` can read/propose in that project, while mutations require `["write:project:nullpantry"]`; verification/deletion can be narrowed with `verify:<scope>` and `delete:<scope>`. Local/dev without a token uses `["admin"]`; once `--token` or `NULLPANTRY_TOKEN` is set, the default is read-only `["public"]` until explicit scopes/capabilities are configured.
 
