@@ -147,6 +147,14 @@ const NativeLibpqTransport = struct {
         const conn = try self.acquireConnection();
         defer self.releaseConnection(conn);
 
+        const timeout_sql = try std.fmt.allocPrint(allocator, "SET statement_timeout = '{d}ms'", .{statement_timeout_ms});
+        defer allocator.free(timeout_sql);
+        const timeout_sql_z = try allocator.dupeZ(u8, timeout_sql);
+        defer allocator.free(timeout_sql_z);
+        const timeout_result = self.lib.PQexec(conn, timeout_sql_z.ptr) orelse return error.PostgresCommandFailed;
+        defer self.lib.PQclear(timeout_result);
+        if (self.lib.PQresultStatus(timeout_result) != pgres_command_ok) return error.PostgresCommandFailed;
+
         const sql_z = try allocator.dupeZ(u8, sql);
         defer allocator.free(sql_z);
 

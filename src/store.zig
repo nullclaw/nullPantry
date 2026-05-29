@@ -7320,8 +7320,12 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = try std.fmt.allocPrint(allocator, "SELECT CASE WHEN EXISTS (SELECT 1 FROM schema_migrations WHERE version = {d} AND name = {s} AND checksum = {s}) THEN 'true' ELSE 'false' END", .{ version, try sqlString(allocator, expected.name), try sqlString(allocator, expected.checksum) });
-        const text = try self.queryText(allocator, sql);
+        const version_text = try std.fmt.allocPrint(allocator, "{d}", .{version});
+        const text = try self.queryParamsText(
+            allocator,
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1::bigint AND name = $2 AND checksum = $3) THEN 'true' ELSE 'false' END",
+            &.{ version_text, expected.name, expected.checksum },
+        );
         return std.mem.eql(u8, text, "true");
     }
 
@@ -7367,16 +7371,15 @@ pub const PostgresStore = struct {
     }
 
     fn insertAudit(self: *PostgresStore, allocator: std.mem.Allocator, event_type: []const u8, actor_id: ?[]const u8, object_type: []const u8, object_id: []const u8) !void {
-        _ = allocator;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const sql_allocator = arena.allocator();
-        const sql = try std.fmt.allocPrint(
+        const sql_allocator = allocator;
+        const now_text = try std.fmt.allocPrint(arena.allocator(), "{d}", .{ids.nowMs()});
+        try self.runParams(
             sql_allocator,
-            "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ({s},{s},{s},{s},'{{}}'::jsonb,{d})",
-            .{ try sqlString(sql_allocator, event_type), try sqlNullableString(sql_allocator, actor_id), try sqlString(sql_allocator, object_type), try sqlString(sql_allocator, object_id), ids.nowMs() },
+            "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ($1,$2,$3,$4,'{}'::jsonb,$5::bigint)",
+            &.{ event_type, actor_id, object_type, object_id, now_text },
         );
-        try self.runSql(sql);
     }
 
     pub fn listAuditEvents(self: *PostgresStore, allocator: std.mem.Allocator, since_id: i64, limit: usize) ![]AuditEvent {
@@ -8486,9 +8489,16 @@ pub const PostgresStore = struct {
         if (!try self.vectorBackingObjectExists(allocator, input.object_type, input.object_id)) return error.InvalidVectorTarget;
         const id = try std.fmt.allocPrint(allocator, "vec_{s}_{d}", .{ input.object_id, input.chunk_ordinal });
         const now = ids.nowMs();
-        const embedding_sql = try std.fmt.allocPrint(allocator, "{s}::vector", .{try sqlString(allocator, input.embedding_json)});
-        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,embedding,model,dimensions,created_at_ms,updated_at_ms) VALUES ({s},{s},{s},{d},{s},{s},{s},{s},{s},{s},{d},{d},{d}) ON CONFLICT(id) DO UPDATE SET text=excluded.text, scope=excluded.scope, permissions_json=excluded.permissions_json, embedding_json=excluded.embedding_json, embedding=excluded.embedding, model=excluded.model, dimensions=excluded.dimensions, updated_at_ms=excluded.updated_at_ms", .{ try sqlString(allocator, id), try sqlString(allocator, input.object_type), try sqlString(allocator, input.object_id), input.chunk_ordinal, try sqlString(allocator, input.text), try sqlString(allocator, input.scope), try sqlJsonb(allocator, input.permissions_json), try sqlJsonb(allocator, input.embedding_json), embedding_sql, try sqlNullableString(allocator, input.model), input.dimensions, now, now });
-        try self.runSql(sql);
+        const chunk_ordinal = try std.fmt.allocPrint(allocator, "{d}", .{input.chunk_ordinal});
+        const dimensions = try std.fmt.allocPrint(allocator, "{d}", .{input.dimensions});
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        try self.runParams(
+            allocator,
+            "INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,embedding,model,dimensions,created_at_ms,updated_at_ms) " ++
+                "VALUES ($1,$2,$3,$4::bigint,$5,$6,$7::jsonb,$8::jsonb,$9::vector,$10,$11::bigint,$12::bigint,$13::bigint) " ++
+                "ON CONFLICT(id) DO UPDATE SET text=excluded.text, scope=excluded.scope, permissions_json=excluded.permissions_json, embedding_json=excluded.embedding_json, embedding=excluded.embedding, model=excluded.model, dimensions=excluded.dimensions, updated_at_ms=excluded.updated_at_ms",
+            &.{ id, input.object_type, input.object_id, chunk_ordinal, input.text, input.scope, input.permissions_json, input.embedding_json, input.embedding_json, input.model, dimensions, now_text, now_text },
+        );
         const outbox_payload = try vectorUpsertPayloadJson(allocator, id);
         _ = try self.enqueueVectorOutbox(.{ .action = "upsert", .object_type = input.object_type, .object_id = input.object_id, .payload_json = outbox_payload });
         try self.insertAudit(allocator, "vector_chunk.upserted", input.actor_id, "vector_chunk", id);
@@ -8496,8 +8506,7 @@ pub const PostgresStore = struct {
     }
 
     pub fn getVectorChunk(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?VectorChunk {
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms FROM vector_chunks WHERE id = {s} LIMIT 1", .{try sqlString(allocator, id)});
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const parsed = try self.queryParamsJson(allocator, try arrayJsonSql(allocator, "SELECT id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms FROM vector_chunks WHERE id = $1 LIMIT 1"), &.{id});
         defer parsed.deinit();
         if (parsed.value != .array or parsed.value.array.items.len == 0) return null;
         const item = parsed.value.array.items[0];
@@ -8523,8 +8532,7 @@ pub const PostgresStore = struct {
 
     pub fn deleteVectorChunk(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8, actor_id: ?[]const u8) !bool {
         const chunk = (try self.getVectorChunk(allocator, id)) orelse return false;
-        const sql = try std.fmt.allocPrint(allocator, "WITH deleted AS (DELETE FROM vector_chunks WHERE id = {s} RETURNING 1) SELECT count(*)::text FROM deleted", .{try sqlString(allocator, id)});
-        const text = try self.queryText(allocator, sql);
+        const text = try self.queryParamsText(allocator, "WITH deleted AS (DELETE FROM vector_chunks WHERE id = $1 RETURNING 1) SELECT count(*)::text FROM deleted", &.{id});
         const changed = (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
         if (!changed) return false;
         const outbox_payload = try vectorUpsertPayloadJson(allocator, id);
@@ -8539,8 +8547,7 @@ pub const PostgresStore = struct {
     }
 
     fn deleteVectorChunksForObject(self: *PostgresStore, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, actor_id: ?[]const u8) !usize {
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id FROM vector_chunks WHERE object_type = {s} AND object_id = {s} ORDER BY id", .{ try sqlString(allocator, object_type), try sqlString(allocator, object_id) });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const parsed = try self.queryParamsJson(allocator, try arrayJsonSql(allocator, "SELECT id FROM vector_chunks WHERE object_type = $1 AND object_id = $2 ORDER BY id"), &.{ object_type, object_id });
         defer parsed.deinit();
         var ids_to_delete: std.ArrayListUnmanaged([]const u8) = .empty;
         if (parsed.value == .array) {
@@ -8663,8 +8670,12 @@ pub const PostgresStore = struct {
         defer arena.deinit();
         const allocator = arena.allocator();
         const now = ids.nowMs();
-        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO vector_outbox (action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms) VALUES ({s},{s},{s},{s},0,{s},{d},{d}) RETURNING id::text", .{ try sqlString(allocator, input.action), try sqlString(allocator, input.object_type), try sqlString(allocator, input.object_id), try sqlString(allocator, input.status), try sqlJsonb(allocator, input.payload_json), now, now });
-        const text = try self.queryText(allocator, sql);
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        const text = try self.queryParamsText(
+            allocator,
+            "INSERT INTO vector_outbox (action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms) VALUES ($1,$2,$3,$4,0,$5::jsonb,$6::bigint,$7::bigint) RETURNING id::text",
+            &.{ input.action, input.object_type, input.object_id, input.status, input.payload_json, now_text, now_text },
+        );
         const id = std.fmt.parseInt(i64, text, 10) catch 0;
         if (id > 0) try self.insertAudit(self.allocator, "vector_outbox.enqueued", null, "vector_outbox", input.object_id);
         return id;
@@ -8674,15 +8685,22 @@ pub const PostgresStore = struct {
         try self.reclaimExpiredVectorOutbox(allocator);
         const capped = @max(@as(usize, 1), @min(input.limit, 1000));
         const filter = if (input.action != null and input.status != null)
-            try std.fmt.allocPrint(allocator, "WHERE action = {s} AND status = {s}", .{ try sqlString(allocator, input.action.?), try sqlString(allocator, input.status.?) })
+            "WHERE action = $1 AND status = $2"
         else if (input.action != null)
-            try std.fmt.allocPrint(allocator, "WHERE action = {s}", .{try sqlString(allocator, input.action.?)})
+            "WHERE action = $1"
         else if (input.status != null)
-            try std.fmt.allocPrint(allocator, "WHERE status = {s}", .{try sqlString(allocator, input.status.?)})
+            "WHERE status = $1"
         else
             "";
         const inner = try std.fmt.allocPrint(allocator, "SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms FROM vector_outbox {s} ORDER BY id LIMIT {d}", .{ filter, capped });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const parsed = if (input.action != null and input.status != null)
+            try self.queryParamsJson(allocator, try arrayJsonSql(allocator, inner), &.{ input.action.?, input.status.? })
+        else if (input.action != null)
+            try self.queryParamsJson(allocator, try arrayJsonSql(allocator, inner), &.{input.action.?})
+        else if (input.status != null)
+            try self.queryParamsJson(allocator, try arrayJsonSql(allocator, inner), &.{input.status.?})
+        else
+            try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(VectorOutboxEntry) = .empty;
         errdefer out.deinit(allocator);
@@ -8697,8 +8715,12 @@ pub const PostgresStore = struct {
 
     fn reclaimExpiredVectorOutbox(self: *PostgresStore, allocator: std.mem.Allocator) !void {
         const now = ids.nowMs();
-        const sql = try std.fmt.allocPrint(allocator, "UPDATE vector_outbox SET status = 'pending', locked_until_ms = NULL, worker_id = NULL, updated_at_ms = {d} WHERE status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= {d}", .{ now, now });
-        try self.runSql(sql);
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        try self.runParams(
+            allocator,
+            "UPDATE vector_outbox SET status = 'pending', locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $1::bigint WHERE status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= $2::bigint",
+            &.{ now_text, now_text },
+        );
     }
 
     pub fn claimVectorOutbox(self: *PostgresStore, id: i64) !bool {
@@ -8721,8 +8743,13 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = try std.fmt.allocPrint(allocator, "WITH updated AS (UPDATE vector_outbox SET status = {s}, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = {d} WHERE id = {d} RETURNING 1) SELECT count(*)::text FROM updated", .{ try sqlString(allocator, status), ids.nowMs(), id });
-        const text = try self.queryText(allocator, sql);
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
+        const id_text = try std.fmt.allocPrint(allocator, "{d}", .{id});
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH updated AS (UPDATE vector_outbox SET status = $1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $2::bigint WHERE id = $3::bigint RETURNING 1) SELECT count(*)::text FROM updated",
+            &.{ status, now_text, id_text },
+        );
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
@@ -8731,8 +8758,10 @@ pub const PostgresStore = struct {
         defer arena.deinit();
         const allocator = arena.allocator();
         try self.reclaimExpiredVectorOutbox(allocator);
-        const sql = if (status) |s| try std.fmt.allocPrint(allocator, "SELECT count(*)::text FROM vector_outbox WHERE status = {s}", .{try sqlString(allocator, s)}) else "SELECT count(*)::text FROM vector_outbox";
-        const text = try self.queryText(allocator, sql);
+        const text = if (status) |s|
+            try self.queryParamsText(allocator, "SELECT count(*)::text FROM vector_outbox WHERE status = $1", &.{s})
+        else
+            try self.queryText(allocator, "SELECT count(*)::text FROM vector_outbox");
         return std.fmt.parseInt(usize, text, 10) catch 0;
     }
 
@@ -8750,8 +8779,13 @@ pub const PostgresStore = struct {
         try self.reclaimExpiredVectorOutbox(allocator);
         const capped = @max(@as(usize, 1), @min(limit, 1000));
         const now = ids.nowMs();
-        const sql = try std.fmt.allocPrint(allocator, "WITH updated AS (UPDATE vector_outbox SET status = 'indexed_local', attempts = attempts + 1, updated_at_ms = {d} WHERE id IN (SELECT id FROM vector_outbox WHERE status = 'pending' AND action <> 'embed' ORDER BY id LIMIT {d}) RETURNING id) SELECT count(*)::text FROM updated", .{ now, capped });
-        const text = try self.queryText(allocator, sql);
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{capped});
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH updated AS (UPDATE vector_outbox SET status = 'indexed_local', attempts = attempts + 1, updated_at_ms = $1::bigint WHERE id IN (SELECT id FROM vector_outbox WHERE status = 'pending' AND action <> 'embed' ORDER BY id LIMIT $2::bigint) RETURNING id) SELECT count(*)::text FROM updated",
+            &.{ now_text, limit_text },
+        );
         return .{ .processed = std.fmt.parseInt(usize, text, 10) catch 0, .failed = 0 };
     }
 
@@ -8763,9 +8797,15 @@ pub const PostgresStore = struct {
         defer arena.deinit();
         const allocator = arena.allocator();
         const now = ids.nowMs();
-        const applied = if (std.mem.eql(u8, input.status, "applied")) try std.fmt.allocPrint(allocator, "{d}", .{now}) else "NULL";
-        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO memory_feed_events (event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{s}) ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO UPDATE SET dedupe_key = excluded.dedupe_key RETURNING id::text", .{ try sqlString(allocator, input.event_type), try sqlString(allocator, input.operation), try sqlString(allocator, input.object_type), try sqlString(allocator, input.object_id), try sqlString(allocator, input.scope), try sqlJsonb(allocator, input.permissions_json), try sqlNullableString(allocator, input.actor_id), try sqlNullableString(allocator, input.dedupe_key), try sqlJsonb(allocator, input.causality_json), try sqlJsonb(allocator, input.payload_json), try sqlString(allocator, input.status), now, applied });
-        const text = try self.queryText(allocator, sql);
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        const applied_text: ?[]const u8 = if (std.mem.eql(u8, input.status, "applied")) now_text else null;
+        const text = try self.queryParamsText(
+            allocator,
+            "INSERT INTO memory_feed_events (event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms) " ++
+                "VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9::jsonb,$10::jsonb,$11,$12::bigint,$13::bigint) " ++
+                "ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO UPDATE SET dedupe_key = excluded.dedupe_key RETURNING id::text",
+            &.{ input.event_type, input.operation, input.object_type, input.object_id, input.scope, input.permissions_json, input.actor_id, input.dedupe_key, input.causality_json, input.payload_json, input.status, now_text, applied_text },
+        );
         const id = std.fmt.parseInt(i64, text, 10) catch 0;
         if (id > 0) try self.insertAudit(self.allocator, "memory_feed.appended", input.actor_id, "memory_feed_event", input.object_id);
         return id;
@@ -8775,12 +8815,13 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = try std.fmt.allocPrint(
+        const id_text = try std.fmt.allocPrint(allocator, "{d}", .{id});
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
+        const text = try self.queryParamsText(
             allocator,
-            "WITH updated AS (UPDATE memory_feed_events SET object_type = {s}, object_id = {s}, payload_json = {s}, status = 'applied', applied_at_ms = {d} WHERE id = {d} AND status = 'applying' RETURNING id) SELECT count(*)::text FROM updated",
-            .{ try sqlString(allocator, object_type), try sqlString(allocator, object_id), try sqlJsonb(allocator, payload_json), ids.nowMs(), id },
+            "WITH updated AS (UPDATE memory_feed_events SET object_type = $1, object_id = $2, payload_json = $3::jsonb, status = 'applied', applied_at_ms = $4::bigint WHERE id = $5::bigint AND status = 'applying' RETURNING id) SELECT count(*)::text FROM updated",
+            &.{ object_type, object_id, payload_json, now_text, id_text },
         );
-        const text = try self.queryText(allocator, sql);
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
@@ -8788,8 +8829,8 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = try std.fmt.allocPrint(allocator, "WITH deleted AS (DELETE FROM memory_feed_events WHERE id = {d} AND status = 'applying' RETURNING id) SELECT count(*)::text FROM deleted", .{id});
-        const text = try self.queryText(allocator, sql);
+        const id_text = try std.fmt.allocPrint(allocator, "{d}", .{id});
+        const text = try self.queryParamsText(allocator, "WITH deleted AS (DELETE FROM memory_feed_events WHERE id = $1::bigint AND status = 'applying' RETURNING id) SELECT count(*)::text FROM deleted", &.{id_text});
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
@@ -8797,8 +8838,7 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = try std.fmt.allocPrint(allocator, "SELECT coalesce((SELECT id::text FROM memory_feed_events WHERE dedupe_key = {s} LIMIT 1), '')", .{try sqlString(allocator, key)});
-        const text = try self.queryText(allocator, sql);
+        const text = try self.queryParamsText(allocator, "SELECT coalesce((SELECT id::text FROM memory_feed_events WHERE dedupe_key = $1 LIMIT 1), '')", &.{key});
         if (text.len == 0) return null;
         return std.fmt.parseInt(i64, text, 10) catch null;
     }
@@ -8825,8 +8865,7 @@ pub const PostgresStore = struct {
     }
 
     pub fn getFeedEventByDedupeKey(self: *PostgresStore, allocator: std.mem.Allocator, dedupe_key: []const u8) !?FeedEvent {
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms,compacted_at_ms FROM memory_feed_events WHERE dedupe_key = {s} LIMIT 1", .{try sqlString(allocator, dedupe_key)});
-        const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
+        const parsed = try self.queryParamsJson(allocator, try rowJsonSql(allocator, "SELECT id,event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms,compacted_at_ms FROM memory_feed_events WHERE dedupe_key = $1 LIMIT 1"), &.{dedupe_key});
         defer parsed.deinit();
         if (parsed.value == .null) return null;
         return try readPgFeedEvent(allocator, parsed.value.object);
@@ -8868,23 +8907,34 @@ pub const PostgresStore = struct {
         const max_id = std.fmt.parseInt(i64, max_text, 10) catch 0;
         const floor = @max(@as(i64, 0), @min(before_id, max_id));
         const now = ids.nowMs();
-        const compacted_text = try self.queryText(allocator, try std.fmt.allocPrint(allocator, "SELECT count(*)::text FROM memory_feed_events WHERE id <= {d} AND compacted_at_ms IS NULL", .{floor}));
+        const floor_text = try std.fmt.allocPrint(allocator, "{d}", .{floor});
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        const compacted_text = try self.queryParamsText(allocator, "SELECT count(*)::text FROM memory_feed_events WHERE id <= $1::bigint AND compacted_at_ms IS NULL", &.{floor_text});
         const compacted = std.fmt.parseInt(usize, compacted_text, 10) catch 0;
         const payload = try std.fmt.allocPrint(allocator, "{{\"compacted_events\":{d}}}", .{compacted});
-        const sql = try std.fmt.allocPrint(
+        _ = try self.queryParamsText(
             allocator,
-            "BEGIN; UPDATE memory_feed_events SET compacted_at_ms = {d} WHERE id <= {d} AND compacted_at_ms IS NULL; UPDATE memory_feed_state SET cursor_floor = greatest(cursor_floor, {d}), updated_at_ms = {d} WHERE id = 1; INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_feed.compacted',{s},'memory_feed','cursor_floor',{s},{d}); COMMIT; SELECT 'ok';",
-            .{ now, floor, floor, now, try sqlNullableString(allocator, actor_id), try sqlJsonb(allocator, payload), now },
+            "WITH updated_events AS (" ++
+                "UPDATE memory_feed_events SET compacted_at_ms = $1::bigint WHERE id <= $2::bigint AND compacted_at_ms IS NULL RETURNING id" ++
+                "), updated_state AS (" ++
+                "UPDATE memory_feed_state SET cursor_floor = greatest(cursor_floor, $2::bigint), updated_at_ms = $1::bigint WHERE id = 1 RETURNING cursor_floor" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_feed.compacted',$3,'memory_feed','cursor_floor',$4::jsonb,$1::bigint) RETURNING 1" ++
+                ") SELECT coalesce((SELECT cursor_floor::text FROM updated_state), '0')",
+            &.{ now_text, floor_text, actor_id, payload },
         );
-        _ = try self.queryText(allocator, sql);
         return .{ .cursor_floor = try self.feedCursorFloor(allocator), .max_event_id = max_id, .compacted_events = compacted };
     }
 
     pub fn createLifecycleSnapshot(self: *PostgresStore, allocator: std.mem.Allocator, snapshot_type: []const u8, summary_json: []const u8) !LifecycleSnapshot {
         const id = try ids.make(allocator, "snap_");
         const now = ids.nowMs();
-        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO lifecycle_snapshots (id,snapshot_type,summary_json,created_at_ms) VALUES ({s},{s},{s},{d})", .{ try sqlString(allocator, id), try sqlString(allocator, snapshot_type), try sqlJsonb(allocator, summary_json), now });
-        try self.runSql(sql);
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        try self.runParams(
+            allocator,
+            "INSERT INTO lifecycle_snapshots (id,snapshot_type,summary_json,created_at_ms) VALUES ($1,$2,$3::jsonb,$4::bigint)",
+            &.{ id, snapshot_type, summary_json, now_text },
+        );
         return .{ .id = id, .snapshot_type = snapshot_type, .summary_json = summary_json, .created_at_ms = now };
     }
 
@@ -8919,12 +8969,14 @@ pub const PostgresStore = struct {
         const expires = if (input.ttl_ms > 0) now + input.ttl_ms else 0;
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
         const expires_text = try std.fmt.allocPrint(allocator, "{d}", .{expires});
-        try self.runParams(
+        _ = try self.queryParamsText(
             allocator,
-            "BEGIN; " ++
-                "INSERT INTO response_cache (cache_key,response_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES ($1,$2::jsonb,$3::jsonb,$4,$5::bigint,$6::bigint) ON CONFLICT(actor_id,cache_key) DO UPDATE SET response_json=excluded.response_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms; " ++
-                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('cache.response.put',$4,'response_cache',$1,'{}'::jsonb,$5::bigint); " ++
-                "COMMIT;",
+            "WITH upserted AS (" ++
+                "INSERT INTO response_cache (cache_key,response_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES ($1,$2::jsonb,$3::jsonb,$4,$5::bigint,$6::bigint) " ++
+                "ON CONFLICT(actor_id,cache_key) DO UPDATE SET response_json=excluded.response_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms RETURNING cache_key" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'cache.response.put',$4,'response_cache',cache_key,'{}'::jsonb,$5::bigint FROM upserted RETURNING 1" ++
+                ") SELECT count(*)::text FROM upserted",
             &.{ input.cache_key, input.response_json, input.scopes_json, input.actor_id, now_text, expires_text },
         );
     }
@@ -8957,12 +9009,14 @@ pub const PostgresStore = struct {
         const expires = if (input.ttl_ms > 0) now + input.ttl_ms else 0;
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
         const expires_text = try std.fmt.allocPrint(allocator, "{d}", .{expires});
-        try self.runParams(
+        _ = try self.queryParamsText(
             allocator,
-            "BEGIN; " ++
-                "INSERT INTO semantic_cache (cache_key,query,response_json,embedding_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6,$7::bigint,$8::bigint) ON CONFLICT(actor_id,cache_key) DO UPDATE SET query=excluded.query, response_json=excluded.response_json, embedding_json=excluded.embedding_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms; " ++
-                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('cache.semantic.put',$6,'semantic_cache',$1,'{}'::jsonb,$7::bigint); " ++
-                "COMMIT;",
+            "WITH upserted AS (" ++
+                "INSERT INTO semantic_cache (cache_key,query,response_json,embedding_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6,$7::bigint,$8::bigint) " ++
+                "ON CONFLICT(actor_id,cache_key) DO UPDATE SET query=excluded.query, response_json=excluded.response_json, embedding_json=excluded.embedding_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms RETURNING cache_key" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'cache.semantic.put',$6,'semantic_cache',cache_key,'{}'::jsonb,$7::bigint FROM upserted RETURNING 1" ++
+                ") SELECT count(*)::text FROM upserted",
             &.{ input.cache_key, input.query, input.response_json, input.embedding_json, input.scopes_json, input.actor_id, now_text, expires_text },
         );
     }
@@ -12497,4 +12551,104 @@ test "postgres storage contract covers primitives when configured" {
 
     const pack = try store.createContextPack(alloc, .{ .query = unique, .scopes_json = "[\"public\"]" });
     try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, unique) != null);
+
+    try std.testing.expectEqual(migrations.expected_schema_version, try store.schemaVersion());
+
+    const cache_key = try std.fmt.allocPrint(alloc, "{s}.response-cache", .{unique});
+    try store.putResponseCache(.{
+        .cache_key = cache_key,
+        .response_json = "{\"ok\":true}",
+        .scopes_json = "[\"team:pg\"]",
+        .actor_id = "agent:pg-a",
+        .ttl_ms = 60_000,
+    });
+    try std.testing.expect((try store.getResponseCacheForScopes(alloc, cache_key, ids.nowMs(), "[\"team:pg\"]", "agent:pg-a")) != null);
+    try std.testing.expect((try store.getResponseCacheForScopes(alloc, cache_key, ids.nowMs(), "[\"team:pg\"]", "agent:pg-b")) == null);
+    try std.testing.expect((try store.getResponseCacheForScopes(alloc, cache_key, ids.nowMs(), "[\"public\"]", "agent:pg-a")) == null);
+
+    const semantic_key = try std.fmt.allocPrint(alloc, "{s}.semantic-cache", .{unique});
+    try store.putSemanticCache(.{
+        .cache_key = semantic_key,
+        .query = "postgres semantic cache",
+        .response_json = "{\"semantic\":true}",
+        .embedding_json = "[1,0,0]",
+        .scopes_json = "[\"team:pg\"]",
+        .actor_id = "agent:pg-a",
+        .ttl_ms = 60_000,
+    });
+    try std.testing.expect((try store.searchSemanticCache(alloc, .{ .embedding_json = "[1,0,0]", .scopes_json = "[\"team:pg\"]", .actor_id = "agent:pg-a", .min_score = 0.99 })) != null);
+    try std.testing.expect((try store.searchSemanticCache(alloc, .{ .embedding_json = "[1,0,0]", .scopes_json = "[\"team:pg\"]", .actor_id = "agent:pg-b", .min_score = 0.99 })) == null);
+
+    const vector = try store.upsertVectorChunk(alloc, .{
+        .object_type = "memory_atom",
+        .object_id = atom.id,
+        .chunk_ordinal = 0,
+        .text = "postgres pgvector contract chunk",
+        .scope = "public",
+        .embedding_json = "[1,0,0]",
+        .dimensions = 3,
+        .actor_id = "agent:postgres",
+    });
+    const matches = try store.vectorSearch(alloc, .{ .embedding_json = "[1,0,0]", .scopes_json = "[\"public\"]", .limit = 5 });
+    var saw_vector = false;
+    for (matches) |match| {
+        if (std.mem.eql(u8, match.id, vector.id)) saw_vector = true;
+    }
+    try std.testing.expect(saw_vector);
+    try std.testing.expect((try store.countVectorOutbox("pending")) > 0);
+    const outbox = try store.listVectorOutbox(alloc, .{ .action = "upsert", .status = "pending", .limit = 10 });
+    try std.testing.expect(outbox.len > 0);
+    try std.testing.expect(try store.claimVectorOutbox(outbox[0].id));
+    try std.testing.expect(!(try store.claimVectorOutbox(outbox[0].id)));
+    try std.testing.expect(try store.finishVectorOutbox(outbox[0].id, "indexed_local"));
+
+    const feed_key = try std.fmt.allocPrint(alloc, "{s}.feed", .{unique});
+    const feed_id = try store.appendFeedEvent(.{
+        .event_type = "contract.memory.put",
+        .operation = "put",
+        .object_type = "memory_atom",
+        .object_id = atom.id,
+        .scope = "team:pg",
+        .permissions_json = "[\"team:pg\"]",
+        .actor_id = "agent:pg-a",
+        .dedupe_key = feed_key,
+        .payload_json = "{\"text\":\"postgres feed contract\"}",
+        .status = "applied",
+    });
+    try std.testing.expectEqual(feed_id, try store.appendFeedEvent(.{
+        .event_type = "contract.memory.put",
+        .operation = "put",
+        .object_type = "memory_atom",
+        .object_id = atom.id,
+        .scope = "team:pg",
+        .permissions_json = "[\"team:pg\"]",
+        .actor_id = "agent:pg-a",
+        .dedupe_key = feed_key,
+        .payload_json = "{\"text\":\"postgres feed contract retry\"}",
+        .status = "applied",
+    }));
+    const visible_feed = try store.listFeedEvents(alloc, .{ .since_id = feed_id - 1, .scopes_json = "[\"team:pg\"]", .limit = 10 });
+    var saw_feed = false;
+    for (visible_feed) |event| {
+        if (event.id == feed_id) saw_feed = true;
+    }
+    try std.testing.expect(saw_feed);
+    const hidden_feed = try store.listFeedEvents(alloc, .{ .since_id = feed_id - 1, .scopes_json = "[\"public\"]", .limit = 10 });
+    for (hidden_feed) |event| try std.testing.expect(event.id != feed_id);
+    const compacted = try store.compactFeed(feed_id, "agent:pg-a");
+    try std.testing.expect(compacted.cursor_floor >= feed_id);
+    try std.testing.expectError(error.CursorExpired, store.listFeedEvents(alloc, .{ .since_id = feed_id - 1, .scopes_json = "[\"team:pg\"]", .limit = 10 }));
+
+    const job = try store.createJob(alloc, .{
+        .job_type = "postgres-contract",
+        .scope = "team:pg",
+        .permissions_json = "[\"team:pg\"]",
+        .object_type = "memory_atom",
+        .object_id = atom.id,
+        .input_json = "{\"contract\":true}",
+        .actor_id = "agent:pg-a",
+    });
+    try std.testing.expect(try store.claimJob(job.id));
+    try std.testing.expect(!(try store.claimJob(job.id)));
+    try std.testing.expect(try store.finishJob(job.id, "succeeded", "{\"done\":true}", null));
 }
