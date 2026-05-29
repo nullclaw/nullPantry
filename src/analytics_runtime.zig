@@ -51,34 +51,122 @@ pub const Event = struct {
     created_at_ms: i64,
 };
 
-pub fn exportEvents(allocator: std.mem.Allocator, cfg: Config, events: []const Event) !usize {
+pub const ExportResult = struct {
+    attempted: usize = 0,
+    inserted: usize = 0,
+    skipped_existing: usize = 0,
+};
+
+pub const Status = struct {
+    rows: usize = 0,
+    audit_max_id: i64 = 0,
+    feed_max_id: i64 = 0,
+    latest_created_at_ms: i64 = 0,
+};
+
+pub const QueryInput = struct {
+    event_source: ?[]const u8 = null,
+    object_type: ?[]const u8 = null,
+    object_id: ?[]const u8 = null,
+    actor_id: ?[]const u8 = null,
+    since_id: i64 = 0,
+    limit: usize = 100,
+    newest_first: bool = true,
+};
+
+const EventKey = struct {
+    event_source: []const u8,
+    event_id: i64,
+};
+
+pub fn exportEvents(allocator: std.mem.Allocator, cfg: Config, events: []const Event) !ExportResult {
     if (!cfg.enabled()) return error.AnalyticsBackendNotConfigured;
-    if (events.len == 0) return 0;
+    if (events.len == 0) return .{};
     return switch (cfg.backend) {
         .none => error.AnalyticsBackendNotConfigured,
         .clickhouse => clickhouseInsert(allocator, cfg, events),
     };
 }
 
-fn clickhouseInsert(allocator: std.mem.Allocator, cfg: Config, events: []const Event) !usize {
+pub fn status(allocator: std.mem.Allocator, cfg: Config) !Status {
+    if (!cfg.enabled()) return error.AnalyticsBackendNotConfigured;
     const table = try safeIdentifier(allocator, cfg.table);
     defer allocator.free(table);
     try clickhouseEnsureTable(allocator, cfg, table);
+    const query = try std.fmt.allocPrint(
+        allocator,
+        "SELECT count(), maxIf(event_id, event_source = 'audit'), maxIf(event_id, event_source = 'memory_feed'), toInt64(ifNull(max(created_at_ms), 0)) FROM {s} FINAL FORMAT TSV",
+        .{table},
+    );
+    defer allocator.free(query);
+    const body = try clickhouseQuery(allocator, cfg, query);
+    defer allocator.free(body);
+    return parseStatus(body);
+}
+
+pub fn queryEventsJson(allocator: std.mem.Allocator, cfg: Config, input: QueryInput) ![]u8 {
+    if (!cfg.enabled()) return error.AnalyticsBackendNotConfigured;
+    const table = try safeIdentifier(allocator, cfg.table);
+    defer allocator.free(table);
+    try clickhouseEnsureTable(allocator, cfg, table);
+
+    var where_clause: std.ArrayListUnmanaged(u8) = .empty;
+    defer where_clause.deinit(allocator);
+    try where_clause.print(allocator, "event_id > {d}", .{input.since_id});
+    try appendOptionalFilter(allocator, &where_clause, "event_source", input.event_source);
+    try appendOptionalFilter(allocator, &where_clause, "object_type", input.object_type);
+    try appendOptionalFilter(allocator, &where_clause, "object_id", input.object_id);
+    try appendOptionalFilter(allocator, &where_clause, "actor_id", input.actor_id);
+
+    const order = if (input.newest_first) "created_at_ms DESC, event_source ASC, event_id DESC" else "event_source ASC, event_id ASC";
+    const limit = @max(@as(usize, 1), @min(input.limit, 1000));
+    const query = try std.fmt.allocPrint(
+        allocator,
+        "SELECT event_source,event_id,event_type,operation,actor_id,object_type,object_id,scope,permissions_json,status,payload_json,causality_json,created_at_ms FROM {s} FINAL WHERE {s} ORDER BY {s} LIMIT {d} FORMAT JSONEachRow",
+        .{ table, where_clause.items, order, limit },
+    );
+    defer allocator.free(query);
+    const body = try clickhouseQuery(allocator, cfg, query);
+    defer allocator.free(body);
+    return jsonEachRowsToArray(allocator, body);
+}
+
+fn clickhouseInsert(allocator: std.mem.Allocator, cfg: Config, events: []const Event) !ExportResult {
+    const table = try safeIdentifier(allocator, cfg.table);
+    defer allocator.free(table);
+    try clickhouseEnsureTable(allocator, cfg, table);
+
+    const existing = try queryExistingEventKeys(allocator, cfg, table, events);
+    defer freeEventKeys(allocator, existing);
+
+    var missing: std.ArrayListUnmanaged(Event) = .empty;
+    defer missing.deinit(allocator);
+    for (events) |event| {
+        if (!eventKeyExists(existing, event)) try missing.append(allocator, event);
+    }
+    if (missing.items.len == 0) {
+        return .{ .attempted = events.len, .inserted = 0, .skipped_existing = events.len };
+    }
+
     const query = try std.fmt.allocPrint(allocator, "INSERT INTO {s} FORMAT JSONEachRow", .{table});
     defer allocator.free(query);
     const url = try clickhouseQueryUrl(allocator, cfg.base_url.?, query);
     defer allocator.free(url);
-    const body = try eventsJsonEachRow(allocator, events);
+    const body = try eventsJsonEachRow(allocator, missing.items);
     defer allocator.free(body);
     const response = try post(allocator, url, cfg.api_key, cfg.timeout_secs, "application/x-ndjson", body);
     defer allocator.free(response);
-    return events.len;
+    return .{
+        .attempted = events.len,
+        .inserted = missing.items.len,
+        .skipped_existing = events.len - missing.items.len,
+    };
 }
 
 fn clickhouseEnsureTable(allocator: std.mem.Allocator, cfg: Config, table: []const u8) !void {
     const query = try std.fmt.allocPrint(
         allocator,
-        "CREATE TABLE IF NOT EXISTS {s} (event_source String, event_id Int64, event_type String, operation Nullable(String), actor_id Nullable(String), object_type String, object_id String, scope Nullable(String), permissions_json String, status Nullable(String), payload_json String, causality_json String, created_at_ms Int64) ENGINE = MergeTree ORDER BY (event_source, event_id)",
+        "CREATE TABLE IF NOT EXISTS {s} (event_source String, event_id Int64, event_type String, operation Nullable(String), actor_id Nullable(String), object_type String, object_id String, scope Nullable(String), permissions_json String, status Nullable(String), payload_json String, causality_json String, created_at_ms Int64) ENGINE = ReplacingMergeTree(created_at_ms) ORDER BY (event_source, event_id)",
         .{table},
     );
     defer allocator.free(query);
@@ -93,6 +181,117 @@ fn clickhouseQuery(allocator: std.mem.Allocator, cfg: Config, query: []const u8)
     const url = try clickhouseQueryUrl(allocator, cfg.base_url.?, query);
     defer allocator.free(url);
     return post(allocator, url, cfg.api_key, cfg.timeout_secs, "text/plain", "");
+}
+
+fn queryExistingEventKeys(allocator: std.mem.Allocator, cfg: Config, table: []const u8, events: []const Event) ![]EventKey {
+    if (events.len == 0) return allocator.dupe(EventKey, &.{});
+    var tuples: std.ArrayListUnmanaged(u8) = .empty;
+    defer tuples.deinit(allocator);
+    for (events, 0..) |event, i| {
+        if (i > 0) try tuples.append(allocator, ',');
+        try tuples.append(allocator, '(');
+        try appendSqlString(allocator, &tuples, event.event_source);
+        try tuples.print(allocator, ",{d})", .{event.event_id});
+    }
+    const query = try std.fmt.allocPrint(
+        allocator,
+        "SELECT event_source,event_id FROM {s} FINAL WHERE (event_source,event_id) IN ({s}) FORMAT TSV",
+        .{ table, tuples.items },
+    );
+    defer allocator.free(query);
+    const body = try clickhouseQuery(allocator, cfg, query);
+    defer allocator.free(body);
+    return parseEventKeys(allocator, body);
+}
+
+fn parseEventKeys(allocator: std.mem.Allocator, body: []const u8) ![]EventKey {
+    var keys: std.ArrayListUnmanaged(EventKey) = .empty;
+    errdefer freeEventKeys(allocator, keys.items);
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+        const source = line[0..tab];
+        const event_id = std.fmt.parseInt(i64, std.mem.trim(u8, line[tab + 1 ..], " \t\r\n"), 10) catch continue;
+        try keys.append(allocator, .{
+            .event_source = try allocator.dupe(u8, source),
+            .event_id = event_id,
+        });
+    }
+    return keys.toOwnedSlice(allocator);
+}
+
+fn freeEventKeys(allocator: std.mem.Allocator, keys: []const EventKey) void {
+    for (keys) |key| allocator.free(key.event_source);
+    allocator.free(keys);
+}
+
+fn eventKeyExists(keys: []const EventKey, event: Event) bool {
+    for (keys) |key| {
+        if (key.event_id == event.event_id and std.mem.eql(u8, key.event_source, event.event_source)) return true;
+    }
+    return false;
+}
+
+fn parseStatus(body: []const u8) Status {
+    const line = std.mem.trim(u8, body, " \t\r\n");
+    if (line.len == 0) return .{};
+    var columns = std.mem.splitScalar(u8, line, '\t');
+    return .{
+        .rows = parseUsize(columns.next() orelse "0"),
+        .audit_max_id = parseI64(columns.next() orelse "0"),
+        .feed_max_id = parseI64(columns.next() orelse "0"),
+        .latest_created_at_ms = parseI64(columns.next() orelse "0"),
+    };
+}
+
+fn parseUsize(raw: []const u8) usize {
+    return std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\r\n"), 10) catch 0;
+}
+
+fn parseI64(raw: []const u8) i64 {
+    return std.fmt.parseInt(i64, std.mem.trim(u8, raw, " \t\r\n"), 10) catch 0;
+}
+
+fn appendOptionalFilter(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), column: []const u8, value: ?[]const u8) !void {
+    const actual = value orelse return;
+    try out.appendSlice(allocator, " AND ");
+    try out.appendSlice(allocator, column);
+    try out.appendSlice(allocator, " = ");
+    try appendSqlString(allocator, out, actual);
+}
+
+fn appendSqlString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    try out.append(allocator, '\'');
+    for (value) |ch| {
+        if (ch == '\'') {
+            try out.appendSlice(allocator, "''");
+        } else if (ch == '\\') {
+            try out.appendSlice(allocator, "\\\\");
+        } else {
+            try out.append(allocator, ch);
+        }
+    }
+    try out.append(allocator, '\'');
+}
+
+fn jsonEachRowsToArray(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    var first = true;
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        if (!(std.json.validate(allocator, line) catch false)) continue;
+        if (!first) try out.append(allocator, ',');
+        try out.appendSlice(allocator, line);
+        first = false;
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
 }
 
 fn eventsJsonEachRow(allocator: std.mem.Allocator, events: []const Event) ![]u8 {
@@ -287,6 +486,13 @@ test "clickhouse query URL percent-encodes SQL" {
     try std.testing.expect(std.mem.indexOf(u8, url, "SELECT%20count%28%29%20FROM%20np.events") != null);
 }
 
+test "clickhouse json each row output is wrapped as a JSON array" {
+    const body = "{\"event_source\":\"audit\",\"event_id\":1}\nnot-json\n{\"event_source\":\"memory_feed\",\"event_id\":2}\n";
+    const array = try jsonEachRowsToArray(std.testing.allocator, body);
+    defer std.testing.allocator.free(array);
+    try std.testing.expectEqualStrings("[{\"event_source\":\"audit\",\"event_id\":1},{\"event_source\":\"memory_feed\",\"event_id\":2}]", array);
+}
+
 test "clickhouse analytics live contract when configured" {
     const base_url = compat.process.getEnvVarOwned(std.testing.allocator, "NULLPANTRY_TEST_CLICKHOUSE_URL") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => {
@@ -317,8 +523,24 @@ test "clickhouse analytics live contract when configured" {
         .payload_json = "{\"contract\":true}",
         .created_at_ms = 42,
     }};
-    try std.testing.expectEqual(@as(usize, 1), try exportEvents(std.testing.allocator, cfg, &events));
-    const select_query = try std.fmt.allocPrint(std.testing.allocator, "SELECT count() FROM {s} WHERE event_id = {d}", .{ table, event_id });
+    const first_export = try exportEvents(std.testing.allocator, cfg, &events);
+    try std.testing.expectEqual(@as(usize, 1), first_export.attempted);
+    try std.testing.expectEqual(@as(usize, 1), first_export.inserted);
+    try std.testing.expectEqual(@as(usize, 0), first_export.skipped_existing);
+    const second_export = try exportEvents(std.testing.allocator, cfg, &events);
+    try std.testing.expectEqual(@as(usize, 1), second_export.attempted);
+    try std.testing.expectEqual(@as(usize, 0), second_export.inserted);
+    try std.testing.expectEqual(@as(usize, 1), second_export.skipped_existing);
+
+    const ch_status = try status(std.testing.allocator, cfg);
+    try std.testing.expect(ch_status.rows >= 1);
+
+    const events_json = try queryEventsJson(std.testing.allocator, cfg, .{ .event_source = "contract", .object_id = "mem_contract", .limit = 10 });
+    defer std.testing.allocator.free(events_json);
+    try std.testing.expect(std.mem.indexOf(u8, events_json, "\"event_source\":\"contract\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events_json, "\"object_id\":\"mem_contract\"") != null);
+
+    const select_query = try std.fmt.allocPrint(std.testing.allocator, "SELECT count() FROM {s} FINAL WHERE event_source = 'contract' AND event_id = {d}", .{ table, event_id });
     defer std.testing.allocator.free(select_query);
     var found = false;
     var attempt: usize = 0;

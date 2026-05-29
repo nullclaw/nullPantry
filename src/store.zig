@@ -1172,19 +1172,39 @@ pub const Store = struct {
         };
     }
 
+    pub fn analyticsStatus(self: *Store, allocator: std.mem.Allocator) !analytics_runtime.Status {
+        return analytics_runtime.status(allocator, self.analytics_backend);
+    }
+
+    pub fn queryAnalyticsEventsJson(self: *Store, allocator: std.mem.Allocator, input: analytics_runtime.QueryInput) ![]u8 {
+        return analytics_runtime.queryEventsJson(allocator, self.analytics_backend, input);
+    }
+
     pub fn exportAnalytics(self: *Store, allocator: std.mem.Allocator, input: AnalyticsExportInput) !AnalyticsExportResult {
         if (!self.analytics_backend.enabled()) return error.AnalyticsBackendNotConfigured;
+        var audit_since_id = input.audit_since_id;
+        var feed_since_id = input.feed_since_id;
+        if (input.use_cursor) {
+            if (try self.getConnectorCursor(allocator, input.cursor_name, input.cursor_scope)) |cursor| {
+                const parsed_cursor = parseAnalyticsCursor(allocator, cursor.cursor) catch AnalyticsCursor{};
+                audit_since_id = parsed_cursor.audit_since_id;
+                feed_since_id = parsed_cursor.feed_since_id;
+            }
+        }
         const capped = @max(@as(usize, 1), @min(input.limit, 5000));
-        const audit_events = try self.listAuditEvents(allocator, input.since_id, capped);
+        const audit_events = try self.listAuditEvents(allocator, audit_since_id, capped);
         const feed_events = try self.listFeedEvents(allocator, .{
-            .since_id = input.since_id,
+            .since_id = feed_since_id,
             .limit = capped,
             .scopes_json = input.scopes_json,
             .ignore_cursor_floor = true,
         });
         var rows: std.ArrayListUnmanaged(analytics_runtime.Event) = .empty;
         errdefer rows.deinit(allocator);
+        var next_audit_id = audit_since_id;
+        var next_feed_id = feed_since_id;
         for (audit_events) |event| {
+            next_audit_id = @max(next_audit_id, event.id);
             try rows.append(allocator, .{
                 .event_source = "audit",
                 .event_id = event.id,
@@ -1197,6 +1217,7 @@ pub const Store = struct {
             });
         }
         for (feed_events) |event| {
+            next_feed_id = @max(next_feed_id, event.id);
             try rows.append(allocator, .{
                 .event_source = "memory_feed",
                 .event_id = event.id,
@@ -1214,7 +1235,32 @@ pub const Store = struct {
             });
         }
         const exported = try analytics_runtime.exportEvents(allocator, self.analytics_backend, rows.items);
-        return .{ .audit_events = audit_events.len, .feed_events = feed_events.len, .exported = exported };
+        var cursor_advanced = false;
+        if (input.advance_cursor) {
+            const cursor_json = try analyticsCursorJson(allocator, .{ .audit_since_id = next_audit_id, .feed_since_id = next_feed_id });
+            defer allocator.free(cursor_json);
+            _ = try self.upsertConnectorCursor(allocator, .{
+                .connector = input.cursor_name,
+                .scope = input.cursor_scope,
+                .cursor = cursor_json,
+                .config_json = "{\"kind\":\"analytics_export\",\"backend\":\"clickhouse\"}",
+                .permissions_json = input.cursor_permissions_json,
+                .actor_id = input.actor_id,
+            });
+            cursor_advanced = true;
+        }
+        return .{
+            .audit_events = audit_events.len,
+            .feed_events = feed_events.len,
+            .attempted = exported.attempted,
+            .exported = exported.inserted,
+            .skipped_existing = exported.skipped_existing,
+            .audit_since_id = audit_since_id,
+            .feed_since_id = feed_since_id,
+            .next_audit_id = next_audit_id,
+            .next_feed_id = next_feed_id,
+            .cursor_advanced = cursor_advanced,
+        };
     }
 
     pub fn lifecycleDiagnostics(self: *Store) !LifecycleDiagnostics {
@@ -2646,16 +2692,58 @@ pub const AuditEvent = struct {
 };
 
 pub const AnalyticsExportInput = struct {
-    since_id: i64 = 0,
+    audit_since_id: i64 = 0,
+    feed_since_id: i64 = 0,
     limit: usize = 1000,
     scopes_json: []const u8 = "[\"admin\"]",
+    use_cursor: bool = false,
+    advance_cursor: bool = false,
+    cursor_name: []const u8 = "clickhouse_analytics",
+    cursor_scope: []const u8 = "admin",
+    cursor_permissions_json: []const u8 = "[\"admin\"]",
+    actor_id: ?[]const u8 = null,
 };
 
 pub const AnalyticsExportResult = struct {
     audit_events: usize = 0,
     feed_events: usize = 0,
+    attempted: usize = 0,
     exported: usize = 0,
+    skipped_existing: usize = 0,
+    audit_since_id: i64 = 0,
+    feed_since_id: i64 = 0,
+    next_audit_id: i64 = 0,
+    next_feed_id: i64 = 0,
+    cursor_advanced: bool = false,
 };
+
+const AnalyticsCursor = struct {
+    audit_since_id: i64 = 0,
+    feed_since_id: i64 = 0,
+};
+
+fn parseAnalyticsCursor(allocator: std.mem.Allocator, raw: []const u8) !AnalyticsCursor {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .{};
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch {
+        const single = std.fmt.parseInt(i64, trimmed, 10) catch 0;
+        return .{ .audit_since_id = single, .feed_since_id = single };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    return .{
+        .audit_since_id = json.intField(parsed.value.object, "audit") orelse json.intField(parsed.value.object, "audit_since_id") orelse 0,
+        .feed_since_id = json.intField(parsed.value.object, "memory_feed") orelse json.intField(parsed.value.object, "feed_since_id") orelse 0,
+    };
+}
+
+fn analyticsCursorJson(allocator: std.mem.Allocator, cursor: AnalyticsCursor) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"audit\":{d},\"memory_feed\":{d}}}",
+        .{ cursor.audit_since_id, cursor.feed_since_id },
+    );
+}
 
 fn vectorUpsertPayloadJson(allocator: std.mem.Allocator, vector_id: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -12466,6 +12554,14 @@ test "sqlite connector cursors are permission filtered first-class state" {
         .limit = 10,
     });
     try std.testing.expectEqual(@as(usize, 0), hidden.len);
+}
+
+test "analytics cursor keeps audit and feed offsets independent" {
+    const cursor_json = try analyticsCursorJson(std.testing.allocator, .{ .audit_since_id = 42, .feed_since_id = 7 });
+    defer std.testing.allocator.free(cursor_json);
+    const cursor = try parseAnalyticsCursor(std.testing.allocator, cursor_json);
+    try std.testing.expectEqual(@as(i64, 42), cursor.audit_since_id);
+    try std.testing.expectEqual(@as(i64, 7), cursor.feed_since_id);
 }
 
 test "native agent memory search preserves direct memories" {

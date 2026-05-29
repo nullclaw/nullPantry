@@ -7,6 +7,7 @@ const engines = @import("engines.zig");
 const retrieval = @import("retrieval.zig");
 const lifecycle = @import("lifecycle.zig");
 const vector_mod = @import("vector.zig");
+const analytics_runtime = @import("analytics_runtime.zig");
 const ids = @import("ids.zig");
 const extraction = @import("extraction.zig");
 const providers = @import("providers.zig");
@@ -179,6 +180,10 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return memoryFeedCheckpointRestore(ctx, body);
     } else if (eql(seg1, "memory") and eql(seg2, "apply") and is_post) {
         return applyMemoryEvent(ctx, body);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "analytics") and eql(seg3, "status") and is_get) {
+        return lifecycleAnalyticsStatus(ctx);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "analytics") and eql(seg3, "query") and is_post) {
+        return lifecycleAnalyticsQuery(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "analytics") and eql(seg3, "export") and is_post) {
         return lifecycleAnalyticsExport(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "diagnostics") and is_get) {
@@ -879,6 +884,8 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/lifecycle/snapshot", .post = "createSnapshot" },
         .{ .path = "/lifecycle/snapshot/export", .post = "exportSnapshot" },
         .{ .path = "/lifecycle/snapshot/import", .post = "importSnapshot" },
+        .{ .path = "/lifecycle/analytics/status", .get = "analyticsStatus" },
+        .{ .path = "/lifecycle/analytics/query", .post = "queryAnalytics" },
         .{ .path = "/lifecycle/analytics/export", .post = "exportAnalytics" },
         .{ .path = "/lifecycle/cache/put", .post = "putResponseCache" },
         .{ .path = "/lifecycle/cache/get", .post = "getResponseCache" },
@@ -925,7 +932,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","analytics_export"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -1663,7 +1670,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -3193,27 +3200,87 @@ fn lifecycleDiagnostics(ctx: *Context) HttpResponse {
     return .{ .status = "200 OK", .body = body };
 }
 
-fn lifecycleAnalyticsExport(ctx: *Context, body: []const u8) HttpResponse {
-    if (!hasCapability(ctx, "export") or !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return forbidden(ctx);
+fn analyticsAllowed(ctx: *Context) bool {
+    return hasCapability(ctx, "export") and domain.hasActorScope(ctx.actor_scopes_json, "admin");
+}
+
+fn analyticsError(ctx: *Context, err: anyerror) HttpResponse {
+    return switch (err) {
+        error.AnalyticsBackendNotConfigured => json.errorResponse(ctx.allocator, 400, "bad_request", "Analytics backend is not configured"),
+        error.AnalyticsBackendUnavailable => json.errorResponse(ctx.allocator, 500, "analytics_unavailable", "Analytics backend is unavailable"),
+        error.AnalyticsBackendHttpError => json.errorResponse(ctx.allocator, 500, "analytics_error", "Analytics backend rejected the request"),
+        error.AnalyticsBackendResponseTooLarge => json.errorResponse(ctx.allocator, 500, "analytics_response_too_large", "Analytics backend response exceeded the configured safety limit"),
+        else => serverError(ctx),
+    };
+}
+
+fn lifecycleAnalyticsStatus(ctx: *Context) HttpResponse {
+    if (!analyticsAllowed(ctx)) return forbidden(ctx);
+    const status = ctx.store.analyticsStatus(ctx.allocator) catch |err| return analyticsError(ctx, err);
+    const cursor = ctx.store.getConnectorCursor(ctx.allocator, "clickhouse_analytics", "admin") catch null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.print(
+        ctx.allocator,
+        "{{\"analytics_status\":{{\"backend\":\"{s}\",\"rows\":{d},\"audit_max_id\":{d},\"feed_max_id\":{d},\"latest_created_at_ms\":{d},\"cursor\":",
+        .{ ctx.store.analyticsBackendName(), status.rows, status.audit_max_id, status.feed_max_id, status.latest_created_at_ms },
+    ) catch return serverError(ctx);
+    if (cursor) |loaded| {
+        loaded.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+    } else {
+        out.appendSlice(ctx.allocator, "null") catch return serverError(ctx);
+    }
+    out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn lifecycleAnalyticsQuery(ctx: *Context, body: []const u8) HttpResponse {
+    if (!analyticsAllowed(ctx)) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    const result = ctx.store.exportAnalytics(ctx.allocator, .{
+    const events_json = ctx.store.queryAnalyticsEventsJson(ctx.allocator, .{
+        .event_source = json.stringField(obj, "event_source"),
+        .object_type = json.stringField(obj, "object_type"),
+        .object_id = json.stringField(obj, "object_id"),
+        .actor_id = json.stringField(obj, "actor_id"),
         .since_id = json.intField(obj, "since_id") orelse 0,
+        .limit = positiveLimit(json.intField(obj, "limit"), 100),
+        .newest_first = json.boolField(obj, "newest_first") orelse true,
+    }) catch |err| return analyticsError(ctx, err);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"analytics_events\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, events_json) catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn lifecycleAnalyticsExport(ctx: *Context, body: []const u8) HttpResponse {
+    if (!analyticsAllowed(ctx)) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const since_id = json.intField(obj, "since_id") orelse 0;
+    const result = ctx.store.exportAnalytics(ctx.allocator, .{
+        .audit_since_id = json.intField(obj, "audit_since_id") orelse since_id,
+        .feed_since_id = json.intField(obj, "feed_since_id") orelse since_id,
         .limit = positiveLimit(json.intField(obj, "limit"), 1000),
         .scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx),
-    }) catch |err| switch (err) {
-        error.AnalyticsBackendNotConfigured => return json.errorResponse(ctx.allocator, 400, "bad_request", "Analytics backend is not configured"),
-        error.AnalyticsBackendUnavailable => return json.errorResponse(ctx.allocator, 500, "analytics_unavailable", "Analytics backend is unavailable"),
-        error.AnalyticsBackendHttpError => return json.errorResponse(ctx.allocator, 500, "analytics_error", "Analytics backend rejected the export"),
-        else => return serverError(ctx),
-    };
-    const response = std.fmt.allocPrint(
+        .use_cursor = json.boolField(obj, "use_cursor") orelse false,
+        .advance_cursor = json.boolField(obj, "advance_cursor") orelse false,
+        .cursor_name = json.stringField(obj, "cursor_name") orelse "clickhouse_analytics",
+        .cursor_scope = json.stringField(obj, "cursor_scope") orelse "admin",
+        .cursor_permissions_json = rawField(ctx.allocator, obj, "cursor_permissions", "[\"admin\"]") catch return badJson(ctx),
+        .actor_id = ctx.actor_id,
+    }) catch |err| return analyticsError(ctx, err);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.print(
         ctx.allocator,
-        "{{\"analytics_export\":{{\"backend\":\"{s}\",\"audit_events\":{d},\"feed_events\":{d},\"exported\":{d}}}}}",
-        .{ ctx.store.analyticsBackendName(), result.audit_events, result.feed_events, result.exported },
+        "{{\"analytics_export\":{{\"backend\":\"{s}\",\"audit_events\":{d},\"feed_events\":{d},\"attempted\":{d},\"exported\":{d},\"skipped_existing\":{d},\"audit_since_id\":{d},\"feed_since_id\":{d},\"next_audit_id\":{d},\"next_feed_id\":{d},\"cursor_advanced\":",
+        .{ ctx.store.analyticsBackendName(), result.audit_events, result.feed_events, result.attempted, result.exported, result.skipped_existing, result.audit_since_id, result.feed_since_id, result.next_audit_id, result.next_feed_id },
     ) catch return serverError(ctx);
-    return .{ .status = "200 OK", .body = response };
+    out.appendSlice(ctx.allocator, if (result.cursor_advanced) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
 fn lifecycleSnapshot(ctx: *Context, body: []const u8) HttpResponse {
@@ -6515,6 +6582,10 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"queued_jobs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"pending_feed_events\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"agent_memories\"") != null);
+    const analytics_status = handleRequest(&ctx, "GET", "/v1/lifecycle/analytics/status", "", "");
+    try std.testing.expectEqualStrings("400 Bad Request", analytics_status.status);
+    const analytics_query = handleRequest(&ctx, "POST", "/v1/lifecycle/analytics/query", "{\"limit\":10}", "");
+    try std.testing.expectEqualStrings("400 Bad Request", analytics_query.status);
     const analytics_export = handleRequest(&ctx, "POST", "/v1/lifecycle/analytics/export", "{\"limit\":10}", "");
     try std.testing.expectEqualStrings("400 Bad Request", analytics_export.status);
     const snapshot = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot", "{\"type\":\"manual\",\"summary\":{\"memory_atoms\":1}}", "");
