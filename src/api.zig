@@ -3203,7 +3203,7 @@ test "api requires bearer token except health" {
     const health_resp = handleRequest(&ctx, "GET", "/health", "", "");
     try std.testing.expectEqualStrings("200 OK", health_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"schema_ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"expected_schema_version\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"expected_schema_version\":9") != null);
 
     const missing = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"x\"}", "");
     try std.testing.expectEqualStrings("401 Unauthorized", missing.status);

@@ -62,18 +62,24 @@ fn requiredScopesVisible(required_scopes_json: []const u8, actor_scopes_json: []
 }
 
 fn compatActorVisible(request_actor_id: ?[]const u8, row_actor_id: ?[]const u8) bool {
-    const row = row_actor_id orelse return true;
-    if (row.len == 0) return true;
     const request = request_actor_id orelse return false;
+    const row = row_actor_id orelse return false;
+    if (request.len == 0 or row.len == 0) return false;
     return std.mem.eql(u8, row, request);
 }
 
+fn requiredActorId(actor_id: ?[]const u8) ![]const u8 {
+    const actor = actor_id orelse return error.MissingActorId;
+    if (actor.len == 0) return error.MissingActorId;
+    return actor;
+}
+
 const sqlite_compat_actor_where =
-    "((?3 IS NOT NULL AND (coalesce(actor_id, '') = ?3 OR coalesce(actor_id, '') = '')) OR (?3 IS NULL AND coalesce(actor_id, '') = ''))";
+    "(?3 IS NOT NULL AND actor_id = ?3)";
 const sqlite_compat_session_actor_where =
     "((?2 IS NULL AND session_id IS NULL AND " ++ sqlite_compat_actor_where ++ ") OR (?2 IS NOT NULL AND session_id = ?2 AND " ++ sqlite_compat_actor_where ++ "))";
 const sqlite_compat_actor_where_cm =
-    "((?3 IS NOT NULL AND (coalesce(cm.actor_id, '') = ?3 OR coalesce(cm.actor_id, '') = '')) OR (?3 IS NULL AND coalesce(cm.actor_id, '') = ''))";
+    "(?3 IS NOT NULL AND cm.actor_id = ?3)";
 const sqlite_compat_session_actor_where_cm =
     "((?2 IS NULL AND cm.session_id IS NULL AND " ++ sqlite_compat_actor_where_cm ++ ") OR (?2 IS NOT NULL AND cm.session_id = ?2 AND " ++ sqlite_compat_actor_where_cm ++ "))";
 
@@ -1316,6 +1322,7 @@ pub const SQLiteStore = struct {
         errdefer _ = c.sqlite3_close(db.?);
         _ = c.sqlite3_busy_timeout(db.?, 5000);
         var self = Self{ .allocator = allocator, .db = db.? };
+        try self.prepareLegacyTablesForSchema();
         try self.exec(migrations.sqlite_schema);
         try self.applyCompatibilityMigrations();
         try self.assertSchemaCurrent();
@@ -1353,6 +1360,28 @@ pub const SQLiteStore = struct {
         const checksum = try columnText(self.allocator, stmt, 1);
         defer self.allocator.free(checksum);
         return std.mem.eql(u8, name, expected.name) and std.mem.eql(u8, checksum, expected.checksum);
+    }
+
+    fn prepareLegacyTablesForSchema(self: *Self) !void {
+        if (try self.tableExists("compat_memories")) {
+            if (!try self.columnExists("compat_memories", "actor_id")) {
+                try self.exec("ALTER TABLE compat_memories ADD COLUMN actor_id TEXT");
+            }
+        }
+        if (try self.tableExists("session_messages")) {
+            if (!try self.columnExists("session_messages", "actor_id")) {
+                try self.exec("ALTER TABLE session_messages ADD COLUMN actor_id TEXT");
+            }
+        }
+        if (try self.tableExists("session_usage")) {
+            if (!try self.columnExists("session_usage", "actor_id")) {
+                try self.exec("ALTER TABLE session_usage ADD COLUMN actor_id TEXT");
+            }
+        }
+    }
+
+    fn tableExists(self: *Self, comptime table: []const u8) !bool {
+        return (try self.countSql("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='" ++ table ++ "'")) > 0;
     }
 
     fn exec(self: *Self, sql: [*:0]const u8) !void {
@@ -1418,23 +1447,64 @@ pub const SQLiteStore = struct {
             try self.exec("ALTER TABLE compat_memories ADD COLUMN actor_id TEXT");
         }
         if (!try self.columnExists("session_messages", "actor_id")) {
-            try self.exec("ALTER TABLE session_messages ADD COLUMN actor_id TEXT NOT NULL DEFAULT ''");
+            try self.exec("ALTER TABLE session_messages ADD COLUMN actor_id TEXT");
         }
         if (!try self.columnExists("session_usage", "actor_id")) {
             try self.exec(
                 \\CREATE TABLE session_usage_actor_migration (
                 \\  session_id TEXT NOT NULL,
-                \\  actor_id TEXT NOT NULL DEFAULT '',
+                \\  actor_id TEXT NOT NULL,
                 \\  total_tokens INTEGER NOT NULL DEFAULT 0,
                 \\  updated_at_ms INTEGER NOT NULL,
                 \\  PRIMARY KEY (session_id, actor_id)
                 \\);
-                \\INSERT OR REPLACE INTO session_usage_actor_migration (session_id, actor_id, total_tokens, updated_at_ms)
-                \\  SELECT session_id, '', total_tokens, updated_at_ms FROM session_usage;
                 \\DROP TABLE session_usage;
                 \\ALTER TABLE session_usage_actor_migration RENAME TO session_usage;
             );
         }
+        try self.exec("DELETE FROM compat_memories WHERE actor_id IS NULL OR actor_id = ''");
+        try self.exec("DELETE FROM session_messages WHERE actor_id IS NULL OR actor_id = ''");
+        try self.exec("DELETE FROM session_usage WHERE actor_id IS NULL OR actor_id = ''");
+        try self.exec(
+            \\DROP TABLE IF EXISTS compat_memories_strict_actor_migration;
+            \\DROP TABLE IF EXISTS session_messages_strict_actor_migration;
+            \\DROP TABLE IF EXISTS session_usage_strict_actor_migration;
+            \\CREATE TABLE compat_memories_strict_actor_migration (
+            \\  key TEXT NOT NULL,
+            \\  session_id TEXT,
+            \\  actor_id TEXT NOT NULL,
+            \\  memory_atom_id TEXT NOT NULL,
+            \\  category TEXT NOT NULL DEFAULT 'core',
+            \\  timestamp_ms INTEGER NOT NULL
+            \\);
+            \\INSERT INTO compat_memories_strict_actor_migration (key, session_id, actor_id, memory_atom_id, category, timestamp_ms)
+            \\  SELECT key, session_id, actor_id, memory_atom_id, category, timestamp_ms FROM compat_memories WHERE actor_id IS NOT NULL AND actor_id <> '';
+            \\DROP TABLE compat_memories;
+            \\ALTER TABLE compat_memories_strict_actor_migration RENAME TO compat_memories;
+            \\CREATE TABLE session_messages_strict_actor_migration (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  session_id TEXT NOT NULL,
+            \\  actor_id TEXT NOT NULL,
+            \\  role TEXT NOT NULL,
+            \\  content TEXT NOT NULL,
+            \\  created_at_ms INTEGER NOT NULL
+            \\);
+            \\INSERT INTO session_messages_strict_actor_migration (id, session_id, actor_id, role, content, created_at_ms)
+            \\  SELECT id, session_id, actor_id, role, content, created_at_ms FROM session_messages WHERE actor_id IS NOT NULL AND actor_id <> '';
+            \\DROP TABLE session_messages;
+            \\ALTER TABLE session_messages_strict_actor_migration RENAME TO session_messages;
+            \\CREATE TABLE session_usage_strict_actor_migration (
+            \\  session_id TEXT NOT NULL,
+            \\  actor_id TEXT NOT NULL,
+            \\  total_tokens INTEGER NOT NULL DEFAULT 0,
+            \\  updated_at_ms INTEGER NOT NULL,
+            \\  PRIMARY KEY (session_id, actor_id)
+            \\);
+            \\INSERT OR REPLACE INTO session_usage_strict_actor_migration (session_id, actor_id, total_tokens, updated_at_ms)
+            \\  SELECT session_id, actor_id, total_tokens, updated_at_ms FROM session_usage WHERE actor_id IS NOT NULL AND actor_id <> '';
+            \\DROP TABLE session_usage;
+            \\ALTER TABLE session_usage_strict_actor_migration RENAME TO session_usage;
+        );
         if (!try self.columnExists("artifacts", "scope")) {
             try self.exec("ALTER TABLE artifacts ADD COLUMN scope TEXT NOT NULL DEFAULT 'workspace'");
         }
@@ -1457,7 +1527,8 @@ pub const SQLiteStore = struct {
         try self.exec("DROP INDEX IF EXISTS idx_entities_type_name");
         try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_type_name_scope ON entities(type, lower(name), scope)");
         try self.exec("DROP INDEX IF EXISTS idx_compat_memories_key_session");
-        try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_compat_memories_key_session_actor ON compat_memories(key, coalesce(session_id, ''), coalesce(actor_id, ''))");
+        try self.exec("DROP INDEX IF EXISTS idx_compat_memories_key_session_actor");
+        try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_compat_memories_key_session_actor ON compat_memories(key, coalesce(session_id, ''), actor_id)");
         try self.exec("DROP INDEX IF EXISTS idx_session_messages_session");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_session_messages_session_actor ON session_messages(session_id, actor_id, id)");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (2, 'security_and_retrieval_hardening', 'np-002-security-retrieval', strftime('%s','now') * 1000)");
@@ -1495,6 +1566,8 @@ pub const SQLiteStore = struct {
         try self.exec("UPDATE schema_migrations SET name = 'vector_backing_invariant', checksum = 'np-007-vector-backing-invariant' WHERE version = 7");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (8, 'nullclaw_actor_isolation', 'np-008-nullclaw-actor-isolation', strftime('%s','now') * 1000)");
         try self.exec("UPDATE schema_migrations SET name = 'nullclaw_actor_isolation', checksum = 'np-008-nullclaw-actor-isolation' WHERE version = 8");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (9, 'strict_actor_memory', 'np-009-strict-actor-memory', strftime('%s','now') * 1000)");
+        try self.exec("UPDATE schema_migrations SET name = 'strict_actor_memory', checksum = 'np-009-strict-actor-memory' WHERE version = 9");
     }
 
     fn columnExists(self: *Self, comptime table: []const u8, column: []const u8) !bool {
@@ -3576,6 +3649,7 @@ pub const SQLiteStore = struct {
     }
 
     pub fn compatStore(self: *Self, allocator: std.mem.Allocator, input: CompatStoreInput) !void {
+        const actor_id = try requiredActorId(input.actor_id);
         self.tx_mutex.lockUncancelable(compat.io());
         defer self.tx_mutex.unlock(compat.io());
         try self.exec("BEGIN IMMEDIATE");
@@ -3588,7 +3662,7 @@ pub const SQLiteStore = struct {
             .content = input.content,
             .scope = compat_scope,
             .metadata_json = "{\"compat\":\"nullclaw\"}",
-            .actor_id = input.actor_id,
+            .actor_id = actor_id,
         });
         const source_ids = try singleJsonString(allocator, source.id);
         const evidence = try evidenceRangeJson(allocator, source.id, input.content.len, "nullclaw_compat");
@@ -3603,19 +3677,19 @@ pub const SQLiteStore = struct {
             .evidence_ranges_json = evidence,
             .created_by = "agent",
             .tags_json = "[\"nullclaw\"]",
-            .actor_id = input.actor_id,
+            .actor_id = actor_id,
         });
-        try self.compatDeleteExact(input.key, input.session_id, input.actor_id);
+        try self.compatDeleteExact(input.key, input.session_id, actor_id);
         const stmt = try self.prepare("INSERT INTO compat_memories (key, session_id, actor_id, memory_atom_id, category, timestamp_ms) VALUES (?1,?2,?3,?4,?5,?6)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, input.key);
         bindNullableText(stmt, 2, input.session_id);
-        bindNullableText(stmt, 3, input.actor_id);
+        bindText(stmt, 3, actor_id);
         bindText(stmt, 4, atom.id);
         bindText(stmt, 5, input.category);
         _ = c.sqlite3_bind_int64(stmt, 6, atom.created_at_ms);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
-        self.insertAuditActor("compat_memory.upserted", input.actor_id, "compat_memory", input.key);
+        self.insertAuditActor("compat_memory.upserted", actor_id, "compat_memory", input.key);
         try self.exec("COMMIT");
     }
 
@@ -3749,6 +3823,7 @@ pub const SQLiteStore = struct {
             defer if (session_id) |sid| self.allocator.free(sid);
             const row_actor_id = try columnTextNullable(self.allocator, stmt, 1);
             defer if (row_actor_id) |id| self.allocator.free(id);
+            if (row_actor_id == null or row_actor_id.?.len == 0) continue;
             if (actor_id != null and !compatActorVisible(actor_id, row_actor_id)) continue;
             if (session_id) |sid| {
                 if (!sessionVisibleForScopes(self.allocator, sid, scopes_json)) continue;
@@ -3780,10 +3855,11 @@ pub const SQLiteStore = struct {
     }
 
     pub fn saveMessage(self: *Self, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
+        const actor = try requiredActorId(actor_id);
         const stmt = try self.prepare("INSERT INTO session_messages (session_id, actor_id, role, content, created_at_ms) VALUES (?1,?2,?3,?4,?5)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, session_id);
-        bindText(stmt, 2, actor_id orelse "");
+        bindText(stmt, 2, actor);
         bindText(stmt, 3, role);
         bindText(stmt, 4, content);
         _ = c.sqlite3_bind_int64(stmt, 5, ids.nowMs());
@@ -3791,7 +3867,7 @@ pub const SQLiteStore = struct {
     }
 
     pub fn loadMessages(self: *Self, allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8) ![]Message {
-        const stmt = try self.prepare("SELECT role, content, created_at_ms FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2 OR actor_id = '') ORDER BY id ASC");
+        const stmt = try self.prepare("SELECT role, content, created_at_ms FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2) ORDER BY id ASC");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, session_id);
         bindNullableText(stmt, 2, actor_id);
@@ -3803,12 +3879,12 @@ pub const SQLiteStore = struct {
     }
 
     pub fn clearMessages(self: *Self, session_id: []const u8, actor_id: ?[]const u8) !void {
-        const stmt = try self.prepare("DELETE FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2 OR actor_id = '')");
+        const stmt = try self.prepare("DELETE FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, session_id);
         bindNullableText(stmt, 2, actor_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
-        const usage = try self.prepare("DELETE FROM session_usage WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2 OR actor_id = '')");
+        const usage = try self.prepare("DELETE FROM session_usage WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2)");
         defer _ = c.sqlite3_finalize(usage);
         bindText(usage, 1, session_id);
         bindNullableText(usage, 2, actor_id);
@@ -3817,31 +3893,32 @@ pub const SQLiteStore = struct {
 
     pub fn clearAutoSaved(self: *Self, session_id: ?[]const u8, actor_id: ?[]const u8) !void {
         if (session_id) |sid| {
-            const stmt = try self.prepare("DELETE FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2 OR actor_id = '') AND (role = 'autosave_user' OR role = 'autosave_assistant')");
+            const stmt = try self.prepare("DELETE FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2) AND (role = 'autosave_user' OR role = 'autosave_assistant')");
             defer _ = c.sqlite3_finalize(stmt);
             bindText(stmt, 1, sid);
             bindNullableText(stmt, 2, actor_id);
             if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
             return;
         }
-        const stmt = try self.prepare("DELETE FROM session_messages WHERE (?1 IS NULL OR actor_id = ?1 OR actor_id = '') AND (role = 'autosave_user' OR role = 'autosave_assistant')");
+        const stmt = try self.prepare("DELETE FROM session_messages WHERE (?1 IS NULL OR actor_id = ?1) AND (role = 'autosave_user' OR role = 'autosave_assistant')");
         defer _ = c.sqlite3_finalize(stmt);
         bindNullableText(stmt, 1, actor_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
     }
 
     pub fn saveUsage(self: *Self, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8) !void {
+        const actor = try requiredActorId(actor_id);
         const stmt = try self.prepare("INSERT INTO session_usage (session_id,actor_id,total_tokens,updated_at_ms) VALUES (?1,?2,?3,?4) ON CONFLICT(session_id, actor_id) DO UPDATE SET total_tokens = excluded.total_tokens, updated_at_ms = excluded.updated_at_ms");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, session_id);
-        bindText(stmt, 2, actor_id orelse "");
+        bindText(stmt, 2, actor);
         _ = c.sqlite3_bind_int64(stmt, 3, @intCast(total_tokens));
         _ = c.sqlite3_bind_int64(stmt, 4, ids.nowMs());
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
     }
 
     pub fn deleteUsage(self: *Self, session_id: []const u8, actor_id: ?[]const u8) !bool {
-        const stmt = try self.prepare("DELETE FROM session_usage WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2 OR actor_id = '')");
+        const stmt = try self.prepare("DELETE FROM session_usage WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, session_id);
         bindNullableText(stmt, 2, actor_id);
@@ -3850,7 +3927,7 @@ pub const SQLiteStore = struct {
     }
 
     pub fn loadUsage(self: *Self, session_id: []const u8, actor_id: ?[]const u8) !?u64 {
-        const stmt = try self.prepare("SELECT total_tokens FROM session_usage WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2 OR actor_id = '') ORDER BY CASE WHEN actor_id = coalesce(?2, '') THEN 0 ELSE 1 END LIMIT 1");
+        const stmt = try self.prepare("SELECT total_tokens FROM session_usage WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2) ORDER BY CASE WHEN ?2 IS NOT NULL AND actor_id = ?2 THEN 0 ELSE 1 END LIMIT 1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, session_id);
         bindNullableText(stmt, 2, actor_id);
@@ -3859,12 +3936,12 @@ pub const SQLiteStore = struct {
     }
 
     pub fn listSessions(self: *Self, allocator: std.mem.Allocator, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryList {
-        const count_stmt = try self.prepare("SELECT COUNT(*) FROM (SELECT session_id FROM session_messages WHERE (?1 IS NULL OR actor_id = ?1 OR actor_id = '') GROUP BY session_id)");
+        const count_stmt = try self.prepare("SELECT COUNT(*) FROM (SELECT session_id FROM session_messages WHERE (?1 IS NULL OR actor_id = ?1) GROUP BY session_id)");
         defer _ = c.sqlite3_finalize(count_stmt);
         bindNullableText(count_stmt, 1, actor_id);
         var total: u64 = 0;
         if (c.sqlite3_step(count_stmt) == c.SQLITE_ROW) total = @intCast(c.sqlite3_column_int64(count_stmt, 0));
-        const stmt = try self.prepare("SELECT session_id, COUNT(*), MIN(created_at_ms), MAX(created_at_ms) FROM session_messages WHERE (?1 IS NULL OR actor_id = ?1 OR actor_id = '') GROUP BY session_id ORDER BY MAX(created_at_ms) DESC LIMIT ?2 OFFSET ?3");
+        const stmt = try self.prepare("SELECT session_id, COUNT(*), MIN(created_at_ms), MAX(created_at_ms) FROM session_messages WHERE (?1 IS NULL OR actor_id = ?1) GROUP BY session_id ORDER BY MAX(created_at_ms) DESC LIMIT ?2 OFFSET ?3");
         defer _ = c.sqlite3_finalize(stmt);
         bindNullableText(stmt, 1, actor_id);
         _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
@@ -3882,14 +3959,14 @@ pub const SQLiteStore = struct {
     }
 
     pub fn history(self: *Self, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryShow {
-        const count_stmt = try self.prepare("SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2 OR actor_id = '')");
+        const count_stmt = try self.prepare("SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2)");
         defer _ = c.sqlite3_finalize(count_stmt);
         bindText(count_stmt, 1, session_id);
         bindNullableText(count_stmt, 2, actor_id);
         var total: u64 = 0;
         if (c.sqlite3_step(count_stmt) == c.SQLITE_ROW) total = @intCast(c.sqlite3_column_int64(count_stmt, 0));
 
-        const stmt = try self.prepare("SELECT role, content, created_at_ms FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2 OR actor_id = '') ORDER BY id ASC LIMIT ?3 OFFSET ?4");
+        const stmt = try self.prepare("SELECT role, content, created_at_ms FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2) ORDER BY id ASC LIMIT ?3 OFFSET ?4");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, session_id);
         bindNullableText(stmt, 2, actor_id);
@@ -4195,6 +4272,7 @@ pub const PostgresStore = struct {
         defer allocator.free(owned);
         var self = PostgresStore{ .allocator = allocator, .transport = try postgres_transport.QueryTransport.init(allocator, owned) };
         errdefer self.deinit();
+        try self.prepareLegacyTablesForSchema();
         try self.runSql(migrations.postgres_schema);
         try self.applyCompatibilityMigrations();
         try self.assertSchemaCurrent();
@@ -4237,6 +4315,25 @@ pub const PostgresStore = struct {
         self.allocator.free(out);
     }
 
+    fn prepareLegacyTablesForSchema(self: *PostgresStore) !void {
+        try self.runSql(
+            \\DO $$ BEGIN
+            \\  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'compat_memories')
+            \\     AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'compat_memories' AND column_name = 'actor_id') THEN
+            \\    ALTER TABLE compat_memories ADD COLUMN actor_id text;
+            \\  END IF;
+            \\  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'session_messages')
+            \\     AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'session_messages' AND column_name = 'actor_id') THEN
+            \\    ALTER TABLE session_messages ADD COLUMN actor_id text;
+            \\  END IF;
+            \\  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'session_usage')
+            \\     AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'session_usage' AND column_name = 'actor_id') THEN
+            \\    ALTER TABLE session_usage ADD COLUMN actor_id text;
+            \\  END IF;
+            \\END $$;
+        );
+    }
+
     fn queryRaw(self: *PostgresStore, allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
         return self.transport.queryRaw(allocator, sql);
     }
@@ -4271,13 +4368,22 @@ pub const PostgresStore = struct {
             \\ALTER TABLE semantic_cache ADD COLUMN IF NOT EXISTS scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE semantic_cache ADD COLUMN IF NOT EXISTS actor_id text NOT NULL DEFAULT '';
             \\ALTER TABLE compat_memories ADD COLUMN IF NOT EXISTS actor_id text;
-            \\ALTER TABLE session_messages ADD COLUMN IF NOT EXISTS actor_id text NOT NULL DEFAULT '';
-            \\ALTER TABLE session_usage ADD COLUMN IF NOT EXISTS actor_id text NOT NULL DEFAULT '';
+            \\ALTER TABLE session_messages ADD COLUMN IF NOT EXISTS actor_id text;
+            \\ALTER TABLE session_usage ADD COLUMN IF NOT EXISTS actor_id text;
+            \\DELETE FROM compat_memories WHERE actor_id IS NULL OR actor_id = '';
+            \\DELETE FROM session_messages WHERE actor_id IS NULL OR actor_id = '';
+            \\DELETE FROM session_usage WHERE actor_id IS NULL OR actor_id = '';
+            \\ALTER TABLE compat_memories ALTER COLUMN actor_id SET NOT NULL;
+            \\ALTER TABLE session_messages ALTER COLUMN actor_id SET NOT NULL;
+            \\ALTER TABLE session_usage ALTER COLUMN actor_id SET NOT NULL;
+            \\ALTER TABLE session_messages ALTER COLUMN actor_id DROP DEFAULT;
+            \\ALTER TABLE session_usage ALTER COLUMN actor_id DROP DEFAULT;
             \\ALTER TABLE connector_cursors ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\DROP INDEX IF EXISTS entities_type_name_idx;
             \\CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx ON entities(type, lower(name), scope);
             \\DROP INDEX IF EXISTS compat_memories_key_session_idx;
-            \\CREATE UNIQUE INDEX IF NOT EXISTS compat_memories_key_session_actor_idx ON compat_memories(key, coalesce(session_id, ''), coalesce(actor_id, ''));
+            \\DROP INDEX IF EXISTS compat_memories_key_session_actor_idx;
+            \\CREATE UNIQUE INDEX IF NOT EXISTS compat_memories_key_session_actor_idx ON compat_memories(key, coalesce(session_id, ''), actor_id);
             \\DROP INDEX IF EXISTS session_messages_session_idx;
             \\CREATE INDEX IF NOT EXISTS session_messages_session_actor_idx ON session_messages(session_id, actor_id, id);
             \\ALTER TABLE session_usage DROP CONSTRAINT IF EXISTS session_usage_pkey;
@@ -4302,6 +4408,8 @@ pub const PostgresStore = struct {
             \\UPDATE schema_migrations SET name = 'vector_backing_invariant', checksum = 'np-007-vector-backing-invariant' WHERE version = 7;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (8, 'nullclaw_actor_isolation', 'np-008-nullclaw-actor-isolation', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
             \\UPDATE schema_migrations SET name = 'nullclaw_actor_isolation', checksum = 'np-008-nullclaw-actor-isolation' WHERE version = 8;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (9, 'strict_actor_memory', 'np-009-strict-actor-memory', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\UPDATE schema_migrations SET name = 'strict_actor_memory', checksum = 'np-009-strict-actor-memory' WHERE version = 9;
         );
     }
 
@@ -4341,16 +4449,17 @@ pub const PostgresStore = struct {
 
     fn pgSessionActorFilter(allocator: std.mem.Allocator, comptime prefix: []const u8, actor_id: ?[]const u8) ![]const u8 {
         if (actor_id) |actor| {
-            return std.fmt.allocPrint(allocator, "(coalesce({s}actor_id, '') = {s} OR coalesce({s}actor_id, '') = '')", .{ prefix, try sqlString(allocator, actor), prefix });
+            if (actor.len == 0) return "FALSE";
+            return std.fmt.allocPrint(allocator, "{s}actor_id = {s}", .{ prefix, try sqlString(allocator, actor) });
         }
         return "TRUE";
     }
 
     fn pgCompatSessionFilterQualified(allocator: std.mem.Allocator, comptime prefix: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]u8 {
-        const actor_filter = if (actor_id) |actor|
-            try std.fmt.allocPrint(allocator, "(coalesce({s}actor_id, '') = {s} OR coalesce({s}actor_id, '') = '')", .{ prefix, try sqlString(allocator, actor), prefix })
-        else
-            try std.fmt.allocPrint(allocator, "coalesce({s}actor_id, '') = ''", .{prefix});
+        const actor_filter = if (actor_id) |actor| blk: {
+            if (actor.len == 0) break :blk try allocator.dupe(u8, "FALSE");
+            break :blk try std.fmt.allocPrint(allocator, "{s}actor_id = {s}", .{ prefix, try sqlString(allocator, actor) });
+        } else try allocator.dupe(u8, "FALSE");
         if (session_id) |sid| {
             return std.fmt.allocPrint(allocator, "{s}session_id = {s} AND {s}", .{ prefix, try sqlString(allocator, sid), actor_filter });
         }
@@ -5225,6 +5334,7 @@ pub const PostgresStore = struct {
     }
 
     pub fn compatStore(self: *PostgresStore, allocator: std.mem.Allocator, input: CompatStoreInput) !void {
+        const actor_id = try requiredActorId(input.actor_id);
         const source_title = try std.fmt.allocPrint(allocator, "NullClaw memory: {s}", .{input.key});
         const source_id = try ids.make(allocator, "src_");
         const atom_id = try ids.make(allocator, "mem_");
@@ -5232,7 +5342,7 @@ pub const PostgresStore = struct {
         const evidence = try evidenceRangeJson(allocator, source_id, input.content.len, "nullclaw_compat");
         const now = ids.nowMs();
         const compat_scope = if (input.session_id) |sid| try std.fmt.allocPrint(allocator, "session:{s}", .{sid}) else "agent:nullclaw";
-        const session_filter = try pgCompatSessionFilter(allocator, input.session_id, input.actor_id);
+        const session_filter = try pgCompatSessionFilter(allocator, input.session_id, actor_id);
         const sql = try std.fmt.allocPrint(
             allocator,
             "BEGIN; " ++
@@ -5262,16 +5372,16 @@ pub const PostgresStore = struct {
                 now,
                 try sqlString(allocator, input.key),
                 try sqlNullableString(allocator, input.session_id),
-                try sqlNullableString(allocator, input.actor_id),
+                try sqlString(allocator, actor_id),
                 try sqlString(allocator, atom_id),
                 try sqlString(allocator, input.category),
                 now,
             },
         );
         try self.runSql(sql);
-        try self.insertAudit(allocator, "source.created", input.actor_id, "source", source_id);
-        try self.insertAudit(allocator, "memory_atom.created", input.actor_id, "memory_atom", atom_id);
-        try self.insertAudit(allocator, "compat_memory.upserted", input.actor_id, "compat_memory", input.key);
+        try self.insertAudit(allocator, "source.created", actor_id, "source", source_id);
+        try self.insertAudit(allocator, "memory_atom.created", actor_id, "memory_atom", atom_id);
+        try self.insertAudit(allocator, "compat_memory.upserted", actor_id, "compat_memory", input.key);
     }
 
     pub fn compatGet(self: *PostgresStore, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.CompatMemory {
@@ -5364,7 +5474,9 @@ pub const PostgresStore = struct {
         var count: usize = 0;
         for (parsed.value.array.items) |item| {
             if (item != .object) continue;
-            if (actor_id != null and !compatActorVisible(actor_id, json.stringField(item.object, "actor_id"))) continue;
+            const row_actor_id = json.stringField(item.object, "actor_id");
+            if (row_actor_id == null or row_actor_id.?.len == 0) continue;
+            if (actor_id != null and !compatActorVisible(actor_id, row_actor_id)) continue;
             if (json.stringField(item.object, "session_id")) |sid| {
                 if (!sessionVisibleForScopes(self.allocator, sid, scopes_json)) continue;
             } else if (!domain.scopeVisible("agent:nullclaw", scopes_json)) {
@@ -5376,7 +5488,8 @@ pub const PostgresStore = struct {
     }
 
     pub fn saveMessage(self: *PostgresStore, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
-        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO session_messages (session_id,actor_id,role,content,created_at_ms) VALUES ({s},{s},{s},{s},{d})", .{ try sqlString(self.allocator, session_id), try sqlString(self.allocator, actor_id orelse ""), try sqlString(self.allocator, role), try sqlString(self.allocator, content), ids.nowMs() });
+        const actor = try requiredActorId(actor_id);
+        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO session_messages (session_id,actor_id,role,content,created_at_ms) VALUES ({s},{s},{s},{s},{d})", .{ try sqlString(self.allocator, session_id), try sqlString(self.allocator, actor), try sqlString(self.allocator, role), try sqlString(self.allocator, content), ids.nowMs() });
         try self.runSql(sql);
     }
 
@@ -5411,7 +5524,8 @@ pub const PostgresStore = struct {
     }
 
     pub fn saveUsage(self: *PostgresStore, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8) !void {
-        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO session_usage (session_id,actor_id,total_tokens,updated_at_ms) VALUES ({s},{s},{d},{d}) ON CONFLICT(session_id, actor_id) DO UPDATE SET total_tokens=excluded.total_tokens, updated_at_ms=excluded.updated_at_ms", .{ try sqlString(self.allocator, session_id), try sqlString(self.allocator, actor_id orelse ""), total_tokens, ids.nowMs() });
+        const actor = try requiredActorId(actor_id);
+        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO session_usage (session_id,actor_id,total_tokens,updated_at_ms) VALUES ({s},{s},{d},{d}) ON CONFLICT(session_id, actor_id) DO UPDATE SET total_tokens=excluded.total_tokens, updated_at_ms=excluded.updated_at_ms", .{ try sqlString(self.allocator, session_id), try sqlString(self.allocator, actor), total_tokens, ids.nowMs() });
         try self.runSql(sql);
     }
 
@@ -6921,11 +7035,11 @@ test "sqlite storage contract covers primitives lifecycle and audit events" {
     try std.testing.expect(verified.last_verified_at_ms != null);
 
     try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM audit_events")) >= 7);
-    try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1,2,3,4,5,6,7,8)")) == 8);
-    try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE checksum <> ''")) == 8);
+    try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1,2,3,4,5,6,7,8,9)")) == 9);
+    try std.testing.expect((try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE checksum <> ''")) == 9);
 }
 
-test "sqlite compatibility migration adds manifest checksums and purges legacy orphan vectors" {
+test "sqlite compatibility migration adds manifest checksums and purges legacy orphan data" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -6957,13 +7071,41 @@ test "sqlite compatibility migration adds manifest checksums and purges legacy o
         \\VALUES ('vec_raw_0','raw','raw_1',0,'orphan vector text','public','[]','[1,0]',NULL,2,1,1);
         \\INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms)
         \\VALUES ('vec_mem_missing_0','memory_atom','mem_missing',0,'missing memory vector','public','[]','[1,0]',NULL,2,1,1);
+        \\CREATE TABLE compat_memories (
+        \\  key TEXT NOT NULL,
+        \\  session_id TEXT,
+        \\  memory_atom_id TEXT NOT NULL,
+        \\  category TEXT NOT NULL DEFAULT 'core',
+        \\  timestamp_ms INTEGER NOT NULL
+        \\);
+        \\INSERT INTO compat_memories (key, session_id, memory_atom_id, category, timestamp_ms)
+        \\VALUES ('legacy.key', NULL, 'mem_legacy', 'core', 1);
+        \\CREATE TABLE session_messages (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  session_id TEXT NOT NULL,
+        \\  role TEXT NOT NULL,
+        \\  content TEXT NOT NULL,
+        \\  created_at_ms INTEGER NOT NULL
+        \\);
+        \\INSERT INTO session_messages (session_id, role, content, created_at_ms)
+        \\VALUES ('legacy-session', 'user', 'legacy message', 1);
+        \\CREATE TABLE session_usage (
+        \\  session_id TEXT PRIMARY KEY,
+        \\  total_tokens INTEGER NOT NULL,
+        \\  updated_at_ms INTEGER NOT NULL
+        \\);
+        \\INSERT INTO session_usage (session_id, total_tokens, updated_at_ms)
+        \\VALUES ('legacy-session', 10, 1);
     );
     _ = c.sqlite3_close(db.?);
 
     var store = try Store.initSQLite(std.testing.allocator, db_path);
     defer store.deinit();
-    try std.testing.expectEqual(@as(i64, 8), try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE checksum <> ''"));
+    try std.testing.expectEqual(@as(i64, 9), try testingSqliteCount(&store, "SELECT COUNT(*) FROM schema_migrations WHERE checksum <> ''"));
     try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM vector_chunks WHERE object_type = 'raw' OR object_id = 'mem_missing'"));
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM compat_memories"));
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM session_messages"));
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM session_usage"));
 }
 
 test "sqlite search excludes deprecated and superseded memory by default" {
@@ -7391,11 +7533,11 @@ test "sqlite context pack can include guarded session history when requested" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    try store.saveMessage("agent:coder", "user", "session-only NullClaw context", null);
-    const without_sessions = try store.createContextPack(alloc, .{ .query = "session-only", .scopes_json = "[\"session:agent:coder\"]", .persist = false, .include_sessions = false });
+    try store.saveMessage("agent:coder", "user", "session-only NullClaw context", "agent:nullclaw:coder");
+    const without_sessions = try store.createContextPack(alloc, .{ .query = "session-only", .scopes_json = "[\"session:agent:coder\"]", .persist = false, .include_sessions = false, .actor_id = "agent:nullclaw:coder" });
     try std.testing.expect(std.mem.indexOf(u8, without_sessions.generated_summary, "session-only NullClaw context") == null);
 
-    const with_sessions = try store.createContextPack(alloc, .{ .query = "session-only", .scopes_json = "[\"session:agent:coder\"]", .persist = false, .include_sessions = true });
+    const with_sessions = try store.createContextPack(alloc, .{ .query = "session-only", .scopes_json = "[\"session:agent:coder\"]", .persist = false, .include_sessions = true, .actor_id = "agent:nullclaw:coder" });
     try std.testing.expect(std.mem.indexOf(u8, with_sessions.generated_summary, "session-only NullClaw context") != null);
 }
 
@@ -7419,11 +7561,11 @@ test "sqlite global search covers operational first-class groups" {
     _ = try store.createRelation(alloc, .{ .from_entity_id = from.id, .relation_type = "roadmap_depends_on", .to_entity_id = to.id });
     _ = try store.createContextPack(alloc, .{ .query = "roadmap", .scopes_json = "[\"admin\"]" });
     _ = try store.appendFeedEvent(.{ .event_type = "roadmap.feed", .object_type = "memory_atom", .object_id = atom.id, .scope = "public", .payload_json = "{\"text\":\"roadmap feed\"}" });
-    try store.compatStore(alloc, .{ .key = "roadmap.compat", .content = "roadmap compat memory", .category = "core", .session_id = null });
-    try store.saveMessage("sess_roadmap", "user", "roadmap session message", null);
+    try store.compatStore(alloc, .{ .key = "roadmap.compat", .content = "roadmap compat memory", .category = "core", .session_id = null, .actor_id = "agent:nullclaw:roadmap" });
+    try store.saveMessage("sess_roadmap", "user", "roadmap session message", "agent:nullclaw:roadmap");
     _ = artifact;
 
-    const results = try store.search(alloc, .{ .query = "roadmap", .scopes_json = "[\"admin\"]", .limit = 100, .include_sessions = true });
+    const results = try store.search(alloc, .{ .query = "roadmap", .scopes_json = "[\"admin\"]", .limit = 100, .include_sessions = true, .actor_id = "agent:nullclaw:roadmap" });
     var saw_relation = false;
     var saw_context_pack = false;
     var saw_feed = false;
@@ -7447,7 +7589,7 @@ test "sqlite global search covers operational first-class groups" {
         try std.testing.expect(!std.mem.eql(u8, result.result_type, "session_message"));
     }
 
-    const session_results = try store.search(alloc, .{ .query = "roadmap session", .scopes_json = "[\"session:sess_roadmap\"]", .limit = 20, .include_sessions = true });
+    const session_results = try store.search(alloc, .{ .query = "roadmap session", .scopes_json = "[\"session:sess_roadmap\"]", .limit = 20, .include_sessions = true, .actor_id = "agent:nullclaw:roadmap" });
     var session_scope_saw_message = false;
     for (session_results) |result| {
         if (std.mem.eql(u8, result.result_type, "session_message")) session_scope_saw_message = true;
@@ -7566,9 +7708,10 @@ test "nullclaw compatibility maps key memory to memory atom" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    const actor = "agent:nullclaw:test";
 
-    try store.compatStore(alloc, .{ .key = "pref.lang", .content = "Use Zig examples", .category = "core", .session_id = null });
-    const entry = (try store.compatGet(alloc, "pref.lang", null, null)).?;
+    try store.compatStore(alloc, .{ .key = "pref.lang", .content = "Use Zig examples", .category = "core", .session_id = null, .actor_id = actor });
+    const entry = (try store.compatGet(alloc, "pref.lang", null, actor)).?;
     try std.testing.expectEqualStrings("pref.lang", entry.key);
     try std.testing.expectEqualStrings("Use Zig examples", entry.content);
     const atom = (try store.getMemoryAtom(alloc, entry.id)).?;
@@ -7577,23 +7720,36 @@ test "nullclaw compatibility maps key memory to memory atom" {
     try std.testing.expectEqual(@as(usize, 1), try store.compatCount(null, "[\"admin\"]"));
 }
 
-test "nullclaw compatibility upsert preserves scoped memories" {
+test "nullclaw compatibility rejects missing actor ids" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    try store.compatStore(alloc, .{ .key = "pref.lang", .content = "Session value", .category = "core", .session_id = "agent:coder" });
-    try store.compatStore(alloc, .{ .key = "pref.lang", .content = "Global value", .category = "core", .session_id = null });
+    try std.testing.expectError(error.MissingActorId, store.compatStore(alloc, .{ .key = "pref.lang", .content = "legacy shared write", .category = "core", .session_id = null }));
+    try std.testing.expectError(error.MissingActorId, store.saveMessage("sess_missing_actor", "user", "legacy shared message", null));
+    try std.testing.expectError(error.MissingActorId, store.saveUsage("sess_missing_actor", 1, null));
+}
 
-    const scoped = (try store.compatGet(alloc, "pref.lang", "agent:coder", null)).?;
+test "nullclaw compatibility upsert preserves scoped memories" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const actor = "agent:nullclaw:test";
+
+    try store.compatStore(alloc, .{ .key = "pref.lang", .content = "Session value", .category = "core", .session_id = "agent:coder", .actor_id = actor });
+    try store.compatStore(alloc, .{ .key = "pref.lang", .content = "Global value", .category = "core", .session_id = null, .actor_id = actor });
+
+    const scoped = (try store.compatGet(alloc, "pref.lang", "agent:coder", actor)).?;
     try std.testing.expectEqualStrings("Session value", scoped.content);
-    const global = (try store.compatGet(alloc, "pref.lang", null, null)).?;
+    const global = (try store.compatGet(alloc, "pref.lang", null, actor)).?;
     try std.testing.expectEqualStrings("Global value", global.content);
     try std.testing.expectEqual(@as(usize, 2), try store.compatCount(null, "[\"admin\"]"));
 
-    const session_search = try store.search(alloc, .{ .query = "Session value", .scopes_json = "[\"session:agent:coder\"]", .limit = 10, .use_vector = false, .include_sessions = true });
+    const session_search = try store.search(alloc, .{ .query = "Session value", .scopes_json = "[\"session:agent:coder\"]", .limit = 10, .use_vector = false, .include_sessions = true, .actor_id = actor });
     var saw_scoped_compat = false;
     for (session_search) |result| {
         if (std.mem.eql(u8, result.result_type, "compat_memory")) saw_scoped_compat = true;
@@ -7661,14 +7817,15 @@ test "nullclaw compatibility scoped delete preserves global memory and deprecate
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    const actor = "agent:nullclaw:test";
 
-    try store.compatStore(alloc, .{ .key = "pref.lang", .content = "Global value", .category = "core", .session_id = null });
-    try store.compatStore(alloc, .{ .key = "pref.lang", .content = "Session value", .category = "core", .session_id = "agent:coder" });
-    const scoped = (try store.compatGet(alloc, "pref.lang", "agent:coder", null)).?;
+    try store.compatStore(alloc, .{ .key = "pref.lang", .content = "Global value", .category = "core", .session_id = null, .actor_id = actor });
+    try store.compatStore(alloc, .{ .key = "pref.lang", .content = "Session value", .category = "core", .session_id = "agent:coder", .actor_id = actor });
+    const scoped = (try store.compatGet(alloc, "pref.lang", "agent:coder", actor)).?;
 
-    try std.testing.expect(try store.compatDelete("pref.lang", "agent:coder", null));
-    try std.testing.expect((try store.compatGet(alloc, "pref.lang", "agent:coder", null)) == null);
-    const global = (try store.compatGet(alloc, "pref.lang", null, null)).?;
+    try std.testing.expect(try store.compatDelete("pref.lang", "agent:coder", actor));
+    try std.testing.expect((try store.compatGet(alloc, "pref.lang", "agent:coder", actor)) == null);
+    const global = (try store.compatGet(alloc, "pref.lang", null, actor)).?;
     try std.testing.expectEqualStrings("Global value", global.content);
     try std.testing.expectEqual(@as(usize, 1), try store.compatCount(null, "[\"admin\"]"));
 
@@ -7682,19 +7839,20 @@ test "sqlite session store clears only autosaved messages in requested session" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    const actor = "agent:nullclaw:test";
 
-    try store.saveMessage("sess_a", "autosave_user", "draft A", null);
-    try store.saveMessage("sess_a", "user", "kept A", null);
-    try store.saveMessage("sess_b", "autosave_user", "draft B", null);
+    try store.saveMessage("sess_a", "autosave_user", "draft A", actor);
+    try store.saveMessage("sess_a", "user", "kept A", actor);
+    try store.saveMessage("sess_b", "autosave_user", "draft B", actor);
 
-    try store.clearAutoSaved("sess_a", null);
+    try store.clearAutoSaved("sess_a", actor);
 
-    const a = try store.loadMessages(alloc, "sess_a", null);
+    const a = try store.loadMessages(alloc, "sess_a", actor);
     try std.testing.expectEqual(@as(usize, 1), a.len);
     try std.testing.expectEqualStrings("user", a[0].role);
     try std.testing.expectEqualStrings("kept A", a[0].content);
 
-    const b = try store.loadMessages(alloc, "sess_b", null);
+    const b = try store.loadMessages(alloc, "sess_b", actor);
     try std.testing.expectEqual(@as(usize, 1), b.len);
     try std.testing.expectEqualStrings("autosave_user", b[0].role);
 }
@@ -7702,12 +7860,13 @@ test "sqlite session store clears only autosaved messages in requested session" 
 test "sqlite session usage delete removes usage record" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
+    const actor = "agent:nullclaw:test";
 
-    try store.saveUsage("sess_usage", 77, null);
-    try std.testing.expectEqual(@as(?u64, 77), try store.loadUsage("sess_usage", null));
-    try std.testing.expect(try store.deleteUsage("sess_usage", null));
-    try std.testing.expect((try store.loadUsage("sess_usage", null)) == null);
-    try std.testing.expect(!try store.deleteUsage("sess_usage", null));
+    try store.saveUsage("sess_usage", 77, actor);
+    try std.testing.expectEqual(@as(?u64, 77), try store.loadUsage("sess_usage", actor));
+    try std.testing.expect(try store.deleteUsage("sess_usage", actor));
+    try std.testing.expect((try store.loadUsage("sess_usage", actor)) == null);
+    try std.testing.expect(!try store.deleteUsage("sess_usage", actor));
 }
 
 test "sqlite jobs persist status transitions with scoped listing" {
@@ -8119,9 +8278,10 @@ test "nullclaw compat search preserves direct memories before synthetic context 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    const actor = "agent:nullclaw:test";
 
-    try store.compatStore(alloc, .{ .key = "pref.direct", .content = "Use direct NullClaw memory first", .category = "core", .session_id = null });
-    const results = try store.compatSearch(alloc, "direct NullClaw", 1, null, "[\"agent:nullclaw\"]", null);
+    try store.compatStore(alloc, .{ .key = "pref.direct", .content = "Use direct NullClaw memory first", .category = "core", .session_id = null, .actor_id = actor });
+    const results = try store.compatSearch(alloc, "direct NullClaw", 1, null, "[\"agent:nullclaw\"]", actor);
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("pref.direct", results[0].key);
 }
@@ -8174,12 +8334,12 @@ test "postgres storage contract covers primitives when configured" {
     }
     try std.testing.expect(saw_atom);
 
-    try store.compatStore(alloc, .{ .key = unique, .content = "postgres compat memory", .category = "core", .session_id = "pg-session" });
-    const compat_entry = (try store.compatGet(alloc, unique, "pg-session", null)).?;
+    try store.compatStore(alloc, .{ .key = unique, .content = "postgres compat memory", .category = "core", .session_id = "pg-session", .actor_id = "agent:nullclaw:postgres" });
+    const compat_entry = (try store.compatGet(alloc, unique, "pg-session", "agent:nullclaw:postgres")).?;
     try std.testing.expectEqualStrings("postgres compat memory", compat_entry.content);
 
-    try store.saveMessage(unique, "user", "hello postgres history", null);
-    const history_result = try store.history(alloc, unique, 10, 0, null);
+    try store.saveMessage(unique, "user", "hello postgres history", "agent:nullclaw:postgres");
+    const history_result = try store.history(alloc, unique, 10, 0, "agent:nullclaw:postgres");
     try std.testing.expectEqual(@as(u64, 1), history_result.total);
 
     const pack = try store.createContextPack(alloc, .{ .query = unique, .scopes_json = "[\"public\"]" });

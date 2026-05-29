@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const expected_schema_version: i64 = 8;
+pub const expected_schema_version: i64 = 9;
 
 pub const Migration = struct {
     version: i64,
@@ -17,6 +17,7 @@ pub const migration_manifest = [_]Migration{
     .{ .version = 6, .name = "connector_cursor_permissions", .checksum = "np-006-connector-cursor-permissions" },
     .{ .version = 7, .name = "vector_backing_invariant", .checksum = "np-007-vector-backing-invariant" },
     .{ .version = 8, .name = "nullclaw_actor_isolation", .checksum = "np-008-nullclaw-actor-isolation" },
+    .{ .version = 9, .name = "strict_actor_memory", .checksum = "np-009-strict-actor-memory" },
 };
 
 pub fn expectedMigration(version: i64) ?Migration {
@@ -191,16 +192,16 @@ pub const sqlite_schema =
     \\CREATE TABLE IF NOT EXISTS compat_memories (
     \\  key TEXT NOT NULL,
     \\  session_id TEXT,
-    \\  actor_id TEXT,
+    \\  actor_id TEXT NOT NULL,
     \\  memory_atom_id TEXT NOT NULL,
     \\  category TEXT NOT NULL DEFAULT 'core',
     \\  timestamp_ms INTEGER NOT NULL
     \\);
-    \\CREATE UNIQUE INDEX IF NOT EXISTS idx_compat_memories_key_session_actor ON compat_memories(key, coalesce(session_id, ''), coalesce(actor_id, ''));
+    \\CREATE UNIQUE INDEX IF NOT EXISTS idx_compat_memories_key_session_actor ON compat_memories(key, coalesce(session_id, ''), actor_id);
     \\CREATE TABLE IF NOT EXISTS session_messages (
     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
     \\  session_id TEXT NOT NULL,
-    \\  actor_id TEXT NOT NULL DEFAULT '',
+    \\  actor_id TEXT NOT NULL,
     \\  role TEXT NOT NULL,
     \\  content TEXT NOT NULL,
     \\  created_at_ms INTEGER NOT NULL
@@ -208,7 +209,7 @@ pub const sqlite_schema =
     \\CREATE INDEX IF NOT EXISTS idx_session_messages_session_actor ON session_messages(session_id, actor_id, id);
     \\CREATE TABLE IF NOT EXISTS session_usage (
     \\  session_id TEXT NOT NULL,
-    \\  actor_id TEXT NOT NULL DEFAULT '',
+    \\  actor_id TEXT NOT NULL,
     \\  total_tokens INTEGER NOT NULL DEFAULT 0,
     \\  updated_at_ms INTEGER NOT NULL,
     \\  PRIMARY KEY (session_id, actor_id)
@@ -310,6 +311,7 @@ pub const sqlite_schema =
     \\DELETE FROM vector_chunks WHERE object_type = 'artifact' AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.id = vector_chunks.object_id);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (7, 'vector_backing_invariant', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (8, 'nullclaw_actor_isolation', strftime('%s','now') * 1000);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (9, 'strict_actor_memory', strftime('%s','now') * 1000);
 ;
 
 pub const postgres_schema =
@@ -479,16 +481,16 @@ pub const postgres_schema =
     \\CREATE TABLE IF NOT EXISTS compat_memories (
     \\  key text NOT NULL,
     \\  session_id text,
-    \\  actor_id text,
+    \\  actor_id text NOT NULL,
     \\  memory_atom_id text NOT NULL,
     \\  category text NOT NULL DEFAULT 'core',
     \\  timestamp_ms bigint NOT NULL
     \\);
-    \\CREATE UNIQUE INDEX IF NOT EXISTS compat_memories_key_session_actor_idx ON compat_memories(key, coalesce(session_id, ''), coalesce(actor_id, ''));
+    \\CREATE UNIQUE INDEX IF NOT EXISTS compat_memories_key_session_actor_idx ON compat_memories(key, coalesce(session_id, ''), actor_id);
     \\CREATE TABLE IF NOT EXISTS session_messages (
     \\  id bigserial PRIMARY KEY,
     \\  session_id text NOT NULL,
-    \\  actor_id text NOT NULL DEFAULT '',
+    \\  actor_id text NOT NULL,
     \\  role text NOT NULL,
     \\  content text NOT NULL,
     \\  created_at_ms bigint NOT NULL
@@ -496,7 +498,7 @@ pub const postgres_schema =
     \\CREATE INDEX IF NOT EXISTS session_messages_session_actor_idx ON session_messages(session_id, actor_id, id);
     \\CREATE TABLE IF NOT EXISTS session_usage (
     \\  session_id text NOT NULL,
-    \\  actor_id text NOT NULL DEFAULT '',
+    \\  actor_id text NOT NULL,
     \\  total_tokens bigint NOT NULL DEFAULT 0,
     \\  updated_at_ms bigint NOT NULL,
     \\  PRIMARY KEY (session_id, actor_id)
@@ -599,6 +601,7 @@ pub const postgres_schema =
     \\DELETE FROM vector_chunks WHERE object_type = 'artifact' AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.id = vector_chunks.object_id);
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (7, 'vector_backing_invariant', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (8, 'nullclaw_actor_isolation', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (9, 'strict_actor_memory', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
 ;
 
 test "sqlite migration includes core primitive tables and indexes" {
@@ -630,11 +633,14 @@ test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS connector_cursors") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'connector_cursor_permissions'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'vector_backing_invariant'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'strict_actor_memory'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "checksum TEXT NOT NULL DEFAULT ''") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "object_type TEXT NOT NULL CHECK") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'ingest_jobs_conflicts'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'spaces_policy_scopes'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE UNIQUE INDEX IF NOT EXISTS idx_compat_memories_key_session_actor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "actor_id TEXT NOT NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "coalesce(actor_id") == null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE INDEX IF NOT EXISTS idx_session_messages_session_actor") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "PRIMARY KEY (session_id, actor_id)") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'nullclaw_actor_isolation'") != null);
@@ -665,6 +671,7 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS connector_cursors") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'connector_cursor_permissions'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'vector_backing_invariant'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'strict_actor_memory'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "checksum text NOT NULL DEFAULT ''") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "object_type text NOT NULL CHECK") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'ingest_jobs_conflicts'") != null);
@@ -676,6 +683,8 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "USING gin(search_tsv)") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS compat_memories_key_session_actor_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "actor_id text NOT NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "coalesce(actor_id") == null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE INDEX IF NOT EXISTS session_messages_session_actor_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "PRIMARY KEY (session_id, actor_id)") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'nullclaw_actor_isolation'") != null);
