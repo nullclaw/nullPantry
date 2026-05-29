@@ -15,6 +15,7 @@ const agent_memory_runtime = @import("agent_memory_runtime.zig");
 const vector_runtime = @import("vector_runtime.zig");
 const analytics_runtime = @import("analytics_runtime.zig");
 const lucid_runtime = @import("lucid_runtime.zig");
+const graph_mod = @import("graph.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -4686,6 +4687,8 @@ pub const SQLiteStore = struct {
     pub fn createRelation(self: *Self, allocator: std.mem.Allocator, input: RelationInput) !domain.Relation {
         const from_entity = (try self.getEntity(allocator, input.from_entity_id)) orelse return error.EntityNotFound;
         const to_entity = (try self.getEntity(allocator, input.to_entity_id)) orelse return error.EntityNotFound;
+        const relation_type = graph_mod.canonicalRelationType(input.relation_type);
+        try graph_mod.validateRelationShape(relation_type, from_entity.entity_type, to_entity.entity_type);
         if (!aclCoversTarget(allocator, from_entity.scope, from_entity.permissions_json, input.scope, input.permissions_json) or
             !aclCoversTarget(allocator, to_entity.scope, to_entity.permissions_json, input.scope, input.permissions_json))
         {
@@ -4699,7 +4702,7 @@ pub const SQLiteStore = struct {
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         bindText(stmt, 2, input.from_entity_id);
-        bindText(stmt, 3, input.relation_type);
+        bindText(stmt, 3, relation_type);
         bindText(stmt, 4, input.to_entity_id);
         bindText(stmt, 5, input.source_ids_json);
         bindText(stmt, 6, input.scope);
@@ -4708,10 +4711,10 @@ pub const SQLiteStore = struct {
         bindText(stmt, 9, input.status);
         _ = c.sqlite3_bind_int64(stmt, 10, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
-        try self.upsertRelationFts(id, input.relation_type, from_entity.name, to_entity.name);
+        try self.upsertRelationFts(id, relation_type, from_entity.name, to_entity.name);
         try self.insertAuditActor("relation.created", input.actor_id, "relation", id);
         committed = true;
-        return .{ .id = id, .from_entity_id = input.from_entity_id, .relation_type = input.relation_type, .to_entity_id = input.to_entity_id, .source_ids_json = input.source_ids_json, .scope = input.scope, .permissions_json = input.permissions_json, .confidence = input.confidence, .status = input.status, .created_at_ms = now };
+        return .{ .id = id, .from_entity_id = input.from_entity_id, .relation_type = relation_type, .to_entity_id = input.to_entity_id, .source_ids_json = input.source_ids_json, .scope = input.scope, .permissions_json = input.permissions_json, .confidence = input.confidence, .status = input.status, .created_at_ms = now };
     }
 
     pub fn getRelation(self: *Self, allocator: std.mem.Allocator, id: []const u8) !?domain.Relation {
@@ -5586,7 +5589,7 @@ pub const SQLiteStore = struct {
     }
 
     fn expandEntityArtifacts(self: *Self, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const stmt = try self.prepare("SELECT id,title,body,status,scope,permissions_json,source_ids_json,updated_at_ms,fields_json FROM artifacts WHERE instr(related_entities_json, ?1) > 0 ORDER BY updated_at_ms DESC");
+        const stmt = try self.prepare("SELECT id,title,body,status,scope,permissions_json,source_ids_json,updated_at_ms,fields_json FROM artifacts WHERE EXISTS (SELECT 1 FROM json_each(artifacts.related_entities_json) WHERE value = ?1) ORDER BY updated_at_ms DESC");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, entity_id);
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
@@ -5613,7 +5616,7 @@ pub const SQLiteStore = struct {
     }
 
     fn expandEntitySources(self: *Self, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const stmt = try self.prepare("SELECT id,title,content,scope,permissions_json,imported_at_ms FROM sources WHERE instr(related_entities_json, ?1) > 0 ORDER BY imported_at_ms DESC");
+        const stmt = try self.prepare("SELECT id,title,content,scope,permissions_json,imported_at_ms FROM sources WHERE EXISTS (SELECT 1 FROM json_each(sources.related_entities_json) WHERE value = ?1) ORDER BY imported_at_ms DESC");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, entity_id);
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
@@ -7945,6 +7948,9 @@ pub const PostgresStore = struct {
             \\ALTER TABLE connector_cursors ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\DROP INDEX IF EXISTS entities_type_name_idx;
             \\CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx ON entities(type, lower(name), scope);
+            \\CREATE INDEX IF NOT EXISTS relations_from_idx ON relations(from_entity_id);
+            \\CREATE INDEX IF NOT EXISTS relations_to_idx ON relations(to_entity_id);
+            \\CREATE INDEX IF NOT EXISTS relations_type_status_idx ON relations(relation_type, status);
             \\DROP INDEX IF EXISTS session_messages_session_idx;
             \\CREATE INDEX IF NOT EXISTS session_messages_session_actor_idx ON session_messages(session_id, actor_id, id);
             \\ALTER TABLE session_usage DROP CONSTRAINT IF EXISTS session_usage_pkey;
@@ -8393,6 +8399,8 @@ pub const PostgresStore = struct {
     pub fn createRelation(self: *PostgresStore, allocator: std.mem.Allocator, input: RelationInput) !domain.Relation {
         const from_entity = (try self.getEntity(allocator, input.from_entity_id)) orelse return error.EntityNotFound;
         const to_entity = (try self.getEntity(allocator, input.to_entity_id)) orelse return error.EntityNotFound;
+        const relation_type = graph_mod.canonicalRelationType(input.relation_type);
+        try graph_mod.validateRelationShape(relation_type, from_entity.entity_type, to_entity.entity_type);
         if (!aclCoversTarget(allocator, from_entity.scope, from_entity.permissions_json, input.scope, input.permissions_json) or
             !aclCoversTarget(allocator, to_entity.scope, to_entity.permissions_json, input.scope, input.permissions_json))
         {
@@ -8400,9 +8408,9 @@ pub const PostgresStore = struct {
         }
         const id = try idOrMake(allocator, input.id, "rel_");
         const now = ids.nowMs();
-        const sql = try std.fmt.allocPrint(allocator, "BEGIN; INSERT INTO relations (id,from_entity_id,relation_type,to_entity_id,source_ids_json,scope,permissions_json,confidence,status,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{d},{s},{d}); INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('relation.created',{s},'relation',{s},'{{}}'::jsonb,{d}); COMMIT;", .{ try sqlString(allocator, id), try sqlString(allocator, input.from_entity_id), try sqlString(allocator, input.relation_type), try sqlString(allocator, input.to_entity_id), try sqlJsonb(allocator, input.source_ids_json), try sqlString(allocator, input.scope), try sqlJsonb(allocator, input.permissions_json), input.confidence, try sqlString(allocator, input.status), now, try sqlNullableString(allocator, input.actor_id), try sqlString(allocator, id), now });
+        const sql = try std.fmt.allocPrint(allocator, "BEGIN; INSERT INTO relations (id,from_entity_id,relation_type,to_entity_id,source_ids_json,scope,permissions_json,confidence,status,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{d},{s},{d}); INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('relation.created',{s},'relation',{s},'{{}}'::jsonb,{d}); COMMIT;", .{ try sqlString(allocator, id), try sqlString(allocator, input.from_entity_id), try sqlString(allocator, relation_type), try sqlString(allocator, input.to_entity_id), try sqlJsonb(allocator, input.source_ids_json), try sqlString(allocator, input.scope), try sqlJsonb(allocator, input.permissions_json), input.confidence, try sqlString(allocator, input.status), now, try sqlNullableString(allocator, input.actor_id), try sqlString(allocator, id), now });
         try self.runSql(sql);
-        return .{ .id = id, .from_entity_id = input.from_entity_id, .relation_type = input.relation_type, .to_entity_id = input.to_entity_id, .source_ids_json = input.source_ids_json, .scope = input.scope, .permissions_json = input.permissions_json, .confidence = input.confidence, .status = input.status, .created_at_ms = now };
+        return .{ .id = id, .from_entity_id = input.from_entity_id, .relation_type = relation_type, .to_entity_id = input.to_entity_id, .source_ids_json = input.source_ids_json, .scope = input.scope, .permissions_json = input.permissions_json, .confidence = input.confidence, .status = input.status, .created_at_ms = now };
     }
 
     pub fn getRelation(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?domain.Relation {
@@ -8712,15 +8720,16 @@ pub const PostgresStore = struct {
         var relations: std.ArrayListUnmanaged(domain.Relation) = .empty;
         errdefer relations.deinit(allocator);
         for (resolved_relations.items) |resolved| {
+            const relation_type = graph_mod.canonicalRelationType(resolved.input.relation_type);
             const relation_id = try ids.make(allocator, "rel_");
             const now = ids.nowMs();
             try sql.print(
                 allocator,
                 "INSERT INTO relations (id,from_entity_id,relation_type,to_entity_id,source_ids_json,scope,permissions_json,confidence,status,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{d},{s},{d});\n",
-                .{ try sqlString(allocator, relation_id), try sqlString(allocator, resolved.from_entity.id), try sqlString(allocator, resolved.input.relation_type), try sqlString(allocator, resolved.to_entity.id), try sqlJsonb(allocator, resolved.input.source_ids_json), try sqlString(allocator, resolved.input.scope), try sqlJsonb(allocator, resolved.input.permissions_json), resolved.input.confidence, try sqlString(allocator, resolved.input.status), now },
+                .{ try sqlString(allocator, relation_id), try sqlString(allocator, resolved.from_entity.id), try sqlString(allocator, relation_type), try sqlString(allocator, resolved.to_entity.id), try sqlJsonb(allocator, resolved.input.source_ids_json), try sqlString(allocator, resolved.input.scope), try sqlJsonb(allocator, resolved.input.permissions_json), resolved.input.confidence, try sqlString(allocator, resolved.input.status), now },
             );
             try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('relation.created',{s},'relation',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, resolved.input.actor_id), try sqlString(allocator, relation_id), now });
-            try relations.append(allocator, .{ .id = relation_id, .from_entity_id = resolved.from_entity.id, .relation_type = resolved.input.relation_type, .to_entity_id = resolved.to_entity.id, .source_ids_json = resolved.input.source_ids_json, .scope = resolved.input.scope, .permissions_json = resolved.input.permissions_json, .confidence = resolved.input.confidence, .status = resolved.input.status, .created_at_ms = now });
+            try relations.append(allocator, .{ .id = relation_id, .from_entity_id = resolved.from_entity.id, .relation_type = relation_type, .to_entity_id = resolved.to_entity.id, .source_ids_json = resolved.input.source_ids_json, .scope = resolved.input.scope, .permissions_json = resolved.input.permissions_json, .confidence = resolved.input.confidence, .status = resolved.input.status, .created_at_ms = now });
         }
 
         try sql.appendSlice(allocator, "COMMIT;\n");
@@ -12002,6 +12011,40 @@ test "sqlite graph expansion pulls entity context without bypassing acl" {
         if (std.mem.indexOf(u8, result.text, "include this verified service decision") != null) saw_atom = true;
     }
     try std.testing.expect(saw_atom);
+}
+
+test "sqlite graph expansion matches related entity ids exactly" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const exact = try store.resolveEntity(alloc, .{ .id = "ent_graph_exact", .entity_type = "service", .name = "GraphExactAlpha", .scope = "public" });
+    const sibling = try store.resolveEntity(alloc, .{ .id = "ent_graph_exact_suffix", .entity_type = "service", .name = "Other Graph Node", .scope = "public" });
+    const sibling_entities = try std.fmt.allocPrint(alloc, "[\"{s}\"]", .{sibling.id});
+
+    const suffix_source = try store.createSource(alloc, .{
+        .title = "Suffix-only source",
+        .content = "This source belongs only to the suffix entity.",
+        .scope = "public",
+        .related_entities_json = sibling_entities,
+    });
+    const suffix_artifact = try store.createArtifact(alloc, .{
+        .title = "Suffix-only artifact",
+        .body = "This artifact belongs only to the suffix entity.",
+        .scope = "public",
+        .related_entities_json = sibling_entities,
+    });
+
+    const results = try store.search(alloc, .{ .query = exact.name, .scopes_json = "[\"public\"]", .limit = 20, .use_vector = false });
+    var saw_exact = false;
+    for (results) |result| {
+        if (std.mem.eql(u8, result.id, exact.id)) saw_exact = true;
+        try std.testing.expect(!std.mem.eql(u8, result.id, suffix_source.id));
+        try std.testing.expect(!std.mem.eql(u8, result.id, suffix_artifact.id));
+    }
+    try std.testing.expect(saw_exact);
 }
 
 test "sqlite context packs respect approximate token budget" {

@@ -19,6 +19,7 @@ const auth = @import("auth.zig");
 const markdown_adapter = @import("markdown_adapter.zig");
 const markdown_filesystem = @import("markdown_filesystem.zig");
 const compat = @import("compat.zig");
+const graph_mod = @import("graph.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -136,10 +137,16 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
     } else if (eql(seg1, "entities")) {
         if (eql(seg2, "resolve") and is_post) return resolveEntity(ctx, body);
         if (is_get and seg2 != null and seg3 == null) return getEntity(ctx, seg2.?);
+        if ((is_patch or is_put or is_post) and seg2 != null and seg3 == null) return patchEntity(ctx, seg2.?, body);
+        if (is_delete and seg2 != null and seg3 == null) return deleteEntity(ctx, seg2.?);
     } else if (eql(seg1, "relations")) {
         if (is_post and seg2 == null) return createRelation(ctx, body);
         if (is_get and seg2 != null and seg3 == null) return getRelation(ctx, seg2.?);
+        if ((is_patch or is_put) and seg2 != null and seg3 == null) return patchRelation(ctx, seg2.?, body);
+        if (is_delete and seg2 != null and seg3 == null) return deleteRelation(ctx, seg2.?);
     } else if (eql(seg1, "graph")) {
+        if (eql(seg2, "schema") and is_get) return graphSchema(ctx);
+        if (eql(seg2, "query") and is_post) return graphQuery(ctx, body);
         if (eql(seg2, "neighbors") and is_post) return graphNeighbors(ctx, body);
         if (eql(seg2, "path") and is_post) return graphPath(ctx, body);
     } else if (eql(seg1, "search") and is_post) {
@@ -511,6 +518,7 @@ fn createRelation(ctx: *Context, body: []const u8) HttpResponse {
     }) catch |err| switch (err) {
         error.EntityNotFound => return json.errorResponse(ctx.allocator, 400, "bad_request", "Relation endpoints must reference existing entities"),
         error.RelationAclBroaderThanEntity => return json.errorResponse(ctx.allocator, 400, "bad_request", "Relation ACL cannot be broader than endpoint entity ACL"),
+        error.InvalidRelationSchema => return json.errorResponse(ctx.allocator, 400, "bad_request", "Relation type is not valid for the endpoint entity types"),
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
@@ -521,7 +529,30 @@ fn getEntity(ctx: *Context, id: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const entity = (ctx.store.getEntity(ctx.allocator, id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
     if (!recordVisibleToActor(ctx, entity.scope, entity.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
-    return objectResponse(ctx, "entity", entity);
+    return entityResponse(ctx, entity);
+}
+
+fn patchEntity(ctx: *Context, id: []const u8, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const status = json.stringField(parsed.value.object, "status") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing status");
+    const entity = (ctx.store.getEntity(ctx.allocator, id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
+    if (!recordVisibleToActor(ctx, entity.scope, entity.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
+    if (!canChangeGraphPrimitiveStatus(ctx, entity.scope, entity.permissions_json, status)) return forbidden(ctx);
+    const payload_json = rawField(ctx.allocator, parsed.value.object, "payload", "{}") catch return badJson(ctx);
+    const changed = ctx.store.patchPrimitiveLifecycleActor(ctx.allocator, "entity", id, status, ctx.actor_id, payload_json) catch return serverError(ctx);
+    if (!changed) return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
+    return entityResponse(ctx, entity);
+}
+
+fn deleteEntity(ctx: *Context, id: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "delete")) return forbidden(ctx);
+    const entity = (ctx.store.getEntity(ctx.allocator, id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
+    if (!recordVisibleToActor(ctx, entity.scope, entity.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
+    if (!canChangeGraphPrimitiveStatus(ctx, entity.scope, entity.permissions_json, "deprecated")) return forbidden(ctx);
+    const changed = ctx.store.patchPrimitiveLifecycleActor(ctx.allocator, "entity", id, "deprecated", ctx.actor_id, "{\"deleted\":true}") catch return serverError(ctx);
+    if (!changed) return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
+    return ok(ctx, "{\"ok\":true,\"status\":\"deprecated\"}");
 }
 
 fn getRelation(ctx: *Context, id: []const u8) HttpResponse {
@@ -532,17 +563,53 @@ fn getRelation(ctx: *Context, id: []const u8) HttpResponse {
     return relationResponse(ctx, visible.?.relation);
 }
 
+fn patchRelation(ctx: *Context, id: []const u8, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const status = json.stringField(parsed.value.object, "status") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing status");
+    const relation = (ctx.store.getRelation(ctx.allocator, id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Relation not found");
+    const visible = visibleGraphRelation(ctx, relation, true) catch return serverError(ctx);
+    if (visible == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Relation not found");
+    if (!canChangeGraphPrimitiveStatus(ctx, relation.scope, relation.permissions_json, status)) return forbidden(ctx);
+    const changed = ctx.store.patchRelationStatusActor(id, status, ctx.actor_id) catch return serverError(ctx);
+    if (!changed) return json.errorResponse(ctx.allocator, 404, "not_found", "Relation not found");
+    const updated = (ctx.store.getRelation(ctx.allocator, id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Relation not found");
+    return relationResponse(ctx, updated);
+}
+
+fn deleteRelation(ctx: *Context, id: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "delete")) return forbidden(ctx);
+    const relation = (ctx.store.getRelation(ctx.allocator, id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Relation not found");
+    const visible = visibleGraphRelation(ctx, relation, true) catch return serverError(ctx);
+    if (visible == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Relation not found");
+    if (!canChangeGraphPrimitiveStatus(ctx, relation.scope, relation.permissions_json, "deprecated")) return forbidden(ctx);
+    const changed = ctx.store.patchRelationStatusActor(id, "deprecated", ctx.actor_id) catch return serverError(ctx);
+    if (!changed) return json.errorResponse(ctx.allocator, 404, "not_found", "Relation not found");
+    return ok(ctx, "{\"ok\":true,\"status\":\"deprecated\"}");
+}
+
+fn graphSchema(ctx: *Context) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    graph_mod.appendSchemaJson(ctx.allocator, &out) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
 fn graphNeighbors(ctx: *Context, body: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
     const entity_id = json.stringField(obj, "entity_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing entity_id");
-    const include_deprecated = json.boolField(obj, "include_deprecated") orelse false;
+    const options = graphTraversalOptions(ctx, obj) catch |err| switch (err) {
+        error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
+        else => return serverError(ctx),
+    };
     const depth = graphDepth(json.intField(obj, "depth"));
     const limit = positiveLimit(json.intField(obj, "limit"), 50);
     const root = (ctx.store.getEntity(ctx.allocator, entity_id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
-    if (!recordVisibleToActor(ctx, root.scope, root.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
+    const root_visible = visibleGraphEntity(ctx, root, options.include_deprecated) catch return serverError(ctx);
+    if (!root_visible) return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
 
     var entities: std.ArrayListUnmanaged(domain.Entity) = .empty;
     var relations: std.ArrayListUnmanaged(domain.Relation) = .empty;
@@ -556,13 +623,16 @@ fn graphNeighbors(ctx: *Context, body: []const u8) HttpResponse {
         for (frontier.items) |current_entity_id| {
             const raw_relations = ctx.store.listEntityRelations(ctx.allocator, current_entity_id, limit) catch return serverError(ctx);
             for (raw_relations) |relation| {
-                const visible = visibleGraphRelation(ctx, relation, include_deprecated) catch return serverError(ctx);
+                const visible = visibleGraphRelation(ctx, relation, options.include_deprecated) catch return serverError(ctx);
                 if (visible == null) continue;
+                if (!graphRelationAllowed(visible.?.relation, options)) continue;
                 if (relationInList(relations.items, relation.id)) continue;
+                const other = otherEntityForTraversal(visible.?, current_entity_id, options) orelse continue;
                 relations.append(ctx.allocator, visible.?.relation) catch return serverError(ctx);
-                const other = otherEntityForRelation(visible.?, current_entity_id) orelse continue;
-                if (!entityInList(entities.items, other.id)) entities.append(ctx.allocator, other) catch return serverError(ctx);
-                if (!stringInList(next.items, other.id)) next.append(ctx.allocator, other.id) catch return serverError(ctx);
+                if (!entityInList(entities.items, other.id)) {
+                    entities.append(ctx.allocator, other) catch return serverError(ctx);
+                    if (!stringInList(next.items, other.id)) next.append(ctx.allocator, other.id) catch return serverError(ctx);
+                }
                 if (relations.items.len >= limit) break;
             }
             if (relations.items.len >= limit) break;
@@ -573,6 +643,61 @@ fn graphNeighbors(ctx: *Context, body: []const u8) HttpResponse {
     return graphNeighborsResponse(ctx, root, entities.items, relations.items, depth, limit);
 }
 
+fn graphQuery(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const root_ids = graphRootEntityIds(ctx, obj) catch return badJson(ctx);
+    if (root_ids.len == 0) return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing entity_id or entity_ids");
+    const options = graphTraversalOptions(ctx, obj) catch |err| switch (err) {
+        error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
+        else => return serverError(ctx),
+    };
+    const depth = graphDepth(json.intField(obj, "depth"));
+    const limit = positiveLimit(json.intField(obj, "limit"), 50);
+
+    var roots: std.ArrayListUnmanaged(domain.Entity) = .empty;
+    var entities: std.ArrayListUnmanaged(domain.Entity) = .empty;
+    var relations: std.ArrayListUnmanaged(domain.Relation) = .empty;
+    var frontier: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (root_ids) |entity_id| {
+        const entity = (ctx.store.getEntity(ctx.allocator, entity_id) catch return serverError(ctx)) orelse continue;
+        const entity_visible = visibleGraphEntity(ctx, entity, options.include_deprecated) catch return serverError(ctx);
+        if (!entity_visible) continue;
+        if (!graph_mod.entityMatchesTypeFilter(entity.entity_type, options.entity_types)) continue;
+        if (!entityInList(entities.items, entity.id)) entities.append(ctx.allocator, entity) catch return serverError(ctx);
+        if (!entityInList(roots.items, entity.id)) roots.append(ctx.allocator, entity) catch return serverError(ctx);
+        if (!stringInList(frontier.items, entity.id)) frontier.append(ctx.allocator, entity.id) catch return serverError(ctx);
+    }
+    if (roots.items.len == 0) return json.errorResponse(ctx.allocator, 404, "not_found", "No visible root entities found");
+
+    var current_depth: usize = 0;
+    while (current_depth < depth and frontier.items.len > 0 and relations.items.len < limit) : (current_depth += 1) {
+        var next: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (frontier.items) |current_entity_id| {
+            const raw_relations = ctx.store.listEntityRelations(ctx.allocator, current_entity_id, limit) catch return serverError(ctx);
+            for (raw_relations) |relation| {
+                const visible = visibleGraphRelation(ctx, relation, options.include_deprecated) catch return serverError(ctx);
+                if (visible == null) continue;
+                if (!graphRelationAllowed(visible.?.relation, options)) continue;
+                if (relationInList(relations.items, relation.id)) continue;
+                const other = otherEntityForTraversal(visible.?, current_entity_id, options) orelse continue;
+                relations.append(ctx.allocator, visible.?.relation) catch return serverError(ctx);
+                if (!entityInList(entities.items, other.id)) {
+                    entities.append(ctx.allocator, other) catch return serverError(ctx);
+                    if (!stringInList(next.items, other.id)) next.append(ctx.allocator, other.id) catch return serverError(ctx);
+                }
+                if (relations.items.len >= limit) break;
+            }
+            if (relations.items.len >= limit) break;
+        }
+        frontier = next;
+    }
+
+    return graphQueryResponse(ctx, roots.items, entities.items, relations.items, options, depth, limit);
+}
+
 fn graphPath(ctx: *Context, body: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
@@ -580,14 +705,20 @@ fn graphPath(ctx: *Context, body: []const u8) HttpResponse {
     const obj = parsed.value.object;
     const from_entity_id = json.stringField(obj, "from_entity_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing from_entity_id");
     const to_entity_id = json.stringField(obj, "to_entity_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing to_entity_id");
-    const include_deprecated = json.boolField(obj, "include_deprecated") orelse false;
+    const options = graphTraversalOptions(ctx, obj) catch |err| switch (err) {
+        error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
+        else => return serverError(ctx),
+    };
     const max_depth = graphDepth(json.intField(obj, "max_depth"));
     const limit = positiveLimit(json.intField(obj, "limit"), 100);
 
     const from = (ctx.store.getEntity(ctx.allocator, from_entity_id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "From entity not found");
     const to = (ctx.store.getEntity(ctx.allocator, to_entity_id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "To entity not found");
-    if (!recordVisibleToActor(ctx, from.scope, from.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "From entity not found");
-    if (!recordVisibleToActor(ctx, to.scope, to.permissions_json)) return json.errorResponse(ctx.allocator, 404, "not_found", "To entity not found");
+    const from_visible = visibleGraphEntity(ctx, from, options.include_deprecated) catch return serverError(ctx);
+    const to_visible = visibleGraphEntity(ctx, to, options.include_deprecated) catch return serverError(ctx);
+    if (!from_visible) return json.errorResponse(ctx.allocator, 404, "not_found", "From entity not found");
+    if (!to_visible) return json.errorResponse(ctx.allocator, 404, "not_found", "To entity not found");
+    if (!graph_mod.entityMatchesTypeFilter(from.entity_type, options.entity_types) or !graph_mod.entityMatchesTypeFilter(to.entity_type, options.entity_types)) return graphPathNotFoundResponse(ctx, from.id, to.id, max_depth);
 
     var parents: std.ArrayListUnmanaged(GraphParent) = .empty;
     var frontier: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -601,9 +732,10 @@ fn graphPath(ctx: *Context, body: []const u8) HttpResponse {
         for (frontier.items) |current_entity_id| {
             const raw_relations = ctx.store.listEntityRelations(ctx.allocator, current_entity_id, limit) catch return serverError(ctx);
             for (raw_relations) |relation| {
-                const visible = visibleGraphRelation(ctx, relation, include_deprecated) catch return serverError(ctx);
+                const visible = visibleGraphRelation(ctx, relation, options.include_deprecated) catch return serverError(ctx);
                 if (visible == null) continue;
-                const other = otherEntityForRelation(visible.?, current_entity_id) orelse continue;
+                if (!graphRelationAllowed(visible.?.relation, options)) continue;
+                const other = otherEntityForTraversal(visible.?, current_entity_id, options) orelse continue;
                 if (parentIndex(parents.items, other.id) != null) continue;
                 parents.append(ctx.allocator, .{ .entity_id = other.id, .previous_entity_id = current_entity_id, .relation_id = visible.?.relation.id }) catch return serverError(ctx);
                 if (std.mem.eql(u8, other.id, to.id)) {
@@ -633,20 +765,95 @@ const GraphParent = struct {
     relation_id: ?[]const u8 = null,
 };
 
+const GraphTraversalOptions = struct {
+    direction: graph_mod.Direction = .both,
+    relation_types: []const []const u8 = &[_][]const u8{},
+    entity_types: []const []const u8 = &[_][]const u8{},
+    min_confidence: f64 = 0,
+    include_deprecated: bool = false,
+};
+
+fn graphTraversalOptions(ctx: *Context, obj: std.json.ObjectMap) !GraphTraversalOptions {
+    return .{
+        .direction = try graph_mod.parseDirection(json.stringField(obj, "direction")),
+        .relation_types = try graphStringListField(ctx.allocator, obj, "relation_types", "relation_type"),
+        .entity_types = try graphStringListField(ctx.allocator, obj, "entity_types", "entity_type"),
+        .min_confidence = json.floatField(obj, "min_confidence") orelse 0,
+        .include_deprecated = json.boolField(obj, "include_deprecated") orelse false,
+    };
+}
+
+fn graphRootEntityIds(ctx: *Context, obj: std.json.ObjectMap) ![]const []const u8 {
+    if (json.stringField(obj, "entity_id")) |entity_id| {
+        const out = try ctx.allocator.alloc([]const u8, 1);
+        out[0] = entity_id;
+        return out;
+    }
+    return graphStringListField(ctx.allocator, obj, "entity_ids", "ids");
+}
+
+fn graphStringListField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, array_name: []const u8, singular_name: []const u8) ![]const []const u8 {
+    if (obj.get(array_name)) |value| return graphStringListFromValue(allocator, value);
+    if (json.stringField(obj, singular_name)) |single| {
+        const out = try allocator.alloc([]const u8, 1);
+        out[0] = single;
+        return out;
+    }
+    return &[_][]const u8{};
+}
+
+fn graphStringListFromValue(allocator: std.mem.Allocator, value: std.json.Value) ![]const []const u8 {
+    return switch (value) {
+        .string => |single| blk: {
+            const out = try allocator.alloc([]const u8, 1);
+            out[0] = single;
+            break :blk out;
+        },
+        .array => |items| blk: {
+            var out = try allocator.alloc([]const u8, items.items.len);
+            var count: usize = 0;
+            for (items.items) |item| {
+                if (item != .string) return error.InvalidGraphFilter;
+                out[count] = item.string;
+                count += 1;
+            }
+            break :blk out[0..count];
+        },
+        else => error.InvalidGraphFilter,
+    };
+}
+
+fn graphRelationAllowed(relation: domain.Relation, options: GraphTraversalOptions) bool {
+    if (relation.confidence < options.min_confidence) return false;
+    return graph_mod.relationMatchesTypeFilter(relation.relation_type, options.relation_types);
+}
+
+fn visibleGraphEntity(ctx: *Context, entity: domain.Entity, include_deprecated: bool) !bool {
+    if (!recordVisibleToActor(ctx, entity.scope, entity.permissions_json)) return false;
+    if (include_deprecated) return true;
+    const status = try ctx.store.primitiveLifecycleStatus(ctx.allocator, "entity", entity.id);
+    return domain.isDefaultVisibleStatus(status);
+}
+
 fn visibleGraphRelation(ctx: *Context, relation: domain.Relation, include_deprecated: bool) !?VisibleGraphRelation {
     if (!include_deprecated and !domain.isDefaultVisibleStatus(relation.status)) return null;
     if (!recordVisibleToActor(ctx, relation.scope, relation.permissions_json)) return null;
     const from = (try ctx.store.getEntity(ctx.allocator, relation.from_entity_id)) orelse return null;
     const to = (try ctx.store.getEntity(ctx.allocator, relation.to_entity_id)) orelse return null;
-    if (!recordVisibleToActor(ctx, from.scope, from.permissions_json)) return null;
-    if (!recordVisibleToActor(ctx, to.scope, to.permissions_json)) return null;
+    if (!try visibleGraphEntity(ctx, from, include_deprecated)) return null;
+    if (!try visibleGraphEntity(ctx, to, include_deprecated)) return null;
     return .{ .relation = relation, .from = from, .to = to };
 }
 
-fn otherEntityForRelation(visible: VisibleGraphRelation, current_entity_id: []const u8) ?domain.Entity {
-    if (std.mem.eql(u8, visible.relation.from_entity_id, current_entity_id)) return visible.to;
-    if (std.mem.eql(u8, visible.relation.to_entity_id, current_entity_id)) return visible.from;
-    return null;
+fn otherEntityForTraversal(visible: VisibleGraphRelation, current_entity_id: []const u8, options: GraphTraversalOptions) ?domain.Entity {
+    const direction = if (graph_mod.relationTypeSpec(visible.relation.relation_type)) |spec|
+        if (spec.directed) options.direction else graph_mod.Direction.both
+    else
+        options.direction;
+    const other_id = graph_mod.otherEntityIdForDirection(visible.relation.from_entity_id, visible.relation.to_entity_id, current_entity_id, direction) orelse return null;
+    const other = if (std.mem.eql(u8, visible.from.id, other_id)) visible.from else if (std.mem.eql(u8, visible.to.id, other_id)) visible.to else return null;
+    if (!graph_mod.entityMatchesTypeFilter(other.entity_type, options.entity_types)) return null;
+    return other;
 }
 
 fn graphDepth(value: ?i64) usize {
@@ -693,6 +900,31 @@ fn graphNeighborsResponse(ctx: *Context, root: domain.Entity, entities: []const 
     appendGraphRelations(ctx, &out, relations) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, "]}") catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn graphQueryResponse(ctx: *Context, roots: []const domain.Entity, entities: []const domain.Entity, relations: []const domain.Relation, options: GraphTraversalOptions, depth: usize, limit: usize) HttpResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"roots\":[") catch return serverError(ctx);
+    appendGraphEntities(ctx, &out, roots) catch return serverError(ctx);
+    out.print(ctx.allocator, "],\"depth\":{d},\"limit\":{d},\"direction\":", .{ depth, limit }) catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, graph_mod.directionName(options.direction)) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"relation_types\":[") catch return serverError(ctx);
+    appendStringList(ctx, &out, options.relation_types) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "],\"entity_types\":[") catch return serverError(ctx);
+    appendStringList(ctx, &out, options.entity_types) catch return serverError(ctx);
+    out.print(ctx.allocator, "],\"min_confidence\":{d},\"entities\":[", .{options.min_confidence}) catch return serverError(ctx);
+    appendGraphEntities(ctx, &out, entities) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "],\"relations\":[") catch return serverError(ctx);
+    appendGraphRelations(ctx, &out, relations) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "]}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn appendStringList(ctx: *Context, out: *std.ArrayListUnmanaged(u8), values: []const []const u8) !void {
+    for (values, 0..) |value, i| {
+        if (i > 0) try out.append(ctx.allocator, ',');
+        try json.appendString(out, ctx.allocator, value);
+    }
 }
 
 fn graphPathNotFoundResponse(ctx: *Context, from_entity_id: []const u8, to_entity_id: []const u8, max_depth: usize) HttpResponse {
@@ -801,6 +1033,17 @@ fn relationResponse(ctx: *Context, relation: domain.Relation) HttpResponse {
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
+fn entityResponse(ctx: *Context, entity: domain.Entity) HttpResponse {
+    const status = ctx.store.primitiveLifecycleStatus(ctx.allocator, "entity", entity.id) catch return serverError(ctx);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"entity\":") catch return serverError(ctx);
+    entity.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"status\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, status) catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
 fn engineRegistry(ctx: *Context) HttpResponse {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"engines\":") catch return serverError(ctx);
@@ -851,9 +1094,11 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/memory-atoms", .post = "createMemoryAtom" },
         .{ .path = "/memory-atoms/{id}", .patch = "patchMemoryAtom" },
         .{ .path = "/entities/resolve", .post = "resolveEntity" },
-        .{ .path = "/entities/{id}", .get = "getEntity" },
+        .{ .path = "/entities/{id}", .get = "getEntity", .patch = "patchEntity", .delete = "deleteEntity" },
         .{ .path = "/relations", .post = "createRelation" },
-        .{ .path = "/relations/{id}", .get = "getRelation" },
+        .{ .path = "/relations/{id}", .get = "getRelation", .patch = "patchRelation", .delete = "deleteRelation" },
+        .{ .path = "/graph/schema", .get = "graphSchema" },
+        .{ .path = "/graph/query", .post = "graphQuery" },
         .{ .path = "/graph/neighbors", .post = "graphNeighbors" },
         .{ .path = "/graph/path", .post = "graphPath" },
         .{ .path = "/ingest", .post = "ingest" },
@@ -941,7 +1186,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -1679,7 +1924,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -5529,6 +5774,23 @@ fn canChangeMemoryStatus(ctx: *Context, id: []const u8, status: []const u8) bool
     return memoryAtomWritable(ctx, id);
 }
 
+fn canChangeGraphPrimitiveStatus(ctx: *Context, scope: []const u8, permissions_json: []const u8, status: []const u8) bool {
+    const policy = ctx.store.getPolicyScope(ctx.allocator, scope) catch return false;
+    if (policy) |p| {
+        if (!domain.permissionsWritable(p.permissions_json, ctx.actor_scopes_json)) return false;
+    }
+    if (std.mem.eql(u8, status, "verified") or std.mem.eql(u8, status, "accepted")) {
+        return hasCapability(ctx, "verify") and domain.scopeVerifiable(scope, ctx.actor_scopes_json) and domain.permissionsWritable(permissions_json, ctx.actor_scopes_json);
+    }
+    if (std.mem.eql(u8, status, "deprecated") or std.mem.eql(u8, status, "rejected")) {
+        return hasCapability(ctx, "delete") and domain.scopeDeletable(scope, ctx.actor_scopes_json) and domain.permissionsWritable(permissions_json, ctx.actor_scopes_json);
+    }
+    if (std.mem.eql(u8, status, "stale") or std.mem.eql(u8, status, "superseded")) {
+        return hasCapability(ctx, "verify") and domain.scopeVerifiable(scope, ctx.actor_scopes_json) and domain.permissionsWritable(permissions_json, ctx.actor_scopes_json);
+    }
+    return hasCapability(ctx, "write") and domain.scopeWritable(scope, ctx.actor_scopes_json) and domain.permissionsWritable(permissions_json, ctx.actor_scopes_json);
+}
+
 fn canApplyFeed(ctx: *Context) bool {
     return hasCapability(ctx, "feed_apply") or hasCapability(ctx, "write");
 }
@@ -7772,15 +8034,22 @@ test "api graph neighbors and path are acl aware" {
     const a = try store.resolveEntity(alloc, .{ .entity_type = "project", .name = "Graph A", .scope = "public" });
     const b = try store.resolveEntity(alloc, .{ .entity_type = "service", .name = "Graph B", .scope = "public" });
     const c = try store.resolveEntity(alloc, .{ .entity_type = "feature", .name = "Graph C", .scope = "public" });
+    const d = try store.resolveEntity(alloc, .{ .entity_type = "concept", .name = "Graph D", .scope = "public" });
+    const e = try store.resolveEntity(alloc, .{ .entity_type = "concept", .name = "Graph E", .scope = "public" });
     const secret = try store.resolveEntity(alloc, .{ .entity_type = "service", .name = "Secret Graph Service", .scope = "project:secret", .permissions_json = "[\"team:secret\"]" });
     const secret_source = try store.createSource(alloc, .{ .title = "Secret relation evidence", .scope = "project:secret", .permissions_json = "[\"team:secret\"]", .content = "hidden citation" });
     const secret_source_ids = try std.fmt.allocPrint(alloc, "[\"{s}\"]", .{secret_source.id});
 
     _ = try store.createRelation(alloc, .{ .from_entity_id = a.id, .relation_type = "depends_on", .to_entity_id = b.id, .scope = "public", .source_ids_json = secret_source_ids });
-    _ = try store.createRelation(alloc, .{ .from_entity_id = b.id, .relation_type = "implements", .to_entity_id = c.id, .scope = "public" });
+    const bc = try store.createRelation(alloc, .{ .from_entity_id = b.id, .relation_type = "implements", .to_entity_id = c.id, .scope = "public" });
+    _ = try store.createRelation(alloc, .{ .from_entity_id = d.id, .relation_type = "related_to", .to_entity_id = e.id, .scope = "public" });
     _ = try store.createRelation(alloc, .{ .from_entity_id = b.id, .relation_type = "touches_secret", .to_entity_id = secret.id, .scope = "project:secret", .permissions_json = "[\"team:secret\"]" });
 
     var ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\"]", .actor_capabilities_json = "[\"read\"]" };
+    const schema = handleRequest(&ctx, "GET", "/v1/graph/schema", "", "");
+    try std.testing.expectEqualStrings("200 OK", schema.status);
+    try std.testing.expect(std.mem.indexOf(u8, schema.body, "supersedes") != null);
+
     const neighbors_body = try std.fmt.allocPrint(alloc, "{{\"entity_id\":\"{s}\",\"depth\":2,\"limit\":20}}", .{a.id});
     const neighbors = handleRequest(&ctx, "POST", "/v1/graph/neighbors", neighbors_body, "");
     try std.testing.expectEqualStrings("200 OK", neighbors.status);
@@ -7797,9 +8066,55 @@ test "api graph neighbors and path are acl aware" {
     try std.testing.expect(std.mem.indexOf(u8, path.body, "depends_on") != null);
     try std.testing.expect(std.mem.indexOf(u8, path.body, "implements") != null);
 
+    const reverse_outbound_body = try std.fmt.allocPrint(alloc, "{{\"from_entity_id\":\"{s}\",\"to_entity_id\":\"{s}\",\"max_depth\":3,\"direction\":\"outbound\"}}", .{ c.id, a.id });
+    const reverse_outbound = handleRequest(&ctx, "POST", "/v1/graph/path", reverse_outbound_body, "");
+    try std.testing.expectEqualStrings("200 OK", reverse_outbound.status);
+    try std.testing.expect(std.mem.indexOf(u8, reverse_outbound.body, "\"found\":false") != null);
+
+    const symmetric_outbound_body = try std.fmt.allocPrint(alloc, "{{\"from_entity_id\":\"{s}\",\"to_entity_id\":\"{s}\",\"max_depth\":1,\"direction\":\"outbound\"}}", .{ e.id, d.id });
+    const symmetric_outbound = handleRequest(&ctx, "POST", "/v1/graph/path", symmetric_outbound_body, "");
+    try std.testing.expectEqualStrings("200 OK", symmetric_outbound.status);
+    try std.testing.expect(std.mem.indexOf(u8, symmetric_outbound.body, "\"found\":true") != null);
+
+    const filtered_query_body = try std.fmt.allocPrint(alloc, "{{\"entity_id\":\"{s}\",\"depth\":2,\"direction\":\"outbound\",\"relation_types\":[\"depends_on\"],\"limit\":20}}", .{a.id});
+    const filtered_query = handleRequest(&ctx, "POST", "/v1/graph/query", filtered_query_body, "");
+    try std.testing.expectEqualStrings("200 OK", filtered_query.status);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_query.body, "Graph B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_query.body, "Graph C") == null);
+
     const secret_path_body = try std.fmt.allocPrint(alloc, "{{\"from_entity_id\":\"{s}\",\"to_entity_id\":\"{s}\",\"max_depth\":3}}", .{ a.id, secret.id });
     const secret_path = handleRequest(&ctx, "POST", "/v1/graph/path", secret_path_body, "");
     try std.testing.expectEqualStrings("404 Not Found", secret_path.status);
+
+    var admin_ctx = Context{ .allocator = alloc, .store = &store };
+    const decision = try store.resolveEntity(alloc, .{ .entity_type = "decision", .name = "Invalid Implementer", .scope = "public" });
+    const ticket = try store.resolveEntity(alloc, .{ .entity_type = "ticket", .name = "Invalid Target", .scope = "public" });
+    const invalid_body = try std.fmt.allocPrint(alloc, "{{\"from_entity_id\":\"{s}\",\"relation_type\":\"implements\",\"to_entity_id\":\"{s}\",\"scope\":\"public\"}}", .{ decision.id, ticket.id });
+    const invalid = handleRequest(&admin_ctx, "POST", "/v1/relations", invalid_body, "");
+    try std.testing.expectEqualStrings("400 Bad Request", invalid.status);
+
+    const patch_entity_path = try std.fmt.allocPrint(alloc, "/v1/entities/{s}", .{a.id});
+    const patched_entity = handleRequest(&admin_ctx, "PATCH", patch_entity_path, "{\"status\":\"stale\"}", "");
+    try std.testing.expectEqualStrings("200 OK", patched_entity.status);
+    try std.testing.expect(std.mem.indexOf(u8, patched_entity.body, "\"status\":\"stale\"") != null);
+
+    const delete_relation_path = try std.fmt.allocPrint(alloc, "/v1/relations/{s}", .{bc.id});
+    const deleted_relation = handleRequest(&admin_ctx, "DELETE", delete_relation_path, "", "");
+    try std.testing.expectEqualStrings("200 OK", deleted_relation.status);
+    const after_delete_path = handleRequest(&ctx, "POST", "/v1/graph/path", path_body, "");
+    try std.testing.expectEqualStrings("200 OK", after_delete_path.status);
+    try std.testing.expect(std.mem.indexOf(u8, after_delete_path.body, "\"found\":false") != null);
+
+    const delete_entity_path = try std.fmt.allocPrint(alloc, "/v1/entities/{s}", .{b.id});
+    const deleted_entity = handleRequest(&admin_ctx, "DELETE", delete_entity_path, "", "");
+    try std.testing.expectEqualStrings("200 OK", deleted_entity.status);
+    const after_entity_delete = handleRequest(&ctx, "POST", "/v1/graph/neighbors", neighbors_body, "");
+    try std.testing.expectEqualStrings("200 OK", after_entity_delete.status);
+    try std.testing.expect(std.mem.indexOf(u8, after_entity_delete.body, "Graph B") == null);
+    const include_deleted_body = try std.fmt.allocPrint(alloc, "{{\"entity_id\":\"{s}\",\"depth\":1,\"limit\":20,\"include_deprecated\":true}}", .{a.id});
+    const include_deleted = handleRequest(&ctx, "POST", "/v1/graph/neighbors", include_deleted_body, "");
+    try std.testing.expectEqualStrings("200 OK", include_deleted.status);
+    try std.testing.expect(std.mem.indexOf(u8, include_deleted.body, "Graph B") != null);
 }
 
 test "api get source enforces server-side scope" {

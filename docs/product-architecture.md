@@ -30,7 +30,7 @@ Every feature should reduce to the same primitives instead of becoming a separat
 
 `Entity` is the canonical thing knowledge gathers around: project, service, person, team, repository, API, document, decision, meeting, ticket, customer, feature, incident, or concept.
 
-`Relation` links entities into a knowledge graph: meeting produced decision, decision supersedes decision, page documents service, incident affected service, PR fixes ticket, runbook belongs to service, feature depends on API.
+`Relation` links entities into a knowledge graph: meeting produced decision, decision affects project, decision supersedes decision, page documents service, incident affected service, PR fixes ticket, runbook belongs to service, feature depends on API.
 
 `ContextPack` or `Mise` is prepared context for a person or agent. It is not just top vector chunks. It contains relevant facts, accepted decisions, constraints, forbidden assumptions, related docs/tickets/incidents/runbooks, recent changes, open questions, suggested next steps, and citations.
 

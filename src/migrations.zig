@@ -533,6 +533,9 @@ pub const postgres_schema =
     \\  status text NOT NULL DEFAULT 'proposed',
     \\  created_at_ms bigint NOT NULL
     \\);
+    \\CREATE INDEX IF NOT EXISTS relations_from_idx ON relations(from_entity_id);
+    \\CREATE INDEX IF NOT EXISTS relations_to_idx ON relations(to_entity_id);
+    \\CREATE INDEX IF NOT EXISTS relations_type_status_idx ON relations(relation_type, status);
     \\CREATE TABLE IF NOT EXISTS context_packs (
     \\  id text PRIMARY KEY,
     \\  purpose text NOT NULL,
