@@ -50,7 +50,9 @@ export NULLPANTRY_TOKEN_PRINCIPALS='{
 
 When a token principal matches, its `actor_id`, `scopes`, and `capabilities` are authoritative. Request headers can narrow scopes/capabilities for delegated requests, but cannot escalate them or spoof the token-bound actor id.
 
-For NullClaw remote memory, `agent:nullclaw` grants access to the compatibility memory surface. Session/history endpoints additionally require `session:<id>` or `session:*` for reads and `write:session:<id>` or `write:session:*` for writes. A single trusted NullClaw service token can use `["agent:nullclaw","session:*","write:session:*"]`; multi-agent deployments should issue narrower per-agent/session scopes.
+For NullClaw remote memory, `agent:nullclaw` grants access to the compatibility memory surface. Session/history endpoints additionally require `session:<id>` or `session:*` for reads and `write:session:<id>` or `write:session:*` for writes. A single trusted NullClaw service token can use `["agent:nullclaw","session:*","write:session:*"]`; multi-agent deployments should issue one bearer token principal per agent with a stable unique `actor_id`.
+
+NullClaw compatibility memory is isolated by `actor_id` first and `session_id` second. Global memories with the same key can coexist for different agents, session messages/history/usage are filtered by the token-bound actor, and `GET /v1/nullclaw/memories/count` only counts rows visible to the caller's actor and scopes. Existing rows created before actor isolation have an empty actor and remain visible as legacy shared memory until rewritten or deleted.
 
 Reverse proxies can pass `X-NullPantry-Actor-Id`, `X-NullPantry-Actor-Scopes`, and `X-NullPantry-Actor-Capabilities`. Non-admin tokens can only narrow their configured scopes/capabilities; they cannot escalate through headers or request bodies.
 

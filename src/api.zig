@@ -227,7 +227,7 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
         } else if (!allSessionsWriteAllowed(ctx)) {
             return forbidden(ctx);
         }
-        ctx.store.clearAutoSaved(session_id) catch return serverError(ctx);
+        ctx.store.clearAutoSaved(session_id, nullclawActorFilter(ctx)) catch return serverError(ctx);
         return ok(ctx, "{\"ok\":true}");
     }
     if (eql(seg2, "sessions") and seg3 != null and eql(seg4, "messages")) {
@@ -236,7 +236,7 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
         if (is_post) return saveMessage(ctx, seg3.?, body);
         if (is_get) return loadMessages(ctx, seg3.?);
         if (is_delete) {
-            ctx.store.clearMessages(seg3.?) catch return serverError(ctx);
+            ctx.store.clearMessages(seg3.?, nullclawActorFilter(ctx)) catch return serverError(ctx);
             return ok(ctx, "{\"ok\":true}");
         }
     }
@@ -246,7 +246,7 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
         if (is_put) return saveUsage(ctx, seg3.?, body);
         if (is_get) return loadUsage(ctx, seg3.?);
         if (is_delete) {
-            _ = ctx.store.deleteUsage(seg3.?) catch return serverError(ctx);
+            _ = ctx.store.deleteUsage(seg3.?, nullclawActorFilter(ctx)) catch return serverError(ctx);
             return ok(ctx, "{\"ok\":true}");
         }
     }
@@ -254,14 +254,14 @@ fn handleNullClaw(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[
         if (!allSessionsReadAllowed(ctx)) return forbidden(ctx);
         const limit = parseLimit(json.queryParam(query, "limit"), 50);
         const offset = parseLimit(json.queryParam(query, "offset"), 0);
-        const result = ctx.store.listSessions(ctx.allocator, limit, offset) catch return serverError(ctx);
+        const result = ctx.store.listSessions(ctx.allocator, limit, offset, nullclawActorFilter(ctx)) catch return serverError(ctx);
         return writeHistoryList(ctx, result, limit, offset);
     }
     if (eql(seg2, "history") and seg3 != null and is_get) {
         if (!sessionReadAllowed(ctx, seg3.?)) return forbidden(ctx);
         const limit = parseLimit(json.queryParam(query, "limit"), 100);
         const offset = parseLimit(json.queryParam(query, "offset"), 0);
-        const result = ctx.store.history(ctx.allocator, seg3.?, limit, offset) catch return serverError(ctx);
+        const result = ctx.store.history(ctx.allocator, seg3.?, limit, offset, nullclawActorFilter(ctx)) catch return serverError(ctx);
         return writeHistoryShow(ctx, seg3.?, result, limit, offset);
     }
 
@@ -2477,7 +2477,7 @@ fn compatGet(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
     if (session_id) |sid| {
         if (!sessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
-    const entry = ctx.store.compatGet(ctx.allocator, key, session_id) catch return serverError(ctx);
+    const entry = ctx.store.compatGet(ctx.allocator, key, session_id, ctx.actor_id) catch return serverError(ctx);
     if (entry == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Memory entry not found");
     return compatEntryResponse(ctx, "entry", entry.?);
 }
@@ -2488,7 +2488,7 @@ fn compatList(ctx: *Context, query: []const u8) HttpResponse {
     if (session_id) |sid| {
         if (!sessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
-    const entries = ctx.store.compatList(ctx.allocator, category, session_id) catch return serverError(ctx);
+    const entries = ctx.store.compatList(ctx.allocator, category, session_id, ctx.actor_id) catch return serverError(ctx);
     return compatEntriesResponse(ctx, entries);
 }
 
@@ -2501,7 +2501,7 @@ fn compatSearch(ctx: *Context, body: []const u8) HttpResponse {
     if (session_id) |sid| {
         if (!sessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
-    const entries = ctx.store.compatSearch(ctx.allocator, query, positiveLimit(json.intField(obj, "limit"), 5), session_id, ctx.actor_scopes_json) catch return serverError(ctx);
+    const entries = ctx.store.compatSearch(ctx.allocator, query, positiveLimit(json.intField(obj, "limit"), 5), session_id, ctx.actor_scopes_json, ctx.actor_id) catch return serverError(ctx);
     return compatEntriesResponse(ctx, entries);
 }
 
@@ -2510,20 +2510,20 @@ fn compatDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResponse 
     if (session_id) |sid| {
         if (!sessionWriteAllowed(ctx, sid)) return forbidden(ctx);
     }
-    const deleted = ctx.store.compatDelete(key, session_id) catch return serverError(ctx);
+    const deleted = ctx.store.compatDelete(key, session_id, ctx.actor_id) catch return serverError(ctx);
     if (!deleted) return json.errorResponse(ctx.allocator, 404, "not_found", "Memory entry not found");
     return ok(ctx, "{\"ok\":true}");
 }
 
 fn compatCount(ctx: *Context) HttpResponse {
-    const count = if (allSessionsReadAllowed(ctx))
-        ctx.store.compatCount() catch return serverError(ctx)
-    else blk: {
-        const entries = ctx.store.compatList(ctx.allocator, null, null) catch return serverError(ctx);
-        break :blk entries.len;
-    };
+    const actor_filter: ?[]const u8 = if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) null else ctx.actor_id;
+    const count = ctx.store.compatCount(actor_filter, ctx.actor_scopes_json) catch return serverError(ctx);
     const body = std.fmt.allocPrint(ctx.allocator, "{{\"count\":{d}}}", .{count}) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = body };
+}
+
+fn nullclawActorFilter(ctx: *Context) ?[]const u8 {
+    return if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) null else ctx.actor_id;
 }
 
 fn saveMessage(ctx: *Context, session_id: []const u8, body: []const u8) HttpResponse {
@@ -2532,12 +2532,12 @@ fn saveMessage(ctx: *Context, session_id: []const u8, body: []const u8) HttpResp
     const obj = parsed.value.object;
     const role = json.stringField(obj, "role") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing role");
     const content = json.stringField(obj, "content") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing content");
-    ctx.store.saveMessage(session_id, role, content) catch return serverError(ctx);
+    ctx.store.saveMessage(session_id, role, content, ctx.actor_id) catch return serverError(ctx);
     return ok(ctx, "{\"ok\":true}");
 }
 
 fn loadMessages(ctx: *Context, session_id: []const u8) HttpResponse {
-    const messages = ctx.store.loadMessages(ctx.allocator, session_id) catch return serverError(ctx);
+    const messages = ctx.store.loadMessages(ctx.allocator, session_id, nullclawActorFilter(ctx)) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"messages\":[") catch return serverError(ctx);
     for (messages, 0..) |msg, i| {
@@ -2552,12 +2552,12 @@ fn saveUsage(ctx: *Context, session_id: []const u8, body: []const u8) HttpRespon
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const total = json.intField(parsed.value.object, "total_tokens") orelse 0;
-    ctx.store.saveUsage(session_id, @intCast(@max(total, 0))) catch return serverError(ctx);
+    ctx.store.saveUsage(session_id, @intCast(@max(total, 0)), ctx.actor_id) catch return serverError(ctx);
     return ok(ctx, "{\"ok\":true}");
 }
 
 fn loadUsage(ctx: *Context, session_id: []const u8) HttpResponse {
-    const total_opt = ctx.store.loadUsage(session_id) catch return serverError(ctx);
+    const total_opt = ctx.store.loadUsage(session_id, nullclawActorFilter(ctx)) catch return serverError(ctx);
     const total = total_opt orelse return json.errorResponse(ctx.allocator, 404, "not_found", "No usage for session");
     const body = std.fmt.allocPrint(ctx.allocator, "{{\"total_tokens\":{d}}}", .{total}) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = body };
@@ -2784,6 +2784,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
                 .query_embedding_json = null,
                 .query_embedding_provider = query_embedding_provider,
                 .embedding_dimensions = embedding_dimensions,
+                .actor_id = ctx.actor_id,
             };
         };
         query_embedding_json = try vector_mod.embeddingToJson(ctx.allocator, embedding_result.embedding);
@@ -2805,6 +2806,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
         .query_embedding_json = query_embedding_json,
         .query_embedding_provider = query_embedding_provider,
         .embedding_dimensions = embedding_dimensions,
+        .actor_id = ctx.actor_id,
     };
 }
 
@@ -3201,7 +3203,7 @@ test "api requires bearer token except health" {
     const health_resp = handleRequest(&ctx, "GET", "/health", "", "");
     try std.testing.expectEqualStrings("200 OK", health_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"schema_ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"expected_schema_version\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, health_resp.body, "\"expected_schema_version\":8") != null);
 
     const missing = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"x\"}", "");
     try std.testing.expectEqualStrings("401 Unauthorized", missing.status);
@@ -3379,6 +3381,66 @@ test "api nullclaw compatibility protocol" {
     try std.testing.expectEqualStrings("200 OK", put_colon_session.status);
     const get_colon_session = handleRequest(&ctx, "GET", "/v1/nullclaw/memories/colon.pref?session_id=agent%3Acoder", "", "");
     try std.testing.expectEqualStrings("200 OK", get_colon_session.status);
+}
+
+test "api nullclaw global memory is isolated by token actor" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const principals =
+        \\{"agent-a-token":{"actor_id":"agent:nullclaw:a","scopes":["agent:nullclaw","session:*","write:session:*"],"capabilities":["read","write","delete"]},"agent-b-token":{"actor_id":"agent:nullclaw:b","scopes":["agent:nullclaw","session:*","write:session:*"],"capabilities":["read","write","delete"]}}
+    ;
+    var ctx = Context{ .allocator = arena.allocator(), .store = &store, .token_principals_json = principals };
+    const auth_a = "GET / HTTP/1.1\r\nAuthorization: Bearer agent-a-token\r\n\r\n";
+    const auth_b = "GET / HTTP/1.1\r\nAuthorization: Bearer agent-b-token\r\n\r\n";
+
+    const put_a = handleRequest(&ctx, "PUT", "/v1/nullclaw/memories/shared.pref", "{\"content\":\"Agent A private global memory\",\"category\":\"core\",\"session_id\":null}", auth_a);
+    try std.testing.expectEqualStrings("200 OK", put_a.status);
+    const put_b = handleRequest(&ctx, "PUT", "/v1/nullclaw/memories/shared.pref", "{\"content\":\"Agent B private global memory\",\"category\":\"core\",\"session_id\":null}", auth_b);
+    try std.testing.expectEqualStrings("200 OK", put_b.status);
+
+    const get_a = handleRequest(&ctx, "GET", "/v1/nullclaw/memories/shared.pref", "", auth_a);
+    try std.testing.expectEqualStrings("200 OK", get_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_a.body, "Agent A private global memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_a.body, "Agent B private global memory") == null);
+
+    const get_b = handleRequest(&ctx, "GET", "/v1/nullclaw/memories/shared.pref", "", auth_b);
+    try std.testing.expectEqualStrings("200 OK", get_b.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_b.body, "Agent B private global memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_b.body, "Agent A private global memory") == null);
+
+    const search_a = handleRequest(&ctx, "POST", "/v1/nullclaw/memories/search", "{\"query\":\"Agent B private\",\"limit\":10}", auth_a);
+    try std.testing.expectEqualStrings("200 OK", search_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_a.body, "Agent B private global memory") == null);
+
+    const global_search_a = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Agent B private\",\"scopes\":[\"agent:nullclaw\"],\"use_vector\":false}", auth_a);
+    try std.testing.expectEqualStrings("200 OK", global_search_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, global_search_a.body, "Agent B private global memory") == null);
+
+    const msg_a = handleRequest(&ctx, "POST", "/v1/nullclaw/sessions/shared-session/messages", "{\"role\":\"user\",\"content\":\"Agent A private session memory\"}", auth_a);
+    try std.testing.expectEqualStrings("200 OK", msg_a.status);
+    const msg_b = handleRequest(&ctx, "POST", "/v1/nullclaw/sessions/shared-session/messages", "{\"role\":\"user\",\"content\":\"Agent B private session memory\"}", auth_b);
+    try std.testing.expectEqualStrings("200 OK", msg_b.status);
+
+    const history_a = handleRequest(&ctx, "GET", "/v1/nullclaw/history/shared-session?limit=10&offset=0", "", auth_a);
+    try std.testing.expectEqualStrings("200 OK", history_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, history_a.body, "Agent A private session memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history_a.body, "Agent B private session memory") == null);
+
+    const history_b = handleRequest(&ctx, "GET", "/v1/nullclaw/history/shared-session?limit=10&offset=0", "", auth_b);
+    try std.testing.expectEqualStrings("200 OK", history_b.status);
+    try std.testing.expect(std.mem.indexOf(u8, history_b.body, "Agent B private session memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history_b.body, "Agent A private session memory") == null);
+
+    const usage_a = handleRequest(&ctx, "PUT", "/v1/nullclaw/sessions/shared-session/usage", "{\"total_tokens\":11}", auth_a);
+    try std.testing.expectEqualStrings("200 OK", usage_a.status);
+    const usage_b = handleRequest(&ctx, "PUT", "/v1/nullclaw/sessions/shared-session/usage", "{\"total_tokens\":22}", auth_b);
+    try std.testing.expectEqualStrings("200 OK", usage_b.status);
+    const get_usage_a = handleRequest(&ctx, "GET", "/v1/nullclaw/sessions/shared-session/usage", "", auth_a);
+    try std.testing.expect(std.mem.indexOf(u8, get_usage_a.body, "\"total_tokens\":11") != null);
+    const get_usage_b = handleRequest(&ctx, "GET", "/v1/nullclaw/sessions/shared-session/usage", "", auth_b);
+    try std.testing.expect(std.mem.indexOf(u8, get_usage_b.body, "\"total_tokens\":22") != null);
 }
 
 test "api nullclaw current ApiMemory contract shapes" {
