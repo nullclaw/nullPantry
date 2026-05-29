@@ -47,18 +47,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_tests.step);
 
-    const nullclaw_contract_cmd = b.addSystemCommand(&.{ "sh", "scripts/nullclaw_api_contract.sh" });
-    nullclaw_contract_cmd.step.dependOn(b.getInstallStep());
-    const nullclaw_contract_step = b.step("nullclaw-contract", "Run live NullClaw API compatibility contract against the installed service");
-    nullclaw_contract_step.dependOn(&nullclaw_contract_cmd.step);
-
-    const nullclaw_runtime_contract_cmd = b.addSystemCommand(&.{ "sh", "scripts/nullclaw_runtime_contract.sh" });
-    nullclaw_runtime_contract_cmd.step.dependOn(b.getInstallStep());
-    const nullclaw_runtime_contract_step = b.step("nullclaw-runtime-contract", "Check current NullClaw api memory engine and optionally run its tests against NullPantry");
-    nullclaw_runtime_contract_step.dependOn(&nullclaw_runtime_contract_cmd.step);
-
     const postgres_contract_cmd = b.addRunArtifact(tests);
     postgres_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_POSTGRES_TEST", "1");
     const postgres_contract_step = b.step("postgres-contract", "Run the required Postgres/pgvector storage contract with NULLPANTRY_TEST_POSTGRES_URL");
     postgres_contract_step.dependOn(&postgres_contract_cmd.step);
+
+    const redis_contract_cmd = b.addRunArtifact(tests);
+    redis_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_REDIS_TEST", "1");
+    const redis_contract_step = b.step("redis-contract", "Run the Redis agent-memory contract with NULLPANTRY_TEST_REDIS_URL");
+    redis_contract_step.dependOn(&redis_contract_cmd.step);
 }

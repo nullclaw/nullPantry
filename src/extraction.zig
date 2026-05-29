@@ -241,7 +241,7 @@ test "extraction parses structured meeting lines" {
     const inferred = parseMemoryLine("Alice: we decided to keep NullPantry headless").?;
     try std.testing.expectEqualStrings("decision", inferred.predicate);
 
-    const assignee = parseMemoryLine("Assignee: agent:nullclaw").?;
+    const assignee = parseMemoryLine("Assignee: agent:coder").?;
     try std.testing.expectEqualStrings("owner", assignee.predicate);
 
     const acceptance = parseMemoryLine("Acceptance criteria: context pack includes citations").?;

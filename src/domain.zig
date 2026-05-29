@@ -238,6 +238,8 @@ pub const SearchResult = struct {
     status: []const u8,
     score: f64,
     source_ids_json: []const u8,
+    required_scopes_json: []const u8 = "",
+    actor_isolated: bool = false,
     created_at_ms: i64 = 0,
     confidence: f64 = 0.5,
 
@@ -254,22 +256,28 @@ pub const SearchResult = struct {
         try json.appendString(out, allocator, self.scope);
         try out.appendSlice(allocator, ",\"status\":");
         try json.appendString(out, allocator, self.status);
-        try out.print(allocator, ",\"score\":{d},\"created_at_ms\":{d},\"confidence\":{d},\"citations\":", .{ self.score, self.created_at_ms, self.confidence });
+        try out.print(allocator, ",\"score\":{d},\"created_at_ms\":{d},\"confidence\":{d},\"actor_isolated\":{s},\"required_scopes\":", .{ self.score, self.created_at_ms, self.confidence, if (self.actor_isolated) "true" else "false" });
+        try json.appendRawJsonOr(out, allocator, self.required_scopes_json, "[]");
+        try out.appendSlice(allocator, ",\"citations\":");
         try json.appendRawJsonOr(out, allocator, self.source_ids_json, "[]");
         try out.append(allocator, '}');
     }
 };
 
-pub const CompatMemory = struct {
+pub const AgentMemory = struct {
     id: []const u8,
     key: []const u8,
     content: []const u8,
     category: []const u8,
     timestamp: []const u8,
     session_id: ?[]const u8,
+    actor_id: []const u8,
+    writer_actor_id: []const u8 = "",
+    scope: []const u8,
+    permissions_json: []const u8 = "[]",
     score: ?f64 = null,
 
-    pub fn writeJson(self: CompatMemory, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    pub fn writeJson(self: AgentMemory, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
         try out.appendSlice(allocator, "{\"id\":");
         try json.appendString(out, allocator, self.id);
         try out.appendSlice(allocator, ",\"key\":");
@@ -282,6 +290,16 @@ pub const CompatMemory = struct {
         try json.appendString(out, allocator, self.timestamp);
         try out.appendSlice(allocator, ",\"session_id\":");
         try json.appendNullableString(out, allocator, self.session_id);
+        try out.appendSlice(allocator, ",\"actor_id\":");
+        try json.appendString(out, allocator, self.actor_id);
+        try out.appendSlice(allocator, ",\"owner_id\":");
+        try json.appendString(out, allocator, self.actor_id);
+        try out.appendSlice(allocator, ",\"created_by_actor_id\":");
+        try json.appendString(out, allocator, if (self.writer_actor_id.len > 0) self.writer_actor_id else self.actor_id);
+        try out.appendSlice(allocator, ",\"scope\":");
+        try json.appendString(out, allocator, self.scope);
+        try out.appendSlice(allocator, ",\"permissions\":");
+        try json.appendRawJsonOr(out, allocator, self.permissions_json, "[]");
         try out.appendSlice(allocator, ",\"score\":");
         if (self.score) |s| try out.print(allocator, "{d}", .{s}) else try out.appendSlice(allocator, "null");
         try out.append(allocator, '}');
@@ -305,10 +323,74 @@ pub fn defaultMemoryStatus(created_by: []const u8, scope: []const u8) []const u8
     return "proposed";
 }
 
+pub fn defaultAgentMemoryScope(allocator: std.mem.Allocator, actor_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "agent:{s}", .{actor_id});
+}
+
+pub fn actorGrant(allocator: std.mem.Allocator, actor_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "actor:{s}", .{actor_id});
+}
+
+pub fn actorGrantJson(allocator: std.mem.Allocator, actor_id: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    const grant = try actorGrant(allocator, actor_id);
+    defer allocator.free(grant);
+    try json.appendString(&out, allocator, grant);
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn permissionsContainActorGrant(allocator: std.mem.Allocator, permissions_json: []const u8, actor_id: []const u8) bool {
+    const grant = actorGrant(allocator, actor_id) catch return false;
+    defer allocator.free(grant);
+    return hasJsonString(permissions_json, grant);
+}
+
+pub fn isActorOwnedAgentMemoryScope(scope: []const u8, actor_id: []const u8) bool {
+    if (std.mem.eql(u8, scope, actor_id)) return true;
+    if (std.mem.startsWith(u8, scope, "agent:")) {
+        return std.mem.eql(u8, scope["agent:".len..], actor_id);
+    }
+    return false;
+}
+
+pub fn permissionsAreOpen(permissions_json: []const u8) bool {
+    const trimmed = std.mem.trim(u8, permissions_json, " \t\r\n");
+    return trimmed.len == 0 or std.mem.eql(u8, trimmed, "[]") or hasJsonString(trimmed, "public");
+}
+
 pub fn isDefaultVisibleStatus(status: []const u8) bool {
     return !(std.mem.eql(u8, status, "rejected") or
         std.mem.eql(u8, status, "deprecated") or
         std.mem.eql(u8, status, "superseded"));
+}
+
+pub const prompt_bootstrap_key_prefix = "__bootstrap.prompt.";
+
+pub fn isInternalMemoryKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "autosave_user_") or
+        std.mem.startsWith(u8, key, "autosave_assistant_") or
+        std.mem.eql(u8, key, "last_hygiene_at") or
+        std.mem.startsWith(u8, key, prompt_bootstrap_key_prefix);
+}
+
+pub fn extractMarkdownMemoryKey(content: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "**")) return null;
+    const rest = trimmed[2..];
+    const suffix = std.mem.indexOf(u8, rest, "**:") orelse return null;
+    if (suffix == 0) return null;
+    return rest[0..suffix];
+}
+
+pub fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
+    if (isInternalMemoryKey(key)) return true;
+    if (extractMarkdownMemoryKey(content)) |extracted| {
+        if (isInternalMemoryKey(extracted)) return true;
+    }
+    return false;
 }
 
 fn quotedStringContains(list_json: []const u8, value: []const u8) bool {

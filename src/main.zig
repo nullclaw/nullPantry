@@ -6,6 +6,8 @@ const api = @import("api.zig");
 const ids = @import("ids.zig");
 const store_mod = @import("store.zig");
 const worker = @import("worker.zig");
+const agent_memory_runtime = @import("agent_memory_runtime.zig");
+const redis_mod = @import("redis.zig");
 
 const default_port: u16 = 8765;
 const max_request_size: usize = 2 * 1024 * 1024;
@@ -36,6 +38,9 @@ const RuntimeConfig = struct {
     llm_model: ?[]const u8 = null,
     provider_timeout_secs: u32 = 30,
     worker_interval_ms: u64 = 5000,
+    trust_actor_headers: bool = false,
+    agent_memory_backend: agent_memory_runtime.BackendKind = .native,
+    redis_config: redis_mod.Config = .{},
 };
 
 const ServerState = struct {
@@ -55,9 +60,15 @@ pub fn main(init: std.process.Init) !void {
     const cfg = try parseArgs(allocator, args);
     if (cfg.backend == .sqlite) try ensureParentDirForFile(cfg.db_path);
 
+    const store_options = store_mod.StoreOptions{
+        .agent_memory = .{
+            .backend = cfg.agent_memory_backend,
+            .redis = cfg.redis_config,
+        },
+    };
     var store = switch (cfg.backend) {
-        .sqlite => try store_mod.Store.initSQLite(allocator, cfg.db_path),
-        .postgres => try store_mod.Store.initPostgres(allocator, cfg.postgres_url orelse return error.MissingPostgresUrl),
+        .sqlite => try store_mod.Store.initSQLiteWithOptions(allocator, cfg.db_path, store_options),
+        .postgres => try store_mod.Store.initPostgresWithOptions(allocator, cfg.postgres_url orelse return error.MissingPostgresUrl, store_options),
     };
     defer store.deinit();
 
@@ -68,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("nullpantry v{s}\n", .{build_options.version});
     std.debug.print("listening on http://{s}:{d}\n", .{ cfg.host, cfg.port });
     std.debug.print("storage backend: {s}\n", .{@tagName(cfg.backend)});
+    std.debug.print("agent memory backend: {s}\n", .{cfg.agent_memory_backend.name()});
 
     var state = ServerState{ .allocator = allocator, .store = &store, .cfg = cfg };
     if (cfg.worker_interval_ms > 0) {
@@ -137,6 +149,7 @@ fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
         .llm_api_key = state.cfg.llm_api_key,
         .llm_model = state.cfg.llm_model,
         .provider_timeout_secs = state.cfg.provider_timeout_secs,
+        .trust_actor_headers = state.cfg.trust_actor_headers,
     };
     const response = api.handleRequest(&ctx, method, target, body, raw);
 
@@ -245,6 +258,23 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_WORKER_INTERVAL_MS")) |interval| {
         cfg.worker_interval_ms = std.fmt.parseInt(u64, interval, 10) catch cfg.worker_interval_ms;
     } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_TRUST_ACTOR_HEADERS")) |value| {
+        defer allocator.free(value);
+        cfg.trust_actor_headers = parseBool(value);
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_BACKEND")) |backend| {
+        cfg.agent_memory_backend = agent_memory_runtime.BackendKind.parse(backend);
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_REDIS_URL")) |url| {
+        cfg.redis_config = try redis_mod.parseUrl(allocator, url);
+        cfg.agent_memory_backend = .redis;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_REDIS_KEY_PREFIX")) |prefix| {
+        cfg.redis_config.key_prefix = prefix;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_REDIS_TTL_SECONDS")) |ttl| {
+        cfg.redis_config.ttl_seconds = std.fmt.parseInt(u32, ttl, 10) catch cfg.redis_config.ttl_seconds;
+    } else |_| {}
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -319,15 +349,39 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--worker-interval-ms") and i + 1 < args.len) {
             i += 1;
             cfg.worker_interval_ms = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--trust-actor-headers")) {
+            cfg.trust_actor_headers = true;
+        } else if (std.mem.eql(u8, arg, "--agent-memory-backend") and i + 1 < args.len) {
+            i += 1;
+            cfg.agent_memory_backend = agent_memory_runtime.BackendKind.parse(args[i]);
+        } else if (std.mem.eql(u8, arg, "--redis-url") and i + 1 < args.len) {
+            i += 1;
+            cfg.redis_config = try redis_mod.parseUrl(allocator, args[i]);
+            cfg.agent_memory_backend = .redis;
+        } else if (std.mem.eql(u8, arg, "--redis-key-prefix") and i + 1 < args.len) {
+            i += 1;
+            cfg.redis_config.key_prefix = args[i];
+        } else if (std.mem.eql(u8, arg, "--redis-ttl-seconds") and i + 1 < args.len) {
+            i += 1;
+            cfg.redis_config.ttl_seconds = try std.fmt.parseInt(u32, args[i], 10);
         }
     }
     return cfg;
 }
 
+fn parseBool(raw: []const u8) bool {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
+}
+
 fn printUsage() void {
     std.debug.print(
-        \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--token-principals JSON] [--actor-scopes JSON] [--actor-capabilities JSON] [--worker-scopes JSON] [--worker-capabilities JSON]
+        \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--token-principals JSON] [--actor-scopes JSON] [--actor-capabilities JSON] [--worker-scopes JSON] [--worker-capabilities JSON] [--trust-actor-headers]
         \\       nullpantry --backend postgres --postgres-url URL [--token TOKEN|--token-principals JSON]
+        \\       nullpantry --agent-memory-backend redis --redis-url redis://:pass@host:6379/0
         \\
         \\Environment:
         \\  NULLPANTRY_TOKEN
@@ -346,6 +400,11 @@ fn printUsage() void {
         \\  NULLPANTRY_LLM_MODEL
         \\  NULLPANTRY_PROVIDER_TIMEOUT_SECS
         \\  NULLPANTRY_WORKER_INTERVAL_MS
+        \\  NULLPANTRY_TRUST_ACTOR_HEADERS
+        \\  NULLPANTRY_AGENT_MEMORY_BACKEND
+        \\  NULLPANTRY_REDIS_URL
+        \\  NULLPANTRY_REDIS_KEY_PREFIX
+        \\  NULLPANTRY_REDIS_TTL_SECONDS
         \\
     , .{});
 }
@@ -386,6 +445,28 @@ test "worker principal can be narrowed explicitly" {
 
     try std.testing.expectEqualStrings("[\"project:nullpantry\"]", cfg.worker_scopes_json);
     try std.testing.expectEqualStrings("[\"read\",\"write\",\"verify\"]", cfg.worker_capabilities_json);
+}
+
+test "agent memory redis backend can be configured from args" {
+    const args = [_][:0]const u8{
+        "nullpantry",
+        "--agent-memory-backend",
+        "redis",
+        "--redis-url",
+        "redis://127.0.0.1:6379/2",
+        "--redis-key-prefix",
+        "np-test",
+        "--redis-ttl-seconds",
+        "60",
+    };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+    defer std.testing.allocator.free(cfg.redis_config.host);
+
+    try std.testing.expectEqual(agent_memory_runtime.BackendKind.redis, cfg.agent_memory_backend);
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.redis_config.host);
+    try std.testing.expectEqual(@as(u8, 2), cfg.redis_config.db_index);
+    try std.testing.expectEqualStrings("np-test", cfg.redis_config.key_prefix);
+    try std.testing.expectEqual(@as(u32, 60), cfg.redis_config.ttl_seconds.?);
 }
 
 fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max_bytes: usize) !?[]u8 {
@@ -439,6 +520,8 @@ test {
     _ = @import("retrieval.zig");
     _ = @import("lifecycle.zig");
     _ = @import("providers.zig");
+    _ = @import("redis.zig");
+    _ = @import("agent_memory_runtime.zig");
     _ = @import("artifacts.zig");
     _ = @import("extraction.zig");
     _ = @import("worker.zig");

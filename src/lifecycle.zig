@@ -86,7 +86,7 @@ pub const Diagnostics = struct {
     failed_jobs: usize = 0,
     pending_feed_events: usize = 0,
     open_conflicts: usize = 0,
-    compat_memories: usize = 0,
+    agent_memories: usize = 0,
     sessions: usize = 0,
 
     pub fn health(self: Diagnostics) []const u8 {

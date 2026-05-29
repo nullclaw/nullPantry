@@ -4,6 +4,8 @@ const compat = @import("compat.zig");
 const json = @import("json_util.zig");
 const vector = @import("vector.zig");
 
+pub const max_provider_response_bytes: usize = 8 * 1024 * 1024;
+
 pub const EmbeddingConfig = struct {
     base_url: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
@@ -166,9 +168,6 @@ fn postJson(allocator: std.mem.Allocator, url: []const u8, api_key: ?[]const u8,
     var client: std.http.Client = .{ .allocator = allocator, .io = compat.io() };
     defer client.deinit();
 
-    var response_buffer: std.Io.Writer.Allocating = .init(allocator);
-    defer response_buffer.deinit();
-
     const uri = std.Uri.parse(url) catch return error.ProviderUnavailable;
     var req = client.request(.POST, uri, .{
         .redirect_behavior = .unhandled,
@@ -194,8 +193,21 @@ fn postJson(allocator: std.mem.Allocator, url: []const u8, api_key: ?[]const u8,
     if (response.head.status != .ok) return error.ProviderHttpError;
 
     const reader = response.reader(&.{});
-    _ = reader.streamRemaining(&response_buffer.writer) catch return error.ProviderUnavailable;
-    return allocator.dupe(u8, response_buffer.writer.buffer[0..response_buffer.writer.end]);
+    return readLimitedProviderResponse(allocator, reader, max_provider_response_bytes) catch |err| switch (err) {
+        error.StreamTooLong => error.ProviderResponseTooLarge,
+        error.ReadFailed => error.ProviderUnavailable,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+fn readLimitedProviderResponse(allocator: std.mem.Allocator, reader: *std.Io.Reader, limit: usize) ![]u8 {
+    const read_limit = if (limit == std.math.maxInt(usize)) limit else limit + 1;
+    const body = try reader.allocRemaining(allocator, .limited(read_limit));
+    if (body.len > limit) {
+        allocator.free(body);
+        return error.StreamTooLong;
+    }
+    return body;
 }
 
 fn applyProviderSocketTimeout(connection: ?*std.http.Client.Connection, timeout_secs: u32) void {
@@ -306,4 +318,14 @@ test "providers manifest includes concrete and compatible providers" {
     try appendProvidersJson(std.testing.allocator, &out);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "openai-compatible-embeddings") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ollama") != null);
+}
+
+test "provider response reader enforces byte cap" {
+    var ok_reader: std.Io.Reader = .fixed("abcdef");
+    const ok = try readLimitedProviderResponse(std.testing.allocator, &ok_reader, 6);
+    defer std.testing.allocator.free(ok);
+    try std.testing.expectEqualStrings("abcdef", ok);
+
+    var too_large_reader: std.Io.Reader = .fixed("abcdefg");
+    try std.testing.expectError(error.StreamTooLong, readLimitedProviderResponse(std.testing.allocator, &too_large_reader, 6));
 }

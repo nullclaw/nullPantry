@@ -18,7 +18,7 @@ jobs:
       binary_name: nullpantry
       artifact_prefix: nullpantry
       zig_version: "0.16.0"
-      test_command: zig build test --summary all && zig build nullclaw-contract --summary all && zig build nullclaw-runtime-contract --summary all
+      test_command: zig build test --summary all
       targets_json: >-
         [
           {"os":"ubuntu-latest","target":"linux-x86_64","zig_target":"x86_64-linux-musl"},
@@ -26,3 +26,49 @@ jobs:
           {"os":"macos-latest","target":"macos-aarch64","zig_target":"aarch64-macos"},
           {"os":"windows-latest","target":"windows-x86_64","zig_target":"x86_64-windows"}
         ]
+
+  postgres-contract:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: nullpantry
+          POSTGRES_PASSWORD: nullpantry
+          POSTGRES_DB: nullpantry_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nullpantry -d nullpantry_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+      - run: zig build postgres-contract --summary all
+        env:
+          NULLPANTRY_TEST_POSTGRES_URL: postgres://nullpantry:nullpantry@127.0.0.1:5432/nullpantry_test
+
+  redis-contract:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+      - run: zig build redis-contract --summary all
+        env:
+          NULLPANTRY_TEST_REDIS_URL: redis://127.0.0.1:6379/0

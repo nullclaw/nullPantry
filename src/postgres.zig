@@ -35,58 +35,27 @@ pub fn withConnectTimeout(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}{s}connect_timeout=10", .{ url, sep });
 }
 
-pub const TransportKind = enum {
-    libpq,
-    psql,
-};
-
-pub fn parseTransportKind(raw: ?[]const u8) !TransportKind {
-    const value = std.mem.trim(u8, raw orelse return .libpq, " \t\r\n");
-    if (value.len == 0) return .libpq;
-    if (std.ascii.eqlIgnoreCase(value, "libpq") or std.ascii.eqlIgnoreCase(value, "native")) return .libpq;
-    if (std.ascii.eqlIgnoreCase(value, "psql")) return .psql;
-    return error.InvalidPostgresTransport;
-}
-
-fn configuredTransportKind(allocator: std.mem.Allocator) !TransportKind {
-    const raw = compat.process.getEnvVarOwned(allocator, "NULLPANTRY_POSTGRES_TRANSPORT") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return .libpq,
-        else => |e| return e,
-    };
-    defer allocator.free(raw);
-    return parseTransportKind(raw);
-}
-
-pub const QueryTransport = union(TransportKind) {
+pub const QueryTransport = struct {
     libpq: LibpqTransport,
-    psql: PsqlTransport,
 
     pub fn init(allocator: std.mem.Allocator, url: []const u8) !QueryTransport {
-        return switch (try configuredTransportKind(allocator)) {
-            .libpq => .{ .libpq = try LibpqTransport.init(allocator, url) },
-            .psql => .{ .psql = try PsqlTransport.init(allocator, url) },
-        };
+        return .{ .libpq = try LibpqTransport.init(allocator, url) };
     }
 
     pub fn deinit(self: *QueryTransport) void {
-        switch (self.*) {
-            .libpq => |*transport| transport.deinit(),
-            .psql => |*transport| transport.deinit(),
-        }
+        self.libpq.deinit();
     }
 
     pub fn queryRaw(self: *QueryTransport, allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
-        return switch (self.*) {
-            .libpq => |*transport| transport.queryRaw(allocator, sql),
-            .psql => |*transport| transport.queryRaw(allocator, sql),
-        };
+        return self.libpq.queryRaw(allocator, sql);
+    }
+
+    pub fn queryParamsRaw(self: *QueryTransport, allocator: std.mem.Allocator, sql: []const u8, params: []const ?[]const u8) ![]u8 {
+        return self.libpq.queryParamsRaw(allocator, sql, params);
     }
 
     pub fn name(self: *const QueryTransport) []const u8 {
-        return switch (self.*) {
-            .libpq => |*transport| transport.name(),
-            .psql => |*transport| transport.name(),
-        };
+        return self.libpq.name();
     }
 };
 
@@ -107,6 +76,14 @@ const UnsupportedLibpqTransport = struct {
         _ = self;
         _ = allocator;
         _ = sql;
+        return error.LibpqUnavailable;
+    }
+
+    pub fn queryParamsRaw(self: *UnsupportedLibpqTransport, allocator: std.mem.Allocator, sql: []const u8, params: []const ?[]const u8) ![]u8 {
+        _ = self;
+        _ = allocator;
+        _ = sql;
+        _ = params;
         return error.LibpqUnavailable;
     }
 
@@ -163,6 +140,52 @@ const NativeLibpqTransport = struct {
         const result = self.lib.PQexec(conn, sql_z.ptr) orelse return error.PostgresCommandFailed;
         defer self.lib.PQclear(result);
 
+        return try self.resultToText(allocator, result);
+    }
+
+    pub fn queryParamsRaw(self: *NativeLibpqTransport, allocator: std.mem.Allocator, sql: []const u8, params: []const ?[]const u8) ![]u8 {
+        const conn = try self.acquireConnection();
+        defer self.releaseConnection(conn);
+
+        const sql_z = try allocator.dupeZ(u8, sql);
+        defer allocator.free(sql_z);
+
+        var owned_params = try allocator.alloc(?[:0]u8, params.len);
+        defer {
+            for (owned_params) |maybe_param| {
+                if (maybe_param) |param| allocator.free(param);
+            }
+            allocator.free(owned_params);
+        }
+        var values = try allocator.alloc(?[*:0]const u8, params.len);
+        defer allocator.free(values);
+        for (params, 0..) |maybe_value, i| {
+            if (maybe_value) |value| {
+                const z = try allocator.dupeZ(u8, value);
+                owned_params[i] = z;
+                values[i] = z.ptr;
+            } else {
+                owned_params[i] = null;
+                values[i] = null;
+            }
+        }
+
+        const result = self.lib.PQexecParams(
+            conn,
+            sql_z.ptr,
+            @intCast(params.len),
+            null,
+            if (values.len > 0) values.ptr else null,
+            null,
+            null,
+            0,
+        ) orelse return error.PostgresCommandFailed;
+        defer self.lib.PQclear(result);
+
+        return try self.resultToText(allocator, result);
+    }
+
+    fn resultToText(self: *NativeLibpqTransport, allocator: std.mem.Allocator, result: *PGresult) ![]u8 {
         const status = self.lib.PQresultStatus(result);
         return switch (status) {
             pgres_empty_query, pgres_command_ok => allocator.dupe(u8, ""),
@@ -192,7 +215,10 @@ const NativeLibpqTransport = struct {
     }
 
     fn releaseConnection(self: *NativeLibpqTransport, conn: *PGconn) void {
-        if (self.max_idle_connections == 0 or self.lib.PQstatus(conn) != connection_ok) {
+        if (self.max_idle_connections == 0 or
+            self.lib.PQstatus(conn) != connection_ok or
+            self.lib.PQtransactionStatus(conn) != pqtrans_idle)
+        {
             self.lib.PQfinish(conn);
             return;
         }
@@ -213,6 +239,17 @@ const NativeLibpqTransport = struct {
         if (self.lib.PQstatus(conn) != connection_ok) {
             self.lib.PQfinish(conn);
             return error.PostgresConnectionFailed;
+        }
+        var timeout_buf: [64]u8 = undefined;
+        const timeout_sql = std.fmt.bufPrintZ(&timeout_buf, "SET statement_timeout = '{d}ms'", .{statement_timeout_ms}) catch unreachable;
+        const result = self.lib.PQexec(conn, timeout_sql.ptr) orelse {
+            self.lib.PQfinish(conn);
+            return error.PostgresCommandFailed;
+        };
+        defer self.lib.PQclear(result);
+        if (self.lib.PQresultStatus(result) != pgres_command_ok) {
+            self.lib.PQfinish(conn);
+            return error.PostgresCommandFailed;
         }
         return conn;
     }
@@ -237,11 +274,15 @@ const connection_ok: c_int = 0;
 const pgres_empty_query: c_int = 0;
 const pgres_command_ok: c_int = 1;
 const pgres_tuples_ok: c_int = 2;
+const pqtrans_idle: c_int = 0;
 
 const FnPQconnectdb = *const fn ([*:0]const u8) callconv(.c) ?*PGconn;
 const FnPQfinish = *const fn (?*PGconn) callconv(.c) void;
 const FnPQstatus = *const fn (?*PGconn) callconv(.c) c_int;
+const FnPQtransactionStatus = *const fn (?*PGconn) callconv(.c) c_int;
 const FnPQexec = *const fn (?*PGconn, [*:0]const u8) callconv(.c) ?*PGresult;
+const Oid = c_uint;
+const FnPQexecParams = *const fn (?*PGconn, [*:0]const u8, c_int, ?[*]const Oid, ?[*]const ?[*:0]const u8, ?[*]const c_int, ?[*]const c_int, c_int) callconv(.c) ?*PGresult;
 const FnPQresultStatus = *const fn (?*PGresult) callconv(.c) c_int;
 const FnPQntuples = *const fn (?*PGresult) callconv(.c) c_int;
 const FnPQnfields = *const fn (?*PGresult) callconv(.c) c_int;
@@ -254,7 +295,9 @@ const NativeLibpqLibrary = struct {
     PQconnectdb: FnPQconnectdb,
     PQfinish: FnPQfinish,
     PQstatus: FnPQstatus,
+    PQtransactionStatus: FnPQtransactionStatus,
     PQexec: FnPQexec,
+    PQexecParams: FnPQexecParams,
     PQresultStatus: FnPQresultStatus,
     PQntuples: FnPQntuples,
     PQnfields: FnPQnfields,
@@ -289,7 +332,9 @@ const NativeLibpqLibrary = struct {
             .PQconnectdb = dyn.lookup(FnPQconnectdb, "PQconnectdb") orelse return error.MissingLibpqSymbol,
             .PQfinish = dyn.lookup(FnPQfinish, "PQfinish") orelse return error.MissingLibpqSymbol,
             .PQstatus = dyn.lookup(FnPQstatus, "PQstatus") orelse return error.MissingLibpqSymbol,
+            .PQtransactionStatus = dyn.lookup(FnPQtransactionStatus, "PQtransactionStatus") orelse return error.MissingLibpqSymbol,
             .PQexec = dyn.lookup(FnPQexec, "PQexec") orelse return error.MissingLibpqSymbol,
+            .PQexecParams = dyn.lookup(FnPQexecParams, "PQexecParams") orelse return error.MissingLibpqSymbol,
             .PQresultStatus = dyn.lookup(FnPQresultStatus, "PQresultStatus") orelse return error.MissingLibpqSymbol,
             .PQntuples = dyn.lookup(FnPQntuples, "PQntuples") orelse return error.MissingLibpqSymbol,
             .PQnfields = dyn.lookup(FnPQnfields, "PQnfields") orelse return error.MissingLibpqSymbol,
@@ -317,68 +362,6 @@ fn defaultLibpqCandidates() []const []const u8 {
         .linux => &.{ "libpq.so.5", "libpq.so" },
         else => &.{ "libpq.so.5", "libpq.so", "libpq.5.dylib", "libpq.dylib" },
     };
-}
-
-const PsqlTransport = struct {
-    allocator: std.mem.Allocator,
-    url: []const u8,
-    psql_bin: []const u8,
-
-    pub fn init(allocator: std.mem.Allocator, url: []const u8) !PsqlTransport {
-        const owned_url = try allocator.dupe(u8, url);
-        errdefer allocator.free(owned_url);
-        const psql_bin = compat.process.getEnvVarOwned(allocator, "NULLPANTRY_PSQL_BIN") catch blk: {
-            break :blk try allocator.dupe(u8, "psql");
-        };
-        return .{ .allocator = allocator, .url = owned_url, .psql_bin = psql_bin };
-    }
-
-    pub fn deinit(self: *PsqlTransport) void {
-        self.allocator.free(self.url);
-        self.allocator.free(self.psql_bin);
-    }
-
-    pub fn name(self: *const PsqlTransport) []const u8 {
-        _ = self;
-        return "psql";
-    }
-
-    pub fn queryRaw(self: *PsqlTransport, allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
-        const guarded_sql = try std.fmt.allocPrint(allocator, "SET statement_timeout = '{d}ms';\n{s}", .{ statement_timeout_ms, sql });
-        defer allocator.free(guarded_sql);
-        var env_map = std.process.Environ.Map.init(allocator);
-        defer env_map.deinit();
-        const inherited_env = [_][]const u8{ "PATH", "HOME", "USER", "LANG", "LC_ALL", "PGSSLMODE", "PGSSLROOTCERT", "PGSERVICE", "PGSERVICEFILE", "PGPASSFILE" };
-        inline for (inherited_env) |env_name| {
-            if (compat.process.getEnvVarOwned(allocator, env_name)) |value| {
-                defer allocator.free(value);
-                try env_map.put(env_name, value);
-            } else |_| {}
-        }
-        try env_map.put("PGDATABASE", self.url);
-        const argv = [_][]const u8{ self.psql_bin, "-X", "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A", "-c", guarded_sql };
-        const result = try std.process.run(allocator, compat.io(), .{
-            .argv = &argv,
-            .environ_map = &env_map,
-            .stdout_limit = .limited(32 * 1024 * 1024),
-            .stderr_limit = .limited(4 * 1024 * 1024),
-        });
-        defer allocator.free(result.stderr);
-        defer allocator.free(result.stdout);
-        switch (result.term) {
-            .exited => |code| if (code != 0) return error.PostgresCommandFailed,
-            else => return error.PostgresCommandFailed,
-        }
-        return allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
-    }
-};
-
-test "postgres transport selection defaults to native libpq" {
-    try std.testing.expectEqual(TransportKind.libpq, try parseTransportKind(null));
-    try std.testing.expectEqual(TransportKind.libpq, try parseTransportKind(""));
-    try std.testing.expectEqual(TransportKind.libpq, try parseTransportKind("native"));
-    try std.testing.expectEqual(TransportKind.psql, try parseTransportKind("psql"));
-    try std.testing.expectError(error.InvalidPostgresTransport, parseTransportKind("auto"));
 }
 
 test "postgres url connect timeout is added only to postgres urls" {

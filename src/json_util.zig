@@ -175,6 +175,7 @@ pub fn errorResponse(allocator: std.mem.Allocator, code: u16, code_text: []const
         401 => "401 Unauthorized",
         403 => "403 Forbidden",
         404 => "404 Not Found",
+        410 => "410 Gone",
         409 => "409 Conflict",
         500 => "500 Internal Server Error",
         else => "400 Bad Request",
