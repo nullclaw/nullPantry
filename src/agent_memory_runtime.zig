@@ -705,7 +705,21 @@ pub const RedisAgentMemory = struct {
         var old_entry = try self.agentMemoryFromHash(self.allocator, old_hash);
         defer if (old_entry) |*entry| freeAgentMemory(self.allocator, entry);
 
-        var hset = try self.client.command(&.{
+        const global = try self.globalIndexKey(allocator);
+        defer allocator.free(global);
+        const owner = try self.ownerIndexKey(allocator, owner_actor);
+        defer allocator.free(owner);
+        const cat = try self.categoryIndexKey(allocator, input.category);
+        defer allocator.free(cat);
+        const session_index = if (input.session_id) |sid| try self.agentSessionIndexKey(allocator, owner_actor, sid) else null;
+        defer if (session_index) |key_value| allocator.free(key_value);
+
+        try self.beginTransaction();
+        var committed = false;
+        defer if (!committed) self.discardTransaction();
+
+        if (old_entry) |entry| try self.queueRemoveEntryIndexes(entry_key, entry);
+        try self.queueCommand(&.{
             "HSET",             entry_key,
             "id",               entry_id,
             "key",              input.key,
@@ -718,16 +732,18 @@ pub const RedisAgentMemory = struct {
             "scope",            scope,
             "permissions_json", permissions,
         });
-        defer hset.deinit(self.allocator);
-
-        if (old_entry) |entry| try self.removeEntryIndexes(entry_key, entry);
-        try self.indexEntry(entry_key, owner_actor, input.session_id, input.category);
-        if (self.ttl_seconds) |ttl| {
-            var ttl_buf: [16]u8 = undefined;
-            const ttl_text = try std.fmt.bufPrint(&ttl_buf, "{d}", .{ttl});
-            var expire = try self.client.command(&.{ "EXPIRE", entry_key, ttl_text });
-            expire.deinit(self.allocator);
-        }
+        try self.queueCommand(&.{ "SADD", global, entry_key });
+        try self.queueCommand(&.{ "SADD", owner, entry_key });
+        try self.queueCommand(&.{ "SADD", cat, entry_key });
+        if (session_index) |key_value| try self.queueCommand(&.{ "SADD", key_value, entry_key });
+        try self.queueExpireKey(entry_key);
+        try self.queueExpireKey(global);
+        try self.queueExpireKey(owner);
+        try self.queueExpireKey(cat);
+        if (session_index) |key_value| try self.queueExpireKey(key_value);
+        var exec = try self.execTransaction();
+        exec.deinit(self.allocator);
+        committed = true;
 
         return (try self.get(allocator, input.key, input.session_id, owner_actor)).?;
     }
@@ -799,14 +815,24 @@ pub const RedisAgentMemory = struct {
         defer self.allocator.free(entry_key);
         var existing_hash = try self.client.command(&.{ "HGETALL", entry_key });
         defer existing_hash.deinit(self.allocator);
+        try self.beginTransaction();
+        var committed = false;
+        defer if (!committed) self.discardTransaction();
         if (try self.agentMemoryFromHash(self.allocator, existing_hash)) |existing| {
             var mutable_existing = existing;
             defer freeAgentMemory(self.allocator, &mutable_existing);
-            try self.removeEntryIndexes(entry_key, mutable_existing);
+            try self.queueRemoveEntryIndexes(entry_key, mutable_existing);
         }
-        var resp = try self.client.command(&.{ "DEL", entry_key });
+        try self.queueCommand(&.{ "DEL", entry_key });
+        var resp = try self.execTransaction();
+        committed = true;
         defer resp.deinit(self.allocator);
-        return switch (resp) {
+        const replies = switch (resp) {
+            .array => |maybe_items| maybe_items orelse return false,
+            else => return false,
+        };
+        if (replies.len == 0) return false;
+        return switch (replies[replies.len - 1]) {
             .integer => |changed| changed > 0,
             else => false,
         };
@@ -845,16 +871,20 @@ pub const RedisAgentMemory = struct {
         const created_text = try std.fmt.allocPrint(self.allocator, "{d}", .{created_at});
         defer self.allocator.free(created_text);
 
-        var rpush = try self.client.command(&.{ "RPUSH", list_key, payload });
-        rpush.deinit(self.allocator);
-        var sadd = try self.client.command(&.{ "SADD", sessions_key, session_id });
-        sadd.deinit(self.allocator);
-        var hset = try self.client.command(&.{ "HSET", meta_key, "last_message_at", created_text, "session_id", session_id });
-        hset.deinit(self.allocator);
-        var hsetnx = try self.client.command(&.{ "HSETNX", meta_key, "first_message_at", created_text });
-        hsetnx.deinit(self.allocator);
-        var hincr = try self.client.command(&.{ "HINCRBY", meta_key, "message_count", "1" });
-        hincr.deinit(self.allocator);
+        try self.beginTransaction();
+        var committed = false;
+        defer if (!committed) self.discardTransaction();
+        try self.queueCommand(&.{ "RPUSH", list_key, payload });
+        try self.queueCommand(&.{ "SADD", sessions_key, session_id });
+        try self.queueCommand(&.{ "HSET", meta_key, "last_message_at", created_text, "session_id", session_id });
+        try self.queueCommand(&.{ "HSETNX", meta_key, "first_message_at", created_text });
+        try self.queueCommand(&.{ "HINCRBY", meta_key, "message_count", "1" });
+        try self.queueExpireKey(list_key);
+        try self.queueExpireKey(meta_key);
+        try self.queueExpireKey(sessions_key);
+        var exec = try self.execTransaction();
+        exec.deinit(self.allocator);
+        committed = true;
     }
 
     pub fn loadMessages(self: *RedisAgentMemory, allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8) ![]Message {
@@ -874,10 +904,14 @@ pub const RedisAgentMemory = struct {
         defer self.allocator.free(meta_key);
         const sessions_key = try self.sessionsIndexKey(self.allocator, actor);
         defer self.allocator.free(sessions_key);
-        var del = try self.client.command(&.{ "DEL", list_key, meta_key });
-        del.deinit(self.allocator);
-        var srem = try self.client.command(&.{ "SREM", sessions_key, session_id });
-        srem.deinit(self.allocator);
+        try self.beginTransaction();
+        var committed = false;
+        defer if (!committed) self.discardTransaction();
+        try self.queueCommand(&.{ "DEL", list_key, meta_key });
+        try self.queueCommand(&.{ "SREM", sessions_key, session_id });
+        var exec = try self.execTransaction();
+        exec.deinit(self.allocator);
+        committed = true;
     }
 
     pub fn clearAutoSaved(self: *RedisAgentMemory, session_id: ?[]const u8, actor_id: ?[]const u8) !void {
@@ -904,8 +938,14 @@ pub const RedisAgentMemory = struct {
         defer self.allocator.free(key);
         const value = try std.fmt.allocPrint(self.allocator, "{d}", .{total_tokens});
         defer self.allocator.free(value);
-        var set = try self.client.command(&.{ "SET", key, value });
-        set.deinit(self.allocator);
+        try self.beginTransaction();
+        var committed = false;
+        defer if (!committed) self.discardTransaction();
+        try self.queueCommand(&.{ "SET", key, value });
+        try self.queueExpireKey(key);
+        var exec = try self.execTransaction();
+        exec.deinit(self.allocator);
+        committed = true;
     }
 
     pub fn deleteUsage(self: *RedisAgentMemory, session_id: []const u8, actor_id: ?[]const u8) !bool {
@@ -988,6 +1028,48 @@ pub const RedisAgentMemory = struct {
         return .{ .total = @intCast(total), .messages = out };
     }
 
+    fn beginTransaction(self: *RedisAgentMemory) !void {
+        var resp = try self.client.command(&.{"MULTI"});
+        defer resp.deinit(self.allocator);
+        try expectRedisSimple(resp, "OK");
+    }
+
+    fn queueCommand(self: *RedisAgentMemory, args: []const []const u8) !void {
+        var resp = try self.client.command(args);
+        defer resp.deinit(self.allocator);
+        try expectRedisSimple(resp, "QUEUED");
+    }
+
+    fn execTransaction(self: *RedisAgentMemory) !redis.RespValue {
+        var resp = try self.client.command(&.{"EXEC"});
+        errdefer resp.deinit(self.allocator);
+        switch (resp) {
+            .array => |maybe_items| {
+                if (maybe_items) |items| {
+                    for (items) |item| {
+                        if (item == .err) return error.RedisTransactionFailed;
+                    }
+                }
+                return resp;
+            },
+            .err => return error.RedisTransactionFailed,
+            else => return error.UnexpectedRedisResponse,
+        }
+    }
+
+    fn discardTransaction(self: *RedisAgentMemory) void {
+        var resp = self.client.command(&.{"DISCARD"}) catch return;
+        resp.deinit(self.allocator);
+    }
+
+    fn queueExpireKey(self: *RedisAgentMemory, key: []const u8) !void {
+        const ttl = self.ttl_seconds orelse return;
+        if (ttl == 0) return;
+        var ttl_buf: [16]u8 = undefined;
+        const ttl_text = try std.fmt.bufPrint(&ttl_buf, "{d}", .{ttl});
+        try self.queueCommand(&.{ "EXPIRE", key, ttl_text });
+    }
+
     fn indexEntry(self: *RedisAgentMemory, entry_key: []const u8, owner_actor: []const u8, session_id: ?[]const u8, category: []const u8) !void {
         const global = try self.globalIndexKey(self.allocator);
         defer self.allocator.free(global);
@@ -1006,6 +1088,23 @@ pub const RedisAgentMemory = struct {
             defer self.allocator.free(session);
             sadd = try self.client.command(&.{ "SADD", session, entry_key });
             sadd.deinit(self.allocator);
+        }
+    }
+
+    fn queueRemoveEntryIndexes(self: *RedisAgentMemory, entry_key: []const u8, entry: domain.AgentMemory) !void {
+        const global = try self.globalIndexKey(self.allocator);
+        defer self.allocator.free(global);
+        const owner = try self.ownerIndexKey(self.allocator, entry.actor_id);
+        defer self.allocator.free(owner);
+        const cat = try self.categoryIndexKey(self.allocator, entry.category);
+        defer self.allocator.free(cat);
+        try self.queueCommand(&.{ "SREM", global, entry_key });
+        try self.queueCommand(&.{ "SREM", owner, entry_key });
+        try self.queueCommand(&.{ "SREM", cat, entry_key });
+        if (entry.session_id) |sid| {
+            const session = try self.agentSessionIndexKey(self.allocator, entry.actor_id, sid);
+            defer self.allocator.free(session);
+            try self.queueCommand(&.{ "SREM", session, entry_key });
         }
     }
 
@@ -1220,6 +1319,14 @@ pub const RedisAgentMemory = struct {
         return std.fmt.allocPrint(allocator, "{s}:sessions:{s}:{s}:usage", .{ self.prefix, actor_hex, session_hex });
     }
 };
+
+fn expectRedisSimple(resp: redis.RespValue, expected: []const u8) !void {
+    return switch (resp) {
+        .simple_string => |value| if (std.mem.eql(u8, value, expected)) {} else error.UnexpectedRedisResponse,
+        .err => error.RedisCommandFailed,
+        else => error.UnexpectedRedisResponse,
+    };
+}
 
 fn entryVisible(allocator: std.mem.Allocator, entry: domain.AgentMemory, actor_id: []const u8, scopes_json: []const u8) !bool {
     const record_visible = domain.scopeVisible(entry.scope, scopes_json) and
@@ -1570,6 +1677,7 @@ test "redis agent memory contract when configured" {
     }
     cfg.key_prefix = try std.fmt.allocPrint(std.testing.allocator, "np-test:{d}", .{ids.nowMs()});
     defer std.testing.allocator.free(cfg.key_prefix);
+    cfg.ttl_seconds = 60;
 
     var runtime = try Runtime.init(std.testing.allocator, .{ .backend = .redis, .redis = cfg });
     defer runtime.deinit();
@@ -1596,6 +1704,19 @@ test "redis agent memory contract when configured" {
         freeAgentMemory(std.testing.allocator, &copy);
     }
     try std.testing.expectEqualStrings("agent a private", a.content);
+    switch (runtime) {
+        .redis => |*engine| {
+            const key = try engine.entryKey(std.testing.allocator, "agent:a", null, "pref.lang");
+            defer std.testing.allocator.free(key);
+            var ttl = try engine.client.command(&.{ "TTL", key });
+            defer ttl.deinit(std.testing.allocator);
+            try std.testing.expect(switch (ttl) {
+                .integer => |value| value > 0,
+                else => false,
+            });
+        },
+        else => unreachable,
+    }
     const b = (try runtime.get(std.testing.allocator, "pref.lang", null, "agent:b")).?;
     defer {
         var copy = b;
@@ -1610,6 +1731,25 @@ test "redis agent memory contract when configured" {
     try std.testing.expectEqualStrings("team shared", shared_visible.content);
     try std.testing.expect((try runtime.getVisible(std.testing.allocator, "team.pref", null, "agent:c", "[\"public\"]")) == null);
 
+    const private_search = try runtime.search(std.testing.allocator, "agent a", 10, null, "[]", "agent:a");
+    defer {
+        for (private_search) |*entry| freeAgentMemory(std.testing.allocator, entry);
+        std.testing.allocator.free(private_search);
+    }
+    try std.testing.expect(private_search.len > 0);
+    try std.testing.expectEqualStrings("agent a private", private_search[0].content);
+    const shared_search = try runtime.search(std.testing.allocator, "team", 10, null, "[\"team:alpha\"]", "agent:b");
+    defer {
+        for (shared_search) |*entry| freeAgentMemory(std.testing.allocator, entry);
+        std.testing.allocator.free(shared_search);
+    }
+    var saw_shared = false;
+    for (shared_search) |entry| {
+        if (std.mem.eql(u8, entry.content, "team shared")) saw_shared = true;
+    }
+    try std.testing.expect(saw_shared);
+    try std.testing.expect((try runtime.count("agent:a", "[]")) >= 1);
+
     try runtime.saveMessage("sess", "user", "hello from a", "agent:a");
     try runtime.saveMessage("sess", "user", "hello from b", "agent:b");
     const a_messages = try runtime.loadMessages(std.testing.allocator, "sess", "agent:a");
@@ -1622,4 +1762,36 @@ test "redis agent memory contract when configured" {
     }
     try std.testing.expectEqual(@as(usize, 1), a_messages.len);
     try std.testing.expectEqualStrings("hello from a", a_messages[0].content);
+    try runtime.saveMessage("sess", "autosave_user", "draft", "agent:a");
+    try runtime.saveMessage("sess", "assistant", "kept", "agent:a");
+    try runtime.clearAutoSaved("sess", "agent:a");
+    const history = try runtime.history(std.testing.allocator, "sess", 10, 0, "agent:a");
+    defer {
+        for (history.messages) |message| {
+            std.testing.allocator.free(message.role);
+            std.testing.allocator.free(message.content);
+        }
+        std.testing.allocator.free(history.messages);
+    }
+    try std.testing.expectEqual(@as(u64, 2), history.total);
+    try std.testing.expectEqualStrings("hello from a", history.messages[0].content);
+    try std.testing.expectEqualStrings("kept", history.messages[1].content);
+    const sessions = try runtime.listSessions(std.testing.allocator, 10, 0, "agent:a");
+    defer {
+        for (sessions.sessions) |session| std.testing.allocator.free(session.session_id);
+        std.testing.allocator.free(sessions.sessions);
+    }
+    try std.testing.expectEqual(@as(u64, 1), sessions.total);
+    try runtime.saveUsage("sess", 128, "agent:a");
+    try std.testing.expectEqual(@as(?u64, 128), try runtime.loadUsage("sess", "agent:a"));
+    try std.testing.expect(try runtime.deleteUsage("sess", "agent:a"));
+    try std.testing.expectEqual(@as(?u64, null), try runtime.loadUsage("sess", "agent:a"));
+    try std.testing.expect(try runtime.delete("pref.lang", null, "agent:a", "agent:a"));
+    try std.testing.expect((try runtime.get(std.testing.allocator, "pref.lang", null, "agent:a")) == null);
+    const still_b = (try runtime.get(std.testing.allocator, "pref.lang", null, "agent:b")).?;
+    defer {
+        var copy = still_b;
+        freeAgentMemory(std.testing.allocator, &copy);
+    }
+    try std.testing.expectEqualStrings("agent b private", still_b.content);
 }
