@@ -80,6 +80,8 @@ pub const Diagnostics = struct {
     total_memory_atoms: usize,
     stale_memory_atoms: usize,
     vector_outbox_pending: usize,
+    lucid_projection_pending: usize = 0,
+    lucid_projection_failed: usize = 0,
     cache_entries: usize,
     queued_jobs: usize = 0,
     running_jobs: usize = 0,
@@ -91,7 +93,9 @@ pub const Diagnostics = struct {
 
     pub fn health(self: Diagnostics) []const u8 {
         if (self.failed_jobs > 0) return "degraded";
+        if (self.lucid_projection_failed > 0) return "degraded";
         if (self.vector_outbox_pending > 1000) return "degraded";
+        if (self.lucid_projection_pending > 1000) return "degraded";
         if (self.queued_jobs > 1000 or self.pending_feed_events > 1000) return "degraded";
         if (self.total_memory_atoms > 0 and self.stale_memory_atoms * 2 > self.total_memory_atoms) return "needs_review";
         return "ok";

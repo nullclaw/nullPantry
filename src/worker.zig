@@ -5,6 +5,8 @@ const extraction = @import("extraction.zig");
 const providers = @import("providers.zig");
 const vector = @import("vector.zig");
 const json = @import("json_util.zig");
+const ids = @import("ids.zig");
+const compat = @import("compat.zig");
 
 pub const RunOptions = struct {
     scopes_json: []const u8 = "[\"admin\"]",
@@ -28,6 +30,8 @@ pub const RunResult = struct {
     jobs_failed: usize = 0,
     vector_outbox_processed: usize = 0,
     vector_outbox_failed: usize = 0,
+    lucid_projection_processed: usize = 0,
+    lucid_projection_failed: usize = 0,
 };
 
 pub fn runOnce(allocator: std.mem.Allocator, store: *store_mod.Store, options: RunOptions) !RunResult {
@@ -47,10 +51,12 @@ pub fn runOnce(allocator: std.mem.Allocator, store: *store_mod.Store, options: R
         if (runClaimedJob(allocator, store, job, options)) |summary_json| {
             _ = try store.finishJob(job.id, "succeeded", summary_json, null);
             result.jobs_succeeded += 1;
+            if (std.mem.eql(u8, job.job_type, "lucid_projection")) result.lucid_projection_processed += 1;
         } else |err| {
             const error_text = @errorName(err);
             _ = try store.finishJob(job.id, "failed", "{}", error_text);
             result.jobs_failed += 1;
+            if (std.mem.eql(u8, job.job_type, "lucid_projection")) result.lucid_projection_failed += 1;
         }
     }
     return result;
@@ -85,6 +91,9 @@ pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job:
         const scopes_json = try jobExecutionScopesJson(allocator, job);
         const conflicts = try store.scanConflicts(allocator, .{ .scopes_json = scopes_json, .limit = 100 });
         return try std.fmt.allocPrint(allocator, "{{\"conflict_count\":{d}}}", .{conflicts.len});
+    }
+    if (std.mem.eql(u8, job.job_type, "lucid_projection")) {
+        return try store.runLucidProjectionJob(allocator, job);
     }
     if (std.mem.eql(u8, job.job_type, "extract_memory") or std.mem.eql(u8, job.job_type, "ingest_source") or std.mem.eql(u8, job.job_type, "ingest")) {
         if (job.object_id.len == 0 or !std.mem.eql(u8, job.object_type, "source")) return error.UnsupportedJob;
@@ -490,6 +499,67 @@ test "worker processes vector outbox and queued hygiene job" {
     const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]" });
     try std.testing.expect(result.vector_outbox_processed >= 1);
     try std.testing.expectEqual(@as(usize, 1), result.jobs_succeeded);
+}
+
+test "worker processes durable Lucid projection jobs" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const tmp_random = try ids.make(std.testing.allocator, "");
+    defer std.testing.allocator.free(tmp_random);
+    const tmp_name = try std.fmt.allocPrint(std.testing.allocator, "lucid_worker_{d}_{s}", .{ std.c.getpid(), tmp_random });
+    defer std.testing.allocator.free(tmp_name);
+    const tmp_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp_name});
+    defer std.testing.allocator.free(tmp_path);
+    try std.Io.Dir.cwd().createDirPath(compat.io(), tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.io(), tmp_path) catch {};
+
+    const script =
+        \\#!/bin/sh
+        \\case "$1" in
+        \\  store|delete|context) exit 0 ;;
+        \\esac
+        \\exit 1
+        \\
+    ;
+    const command = try std.fmt.allocPrint(std.testing.allocator, "{s}/lucid", .{tmp_path});
+    defer std.testing.allocator.free(command);
+    var file = try std.Io.Dir.cwd().createFile(compat.io(), command, .{ .read = true });
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.File.Writer = .init(file, compat.io(), &buffer);
+    try writer.interface.writeAll(script);
+    try writer.interface.flush();
+    try file.setPermissions(compat.io(), .executable_file);
+    file.close(compat.io());
+
+    var store = try store_mod.Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .lucid_projection = .{
+            .enabled = true,
+            .command = command,
+            .project_scopes_json = "[\"public\"]",
+            .store_timeout_ms = 10_000,
+            .failure_cooldown_ms = 0,
+        },
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createSource(alloc, .{ .title = "Lucid projection source", .content = "Source projected into Lucid", .scope = "public" });
+    const atom = try store.createMemoryAtom(alloc, .{ .text = "Decision: Lucid projection jobs are durable", .scope = "public" });
+    const before = try store.lifecycleDiagnostics();
+    try std.testing.expect(before.lucid_projection_pending >= 2);
+
+    const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]", .job_limit = 10 });
+    try std.testing.expect(result.lucid_projection_processed >= 2);
+    const after = try store.lifecycleDiagnostics();
+    try std.testing.expectEqual(@as(usize, 0), after.lucid_projection_pending);
+
+    try std.testing.expect(try store.patchMemoryAtomStatusActor(atom.id, "superseded", false, "agent:reviewer"));
+    const pending_delete = try store.lifecycleDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), pending_delete.lucid_projection_pending);
+    const delete_result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]", .job_limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), delete_result.lucid_projection_processed);
 }
 
 test "worker job execution scopes are unique" {

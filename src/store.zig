@@ -82,6 +82,16 @@ fn primitiveTypeFromAgentCategory(category: []const u8) ?[]const u8 {
     return null;
 }
 
+fn isLucidProjectableObjectType(object_type: []const u8) bool {
+    return std.mem.eql(u8, object_type, "source") or
+        std.mem.eql(u8, object_type, "artifact") or
+        std.mem.eql(u8, object_type, "memory_atom") or
+        std.mem.eql(u8, object_type, "entity") or
+        std.mem.eql(u8, object_type, "relation") or
+        std.mem.eql(u8, object_type, "context_pack") or
+        std.mem.eql(u8, object_type, "agent_memory");
+}
+
 fn primitiveRuntimeObjectId(allocator: std.mem.Allocator, key: []const u8, fallback: []const u8) ![]u8 {
     if (std.mem.startsWith(u8, key, "primitive:")) {
         var parts = std.mem.splitScalar(u8, key, ':');
@@ -340,6 +350,45 @@ fn primitiveLifecycleUsesOverlay(object_type: []const u8) bool {
         std.mem.eql(u8, object_type, "context_pack");
 }
 
+fn lucidProjectionKey(allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}:{s}", .{ object_type, object_id });
+}
+
+fn agentMemoryProjectionKey(allocator: std.mem.Allocator, entry: domain.AgentMemory) ![]u8 {
+    return agentMemoryProjectionKeyFromParts(allocator, entry.key, entry.session_id, entry.actor_id);
+}
+
+fn agentMemoryProjectionKeyFromParts(allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "agent_memory:{s}:{s}:{s}", .{ actor_id orelse "unknown", session_id orelse "global", key });
+}
+
+fn lucidTypeForPrimitive(object_type: []const u8, title: []const u8, text: []const u8) []const u8 {
+    if (std.mem.eql(u8, object_type, "memory_atom")) return lucid_runtime.typeForMemoryAtom(title, text);
+    if (std.mem.eql(u8, object_type, "agent_memory")) return lucid_runtime.typeForAgentCategory(title);
+    if (std.mem.eql(u8, object_type, "artifact")) {
+        if (std.ascii.eqlIgnoreCase(title, "decision") or std.ascii.eqlIgnoreCase(title, "adr")) return "decision";
+        if (std.ascii.eqlIgnoreCase(title, "meeting_note")) return "conversation";
+        if (std.ascii.eqlIgnoreCase(title, "runbook") or std.ascii.eqlIgnoreCase(title, "recipe")) return "context";
+    }
+    if (std.mem.eql(u8, object_type, "context_pack")) return "context";
+    return "learning";
+}
+
+fn lucidProjectionJobInputJson(allocator: std.mem.Allocator, action: []const u8, key: []const u8, content: []const u8, lucid_type: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"action\":");
+    try json.appendString(&out, allocator, action);
+    try out.appendSlice(allocator, ",\"key\":");
+    try json.appendString(&out, allocator, key);
+    try out.appendSlice(allocator, ",\"content\":");
+    try json.appendString(&out, allocator, content);
+    try out.appendSlice(allocator, ",\"type\":");
+    try json.appendString(&out, allocator, lucid_type);
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
 fn lifecycleScopeFromRequiredScopesJson(allocator: std.mem.Allocator, required_scopes_json: []const u8) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, required_scopes_json, .{}) catch return allocator.dupe(u8, "public");
     defer parsed.deinit();
@@ -464,6 +513,155 @@ pub const Store = struct {
 
     pub fn lucidBackendName(self: *Store) []const u8 {
         return self.lucid_projection.backendName();
+    }
+
+    fn enqueueLucidProjectionPut(
+        self: *Store,
+        allocator: std.mem.Allocator,
+        object_type: []const u8,
+        object_id: []const u8,
+        title: []const u8,
+        text: []const u8,
+        scope: []const u8,
+        permissions_json: []const u8,
+        actor_id: ?[]const u8,
+    ) !void {
+        if (!self.lucid_projection.canProject(scope, permissions_json)) return;
+        const key = if (std.mem.eql(u8, object_type, "agent_memory"))
+            try allocator.dupe(u8, object_id)
+        else
+            try lucidProjectionKey(allocator, object_type, object_id);
+        defer allocator.free(key);
+        const lucid_type = lucidTypeForPrimitive(object_type, title, text);
+        const input_json = try lucidProjectionJobInputJson(allocator, "put", key, text, lucid_type);
+        defer allocator.free(input_json);
+        _ = try self.createJob(allocator, .{
+            .job_type = "lucid_projection",
+            .scope = scope,
+            .permissions_json = permissions_json,
+            .object_type = object_type,
+            .object_id = object_id,
+            .input_json = input_json,
+            .actor_id = actor_id,
+        });
+    }
+
+    fn enqueueLucidProjectionDelete(
+        self: *Store,
+        allocator: std.mem.Allocator,
+        object_type: []const u8,
+        object_id: []const u8,
+        scope: []const u8,
+        permissions_json: []const u8,
+        actor_id: ?[]const u8,
+    ) !void {
+        if (!self.lucid_projection.canProject(scope, permissions_json)) return;
+        const key = if (std.mem.eql(u8, object_type, "agent_memory"))
+            try allocator.dupe(u8, object_id)
+        else
+            try lucidProjectionKey(allocator, object_type, object_id);
+        defer allocator.free(key);
+        const input_json = try lucidProjectionJobInputJson(allocator, "delete", key, "", "learning");
+        defer allocator.free(input_json);
+        _ = try self.createJob(allocator, .{
+            .job_type = "lucid_projection",
+            .scope = scope,
+            .permissions_json = permissions_json,
+            .object_type = object_type,
+            .object_id = object_id,
+            .input_json = input_json,
+            .actor_id = actor_id,
+        });
+    }
+
+    fn enqueueAgentMemoryLucidPut(self: *Store, allocator: std.mem.Allocator, entry: domain.AgentMemory, actor_id: ?[]const u8) !void {
+        const projection_key = try agentMemoryProjectionKey(allocator, entry);
+        defer allocator.free(projection_key);
+        try self.enqueueLucidProjectionPut(allocator, "agent_memory", projection_key, entry.category, entry.content, entry.scope, entry.permissions_json, actor_id);
+    }
+
+    fn enqueueAgentMemoryLucidDelete(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, scope: []const u8, permissions_json: []const u8, writer_actor_id: ?[]const u8) !void {
+        const projection_key = try agentMemoryProjectionKeyFromParts(allocator, key, session_id, actor_id);
+        defer allocator.free(projection_key);
+        try self.enqueueLucidProjectionDelete(allocator, "agent_memory", projection_key, scope, permissions_json, writer_actor_id);
+    }
+
+    fn syncMemoryAtomLucidProjection(self: *Store, allocator: std.mem.Allocator, id: []const u8, status: []const u8, actor_id: ?[]const u8) !void {
+        if (!self.lucid_projection.isEnabled()) return;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        if (domain.isDefaultVisibleStatus(status)) {
+            if (try self.getMemoryAtom(temp, id)) |atom| {
+                try self.enqueueLucidProjectionPut(temp, "memory_atom", atom.id, atom.predicate, atom.text, atom.scope, atom.permissions_json, actor_id);
+            }
+            return;
+        }
+        if (try self.getMemoryAtom(temp, id)) |atom| {
+            try self.enqueueLucidProjectionDelete(temp, "memory_atom", atom.id, atom.scope, atom.permissions_json, actor_id);
+        }
+    }
+
+    fn syncArtifactLucidProjection(self: *Store, allocator: std.mem.Allocator, id: []const u8, status: []const u8, actor_id: ?[]const u8) !void {
+        if (!self.lucid_projection.isEnabled()) return;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        if (domain.isDefaultVisibleStatus(status)) {
+            if (try self.getArtifact(temp, id)) |artifact| {
+                try self.enqueueLucidProjectionPut(temp, "artifact", artifact.id, artifact.artifact_type, artifact.body, artifact.scope, artifact.permissions_json, actor_id);
+            }
+            return;
+        }
+        if (try self.getArtifact(temp, id)) |artifact| {
+            try self.enqueueLucidProjectionDelete(temp, "artifact", artifact.id, artifact.scope, artifact.permissions_json, actor_id);
+        }
+    }
+
+    fn syncRelationLucidProjection(self: *Store, allocator: std.mem.Allocator, id: []const u8, status: []const u8, actor_id: ?[]const u8) !void {
+        if (!self.lucid_projection.isEnabled()) return;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        if (try self.getRelation(temp, id)) |relation| {
+            if (domain.isDefaultVisibleStatus(status)) {
+                const relation_text = try std.fmt.allocPrint(temp, "{s} {s} {s}", .{ relation.from_entity_id, relation.relation_type, relation.to_entity_id });
+                try self.enqueueLucidProjectionPut(temp, "relation", relation.id, relation.relation_type, relation_text, relation.scope, relation.permissions_json, actor_id);
+            } else {
+                try self.enqueueLucidProjectionDelete(temp, "relation", relation.id, relation.scope, relation.permissions_json, actor_id);
+            }
+        }
+    }
+
+    fn syncOverlayPrimitiveLucidProjection(self: *Store, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, status: []const u8, actor_id: ?[]const u8) !void {
+        if (!self.lucid_projection.isEnabled()) return;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        if (std.mem.eql(u8, object_type, "source")) {
+            if (try self.getSource(temp, object_id)) |source| {
+                if (domain.isDefaultVisibleStatus(status)) {
+                    try self.enqueueLucidProjectionPut(temp, "source", source.id, source.title, source.content, source.scope, source.permissions_json, actor_id);
+                } else {
+                    try self.enqueueLucidProjectionDelete(temp, "source", source.id, source.scope, source.permissions_json, actor_id);
+                }
+            }
+            return;
+        }
+        if (std.mem.eql(u8, object_type, "entity")) {
+            if (try self.getEntity(temp, object_id)) |entity| {
+                const text = entity.description orelse entity.name;
+                if (domain.isDefaultVisibleStatus(status)) {
+                    try self.enqueueLucidProjectionPut(temp, "entity", entity.id, entity.name, text, entity.scope, entity.permissions_json, actor_id);
+                } else {
+                    try self.enqueueLucidProjectionDelete(temp, "entity", entity.id, entity.scope, entity.permissions_json, actor_id);
+                }
+            }
+            return;
+        }
+        if (std.mem.eql(u8, object_type, "context_pack") and !domain.isDefaultVisibleStatus(status)) {
+            try self.enqueueLucidProjectionDelete(temp, "context_pack", object_id, "public", "[]", actor_id);
+        }
     }
 
     fn mirrorKnowledgePrimitiveToRuntime(
@@ -614,6 +812,7 @@ pub const Store = struct {
         };
         if (!input.suppress_feed) try self.appendSourcePutFeedEvent(allocator, source, input.actor_id, input.storage_route);
         try self.mirrorKnowledgePrimitive(allocator, .source, source.id, source.title, source.content, source.scope, source.permissions_json, input.actor_id, input.storage_route);
+        try self.enqueueLucidProjectionPut(allocator, "source", source.id, source.title, source.content, source.scope, source.permissions_json, input.actor_id);
         return source;
     }
 
@@ -639,6 +838,7 @@ pub const Store = struct {
         };
         if (!input.suppress_feed) try self.appendArtifactPutFeedEvent(allocator, artifact, input.actor_id, input.storage_route);
         try self.mirrorKnowledgePrimitive(allocator, .artifact, artifact.id, artifact.title, artifact.body, artifact.scope, artifact.permissions_json, input.actor_id, input.storage_route);
+        try self.enqueueLucidProjectionPut(allocator, "artifact", artifact.id, artifact.artifact_type, artifact.body, artifact.scope, artifact.permissions_json, input.actor_id);
         return artifact;
     }
 
@@ -657,6 +857,7 @@ pub const Store = struct {
         };
         if (!input.suppress_feed) try self.appendEntityPutFeedEvent(allocator, entity, input.actor_id, input.storage_route);
         try self.mirrorKnowledgePrimitive(allocator, .entity, entity.id, entity.name, entity.description orelse entity.name, entity.scope, entity.permissions_json, input.actor_id, input.storage_route);
+        try self.enqueueLucidProjectionPut(allocator, "entity", entity.id, entity.name, entity.description orelse entity.name, entity.scope, entity.permissions_json, input.actor_id);
         return entity;
     }
 
@@ -675,7 +876,9 @@ pub const Store = struct {
         };
         if (!input.suppress_feed) try self.appendRelationPutFeedEvent(allocator, relation, input.actor_id, input.storage_route);
         const relation_text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ relation.from_entity_id, relation.relation_type, relation.to_entity_id });
+        defer allocator.free(relation_text);
         try self.mirrorKnowledgePrimitive(allocator, .relation, relation.id, relation.relation_type, relation_text, relation.scope, relation.permissions_json, input.actor_id, input.storage_route);
+        try self.enqueueLucidProjectionPut(allocator, "relation", relation.id, relation.relation_type, relation_text, relation.scope, relation.permissions_json, input.actor_id);
         return relation;
     }
 
@@ -700,7 +903,7 @@ pub const Store = struct {
             .postgres => |*p| p.createMemoryAtom(allocator, input),
         };
         if (!input.suppress_feed and !std.mem.eql(u8, atom.predicate, "agent.memory")) try self.appendMemoryAtomPutFeedEvent(allocator, atom, input.actor_id, input.storage_route);
-        self.lucid_projection.storeMemoryAtom(allocator, atom.id, atom.text, atom.predicate, atom.scope, atom.permissions_json) catch {};
+        try self.enqueueLucidProjectionPut(allocator, "memory_atom", atom.id, atom.predicate, atom.text, atom.scope, atom.permissions_json, input.actor_id);
         if (input.storage_route.target != .primary and !std.mem.eql(u8, atom.predicate, "agent.memory")) {
             try self.mirrorKnowledgePrimitive(allocator, .memory_atom, atom.id, atom.predicate, atom.text, atom.scope, atom.permissions_json, input.actor_id, input.storage_route);
         }
@@ -719,31 +922,39 @@ pub const Store = struct {
     }
 
     pub fn patchMemoryAtomStatusActor(self: *Store, id: []const u8, status: []const u8, verified: bool, actor_id: ?[]const u8) !bool {
-        return switch (self.backend) {
+        const changed = try switch (self.backend) {
             .sqlite => |*s| s.patchMemoryAtomStatusActor(id, status, verified, actor_id),
             .postgres => |*p| p.patchMemoryAtomStatusActor(id, status, verified, actor_id),
         };
+        if (changed) try self.syncMemoryAtomLucidProjection(self.allocator, id, status, actor_id);
+        return changed;
     }
 
     pub fn patchArtifactStatusActor(self: *Store, id: []const u8, status: []const u8, actor_id: ?[]const u8) !bool {
-        return switch (self.backend) {
+        const changed = try switch (self.backend) {
             .sqlite => |*s| s.patchArtifactStatusActor(id, status, actor_id),
             .postgres => |*p| p.patchArtifactStatusActor(id, status, actor_id),
         };
+        if (changed) try self.syncArtifactLucidProjection(self.allocator, id, status, actor_id);
+        return changed;
     }
 
     pub fn patchRelationStatusActor(self: *Store, id: []const u8, status: []const u8, actor_id: ?[]const u8) !bool {
-        return switch (self.backend) {
+        const changed = try switch (self.backend) {
             .sqlite => |*s| s.patchRelationStatusActor(id, status, actor_id),
             .postgres => |*p| p.patchRelationStatusActor(id, status, actor_id),
         };
+        if (changed) try self.syncRelationLucidProjection(self.allocator, id, status, actor_id);
+        return changed;
     }
 
     pub fn patchPrimitiveLifecycleActor(self: *Store, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, status: []const u8, actor_id: ?[]const u8, payload_json: []const u8) !bool {
-        return switch (self.backend) {
+        const changed = try switch (self.backend) {
             .sqlite => |*s| s.patchPrimitiveLifecycleActor(allocator, object_type, object_id, status, actor_id, payload_json),
             .postgres => |*p| p.patchPrimitiveLifecycleActor(allocator, object_type, object_id, status, actor_id, payload_json),
         };
+        if (changed) try self.syncOverlayPrimitiveLucidProjection(allocator, object_type, object_id, status, actor_id);
+        return changed;
     }
 
     pub fn primitiveLifecycleStatus(self: *Store, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8) ![]const u8 {
@@ -1270,6 +1481,64 @@ pub const Store = struct {
         };
     }
 
+    pub fn runLucidProjectionJob(self: *Store, allocator: std.mem.Allocator, job: Job) ![]const u8 {
+        if (!self.lucid_projection.isEnabled()) return error.LucidProjectionUnavailable;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, job.input_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+        const action = json.stringField(obj, "action") orelse "put";
+        const key = json.stringField(obj, "key") orelse return error.InvalidPayload;
+        const content = json.stringField(obj, "content") orelse "";
+        const lucid_type = json.stringField(obj, "type") orelse "learning";
+        const projected = try self.lucid_projection.project(allocator, .{
+            .action = action,
+            .key = key,
+            .content = content,
+            .lucid_type = lucid_type,
+            .scope = job.scope,
+            .permissions_json = job.permissions_json,
+        });
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, "{\"lucid_projection\":{\"projected\":");
+        try out.appendSlice(allocator, if (projected) "true" else "false");
+        try out.appendSlice(allocator, ",\"action\":");
+        try json.appendString(&out, allocator, action);
+        try out.appendSlice(allocator, ",\"key\":");
+        try json.appendString(&out, allocator, key);
+        try out.appendSlice(allocator, ",\"type\":");
+        try json.appendString(&out, allocator, lucid_type);
+        try out.appendSlice(allocator, "}}");
+        return out.toOwnedSlice(allocator);
+    }
+
+    pub fn rebuildLucidProjection(self: *Store, allocator: std.mem.Allocator, input: LucidProjectionRebuildInput) !LucidProjectionRebuildResult {
+        if (!self.lucid_projection.isEnabled()) return .{ .enabled = false };
+        const limit = @max(@as(usize, 1), @min(input.limit, 5000));
+        const results = try self.search(allocator, .{
+            .query = "",
+            .limit = limit,
+            .scopes_json = input.scopes_json,
+            .include_deprecated = false,
+            .include_sessions = true,
+            .use_vector = false,
+            .use_temporal_decay = false,
+            .use_mmr = false,
+            .actor_id = input.actor_id,
+        });
+        defer allocator.free(results);
+        var out = LucidProjectionRebuildResult{ .enabled = true };
+        for (results) |result| {
+            if (!isLucidProjectableObjectType(result.result_type)) continue;
+            if (std.mem.eql(u8, result.result_type, "lucid_projection")) continue;
+            out.scanned += 1;
+            try self.enqueueLucidProjectionPut(allocator, result.result_type, result.id, result.title, result.text, result.scope, result.required_scopes_json, input.actor_id);
+            out.enqueued += 1;
+        }
+        return out;
+    }
+
     pub fn putResponseCache(self: *Store, input: ResponseCacheInput) !void {
         return switch (self.backend) {
             .sqlite => |*s| s.putResponseCache(input),
@@ -1344,6 +1613,7 @@ pub const Store = struct {
         defer allocator.free(permissions);
         if (!input.suppress_feed and pack.persisted) try self.appendContextPackPutFeedEvent(allocator, pack, scope, permissions, input.actor_id, input.agent_memory_route);
         try self.mirrorKnowledgePrimitive(allocator, .context_pack, pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id, input.agent_memory_route);
+        if (pack.persisted) try self.enqueueLucidProjectionPut(allocator, "context_pack", pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id);
         return pack;
     }
 
@@ -1485,7 +1755,7 @@ pub const Store = struct {
         }
         try self.materializeRuntimeAgentMemory(allocator, entry, store_name);
         if (!input.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, store_name, "agent_memory.runtime_put");
-        self.lucid_projection.storeAgentMemory(allocator, entry.key, entry.content, entry.category, entry.scope, entry.permissions_json) catch {};
+        try self.enqueueAgentMemoryLucidPut(allocator, entry, input.writer_actor_id orelse input.actor_id);
         return entry;
     }
 
@@ -1499,7 +1769,7 @@ pub const Store = struct {
             agent_memory_runtime.freeAgentMemory(allocator, &cleanup);
         }
         if (!input.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, "native", "agent_memory.put");
-        self.lucid_projection.storeAgentMemory(allocator, entry.key, entry.content, entry.category, entry.scope, entry.permissions_json) catch {};
+        try self.enqueueAgentMemoryLucidPut(allocator, entry, input.writer_actor_id orelse input.actor_id);
         return entry;
     }
 
@@ -1982,7 +2252,9 @@ pub const Store = struct {
     }
 
     pub fn agentMemoryDeleteRouted(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
-        return switch (route.target) {
+        var existing = if (self.lucid_projection.isEnabled()) self.agentMemoryGetRouted(self.allocator, key, session_id, actor_id, route) catch null else null;
+        defer if (existing) |*entry| agent_memory_runtime.freeAgentMemory(self.allocator, entry);
+        const deleted = try switch (route.target) {
             .primary => self.agentMemoryDelete(key, session_id, actor_id, writer_actor_id),
             .native => self.agentMemoryDeleteNative(key, session_id, actor_id, writer_actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.delete(key, session_id, actor_id, writer_actor_id) else error.AgentMemoryStorageUnavailable,
@@ -1997,6 +2269,13 @@ pub const Store = struct {
                 break :blk deleted;
             },
         };
+        if (deleted) {
+            if (existing) |entry| {
+                const owner_actor_id: ?[]const u8 = if (actor_id) |owner| owner else entry.actor_id;
+                try self.enqueueAgentMemoryLucidDelete(self.allocator, key, session_id, owner_actor_id, entry.scope, entry.permissions_json, writer_actor_id);
+            }
+        }
+        return deleted;
     }
 
     fn agentMemoryDeleteNative(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
@@ -2913,6 +3192,8 @@ pub const LifecycleDiagnostics = struct {
     total_memory_atoms: usize,
     stale_memory_atoms: usize,
     vector_outbox_pending: usize,
+    lucid_projection_pending: usize = 0,
+    lucid_projection_failed: usize = 0,
     cache_entries: usize,
     queued_jobs: usize = 0,
     running_jobs: usize = 0,
@@ -2921,6 +3202,18 @@ pub const LifecycleDiagnostics = struct {
     open_conflicts: usize = 0,
     agent_memories: usize = 0,
     sessions: usize = 0,
+};
+
+pub const LucidProjectionRebuildInput = struct {
+    scopes_json: []const u8 = "[\"admin\"]",
+    actor_id: ?[]const u8 = null,
+    limit: usize = 1000,
+};
+
+pub const LucidProjectionRebuildResult = struct {
+    enabled: bool = false,
+    scanned: usize = 0,
+    enqueued: usize = 0,
 };
 
 pub const ResponseCacheInput = struct {
@@ -6334,6 +6627,8 @@ pub const SQLiteStore = struct {
             .total_memory_atoms = @intCast(total),
             .stale_memory_atoms = @intCast(stale),
             .vector_outbox_pending = pending,
+            .lucid_projection_pending = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE job_type = 'lucid_projection' AND (status = 'queued' OR status = 'running')")),
+            .lucid_projection_failed = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE job_type = 'lucid_projection' AND status = 'failed'")),
             .cache_entries = @intCast(response_cache + semantic_cache),
             .queued_jobs = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE status = 'queued'")),
             .running_jobs = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE status = 'running'")),
@@ -9030,7 +9325,7 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = "SELECT json_build_object('total_memory_atoms',(SELECT count(*) FROM memory_atoms),'stale_memory_atoms',(SELECT count(*) FROM memory_atoms WHERE status='stale'),'vector_outbox_pending',(SELECT count(*) FROM vector_outbox WHERE status='pending'),'cache_entries',(SELECT count(*) FROM response_cache)+(SELECT count(*) FROM semantic_cache),'queued_jobs',(SELECT count(*) FROM jobs WHERE status='queued'),'running_jobs',(SELECT count(*) FROM jobs WHERE status='running'),'failed_jobs',(SELECT count(*) FROM jobs WHERE status='failed'),'pending_feed_events',(SELECT count(*) FROM memory_feed_events WHERE status='pending' OR status='applying'),'open_conflicts',(SELECT count(*) FROM knowledge_conflicts WHERE status='open'),'agent_memories',(SELECT count(*) FROM agent_memory_items),'sessions',(SELECT count(*) FROM (SELECT session_id FROM session_messages GROUP BY session_id) s))::text";
+        const sql = "SELECT json_build_object('total_memory_atoms',(SELECT count(*) FROM memory_atoms),'stale_memory_atoms',(SELECT count(*) FROM memory_atoms WHERE status='stale'),'vector_outbox_pending',(SELECT count(*) FROM vector_outbox WHERE status='pending'),'lucid_projection_pending',(SELECT count(*) FROM jobs WHERE job_type='lucid_projection' AND (status='queued' OR status='running')),'lucid_projection_failed',(SELECT count(*) FROM jobs WHERE job_type='lucid_projection' AND status='failed'),'cache_entries',(SELECT count(*) FROM response_cache)+(SELECT count(*) FROM semantic_cache),'queued_jobs',(SELECT count(*) FROM jobs WHERE status='queued'),'running_jobs',(SELECT count(*) FROM jobs WHERE status='running'),'failed_jobs',(SELECT count(*) FROM jobs WHERE status='failed'),'pending_feed_events',(SELECT count(*) FROM memory_feed_events WHERE status='pending' OR status='applying'),'open_conflicts',(SELECT count(*) FROM knowledge_conflicts WHERE status='open'),'agent_memories',(SELECT count(*) FROM agent_memory_items),'sessions',(SELECT count(*) FROM (SELECT session_id FROM session_messages GROUP BY session_id) s))::text";
         const parsed = try self.queryJson(allocator, sql);
         defer parsed.deinit();
         const obj = parsed.value.object;
@@ -9038,6 +9333,8 @@ pub const PostgresStore = struct {
             .total_memory_atoms = @intCast(json.intField(obj, "total_memory_atoms") orelse 0),
             .stale_memory_atoms = @intCast(json.intField(obj, "stale_memory_atoms") orelse 0),
             .vector_outbox_pending = @intCast(json.intField(obj, "vector_outbox_pending") orelse 0),
+            .lucid_projection_pending = @intCast(json.intField(obj, "lucid_projection_pending") orelse 0),
+            .lucid_projection_failed = @intCast(json.intField(obj, "lucid_projection_failed") orelse 0),
             .cache_entries = @intCast(json.intField(obj, "cache_entries") orelse 0),
             .queued_jobs = @intCast(json.intField(obj, "queued_jobs") orelse 0),
             .running_jobs = @intCast(json.intField(obj, "running_jobs") orelse 0),

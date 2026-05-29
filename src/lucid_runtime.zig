@@ -31,6 +31,15 @@ pub const Entry = struct {
     score: f64,
 };
 
+pub const ProjectionInput = struct {
+    action: []const u8 = "put",
+    key: []const u8,
+    content: []const u8 = "",
+    lucid_type: []const u8 = "learning",
+    scope: []const u8 = "public",
+    permissions_json: []const u8 = "[]",
+};
+
 pub const Runtime = struct {
     config: Config = .{},
     cooldown_until_ms: i64 = 0,
@@ -61,15 +70,28 @@ pub const Runtime = struct {
         return domain.recordVisible(scope, permissions_json, self.config.project_scopes_json);
     }
 
+    pub fn project(self: *Runtime, allocator: std.mem.Allocator, input: ProjectionInput) !bool {
+        if (!self.canProject(input.scope, input.permissions_json)) return false;
+        if (std.mem.eql(u8, input.action, "delete") or
+            std.mem.eql(u8, input.action, "forget") or
+            std.mem.eql(u8, input.action, "retract"))
+        {
+            try self.delete(allocator, input.key);
+            return true;
+        }
+        try self.store(allocator, input.key, input.content, input.lucid_type);
+        return true;
+    }
+
     pub fn storeMemoryAtom(self: *Runtime, allocator: std.mem.Allocator, id: []const u8, text: []const u8, predicate: []const u8, scope: []const u8, permissions_json: []const u8) !void {
-        if (!self.canProject(scope, permissions_json)) return;
         const lucid_type = typeForMemoryAtom(predicate, text);
-        try self.store(allocator, id, text, lucid_type);
+        const key = try std.fmt.allocPrint(allocator, "memory_atom:{s}", .{id});
+        defer allocator.free(key);
+        _ = try self.project(allocator, .{ .key = key, .content = text, .lucid_type = lucid_type, .scope = scope, .permissions_json = permissions_json });
     }
 
     pub fn storeAgentMemory(self: *Runtime, allocator: std.mem.Allocator, key: []const u8, content: []const u8, category: []const u8, scope: []const u8, permissions_json: []const u8) !void {
-        if (!self.canProject(scope, permissions_json)) return;
-        try self.store(allocator, key, content, typeForAgentCategory(category));
+        _ = try self.project(allocator, .{ .key = key, .content = content, .lucid_type = typeForAgentCategory(category), .scope = scope, .permissions_json = permissions_json });
     }
 
     pub fn context(self: *Runtime, allocator: std.mem.Allocator, query: []const u8) ![]Entry {
@@ -93,7 +115,7 @@ pub const Runtime = struct {
 
     fn store(self: *Runtime, allocator: std.mem.Allocator, key: []const u8, content: []const u8, lucid_type: []const u8) !void {
         if (!self.config.isEnabled()) return;
-        if (self.inFailureCooldown()) return;
+        if (self.inFailureCooldown()) return error.LucidProjectionCoolingDown;
 
         const payload = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ key, content });
         defer allocator.free(payload);
@@ -103,9 +125,25 @@ pub const Runtime = struct {
         defer allocator.free(project_flag);
         const argv = [_][]const u8{ self.config.command, "store", payload, type_flag, project_flag };
 
-        const out = self.run(allocator, &argv, self.config.store_timeout_ms) catch {
+        const out = self.run(allocator, &argv, self.config.store_timeout_ms) catch |err| {
             self.markFailure();
-            return;
+            return err;
+        };
+        allocator.free(out);
+        self.clearFailure();
+    }
+
+    fn delete(self: *Runtime, allocator: std.mem.Allocator, key: []const u8) !void {
+        if (!self.config.isEnabled()) return;
+        if (self.inFailureCooldown()) return error.LucidProjectionCoolingDown;
+
+        const project_flag = try std.fmt.allocPrint(allocator, "--project={s}", .{self.config.workspace_dir});
+        defer allocator.free(project_flag);
+        const argv = [_][]const u8{ self.config.command, "delete", key, project_flag };
+
+        const out = self.run(allocator, &argv, self.config.store_timeout_ms) catch |err| {
+            self.markFailure();
+            return err;
         };
         allocator.free(out);
         self.clearFailure();
@@ -292,6 +330,9 @@ test "lucid projection CLI contract with fake command" {
         \\if [ "$1" = "store" ]; then
         \\  exit 0
         \\fi
+        \\if [ "$1" = "delete" ]; then
+        \\  exit 0
+        \\fi
         \\exit 1
         \\
     ;
@@ -316,6 +357,7 @@ test "lucid projection CLI contract with fake command" {
         .failure_cooldown_ms = 0,
     });
     try runtime.storeAgentMemory(std.testing.allocator, "pref.lang", "User prefers Zig", "core", "public", "[]");
+    try std.testing.expect(try runtime.project(std.testing.allocator, .{ .action = "delete", .key = "pref.lang", .scope = "public", .permissions_json = "[]" }));
     const entries = try runtime.context(std.testing.allocator, "projection");
     defer freeEntries(std.testing.allocator, entries);
 
