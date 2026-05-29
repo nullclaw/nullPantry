@@ -510,6 +510,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
             i += 1;
             cfg.vector_backend.backend = .lancedb;
             cfg.vector_backend.lancedb_command = args[i];
+        } else if (std.mem.eql(u8, arg, "--lancedb-table") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.collection = args[i];
         } else if (std.mem.eql(u8, arg, "--lancedb-url") and i + 1 < args.len) {
             i += 1;
             cfg.vector_backend.backend = .lancedb_http;
@@ -654,7 +657,7 @@ fn printUsage() void {
         \\       nullpantry --backend postgres --postgres-url URL [--token TOKEN|--token-principals JSON]
         \\       nullpantry --agent-memory-backend redis --redis-url redis://:pass@host:6379/0
         \\       nullpantry --vector-backend qdrant --vector-base-url http://127.0.0.1:6333 --vector-collection nullpantry_vectors
-        \\       nullpantry --vector-backend lancedb --lancedb-uri .nullpantry/lancedb --vector-collection nullpantry_vectors
+        \\       nullpantry --vector-backend lancedb --lancedb-uri .nullpantry/lancedb --lancedb-table nullpantry_vectors
         \\       nullpantry --analytics-backend clickhouse --analytics-base-url http://127.0.0.1:8123 --analytics-table nullpantry_events
         \\       nullpantry --lucid-enabled --lucid-workspace /path/to/workspace
         \\
@@ -848,7 +851,7 @@ test "lancedb sdk vector backend can be configured from args" {
         ".nullpantry/lancedb",
         "--lancedb-command",
         "python3",
-        "--vector-collection",
+        "--lancedb-table",
         "np_vectors",
     };
     const cfg = try parseArgs(std.testing.allocator, &args);

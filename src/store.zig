@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ids = @import("ids.zig");
 const domain = @import("domain.zig");
 const json = @import("json_util.zig");
@@ -1028,12 +1029,47 @@ pub const Store = struct {
     }
 
     fn appendNativeSearchResults(self: *Store, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        var native_input = input;
+        const use_store_vector_path = self.vector_backend.externalEnabled() or input.strict_vector;
+        if (use_store_vector_path) native_input.use_vector = false;
         const primary = try switch (self.backend) {
-            .sqlite => |*s| s.search(allocator, input),
-            .postgres => |*p| p.search(allocator, input),
+            .sqlite => |*s| s.search(allocator, native_input),
+            .postgres => |*p| p.search(allocator, native_input),
         };
         defer allocator.free(primary);
         for (primary) |result| try results.append(allocator, result);
+
+        if (use_store_vector_path and input.use_vector and input.query.len > 0) {
+            const plan = try retrieval_mod.buildPlan(allocator, input.query, input.use_vector, input.allow_reranker);
+            if (plan.use_vector or input.strict_vector) {
+                try self.appendVectorSearchResults(allocator, input, plan.expanded_query, results);
+            }
+        }
+    }
+
+    fn appendVectorSearchResults(self: *Store, allocator: std.mem.Allocator, input: SearchInput, expanded_query: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const embedding_json = if (input.query_embedding_json) |value| value else blk: {
+            const dimensions = @max(@as(usize, 1), @min(input.embedding_dimensions, 4096));
+            const embedding = try vector_mod.deterministicEmbedding(allocator, expanded_query, dimensions);
+            break :blk try vector_mod.embeddingToJson(allocator, embedding);
+        };
+        const matches = try self.vectorSearch(allocator, .{
+            .embedding_json = embedding_json,
+            .scopes_json = input.scopes_json,
+            .limit = @max(@as(usize, 20), input.limit),
+            .include_deprecated = input.include_deprecated,
+            .strict_external = input.strict_vector,
+        });
+        for (matches) |match| {
+            if (try self.searchResultForVectorMatch(allocator, match, input)) |result| try results.append(allocator, result);
+        }
+    }
+
+    fn searchResultForVectorMatch(self: *Store, allocator: std.mem.Allocator, match: vector_mod.VectorMatch, input: SearchInput) !?domain.SearchResult {
+        return switch (self.backend) {
+            .sqlite => |*s| s.searchResultForVectorMatch(allocator, match, input),
+            .postgres => |*p| p.searchResultForVectorMatch(allocator, match, input),
+        };
     }
 
     fn appendDefaultRuntimeSearchResults(self: *Store, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
@@ -1179,7 +1215,10 @@ pub const Store = struct {
 
     pub fn vectorSearch(self: *Store, allocator: std.mem.Allocator, input: VectorSearchInput) ![]vector_mod.VectorMatch {
         if (self.vector_backend.externalEnabled()) {
-            const candidates = vector_runtime.search(allocator, self.vector_backend, input.embedding_json, @max(@as(usize, 1), @min(input.limit * 4, 1000))) catch return self.localVectorSearch(allocator, input);
+            const candidates = vector_runtime.search(allocator, self.vector_backend, input.embedding_json, @max(@as(usize, 1), @min(input.limit * 4, 1000))) catch |err| {
+                if (input.strict_external) return err;
+                return self.localVectorSearch(allocator, input);
+            };
             defer vector_runtime.freeCandidates(allocator, candidates);
             return self.vectorSearchCandidates(allocator, input, candidates);
         }
@@ -1242,15 +1281,28 @@ pub const Store = struct {
         };
     }
 
+    pub fn requeueVectorOutboxFailures(self: *Store) !usize {
+        return switch (self.backend) {
+            .sqlite => |*s| s.requeueVectorOutboxFailures(),
+            .postgres => |*p| p.requeueVectorOutboxFailures(),
+        };
+    }
+
     pub fn rebuildVectorIndex(self: *Store, allocator: std.mem.Allocator, input: VectorMaintenanceInput) !VectorMaintenanceResult {
+        const requeued = if (input.retry_failed) try self.requeueVectorOutboxFailures() else 0;
         if (input.reset_external and self.vector_backend.externalEnabled()) {
             try vector_runtime.reset(allocator, self.vector_backend);
         }
-        return try self.enqueueVectorUpsertsFromCanonical(allocator, input.limit);
+        var result = try self.enqueueVectorUpsertsFromCanonical(allocator, input.limit);
+        result.requeued_failed = requeued;
+        return result;
     }
 
     pub fn reconcileVectorIndex(self: *Store, allocator: std.mem.Allocator, input: VectorMaintenanceInput) !VectorMaintenanceResult {
-        return try self.enqueueVectorUpsertsFromCanonical(allocator, input.limit);
+        const requeued = if (input.retry_failed) try self.requeueVectorOutboxFailures() else 0;
+        var result = try self.enqueueVectorUpsertsFromCanonical(allocator, input.limit);
+        result.requeued_failed = requeued;
+        return result;
     }
 
     fn enqueueVectorUpsertsFromCanonical(self: *Store, allocator: std.mem.Allocator, limit: usize) !VectorMaintenanceResult {
@@ -1283,19 +1335,21 @@ pub const Store = struct {
     }
 
     fn runExternalVectorOutbox(self: *Store, limit: usize) !VectorOutboxRunResult {
-        const entries = try self.listVectorOutbox(self.allocator, .{ .status = "pending", .limit = limit });
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const entries = try self.listVectorOutbox(allocator, .{ .status = "pending", .limit = limit });
         var result = VectorOutboxRunResult{};
         for (entries) |entry| {
             if (std.mem.eql(u8, entry.action, "embed")) continue;
             if (!try self.claimVectorOutbox(entry.id)) continue;
-            const vector_id = vectorIdFromOutboxPayload(self.allocator, entry.payload_json) catch {
+            const vector_id = vectorIdFromOutboxPayload(allocator, entry.payload_json) catch {
                 _ = try self.finishVectorOutbox(entry.id, "failed_external_index");
                 result.failed += 1;
                 continue;
             };
-            defer self.allocator.free(vector_id);
             if (std.mem.eql(u8, entry.action, "delete")) {
-                vector_runtime.delete(self.allocator, self.vector_backend, vector_id) catch {
+                vector_runtime.delete(allocator, self.vector_backend, vector_id) catch {
                     _ = try self.finishVectorOutbox(entry.id, "failed_external_delete");
                     result.failed += 1;
                     continue;
@@ -1304,12 +1358,12 @@ pub const Store = struct {
                 result.processed += 1;
                 continue;
             }
-            const chunk = (try self.getVectorChunk(self.allocator, vector_id)) orelse {
+            const chunk = (try self.getVectorChunk(allocator, vector_id)) orelse {
                 _ = try self.finishVectorOutbox(entry.id, "failed_external_index");
                 result.failed += 1;
                 continue;
             };
-            vector_runtime.upsert(self.allocator, self.vector_backend, vectorChunkUpsertInput(chunk)) catch {
+            vector_runtime.upsert(allocator, self.vector_backend, vectorChunkUpsertInput(chunk)) catch {
                 _ = try self.finishVectorOutbox(entry.id, "failed_external_index");
                 result.failed += 1;
                 continue;
@@ -2872,6 +2926,7 @@ pub const SearchInput = struct {
     include_sessions: bool = false,
     session_id: ?[]const u8 = null,
     use_vector: bool = true,
+    strict_vector: bool = false,
     use_temporal_decay: bool = true,
     use_mmr: bool = true,
     allow_reranker: bool = false,
@@ -2916,6 +2971,7 @@ pub const VectorSearchInput = struct {
     scopes_json: []const u8 = "[\"admin\"]",
     limit: usize = 10,
     include_deprecated: bool = false,
+    strict_external: bool = false,
 };
 
 pub const VectorOutboxInput = struct {
@@ -2952,11 +3008,13 @@ pub const VectorOutboxRunResult = struct {
 pub const VectorMaintenanceInput = struct {
     limit: usize = 1000,
     reset_external: bool = false,
+    retry_failed: bool = false,
 };
 
 pub const VectorMaintenanceResult = struct {
     canonical_chunks: usize = 0,
     enqueued_upserts: usize = 0,
+    requeued_failed: usize = 0,
     external_enabled: bool = false,
 };
 
@@ -5829,7 +5887,7 @@ pub const SQLiteStore = struct {
             const embedding = try vector_mod.deterministicEmbedding(allocator, expanded_query, dimensions);
             break :blk try vector_mod.embeddingToJson(allocator, embedding);
         };
-        const matches = try self.vectorSearch(allocator, .{ .embedding_json = embedding_json, .scopes_json = input.scopes_json, .limit = @max(@as(usize, 20), input.limit), .include_deprecated = input.include_deprecated });
+        const matches = try self.vectorSearch(allocator, .{ .embedding_json = embedding_json, .scopes_json = input.scopes_json, .limit = @max(@as(usize, 20), input.limit), .include_deprecated = input.include_deprecated, .strict_external = input.strict_vector });
         for (matches) |match| {
             const result = try self.searchResultForVectorMatch(allocator, match, input);
             if (result) |value| try results.append(allocator, value);
@@ -6398,6 +6456,14 @@ pub const SQLiteStore = struct {
 
     pub fn countVectorChunks(self: *Self) !usize {
         return @intCast(try self.countSql("SELECT COUNT(*) FROM vector_chunks"));
+    }
+
+    pub fn requeueVectorOutboxFailures(self: *Self) !usize {
+        const stmt = try self.prepare("UPDATE vector_outbox SET status = 'pending', locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?1 WHERE status IN ('failed_embedding','failed_external_index','failed_external_delete')");
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, ids.nowMs());
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+        return @intCast(c.sqlite3_changes(self.db));
     }
 
     pub fn runVectorOutbox(self: *Self, limit: usize) !VectorOutboxRunResult {
@@ -9155,6 +9221,19 @@ pub const PostgresStore = struct {
         return std.fmt.parseInt(usize, text, 10) catch 0;
     }
 
+    pub fn requeueVectorOutboxFailures(self: *PostgresStore) !usize {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH updated AS (UPDATE vector_outbox SET status = 'pending', locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $1::bigint WHERE status IN ('failed_embedding','failed_external_index','failed_external_delete') RETURNING id) SELECT count(*)::text FROM updated",
+            &.{now_text},
+        );
+        return std.fmt.parseInt(usize, text, 10) catch 0;
+    }
+
     pub fn runVectorOutbox(self: *PostgresStore, limit: usize) !VectorOutboxRunResult {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -10314,7 +10393,7 @@ pub const PostgresStore = struct {
             const embedding = try vector_mod.deterministicEmbedding(allocator, expanded_query, dimensions);
             break :blk try vector_mod.embeddingToJson(allocator, embedding);
         };
-        const matches = try self.vectorSearch(allocator, .{ .embedding_json = embedding_json, .scopes_json = input.scopes_json, .limit = @max(@as(usize, 20), input.limit), .include_deprecated = input.include_deprecated });
+        const matches = try self.vectorSearch(allocator, .{ .embedding_json = embedding_json, .scopes_json = input.scopes_json, .limit = @max(@as(usize, 20), input.limit), .include_deprecated = input.include_deprecated, .strict_external = input.strict_vector });
         for (matches) |match| {
             if (try self.searchResultForVectorMatch(allocator, match, input)) |result| try results.append(allocator, result);
         }
@@ -11452,6 +11531,164 @@ test "sqlite vector lifecycle deletes chunks and rebuilds from canonical store" 
     const run = try store.runVectorOutbox(10);
     try std.testing.expectEqual(@as(usize, 3), run.processed);
     try std.testing.expectEqual(@as(usize, 3), try store.countVectorOutbox("indexed_local"));
+}
+
+test "lancedb external vector plane runs through canonical outbox and ACL hydration" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const tmp_random = try ids.make(std.testing.allocator, "");
+    defer std.testing.allocator.free(tmp_random);
+    const tmp_name = try std.fmt.allocPrint(std.testing.allocator, "np_lancedb_e2e_{d}_{s}", .{ std.c.getpid(), tmp_random });
+    defer std.testing.allocator.free(tmp_name);
+    const tmp_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp_name});
+    defer std.testing.allocator.free(tmp_path);
+    try std.Io.Dir.cwd().createDirPath(compat.io(), tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.io(), tmp_path) catch {};
+
+    const command = try std.fmt.allocPrint(std.testing.allocator, "{s}/lancedb-adapter", .{tmp_path});
+    defer std.testing.allocator.free(command);
+    const script =
+        \\#!/bin/sh
+        \\payload="$(cat)"
+        \\if [ "$1" = "upsert" ]; then
+        \\  echo "$payload" | grep '"rows"' >/dev/null || exit 2
+        \\  echo "$payload" | grep '"vector_id":"vec_mem_lancedb_e2e_0"' >/dev/null || exit 3
+        \\  echo '{"status":"ok"}'
+        \\  exit 0
+        \\fi
+        \\if [ "$1" = "search" ]; then
+        \\  echo "$payload" | grep '\[1,0\]' >/dev/null || exit 4
+        \\  echo '{"matches":[{"id":"vec_mem_lancedb_e2e_0","score":0.99},{"id":"vec_missing","score":1.0}]}'
+        \\  exit 0
+        \\fi
+        \\if [ "$1" = "delete" ]; then
+        \\  echo "$payload" | grep '"vector_id":"vec_mem_lancedb_e2e_0"' >/dev/null || exit 5
+        \\  echo '{"status":"ok"}'
+        \\  exit 0
+        \\fi
+        \\if [ "$1" = "reset" ]; then
+        \\  echo '{"status":"ok"}'
+        \\  exit 0
+        \\fi
+        \\exit 1
+        \\
+    ;
+    var file = try std.Io.Dir.cwd().createFile(compat.io(), command, .{ .read = true });
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.File.Writer = .init(file, compat.io(), &buffer);
+    try writer.interface.writeAll(script);
+    try writer.interface.flush();
+    try file.setPermissions(compat.io(), .executable_file);
+    file.close(compat.io());
+
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{ .vector_backend = .{
+        .backend = .lancedb,
+        .lancedb_uri = ".zig-cache/tmp/nullpantry-lancedb-e2e",
+        .lancedb_command = command,
+        .collection = "vectors",
+        .timeout_secs = 2,
+    } });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    const atom = try store.createMemoryAtom(alloc, .{ .id = "mem_lancedb_e2e", .text = "lancedb external memory", .scope = "public", .created_by = "human" });
+    const chunk = try store.upsertVectorChunk(alloc, .{ .object_id = atom.id, .text = atom.text, .scope = atom.scope, .embedding_json = embedding, .dimensions = 2 });
+    try std.testing.expectEqualStrings("vec_mem_lancedb_e2e_0", chunk.id);
+    try std.testing.expectEqual(@as(usize, 1), try store.countVectorOutbox("pending"));
+
+    const indexed = try store.runVectorOutbox(10);
+    try std.testing.expectEqual(@as(usize, 1), indexed.processed);
+    try std.testing.expectEqual(@as(usize, 1), try store.countVectorOutbox("indexed_external"));
+
+    const matches = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .limit = 10, .strict_external = true });
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings(chunk.id, matches[0].id);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.99), matches[0].score, 0.0001);
+
+    try std.testing.expect(try store.deleteVectorChunk(alloc, chunk.id, "agent:vector"));
+    const deleted = try store.runVectorOutbox(10);
+    try std.testing.expectEqual(@as(usize, 1), deleted.processed);
+    try std.testing.expectEqual(@as(usize, 1), try store.countVectorOutbox("deleted_external"));
+
+    const after_delete = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .limit = 10, .strict_external = true });
+    try std.testing.expectEqual(@as(usize, 0), after_delete.len);
+}
+
+test "strict common search fails closed when external vector plane fails" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const tmp_random = try ids.make(std.testing.allocator, "");
+    defer std.testing.allocator.free(tmp_random);
+    const tmp_name = try std.fmt.allocPrint(std.testing.allocator, "np_lancedb_strict_{d}_{s}", .{ std.c.getpid(), tmp_random });
+    defer std.testing.allocator.free(tmp_name);
+    const tmp_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp_name});
+    defer std.testing.allocator.free(tmp_path);
+    try std.Io.Dir.cwd().createDirPath(compat.io(), tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.io(), tmp_path) catch {};
+
+    const command = try std.fmt.allocPrint(std.testing.allocator, "{s}/lancedb-adapter", .{tmp_path});
+    defer std.testing.allocator.free(command);
+    const script =
+        \\#!/bin/sh
+        \\cat >/dev/null
+        \\if [ "$1" = "search" ]; then
+        \\  exit 9
+        \\fi
+        \\echo '{"status":"ok"}'
+        \\exit 0
+        \\
+    ;
+    var file = try std.Io.Dir.cwd().createFile(compat.io(), command, .{ .read = true });
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.File.Writer = .init(file, compat.io(), &buffer);
+    try writer.interface.writeAll(script);
+    try writer.interface.flush();
+    try file.setPermissions(compat.io(), .executable_file);
+    file.close(compat.io());
+
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{ .vector_backend = .{
+        .backend = .lancedb,
+        .lancedb_uri = ".zig-cache/tmp/nullpantry-lancedb-strict",
+        .lancedb_command = command,
+        .collection = "vectors",
+        .timeout_secs = 2,
+    } });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    const atom = try store.createMemoryAtom(alloc, .{ .text = "strict vector fallback memory", .scope = "public", .created_by = "human" });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_id = atom.id, .text = atom.text, .scope = atom.scope, .embedding_json = embedding, .dimensions = 2 });
+
+    const graceful = try store.search(alloc, .{ .query = "lexical miss for vector fallback", .scopes_json = "[\"public\"]", .limit = 10, .query_embedding_json = embedding });
+    try std.testing.expect(graceful.len >= 1);
+
+    try std.testing.expectError(error.VectorBackendUnavailable, store.search(alloc, .{ .query = "lexical miss for strict vector", .scopes_json = "[\"public\"]", .limit = 10, .query_embedding_json = embedding, .strict_vector = true }));
+}
+
+test "vector maintenance can requeue failed external outbox entries" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    const atom = try store.createMemoryAtom(alloc, .{ .text = "failed vector retry", .scope = "public", .created_by = "human" });
+    const chunk = try store.upsertVectorChunk(alloc, .{ .object_id = atom.id, .text = atom.text, .scope = atom.scope, .embedding_json = embedding, .dimensions = 2 });
+    const failed_payload = try vectorUpsertPayloadJson(alloc, chunk.id);
+    _ = try store.enqueueVectorOutbox(.{ .action = "upsert", .object_type = "memory_atom", .object_id = atom.id, .status = "failed_external_index", .payload_json = failed_payload });
+    try std.testing.expectEqual(@as(usize, 1), try store.countVectorOutbox("failed_external_index"));
+
+    const result = try store.reconcileVectorIndex(alloc, .{ .limit = 1, .retry_failed = true });
+    try std.testing.expectEqual(@as(usize, 1), result.requeued_failed);
+    try std.testing.expectEqual(@as(usize, 0), try store.countVectorOutbox("failed_external_index"));
+    try std.testing.expect((try store.countVectorOutbox("pending")) >= 2);
 }
 
 test "sqlite vector search filters permissions" {

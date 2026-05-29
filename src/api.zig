@@ -144,6 +144,8 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         if (eql(seg2, "path") and is_post) return graphPath(ctx, body);
     } else if (eql(seg1, "search") and is_post) {
         return search(ctx, body);
+    } else if (eql(seg1, "vector") and eql(seg2, "status") and is_get) {
+        return vectorStatus(ctx);
     } else if (eql(seg1, "vector") and eql(seg2, "embed") and is_post) {
         return vectorEmbed(ctx, body);
     } else if (eql(seg1, "vector") and eql(seg2, "upsert") and is_post) {
@@ -872,6 +874,7 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/memory/compact", .post = "compactFeed" },
         .{ .path = "/memory/checkpoint", .get = "exportFeedCheckpoint", .post = "restoreFeedCheckpoint" },
         .{ .path = "/memory/apply", .post = "applyFeedEvent" },
+        .{ .path = "/vector/status", .get = "vectorStatus" },
         .{ .path = "/vector/embed", .post = "embed" },
         .{ .path = "/vector/upsert", .post = "upsertVectorChunk" },
         .{ .path = "/vector/search", .post = "vectorSearch" },
@@ -938,7 +941,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -1676,7 +1679,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -2325,6 +2328,40 @@ fn vectorEmbed(ctx: *Context, body: []const u8) HttpResponse {
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
+fn vectorStatus(ctx: *Context) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
+    const running = ctx.store.countVectorOutbox("running") catch return serverError(ctx);
+    const failed_embedding = ctx.store.countVectorOutbox("failed_embedding") catch return serverError(ctx);
+    const failed_external_index = ctx.store.countVectorOutbox("failed_external_index") catch return serverError(ctx);
+    const failed_external_delete = ctx.store.countVectorOutbox("failed_external_delete") catch return serverError(ctx);
+    const total_chunks = ctx.store.countVectorChunks() catch return serverError(ctx);
+    const cfg = ctx.store.vector_backend;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"vector\":{\"backend\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.store.vectorBackendName()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"collection\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, cfg.collection) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"external_enabled\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (cfg.externalEnabled()) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"mode\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, switch (cfg.backend) {
+        .local => "local",
+        .qdrant => "http",
+        .lancedb => "sdk_process",
+        .lancedb_http => "http_adapter",
+    }) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"base_url_configured\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (cfg.base_url != null) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"lancedb_uri_configured\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (cfg.lancedb_uri != null) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"command_configured\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (cfg.lancedb_command.len > 0) "true" else "false") catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"canonical_chunks\":{d},\"outbox\":{{\"pending\":{d},\"running\":{d},\"failed_embedding\":{d},\"failed_external_index\":{d},\"failed_external_delete\":{d}", .{ total_chunks, pending, running, failed_embedding, failed_external_index, failed_external_delete }) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "}}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
 fn vectorSearch(ctx: *Context, body: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
@@ -2336,6 +2373,7 @@ fn vectorSearch(ctx: *Context, body: []const u8) HttpResponse {
         .scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx),
         .limit = positiveLimit(json.intField(obj, "limit"), 10),
         .include_deprecated = json.boolField(obj, "include_deprecated") orelse false,
+        .strict_external = json.boolField(obj, "strict_external") orelse json.boolField(obj, "strict_vector") orelse false,
     }) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"matches\":[") catch return serverError(ctx);
@@ -2370,6 +2408,7 @@ fn vectorRebuild(ctx: *Context, body: []const u8) HttpResponse {
     const result = ctx.store.rebuildVectorIndex(ctx.allocator, .{
         .limit = positiveLimit(json.intField(obj, "limit"), 1000),
         .reset_external = json.boolField(obj, "reset_external") orelse false,
+        .retry_failed = json.boolField(obj, "retry_failed") orelse false,
     }) catch return serverError(ctx);
     return vectorMaintenanceResponse(ctx, "vector_rebuild", result);
 }
@@ -2381,6 +2420,7 @@ fn vectorReconcile(ctx: *Context, body: []const u8) HttpResponse {
     const result = ctx.store.reconcileVectorIndex(ctx.allocator, .{
         .limit = positiveLimit(json.intField(parsed.value.object, "limit"), 1000),
         .reset_external = false,
+        .retry_failed = json.boolField(parsed.value.object, "retry_failed") orelse false,
     }) catch return serverError(ctx);
     return vectorMaintenanceResponse(ctx, "vector_reconcile", result);
 }
@@ -2388,11 +2428,12 @@ fn vectorReconcile(ctx: *Context, body: []const u8) HttpResponse {
 fn vectorMaintenanceResponse(ctx: *Context, key: []const u8, result: store_mod.VectorMaintenanceResult) HttpResponse {
     const body = std.fmt.allocPrint(
         ctx.allocator,
-        "{{\"{s}\":{{\"canonical_chunks\":{d},\"enqueued_upserts\":{d},\"external_enabled\":{s},\"active_sink\":\"{s}\",\"external_sinks\":{s}}}}}",
+        "{{\"{s}\":{{\"canonical_chunks\":{d},\"enqueued_upserts\":{d},\"requeued_failed\":{d},\"external_enabled\":{s},\"active_sink\":\"{s}\",\"external_sinks\":{s}}}}}",
         .{
             key,
             result.canonical_chunks,
             result.enqueued_upserts,
+            result.requeued_failed,
             if (result.external_enabled) "true" else "false",
             ctx.store.vectorBackendName(),
             ctx.store.vectorExternalSinksJson(),
@@ -5185,6 +5226,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
                 .include_sessions = json.boolField(obj, "include_sessions") orelse include_sessions_default,
                 .session_id = json.nullableStringField(obj, "session_id"),
                 .use_vector = false,
+                .strict_vector = false,
                 .use_temporal_decay = json.boolField(obj, "use_temporal_decay") orelse true,
                 .use_mmr = json.boolField(obj, "use_mmr") orelse true,
                 .allow_reranker = json.boolField(obj, "allow_reranker") orelse false,
@@ -5208,6 +5250,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
         .include_sessions = json.boolField(obj, "include_sessions") orelse include_sessions_default,
         .session_id = json.nullableStringField(obj, "session_id"),
         .use_vector = use_vector,
+        .strict_vector = strict_vector,
         .use_temporal_decay = json.boolField(obj, "use_temporal_decay") orelse true,
         .use_mmr = json.boolField(obj, "use_mmr") orelse true,
         .allow_reranker = json.boolField(obj, "allow_reranker") orelse false,
@@ -6531,6 +6574,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"ask\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"createArtifact\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"runVectorOutbox\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"vectorStatus\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"deleteVectorChunk\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"rebuildVectorIndex\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"reconcileVectorIndex\"") != null);
@@ -6543,6 +6587,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expectEqualStrings("200 OK", capabilities_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_rebuild\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_reconcile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_status\"") != null);
 
     const artifact_types = handleRequest(&ctx, "GET", "/v1/artifact-types", "", "");
     try std.testing.expectEqualStrings("200 OK", artifact_types.status);
@@ -6567,6 +6612,9 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, embed_resp.body, "\"dimensions\":4") != null);
     const embed_override = handleRequest(&ctx, "POST", "/v1/vector/embed", "{\"text\":\"agent memory\",\"base_url\":\"http://127.0.0.1:9\",\"model\":\"x\"}", "");
     try std.testing.expectEqualStrings("400 Bad Request", embed_override.status);
+    const vector_status = handleRequest(&ctx, "GET", "/v1/vector/status", "", "");
+    try std.testing.expectEqualStrings("200 OK", vector_status.status);
+    try std.testing.expect(std.mem.indexOf(u8, vector_status.body, "\"backend\":\"local\"") != null);
 
     const atom_resp = handleRequest(&ctx, "POST", "/v1/memory-atoms", "{\"text\":\"agent memory\",\"scope\":\"public\",\"created_by\":\"agent\"}", "");
     try std.testing.expectEqualStrings("200 OK", atom_resp.status);
