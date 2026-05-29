@@ -26,7 +26,7 @@ zig build run -- --db .nullpantry/nullpantry.db
 
 CI, nightly, and release builds are delegated to `nullclaw/nullbuilder`.
 
-To run NullPantry as the shared agent-memory service for several NullClaw agents while keeping the knowledge base itself on SQLite/Postgres, move the agent-memory/session plane to Redis:
+To run NullPantry as the shared agent-memory service for several NullClaw agents while keeping the knowledge base itself on SQLite/Postgres, move the agent-memory/session plane to Redis. For local parity and tests, the same runtime plane also accepts `NULLPANTRY_AGENT_MEMORY_BACKEND=memory`, `memory_lru`, or `none`:
 
 ```sh
 NULLPANTRY_AGENT_MEMORY_BACKEND=redis \
@@ -35,6 +35,49 @@ zig build run -- --backend postgres --postgres-url "$NULLPANTRY_DATABASE_URL"
 ```
 
 With token principals, each agent keeps private memory under its own `actor_id`; explicit scopes such as `team:alpha` or `project:nullpantry` create shared logical memory owners.
+
+One NullClaw can also address several named runtime stores through the same NullPantry service. Configure them with repeated CLI flags or a JSON env var, then pass `store:"scratch"`, `store:"team"`, or `store:"archive"` per request:
+
+```sh
+NULLPANTRY_AGENT_MEMORY_BACKEND=redis \
+NULLPANTRY_REDIS_URL='redis://redis.internal:6379/0' \
+NULLPANTRY_AGENT_MEMORY_STORES='[
+  {"name":"scratch","backend":"memory_lru"},
+  {"name":"team","redis_url":"redis://redis.internal:6379/1","key_prefix":"team-memory"}
+]' \
+zig build run -- --backend postgres --postgres-url "$NULLPANTRY_DATABASE_URL"
+```
+
+To move ANN vector indexing/search out of the canonical SQLite/Postgres record store, configure an external vector backend. NullPantry still hydrates and ACL-filters every external ANN candidate against its canonical Source/Artifact/MemoryAtom rows before returning text or citations:
+
+```sh
+NULLPANTRY_VECTOR_BACKEND=qdrant \
+NULLPANTRY_VECTOR_BASE_URL='http://qdrant.internal:6333' \
+NULLPANTRY_VECTOR_COLLECTION='nullpantry_vectors' \
+zig build run -- --backend postgres --postgres-url "$NULLPANTRY_DATABASE_URL"
+```
+
+The same vector runtime boundary supports a real LanceDB SDK process adapter. Use `NULLPANTRY_VECTOR_BACKEND=lancedb` with `NULLPANTRY_LANCEDB_URI` and, when needed, `NULLPANTRY_LANCEDB_COMMAND=python3` or a custom adapter executable. The old HTTP adapter shape is explicit as `NULLPANTRY_VECTOR_BACKEND=lancedb_http` or `NULLPANTRY_LANCEDB_URL`.
+
+For high-volume audit/feed history, configure ClickHouse as the analytics export plane:
+
+```sh
+NULLPANTRY_ANALYTICS_BACKEND=clickhouse \
+NULLPANTRY_ANALYTICS_BASE_URL='http://clickhouse.internal:8123' \
+NULLPANTRY_ANALYTICS_TABLE='nullpantry_events' \
+zig build run -- --backend postgres --postgres-url "$NULLPANTRY_DATABASE_URL"
+```
+
+To use Lucid as an optional semantic projection, keep SQLite/Postgres as the canonical NullPantry record store and enable the Lucid CLI projection plane:
+
+```sh
+NULLPANTRY_LUCID_ENABLED=true \
+NULLPANTRY_LUCID_WORKSPACE='/srv/null-workspace' \
+NULLPANTRY_LUCID_PROJECT_SCOPES='["public"]' \
+zig build run -- --backend postgres --postgres-url "$NULLPANTRY_DATABASE_URL"
+```
+
+Lucid projection is best-effort: writes are synced only when the source scope/permissions are allowed by `NULLPANTRY_LUCID_PROJECT_SCOPES`, and Lucid recall is returned only through NullPantry's configured result scope and permissions.
 
 Postgres mode requires a Postgres database with `pgvector` available and `libpq` available at runtime:
 
@@ -55,6 +98,20 @@ Run the Redis agent-memory/session contract against a real Redis with:
 ```sh
 NULLPANTRY_TEST_REDIS_URL='redis://:password@localhost:6379/0' zig build redis-contract --summary all
 ```
+
+Run external runtime contracts against real services with:
+
+```sh
+NULLPANTRY_TEST_QDRANT_URL='http://localhost:6333' zig build qdrant-contract --summary all
+NULLPANTRY_TEST_CLICKHOUSE_URL='http://localhost:8123' zig build clickhouse-contract --summary all
+NULLPANTRY_TEST_LANCEDB_URI='.nullpantry/lancedb-contract' zig build lancedb-contract --summary all
+NULLPANTRY_TEST_LANCEDB_URL='https://your-compatible-vector-service' zig build lancedb-contract --summary all
+zig build lucid-contract --summary all
+```
+
+`zig build runtime-contracts --summary all` is the aggregate gate for the concrete runtime planes: Postgres, Redis, Qdrant, LanceDB, ClickHouse, and Lucid. It expects the corresponding `NULLPANTRY_TEST_*` URLs/URIs to be configured, except Lucid, which uses a fake CLI contract.
+
+`lancedb-contract` prefers the SDK adapter when `NULLPANTRY_TEST_LANCEDB_URI` is set. The default command is `python3` and expects the official `lancedb` Python package to be installed; `NULLPANTRY_TEST_LANCEDB_COMMAND` can point at a custom executable that implements `upsert <uri> <table>`, `search <uri> <table> <limit>`, `delete <uri> <table>`, and `reset <uri> <table>`, reading row/search/delete JSON from stdin where applicable. `NULLPANTRY_TEST_LANCEDB_URL` remains available only for explicit `lancedb_http` adapter-service deployments. NullPantry keeps canonical text/provenance/ACL in SQLite/Postgres in both modes.
 
 Startup migrations target the current native NullPantry schema. Because this product is not in production yet and backward compatibility is intentionally not supported, obsolete compatibility tables, old `compat.memory` projections, and actorless legacy session rows are removed instead of being preserved under synthetic actors.
 
@@ -125,6 +182,12 @@ Native API lives under `/v1`: agent-memory, spaces, policy scopes, sources, arti
 
 `GET|POST /v1/agent-memory`, `PUT|GET|DELETE /v1/agent-memory/:key`, `POST /v1/agent-memory/search`, and `GET /v1/agent-memory/count` are the native key/session memory surface for agents. Omitted `scope` creates actor-private memory; `session_id` without `scope` creates actor-private session memory; explicit `scope` such as `team:alpha`, `project:nullpantry`, `org:null`, or `public` creates shared scoped memory under logical owner `shared:<scope>`. Reads, list/search/count, global search, ask, and context packs use ACL visibility instead of raw owner matching, so multiple NullClaw agents can share one database while still keeping private keys isolated. `GET` without `scope` prefers the caller's private row when a private and shared row use the same key; list/search dedupe the visible map the same way. Pass `?scope=...` for exact shared reads/deletes. Responses include `owner_id` for the logical memory owner and `created_by_actor_id` for the last real writer, so shared team memory remains auditable. All agent memory is backed by `Source` + `MemoryAtom` provenance so it participates in search, ask, context packs, lifecycle, and audit.
 
+Agent-memory calls can choose the storage plane per request. Body fields `storage`, `store`, `target_store`, or exact array `stores`, and query params `?storage=...`, `?store=...`, `?target_store=...`, or comma-separated `?stores=scratch,archive`, accept `primary`, `native`, `redis`/`runtime`, any configured named store id, and `all`/`federated`. `primary` preserves the configured default plane: Redis or memory_lru runtime when `NULLPANTRY_AGENT_MEMORY_BACKEND` is configured, otherwise canonical SQLite/Postgres. `native` forces canonical SQLite/Postgres, `redis`/`runtime` forces the default runtime plane and returns `storage_unavailable` if it is not configured, a named store routes only to that runtime store, `stores:["scratch","archive"]` writes/reads only those selected stores, and `all` writes/deletes/federates canonical native, default runtime, and every named runtime with runtime results preferred over native duplicates. Cross-plane writes are intentionally not a distributed transaction; canonical storage remains the system of record for provenance, ACL, lifecycle, and retrieval.
+
+The same selectors can be used when creating Sources, Artifacts, Entities, Relations, Memory Atoms, and persisted Context Packs. Those objects are always written to the canonical SQLite/Postgres record store first; the selector controls which runtime/named stores receive searchable mirrors. `storage:"native"` disables runtime mirroring, `store:"scratch"` mirrors only to that named store, `stores:["scratch","archive"]` mirrors to the selected stores, and `storage:"all"` mirrors to every configured runtime store. Missing explicit stores fail with `storage_unavailable` instead of falling back.
+
+The same storage selectors are accepted by `/v1/search`, `/v1/ask`, `/v1/retrieval/search`, `/v1/context-packs`, and snapshot export. On retrieval endpoints, `primary` and `all` search canonical knowledge plus visible runtime stores, `native` searches only canonical SQLite/Postgres knowledge, `runtime` searches only the default runtime plane, a named store searches only that runtime store, and a `stores` subset searches exactly the selected planes. This lets one NullClaw process ask for private scratch memory, shared team memory, archive memory, or canonical NullPantry knowledge without changing service instances or credentials.
+
 `GET /v1/agent-sessions`, `GET /v1/agent-sessions/:id`, `GET|POST|DELETE /v1/agent-sessions/:id/messages`, `GET|PUT|DELETE /v1/agent-sessions/:id/usage`, and `DELETE /v1/agent-sessions/auto-saved?session_id=:id` are the native session/history API. Multiple agents may reuse the same `session_id`; results are always filtered by token-bound `actor_id` before session scope checks.
 
 Native memory writes always end with provenance. If a caller omits `source_ids` or `evidence_ranges`, NullPantry creates an internal `Source` with the same scope/permissions and attaches an evidence range for the saved text.
@@ -138,12 +201,12 @@ Additional agent-memory surfaces:
 - Transcript extraction accepts timestamp/speaker-prefixed lines such as `[00:01:04] Alice: Decision: ...`, records evidence ranges, and chunks long source/artifact text into multiple permission-filtered vector chunks instead of indexing only one whole-document vector.
 - `GET|POST /v1/jobs`, `POST /v1/jobs/:id/run`, and `POST /v1/workers/run` persist and execute extraction, hygiene, conflict scan, and vector-outbox jobs with scoped visibility.
 - `GET /v1/conflicts` and `POST /v1/conflicts/scan` detect contradictory visible memory atoms, keeping inaccessible scopes out of conflict summaries.
-- `GET /v1/engines` exposes runtime planes instead of a flat compatibility list: record storage, agent memory/session storage, vector, graph, analytics/audit export, import/export, lifecycle, and feed. `sqlite` and `postgres` remain full system-of-record backends; `redis` is now a native RESP runtime backend for shared/isolated agent memory, session messages, and usage state; `kg` is native graph retrieval. `lancedb`, `clickhouse`, and `lucid` are modeled planes, but are not advertised as runtime-supported until concrete adapters are wired.
-- `POST /v1/vector/embed`, `POST /v1/vector/upsert`, `POST /v1/vector/search`, `GET /v1/vector/outbox`, and `POST /v1/vector/outbox/run` provide the server-side vector layer with deterministic local embeddings, optional OpenAI-compatible embeddings, permission-filtered vector chunks, ANN-style prefiltering, final cosine rerank, local `indexed_local` outbox acknowledgements, dynamic pgvector dimensions in Postgres, and extension contracts for Qdrant/pgvector style adapters.
+- `GET /v1/engines` exposes runtime planes instead of a flat compatibility list: record storage, agent memory/session storage, vector, graph, projection, analytics/audit export, import/export, lifecycle, and feed. `sqlite` and `postgres` remain full system-of-record backends; `none`, `memory_lru`, and `redis` are runtime backends for disabled, in-process, and shared/isolated agent memory, session messages, and usage state; `kg` is native graph retrieval; `qdrant` and `lancedb` are runtime vector planes; `clickhouse` is the runtime analytics/event-history export plane; `lucid` is an optional CLI projection plane for best-effort semantic context.
+- `POST /v1/vector/embed`, `POST /v1/vector/upsert`, `POST /v1/vector/search`, `POST /v1/vector/delete`, `POST /v1/vector/rebuild`, `POST /v1/vector/reconcile`, `GET /v1/vector/outbox`, and `POST /v1/vector/outbox/run` provide the server-side vector layer with deterministic local embeddings, optional OpenAI-compatible embeddings, permission-filtered vector chunks, ANN-style prefiltering, final cosine rerank, local `indexed_local` outbox acknowledgements, dynamic pgvector dimensions in Postgres, Qdrant HTTP upsert/search/delete/reset, LanceDB SDK upsert/search/delete/reset, and an explicit LanceDB HTTP adapter-service contract. External vector search returns candidate vector IDs only; NullPantry hydrates those IDs from its canonical store and re-applies ACL/status checks before returning text. Delete emits external tombstones, reconcile replays canonical chunks into the configured vector plane, and rebuild can reset the external collection/table before replaying canonical truth.
 - `POST /v1/retrieval/plan` exposes retrieval planning primitives for keyword, vector, graph, query expansion, MMR/RRF, temporal decay, adaptive retrieval, and reranking.
-- `/v1/search`, `/v1/ask`, `/v1/context-packs`, and `POST /v1/retrieval/search` use the same hybrid retrieval path: ACL first, scoped keyword/global candidates, deterministic query expansion, configured query embeddings, vector ANN search, RRF fusion, temporal quality rerank, embedding MMR for local-deterministic embeddings with token-diversity fallback for external embedding spaces, optional provider-backed LLM rerank when `allow_reranker=true`, citation-safe result assembly, staleness warnings, optional visible conflict warnings, and grouped results for memory atoms, sources, artifacts, entities, relations, context packs, feed events, native agent memories, and guarded session messages. Context packs return both the generated text summary and typed sections/citations/forbidden assumptions/suggested next steps for agent context serving. Read-only callers receive non-persisted context pack previews; durable context packs require `write` or `propose` and can be requested with `"persist": true`. Ask lists existing visible conflicts by default; callers with `write` or `verify` can pass `"scan_conflicts": true` to update conflict records during the request.
-- `GET|POST /v1/memory/feed`, `GET|POST /v1/memory/events`, `GET /v1/memory/status`, `POST /v1/memory/compact`, `GET|POST /v1/memory/checkpoint`, and `POST /v1/memory/apply` provide native cross-memory feed/apply events. Feed visibility, pending restore, and apply use the same scope plus permissions checks as sources, artifacts, entities, relations, context packs, memory atoms, and agent memory. Apply validates payloads before reserving dedupe keys, preserves the event `actor_id` for admin/service restores, supports `put`, `delete`, `verify`, `mark_stale`, `supersede`, deterministic `merge_string_set`, and deterministic `merge_object`, returns the original applied event on retry, releases stale in-progress reservations after the retry window, exports cursor-floor checkpoints, redacts payloads that cite inaccessible objects, and returns `410 Gone` when a consumer asks for events below the compacted cursor floor.
-- `GET /v1/lifecycle/diagnostics`, `POST /v1/lifecycle/snapshot`, `POST /v1/lifecycle/snapshot/export`, `POST /v1/lifecycle/snapshot/import`, `POST /v1/lifecycle/hygiene`, `POST /v1/lifecycle/summarize`, and `POST /v1/lifecycle/rollout` expose lifecycle runtime operations. Diagnostics include memory, stale memory, vector outbox, cache, queued/running/failed jobs, pending feed events, open conflicts, native agent memories, and session counts. Snapshot export is permission-aware and returns only visible search/context objects. `read + export` can produce a pure export without writing a lifecycle snapshot; persisted export snapshots require `write` or `propose`. Snapshot import preflights the batch and hydrates portable objects back as provenance-backed memory atoms through an atomic storage operation subject to the caller's write/propose/verify scopes.
+- `/v1/search`, `/v1/ask`, `/v1/context-packs`, and `POST /v1/retrieval/search` use the same hybrid retrieval path: ACL first, scoped keyword/global candidates, deterministic query expansion, configured query embeddings, vector ANN search, optional Lucid projection augmentation when local hits are sparse, RRF fusion, temporal quality rerank, embedding MMR for local-deterministic embeddings with token-diversity fallback for external embedding spaces, optional provider-backed LLM rerank when `allow_reranker=true`, citation-safe result assembly, staleness warnings, optional visible conflict warnings, and grouped results for memory atoms, sources, artifacts, entities, relations, context packs, feed events, native agent memories, Lucid projections, and guarded session messages. Context packs return both the generated text summary and typed sections/citations/forbidden assumptions/suggested next steps for agent context serving. Read-only callers receive non-persisted context pack previews; durable context packs require `write` or `propose` and can be requested with `"persist": true`. Ask lists existing visible conflicts by default; callers with `write` or `verify` can pass `"scan_conflicts": true` to update conflict records during the request.
+- `GET|POST /v1/memory/feed`, `GET|POST /v1/memory/events`, `GET /v1/memory/status`, `POST /v1/memory/compact`, `GET|POST /v1/memory/checkpoint`, and `POST /v1/memory/apply` provide native cross-memory feed/apply events. Feed visibility, pending restore, and apply use the same scope plus permissions checks as sources, artifacts, entities, relations, context packs, memory atoms, and agent memory. Apply validates payloads before reserving dedupe keys, preserves the event `actor_id` for admin/service restores, preserves agent-memory storage planes from event payloads (`native`, default `runtime`, named stores, subsets, or `all`), supports `put`, `delete`, `verify`, `mark_stale`, `supersede`, deterministic `merge_string_set`, and deterministic `merge_object`, returns the original applied event on retry, releases stale in-progress reservations after the retry window, exports cursor-floor checkpoints, redacts payloads that cite inaccessible objects, and returns `410 Gone` when a consumer asks for events below the compacted cursor floor.
+- `GET /v1/lifecycle/diagnostics`, `POST /v1/lifecycle/snapshot`, `POST /v1/lifecycle/snapshot/export`, `POST /v1/lifecycle/snapshot/import`, `POST /v1/lifecycle/analytics/export`, `POST /v1/lifecycle/hygiene`, `POST /v1/lifecycle/summarize`, and `POST /v1/lifecycle/rollout` expose lifecycle runtime operations. Diagnostics include memory, stale memory, vector outbox, cache, queued/running/failed jobs, pending feed events, open conflicts, native agent memories, and session counts. Snapshot export is permission-aware and returns only visible search/context objects. `read + export` can produce a pure export without writing a lifecycle snapshot; persisted export snapshots require `write` or `propose`. Snapshot import preflights the batch and hydrates portable objects back as provenance-backed memory atoms through an atomic storage operation subject to the caller's write/propose/verify scopes. Analytics export is admin-only and ships audit plus visible feed events to the configured ClickHouse plane.
 - `POST /v1/lifecycle/cache/put`, `POST /v1/lifecycle/cache/get`, `POST /v1/lifecycle/semantic-cache/put`, and `POST /v1/lifecycle/semantic-cache/search` expose response and semantic cache operations backed by SQLite/Postgres tables.
 - `/v1/search` and `/v1/ask` participate in the lifecycle cache path. They read exact response-cache entries by default and, when called with `cache_ttl_ms` by a writer, persist cache entries. `/v1/ask` can also use semantic cache with `use_semantic_cache=true`. Response and semantic cache entries are keyed by `(actor_id, cache_key)`, store the generating actor/scope set, and are only returned to callers that match the cached actor and can see every cached scope.
 
@@ -156,7 +219,9 @@ The service is being kept headless and layered:
 - `src/auth.zig` owns bearer-token authorization, token-principal extraction, actor spoofing protection, and request scope/capability narrowing.
 - `src/access.zig` owns reusable ACL primitives: actor matching, session visibility, permission openness, ACL coverage, agent-memory scope derivation, and the private-vs-shared logical owner rules.
 - `src/redis.zig` owns the dependency-free RESP client used by runtime engine planes.
-- `src/agent_memory_runtime.zig` owns switchable agent-memory/session backends. SQLite/Postgres can store native agent memory with full provenance; Redis can be selected as a shared low-latency remote plane for multiple NullClaw agents.
+- `src/agent_memory_runtime.zig` owns switchable agent-memory/session backends. SQLite/Postgres can store native agent memory with full provenance; `none` disables the runtime plane, `memory_lru` provides in-process parity for simple NullClaw-style memory, and Redis can be selected as a shared low-latency remote plane for multiple NullClaw agents.
+- `src/vector_runtime.zig` owns switchable external ANN vector planes. Qdrant, LanceDB SDK, and explicit LanceDB HTTP adapter services are treated as candidate indexes with upsert/search/delete/reset hooks; canonical text, provenance, status, and ACL decisions remain in SQLite/Postgres, and reconcile/rebuild replay canonical chunks into the configured plane.
+- `src/lucid_runtime.zig` owns optional Lucid CLI projection. It is a semantic augmentation plane only: canonical writes, provenance, ACL, lifecycle, and citations stay in SQLite/Postgres.
 - `src/store.zig` is the storage facade plus concrete SQLite/Postgres implementations. It delegates agent-memory/session calls to `agent_memory_runtime.zig` when an external plane is configured, while keeping sources/artifacts/entities/relations/feed/lifecycle in the canonical record backend.
 - `src/context_pack.zig` owns context-pack ordering, token budgeting, summary assembly, typed sections, required-scope calculation, and the static agent safety guidance shared by SQLite and Postgres.
 - `src/retrieval.zig`, `src/vector.zig`, `src/lifecycle.zig`, `src/extraction.zig`, and `src/providers.zig` hold independent domain services with focused unit tests.
@@ -169,7 +234,13 @@ SQLite is the working local/dev/test backend and includes relational tables, FTS
 
 Postgres is implemented through a native `libpq` runtime adapter behind a narrow transport boundary. On startup it applies the Postgres DDL, adds `connect_timeout` to Postgres URLs that do not already define one, then storage operations execute SQL with server-side `statement_timeout` through pooled libpq connections: primitives, hybrid search, dynamic-dimension pgvector, lifecycle/cache, native agent memory, sessions/history, jobs, connector cursors, and conflicts. Multi-step writes and snapshot imports run as single Postgres transaction scripts. Postgres vector search uses pgvector candidates and no longer silently falls back to an in-process 5000-row scan.
 
-Redis is implemented as a native RESP runtime plane, not via subprocesses or NullClaw compatibility routes. Configure it with `NULLPANTRY_AGENT_MEMORY_BACKEND=redis` plus `NULLPANTRY_REDIS_URL`, or CLI flags `--agent-memory-backend redis --redis-url redis://host:6379/0`. The Redis plane stores exact actor/session/key agent memory, shared scoped memory through logical owners such as `shared:team:alpha`, session messages, and usage counters. Retrieval/search/ask/context-pack flows still pass through NullPantry ACL checks before Redis-backed agent memory is exposed.
+The agent-memory runtime plane supports `none`, in-process `memory_lru`, Redis, and named runtime stores. Redis is implemented as a native RESP runtime plane, not via subprocesses or NullClaw compatibility routes. Configure the default runtime with `NULLPANTRY_AGENT_MEMORY_BACKEND=redis` plus `NULLPANTRY_REDIS_URL`, or CLI flags `--agent-memory-backend redis --redis-url redis://host:6379/0`. Configure additional named stores with repeated `--agent-memory-store scratch=memory_lru`, `--agent-memory-store team=redis://host:6379/1`, or `NULLPANTRY_AGENT_MEMORY_STORES` JSON. The Redis and memory_lru planes store exact actor/session/key agent memory, shared scoped memory through logical owners such as `shared:team:alpha`, session messages, and usage counters. Retrieval/search/ask/context-pack flows still pass through NullPantry ACL checks before runtime-backed agent memory is exposed.
+
+Qdrant is implemented as a native HTTP vector runtime plane. Configure it with `NULLPANTRY_VECTOR_BACKEND=qdrant`, `NULLPANTRY_VECTOR_BASE_URL`, and `NULLPANTRY_VECTOR_COLLECTION`, or with the Qdrant-specific aliases. LanceDB is implemented as an SDK process adapter with `NULLPANTRY_VECTOR_BACKEND=lancedb`, `NULLPANTRY_LANCEDB_URI`, optional `NULLPANTRY_LANCEDB_COMMAND`, and `NULLPANTRY_LANCEDB_TABLE`/`NULLPANTRY_VECTOR_COLLECTION`. Explicit adapter-service deployments can use `NULLPANTRY_VECTOR_BACKEND=lancedb_http` plus `NULLPANTRY_VECTOR_BASE_URL` or `NULLPANTRY_LANCEDB_URL`. All external vector adapters receive vector IDs and metadata through the vector outbox, then `/v1/vector/search` hydrates candidates from canonical storage and returns only permission-checked NullPantry chunks. `/v1/vector/delete` writes tombstones for external sinks, `/v1/vector/reconcile` queues canonical upserts, and `/v1/vector/rebuild` can reset the configured collection/table before replaying canonical chunks.
+
+ClickHouse is implemented as a native HTTP analytics runtime plane. Configure it with `NULLPANTRY_ANALYTICS_BACKEND=clickhouse`, `NULLPANTRY_ANALYTICS_BASE_URL`, and `NULLPANTRY_ANALYTICS_TABLE`, or with the ClickHouse-specific aliases. `POST /v1/lifecycle/analytics/export` creates the target MergeTree table if needed and writes audit events plus permission-filtered feed events as JSONEachRow rows for long-term history and analytics without making ClickHouse the canonical knowledge store.
+
+Lucid is implemented as an optional CLI projection adapter. Configure it with `NULLPANTRY_LUCID_ENABLED=true` plus `NULLPANTRY_LUCID_WORKSPACE` or CLI flags `--lucid-enabled --lucid-workspace`. NullPantry syncs eligible MemoryAtom and AgentMemory writes to `lucid store`, augments sparse retrieval with `lucid context`, and still treats SQLite/Postgres as the authoritative source for permissions, lifecycle, source provenance, vector chunks, feed events, and context packs.
 
 ## Build System
 

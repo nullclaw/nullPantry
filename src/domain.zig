@@ -66,6 +66,7 @@ pub const Artifact = struct {
     source_ids_json: []const u8,
     related_entities_json: []const u8,
     permissions_json: []const u8,
+    fields_json: []const u8 = "{}",
     summary: ?[]const u8,
     agent_summary: ?[]const u8,
 
@@ -95,6 +96,8 @@ pub const Artifact = struct {
         try json.appendRawJsonOr(out, allocator, self.related_entities_json, "[]");
         try out.appendSlice(allocator, ",\"permissions\":");
         try json.appendRawJsonOr(out, allocator, self.permissions_json, "[]");
+        try out.appendSlice(allocator, ",\"fields\":");
+        try json.appendRawJsonOr(out, allocator, self.fields_json, "{}");
         try out.appendSlice(allocator, ",\"summary\":");
         try json.appendNullableString(out, allocator, self.summary);
         try out.appendSlice(allocator, ",\"agent_summary\":");

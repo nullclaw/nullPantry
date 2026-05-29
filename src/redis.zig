@@ -216,17 +216,12 @@ pub const Client = struct {
         var read_buffer: [4096]u8 = undefined;
         var reader = stream.reader(compat.io(), &read_buffer);
         while (true) {
-            var chunk: [4096]u8 = undefined;
-            const read = reader.interface.readSliceShort(&chunk) catch |err| {
+            const byte = reader.interface.takeByte() catch |err| {
                 self.closeAfterIoError();
                 return err;
             };
-            if (read == 0) {
-                self.closeAfterIoError();
-                return error.RedisConnectionClosed;
-            }
-            if (data.items.len + read > max_response_bytes) return error.RedisResponseTooLarge;
-            try data.appendSlice(self.allocator, chunk[0..read]);
+            if (data.items.len + 1 > max_response_bytes) return error.RedisResponseTooLarge;
+            try data.append(self.allocator, byte);
             const parsed = parseResp(self.allocator, data.items) catch |err| switch (err) {
                 error.IncompleteData => continue,
                 else => return err,

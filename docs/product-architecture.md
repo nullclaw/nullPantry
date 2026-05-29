@@ -87,6 +87,6 @@ Old decisions should be superseded, not deleted, so agents can understand why th
 
 NullClaw keeps local execution and minimal local memory: `none`, in-process `memory`, local `sqlite`, and `markdown`.
 
-NullPantry owns anything central or advanced: shared memory, cross-agent isolation/sharing, source-backed knowledge, permission-aware RAG, context packs, graph retrieval, vector indexes, Redis shared agent memory, Postgres production storage, feed/apply/checkpoint, lifecycle, snapshots, and diagnostics.
+NullPantry owns anything central or advanced: shared memory, cross-agent isolation/sharing, source-backed knowledge, permission-aware RAG, context packs, graph retrieval, vector indexes, Redis shared agent memory/session/usage, Postgres production storage with pgvector, Qdrant and LanceDB vector planes, ClickHouse analytics/event-history export, optional Lucid semantic projection, feed/apply/checkpoint, lifecycle, snapshots, and diagnostics.
 
 NullBoiler can orchestrate multiple agents. NullTickets can send tickets and decisions. NullWatch can send incidents and events. NullHub and NullDesk can render the UI. NullPantry remains the headless knowledge and context service underneath.

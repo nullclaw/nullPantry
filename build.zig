@@ -56,4 +56,31 @@ pub fn build(b: *std.Build) void {
     redis_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_REDIS_TEST", "1");
     const redis_contract_step = b.step("redis-contract", "Run the Redis agent-memory contract with NULLPANTRY_TEST_REDIS_URL");
     redis_contract_step.dependOn(&redis_contract_cmd.step);
+
+    const qdrant_contract_cmd = b.addRunArtifact(tests);
+    qdrant_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_QDRANT_TEST", "1");
+    const qdrant_contract_step = b.step("qdrant-contract", "Run the Qdrant vector runtime contract with NULLPANTRY_TEST_QDRANT_URL");
+    qdrant_contract_step.dependOn(&qdrant_contract_cmd.step);
+
+    const lancedb_contract_cmd = b.addRunArtifact(tests);
+    lancedb_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_LANCEDB_TEST", "1");
+    const lancedb_contract_step = b.step("lancedb-contract", "Run the LanceDB SDK or HTTP vector runtime contract with NULLPANTRY_TEST_LANCEDB_URI or NULLPANTRY_TEST_LANCEDB_URL");
+    lancedb_contract_step.dependOn(&lancedb_contract_cmd.step);
+
+    const clickhouse_contract_cmd = b.addRunArtifact(tests);
+    clickhouse_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_CLICKHOUSE_TEST", "1");
+    const clickhouse_contract_step = b.step("clickhouse-contract", "Run the ClickHouse analytics runtime contract with NULLPANTRY_TEST_CLICKHOUSE_URL");
+    clickhouse_contract_step.dependOn(&clickhouse_contract_cmd.step);
+
+    const lucid_contract_cmd = b.addRunArtifact(tests);
+    const lucid_contract_step = b.step("lucid-contract", "Run the Lucid projection runtime contract with a fake Lucid CLI");
+    lucid_contract_step.dependOn(&lucid_contract_cmd.step);
+
+    const runtime_contracts_step = b.step("runtime-contracts", "Run concrete external runtime contracts when their services are configured");
+    runtime_contracts_step.dependOn(&postgres_contract_cmd.step);
+    runtime_contracts_step.dependOn(&redis_contract_cmd.step);
+    runtime_contracts_step.dependOn(&qdrant_contract_cmd.step);
+    runtime_contracts_step.dependOn(&lancedb_contract_cmd.step);
+    runtime_contracts_step.dependOn(&clickhouse_contract_cmd.step);
+    runtime_contracts_step.dependOn(&lucid_contract_cmd.step);
 }

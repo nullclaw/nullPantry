@@ -45,6 +45,11 @@ pub fn appendRequiredFieldsJson(allocator: std.mem.Allocator, out: *std.ArrayLis
     try appendStringArrayJson(allocator, out, descriptor.required_fields);
 }
 
+pub fn requiredFields(artifact_type: []const u8) []const []const u8 {
+    const descriptor = descriptorFor(artifact_type) orelse return &.{};
+    return descriptor.required_fields;
+}
+
 pub fn appendTypesJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
     try out.append(allocator, '[');
     for (artifact_types, 0..) |descriptor, i| {
@@ -64,7 +69,7 @@ pub fn appendTypesJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanage
     try out.append(allocator, ']');
 }
 
-fn descriptorFor(artifact_type: []const u8) ?ArtifactTypeDescriptor {
+pub fn descriptorFor(artifact_type: []const u8) ?ArtifactTypeDescriptor {
     for (artifact_types) |descriptor| {
         if (std.mem.eql(u8, artifact_type, descriptor.name)) return descriptor;
         if (descriptor.alias) |alias| {

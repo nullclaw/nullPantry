@@ -8,6 +8,9 @@ const store_mod = @import("store.zig");
 const worker = @import("worker.zig");
 const agent_memory_runtime = @import("agent_memory_runtime.zig");
 const redis_mod = @import("redis.zig");
+const vector_runtime = @import("vector_runtime.zig");
+const analytics_runtime = @import("analytics_runtime.zig");
+const lucid_runtime = @import("lucid_runtime.zig");
 
 const default_port: u16 = 8765;
 const max_request_size: usize = 2 * 1024 * 1024;
@@ -41,6 +44,10 @@ const RuntimeConfig = struct {
     trust_actor_headers: bool = false,
     agent_memory_backend: agent_memory_runtime.BackendKind = .native,
     redis_config: redis_mod.Config = .{},
+    agent_memory_store_configs: []const agent_memory_runtime.NamedConfig = &.{},
+    vector_backend: vector_runtime.Config = .{},
+    analytics_backend: analytics_runtime.Config = .{},
+    lucid_projection: lucid_runtime.Config = .{},
 };
 
 const ServerState = struct {
@@ -65,6 +72,10 @@ pub fn main(init: std.process.Init) !void {
             .backend = cfg.agent_memory_backend,
             .redis = cfg.redis_config,
         },
+        .agent_memory_stores = cfg.agent_memory_store_configs,
+        .vector_backend = cfg.vector_backend,
+        .analytics_backend = cfg.analytics_backend,
+        .lucid_projection = cfg.lucid_projection,
     };
     var store = switch (cfg.backend) {
         .sqlite => try store_mod.Store.initSQLiteWithOptions(allocator, cfg.db_path, store_options),
@@ -80,6 +91,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("listening on http://{s}:{d}\n", .{ cfg.host, cfg.port });
     std.debug.print("storage backend: {s}\n", .{@tagName(cfg.backend)});
     std.debug.print("agent memory backend: {s}\n", .{cfg.agent_memory_backend.name()});
+    std.debug.print("named agent memory stores: {d}\n", .{cfg.agent_memory_store_configs.len});
+    std.debug.print("vector backend: {s}\n", .{cfg.vector_backend.backend.name()});
+    std.debug.print("analytics backend: {s}\n", .{cfg.analytics_backend.backend.name()});
+    std.debug.print("lucid projection: {s}\n", .{if (cfg.lucid_projection.isEnabled()) "enabled" else "disabled"});
 
     var state = ServerState{ .allocator = allocator, .store = &store, .cfg = cfg };
     if (cfg.worker_interval_ms > 0) {
@@ -181,6 +196,9 @@ fn workerLoop(state: *ServerState) void {
             .embedding_api_key = state.cfg.embedding_api_key,
             .embedding_model = state.cfg.embedding_model,
             .embedding_dimensions = state.cfg.embedding_dimensions,
+            .llm_base_url = state.cfg.llm_base_url,
+            .llm_api_key = state.cfg.llm_api_key,
+            .llm_model = state.cfg.llm_model,
             .provider_timeout_secs = state.cfg.provider_timeout_secs,
         }) catch |err| {
             arena.deinit();
@@ -275,6 +293,107 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_REDIS_TTL_SECONDS")) |ttl| {
         cfg.redis_config.ttl_seconds = std.fmt.parseInt(u32, ttl, 10) catch cfg.redis_config.ttl_seconds;
     } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_STORES")) |raw| {
+        defer allocator.free(raw);
+        cfg.agent_memory_store_configs = try parseAgentMemoryStoreConfigsJson(allocator, raw);
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_VECTOR_BACKEND")) |backend| {
+        cfg.vector_backend.backend = vector_runtime.BackendKind.parse(backend);
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_VECTOR_BASE_URL")) |url| {
+        cfg.vector_backend.base_url = url;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_VECTOR_API_KEY")) |key| {
+        cfg.vector_backend.api_key = key;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_VECTOR_COLLECTION")) |collection| {
+        cfg.vector_backend.collection = collection;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_VECTOR_TIMEOUT_SECS")) |secs| {
+        cfg.vector_backend.timeout_secs = std.fmt.parseInt(u32, secs, 10) catch cfg.vector_backend.timeout_secs;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_QDRANT_URL")) |url| {
+        cfg.vector_backend.backend = .qdrant;
+        cfg.vector_backend.base_url = url;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_QDRANT_API_KEY")) |key| {
+        cfg.vector_backend.api_key = key;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_QDRANT_COLLECTION")) |collection| {
+        cfg.vector_backend.backend = .qdrant;
+        cfg.vector_backend.collection = collection;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LANCEDB_URI")) |uri| {
+        cfg.vector_backend.backend = .lancedb;
+        cfg.vector_backend.lancedb_uri = uri;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LANCEDB_COMMAND")) |command| {
+        cfg.vector_backend.backend = .lancedb;
+        cfg.vector_backend.lancedb_command = command;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LANCEDB_URL")) |url| {
+        if (cfg.vector_backend.lancedb_uri == null) cfg.vector_backend.backend = .lancedb_http;
+        cfg.vector_backend.base_url = url;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LANCEDB_API_KEY")) |key| {
+        cfg.vector_backend.api_key = key;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LANCEDB_TABLE")) |table| {
+        cfg.vector_backend.collection = table;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_ANALYTICS_BACKEND")) |backend| {
+        cfg.analytics_backend.backend = analytics_runtime.BackendKind.parse(backend);
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_ANALYTICS_BASE_URL")) |url| {
+        cfg.analytics_backend.base_url = url;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_ANALYTICS_API_KEY")) |key| {
+        cfg.analytics_backend.api_key = key;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_ANALYTICS_TABLE")) |table| {
+        cfg.analytics_backend.table = table;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_ANALYTICS_TIMEOUT_SECS")) |secs| {
+        cfg.analytics_backend.timeout_secs = std.fmt.parseInt(u32, secs, 10) catch cfg.analytics_backend.timeout_secs;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_CLICKHOUSE_URL")) |url| {
+        cfg.analytics_backend.backend = .clickhouse;
+        cfg.analytics_backend.base_url = url;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_CLICKHOUSE_API_KEY")) |key| {
+        cfg.analytics_backend.api_key = key;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_CLICKHOUSE_TABLE")) |table| {
+        cfg.analytics_backend.backend = .clickhouse;
+        cfg.analytics_backend.table = table;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LUCID_ENABLED")) |value| {
+        defer allocator.free(value);
+        cfg.lucid_projection.enabled = parseBool(value);
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LUCID_COMMAND")) |command| {
+        cfg.lucid_projection.command = command;
+        cfg.lucid_projection.enabled = true;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LUCID_WORKSPACE")) |workspace| {
+        cfg.lucid_projection.workspace_dir = workspace;
+        cfg.lucid_projection.enabled = true;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LUCID_TOKEN_BUDGET")) |budget| {
+        cfg.lucid_projection.token_budget = std.fmt.parseInt(usize, budget, 10) catch cfg.lucid_projection.token_budget;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LUCID_LOCAL_HIT_THRESHOLD")) |threshold| {
+        cfg.lucid_projection.local_hit_threshold = std.fmt.parseInt(usize, threshold, 10) catch cfg.lucid_projection.local_hit_threshold;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LUCID_PROJECT_SCOPES")) |scopes| {
+        cfg.lucid_projection.project_scopes_json = scopes;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LUCID_RESULT_SCOPE")) |scope| {
+        cfg.lucid_projection.result_scope = scope;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LUCID_PERMISSIONS")) |permissions| {
+        cfg.lucid_projection.permissions_json = permissions;
+    } else |_| {}
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -364,9 +483,161 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--redis-ttl-seconds") and i + 1 < args.len) {
             i += 1;
             cfg.redis_config.ttl_seconds = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--agent-memory-store") and i + 1 < args.len) {
+            i += 1;
+            const named = try parseAgentMemoryStoreSpec(allocator, args[i]);
+            try appendAgentMemoryStoreConfig(allocator, &cfg, named);
+        } else if (std.mem.eql(u8, arg, "--vector-backend") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.backend = vector_runtime.BackendKind.parse(args[i]);
+        } else if (std.mem.eql(u8, arg, "--vector-base-url") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.base_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--vector-api-key") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.api_key = args[i];
+        } else if (std.mem.eql(u8, arg, "--vector-collection") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.collection = args[i];
+        } else if (std.mem.eql(u8, arg, "--vector-timeout-secs") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.timeout_secs = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--lancedb-uri") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.backend = .lancedb;
+            cfg.vector_backend.lancedb_uri = args[i];
+        } else if (std.mem.eql(u8, arg, "--lancedb-command") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.backend = .lancedb;
+            cfg.vector_backend.lancedb_command = args[i];
+        } else if (std.mem.eql(u8, arg, "--lancedb-url") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.backend = .lancedb_http;
+            cfg.vector_backend.base_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--analytics-backend") and i + 1 < args.len) {
+            i += 1;
+            cfg.analytics_backend.backend = analytics_runtime.BackendKind.parse(args[i]);
+        } else if (std.mem.eql(u8, arg, "--analytics-base-url") and i + 1 < args.len) {
+            i += 1;
+            cfg.analytics_backend.base_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--analytics-api-key") and i + 1 < args.len) {
+            i += 1;
+            cfg.analytics_backend.api_key = args[i];
+        } else if (std.mem.eql(u8, arg, "--analytics-table") and i + 1 < args.len) {
+            i += 1;
+            cfg.analytics_backend.table = args[i];
+        } else if (std.mem.eql(u8, arg, "--analytics-timeout-secs") and i + 1 < args.len) {
+            i += 1;
+            cfg.analytics_backend.timeout_secs = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--lucid-enabled")) {
+            cfg.lucid_projection.enabled = true;
+        } else if (std.mem.eql(u8, arg, "--lucid-command") and i + 1 < args.len) {
+            i += 1;
+            cfg.lucid_projection.command = args[i];
+            cfg.lucid_projection.enabled = true;
+        } else if (std.mem.eql(u8, arg, "--lucid-workspace") and i + 1 < args.len) {
+            i += 1;
+            cfg.lucid_projection.workspace_dir = args[i];
+            cfg.lucid_projection.enabled = true;
+        } else if (std.mem.eql(u8, arg, "--lucid-token-budget") and i + 1 < args.len) {
+            i += 1;
+            cfg.lucid_projection.token_budget = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--lucid-local-hit-threshold") and i + 1 < args.len) {
+            i += 1;
+            cfg.lucid_projection.local_hit_threshold = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--lucid-project-scopes") and i + 1 < args.len) {
+            i += 1;
+            cfg.lucid_projection.project_scopes_json = args[i];
+        } else if (std.mem.eql(u8, arg, "--lucid-result-scope") and i + 1 < args.len) {
+            i += 1;
+            cfg.lucid_projection.result_scope = args[i];
+        } else if (std.mem.eql(u8, arg, "--lucid-permissions") and i + 1 < args.len) {
+            i += 1;
+            cfg.lucid_projection.permissions_json = args[i];
         }
     }
     return cfg;
+}
+
+fn parseAgentMemoryStoreConfigsJson(allocator: std.mem.Allocator, raw: []const u8) ![]agent_memory_runtime.NamedConfig {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidAgentMemoryStores;
+    const items = parsed.value.array.items;
+    var configs = try allocator.alloc(agent_memory_runtime.NamedConfig, items.len);
+    errdefer allocator.free(configs);
+    for (items, 0..) |item, i| {
+        if (item != .object) return error.InvalidAgentMemoryStores;
+        const name = jsonStringField(item.object, "name") orelse return error.InvalidAgentMemoryStores;
+        const backend = jsonStringField(item.object, "backend") orelse "memory_lru";
+        var config = agent_memory_runtime.Config{ .backend = try parseNamedAgentMemoryBackend(backend) };
+        if (jsonStringField(item.object, "redis_url")) |url| {
+            config.redis = try redis_mod.parseUrl(allocator, url);
+            config.backend = .redis;
+        }
+        if (jsonStringField(item.object, "redis_key_prefix")) |prefix| {
+            config.redis.key_prefix = try allocator.dupe(u8, prefix);
+        } else if (jsonStringField(item.object, "key_prefix")) |prefix| {
+            config.redis.key_prefix = try allocator.dupe(u8, prefix);
+        }
+        if (jsonIntField(item.object, "redis_ttl_seconds")) |ttl| {
+            config.redis.ttl_seconds = @intCast(@max(ttl, 0));
+        } else if (jsonIntField(item.object, "ttl_seconds")) |ttl| {
+            config.redis.ttl_seconds = @intCast(@max(ttl, 0));
+        }
+        configs[i] = .{ .name = try allocator.dupe(u8, name), .config = config };
+    }
+    return configs;
+}
+
+fn parseAgentMemoryStoreSpec(allocator: std.mem.Allocator, raw: []const u8) !agent_memory_runtime.NamedConfig {
+    const eq = std.mem.indexOfScalar(u8, raw, '=') orelse return error.InvalidAgentMemoryStore;
+    const name = std.mem.trim(u8, raw[0..eq], " \t\r\n");
+    const value = std.mem.trim(u8, raw[eq + 1 ..], " \t\r\n");
+    if (name.len == 0 or value.len == 0) return error.InvalidAgentMemoryStore;
+    var config = agent_memory_runtime.Config{ .backend = undefined };
+    if (std.mem.startsWith(u8, value, "redis://")) {
+        config.redis = try redis_mod.parseUrl(allocator, value);
+        config.backend = .redis;
+    } else {
+        config.backend = try parseNamedAgentMemoryBackend(value);
+    }
+    return .{ .name = try allocator.dupe(u8, name), .config = config };
+}
+
+fn parseNamedAgentMemoryBackend(raw: []const u8) !agent_memory_runtime.BackendKind {
+    if (std.ascii.eqlIgnoreCase(raw, "none")) return .none;
+    if (std.ascii.eqlIgnoreCase(raw, "memory")) return .memory_lru;
+    if (std.ascii.eqlIgnoreCase(raw, "memory_lru")) return .memory_lru;
+    if (std.ascii.eqlIgnoreCase(raw, "in_memory")) return .memory_lru;
+    if (std.ascii.eqlIgnoreCase(raw, "redis")) return .redis;
+    return error.InvalidAgentMemoryStore;
+}
+
+fn appendAgentMemoryStoreConfig(allocator: std.mem.Allocator, cfg: *RuntimeConfig, named: agent_memory_runtime.NamedConfig) !void {
+    const previous = cfg.agent_memory_store_configs;
+    var next = try allocator.alloc(agent_memory_runtime.NamedConfig, previous.len + 1);
+    for (previous, 0..) |existing, i| next[i] = existing;
+    next[previous.len] = named;
+    cfg.agent_memory_store_configs = next;
+    if (previous.len > 0) allocator.free(previous);
+}
+
+fn jsonStringField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    const value = obj.get(name) orelse return null;
+    return switch (value) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn jsonIntField(obj: std.json.ObjectMap, name: []const u8) ?i64 {
+    const value = obj.get(name) orelse return null;
+    return switch (value) {
+        .integer => |n| n,
+        .float => |f| @intFromFloat(f),
+        else => null,
+    };
 }
 
 fn parseBool(raw: []const u8) bool {
@@ -382,6 +653,10 @@ fn printUsage() void {
         \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--token-principals JSON] [--actor-scopes JSON] [--actor-capabilities JSON] [--worker-scopes JSON] [--worker-capabilities JSON] [--trust-actor-headers]
         \\       nullpantry --backend postgres --postgres-url URL [--token TOKEN|--token-principals JSON]
         \\       nullpantry --agent-memory-backend redis --redis-url redis://:pass@host:6379/0
+        \\       nullpantry --vector-backend qdrant --vector-base-url http://127.0.0.1:6333 --vector-collection nullpantry_vectors
+        \\       nullpantry --vector-backend lancedb --lancedb-uri .nullpantry/lancedb --vector-collection nullpantry_vectors
+        \\       nullpantry --analytics-backend clickhouse --analytics-base-url http://127.0.0.1:8123 --analytics-table nullpantry_events
+        \\       nullpantry --lucid-enabled --lucid-workspace /path/to/workspace
         \\
         \\Environment:
         \\  NULLPANTRY_TOKEN
@@ -402,9 +677,39 @@ fn printUsage() void {
         \\  NULLPANTRY_WORKER_INTERVAL_MS
         \\  NULLPANTRY_TRUST_ACTOR_HEADERS
         \\  NULLPANTRY_AGENT_MEMORY_BACKEND
+        \\  NULLPANTRY_AGENT_MEMORY_STORES
         \\  NULLPANTRY_REDIS_URL
         \\  NULLPANTRY_REDIS_KEY_PREFIX
         \\  NULLPANTRY_REDIS_TTL_SECONDS
+        \\  NULLPANTRY_VECTOR_BACKEND
+        \\  NULLPANTRY_VECTOR_BASE_URL
+        \\  NULLPANTRY_VECTOR_API_KEY
+        \\  NULLPANTRY_VECTOR_COLLECTION
+        \\  NULLPANTRY_VECTOR_TIMEOUT_SECS
+        \\  NULLPANTRY_QDRANT_URL
+        \\  NULLPANTRY_QDRANT_API_KEY
+        \\  NULLPANTRY_QDRANT_COLLECTION
+        \\  NULLPANTRY_LANCEDB_URI
+        \\  NULLPANTRY_LANCEDB_COMMAND
+        \\  NULLPANTRY_LANCEDB_URL
+        \\  NULLPANTRY_LANCEDB_API_KEY
+        \\  NULLPANTRY_LANCEDB_TABLE
+        \\  NULLPANTRY_ANALYTICS_BACKEND
+        \\  NULLPANTRY_ANALYTICS_BASE_URL
+        \\  NULLPANTRY_ANALYTICS_API_KEY
+        \\  NULLPANTRY_ANALYTICS_TABLE
+        \\  NULLPANTRY_ANALYTICS_TIMEOUT_SECS
+        \\  NULLPANTRY_CLICKHOUSE_URL
+        \\  NULLPANTRY_CLICKHOUSE_API_KEY
+        \\  NULLPANTRY_CLICKHOUSE_TABLE
+        \\  NULLPANTRY_LUCID_ENABLED
+        \\  NULLPANTRY_LUCID_COMMAND
+        \\  NULLPANTRY_LUCID_WORKSPACE
+        \\  NULLPANTRY_LUCID_TOKEN_BUDGET
+        \\  NULLPANTRY_LUCID_LOCAL_HIT_THRESHOLD
+        \\  NULLPANTRY_LUCID_PROJECT_SCOPES
+        \\  NULLPANTRY_LUCID_RESULT_SCOPE
+        \\  NULLPANTRY_LUCID_PERMISSIONS
         \\
     , .{});
 }
@@ -467,6 +772,142 @@ test "agent memory redis backend can be configured from args" {
     try std.testing.expectEqual(@as(u8, 2), cfg.redis_config.db_index);
     try std.testing.expectEqualStrings("np-test", cfg.redis_config.key_prefix);
     try std.testing.expectEqual(@as(u32, 60), cfg.redis_config.ttl_seconds.?);
+}
+
+test "named agent memory stores can be configured from args and json" {
+    const args = [_][:0]const u8{
+        "nullpantry",
+        "--agent-memory-store",
+        "scratch=memory_lru",
+        "--agent-memory-store",
+        "shared=redis://127.0.0.1:6379/4",
+    };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+    defer std.testing.allocator.free(cfg.agent_memory_store_configs);
+    defer std.testing.allocator.free(cfg.agent_memory_store_configs[0].name);
+    defer std.testing.allocator.free(cfg.agent_memory_store_configs[1].name);
+    defer std.testing.allocator.free(cfg.agent_memory_store_configs[1].config.redis.host);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.agent_memory_store_configs.len);
+    try std.testing.expectEqualStrings("scratch", cfg.agent_memory_store_configs[0].name);
+    try std.testing.expectEqual(agent_memory_runtime.BackendKind.memory_lru, cfg.agent_memory_store_configs[0].config.backend);
+    try std.testing.expectEqualStrings("shared", cfg.agent_memory_store_configs[1].name);
+    try std.testing.expectEqual(agent_memory_runtime.BackendKind.redis, cfg.agent_memory_store_configs[1].config.backend);
+    try std.testing.expectEqual(@as(u8, 4), cfg.agent_memory_store_configs[1].config.redis.db_index);
+
+    const parsed = try parseAgentMemoryStoreConfigsJson(std.testing.allocator,
+        \\[
+        \\  {"name":"fast","backend":"memory_lru"},
+        \\  {"name":"team","redis_url":"redis://127.0.0.1:6379/5","key_prefix":"team-memory","ttl_seconds":30}
+        \\]
+    );
+    defer std.testing.allocator.free(parsed);
+    defer std.testing.allocator.free(parsed[0].name);
+    defer std.testing.allocator.free(parsed[1].name);
+    defer std.testing.allocator.free(parsed[1].config.redis.host);
+    defer std.testing.allocator.free(parsed[1].config.redis.key_prefix);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.len);
+    try std.testing.expectEqualStrings("fast", parsed[0].name);
+    try std.testing.expectEqual(agent_memory_runtime.BackendKind.memory_lru, parsed[0].config.backend);
+    try std.testing.expectEqualStrings("team", parsed[1].name);
+    try std.testing.expectEqual(agent_memory_runtime.BackendKind.redis, parsed[1].config.backend);
+    try std.testing.expectEqualStrings("team-memory", parsed[1].config.redis.key_prefix);
+    try std.testing.expectEqual(@as(u32, 30), parsed[1].config.redis.ttl_seconds.?);
+
+    try std.testing.expectError(error.InvalidAgentMemoryStore, parseAgentMemoryStoreSpec(std.testing.allocator, "bad=native"));
+    try std.testing.expectError(error.InvalidAgentMemoryStore, parseAgentMemoryStoreSpec(std.testing.allocator, "bad=typo"));
+}
+
+test "external vector backend can be configured from args" {
+    const args = [_][:0]const u8{
+        "nullpantry",
+        "--vector-backend",
+        "qdrant",
+        "--vector-base-url",
+        "http://127.0.0.1:6333",
+        "--vector-collection",
+        "np_vectors",
+        "--vector-timeout-secs",
+        "7",
+    };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+
+    try std.testing.expectEqual(vector_runtime.BackendKind.qdrant, cfg.vector_backend.backend);
+    try std.testing.expectEqualStrings("http://127.0.0.1:6333", cfg.vector_backend.base_url.?);
+    try std.testing.expectEqualStrings("np_vectors", cfg.vector_backend.collection);
+    try std.testing.expectEqual(@as(u32, 7), cfg.vector_backend.timeout_secs);
+}
+
+test "lancedb sdk vector backend can be configured from args" {
+    const args = [_][:0]const u8{
+        "nullpantry",
+        "--vector-backend",
+        "lancedb",
+        "--lancedb-uri",
+        ".nullpantry/lancedb",
+        "--lancedb-command",
+        "python3",
+        "--vector-collection",
+        "np_vectors",
+    };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+
+    try std.testing.expectEqual(vector_runtime.BackendKind.lancedb, cfg.vector_backend.backend);
+    try std.testing.expectEqualStrings(".nullpantry/lancedb", cfg.vector_backend.lancedb_uri.?);
+    try std.testing.expectEqualStrings("python3", cfg.vector_backend.lancedb_command);
+    try std.testing.expectEqualStrings("np_vectors", cfg.vector_backend.collection);
+}
+
+test "clickhouse analytics backend can be configured from args" {
+    const args = [_][:0]const u8{
+        "nullpantry",
+        "--analytics-backend",
+        "clickhouse",
+        "--analytics-base-url",
+        "http://127.0.0.1:8123",
+        "--analytics-table",
+        "np_events",
+        "--analytics-timeout-secs",
+        "9",
+    };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+
+    try std.testing.expectEqual(analytics_runtime.BackendKind.clickhouse, cfg.analytics_backend.backend);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8123", cfg.analytics_backend.base_url.?);
+    try std.testing.expectEqualStrings("np_events", cfg.analytics_backend.table);
+    try std.testing.expectEqual(@as(u32, 9), cfg.analytics_backend.timeout_secs);
+}
+
+test "lucid projection can be configured from args" {
+    const args = [_][:0]const u8{
+        "nullpantry",
+        "--lucid-enabled",
+        "--lucid-command",
+        "lucid-test",
+        "--lucid-workspace",
+        "/tmp/nullpantry",
+        "--lucid-token-budget",
+        "512",
+        "--lucid-local-hit-threshold",
+        "2",
+        "--lucid-project-scopes",
+        "[\"admin\"]",
+        "--lucid-result-scope",
+        "project:nullpantry",
+        "--lucid-permissions",
+        "[\"team:platform\"]",
+    };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+
+    try std.testing.expect(cfg.lucid_projection.isEnabled());
+    try std.testing.expectEqualStrings("lucid-test", cfg.lucid_projection.command);
+    try std.testing.expectEqualStrings("/tmp/nullpantry", cfg.lucid_projection.workspace_dir);
+    try std.testing.expectEqual(@as(usize, 512), cfg.lucid_projection.token_budget);
+    try std.testing.expectEqual(@as(usize, 2), cfg.lucid_projection.local_hit_threshold);
+    try std.testing.expectEqualStrings("[\"admin\"]", cfg.lucid_projection.project_scopes_json);
+    try std.testing.expectEqualStrings("project:nullpantry", cfg.lucid_projection.result_scope);
+    try std.testing.expectEqualStrings("[\"team:platform\"]", cfg.lucid_projection.permissions_json);
 }
 
 fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max_bytes: usize) !?[]u8 {
@@ -534,11 +975,15 @@ test {
     _ = @import("domain.zig");
     _ = @import("engines.zig");
     _ = @import("vector.zig");
+    _ = @import("vector_runtime.zig");
+    _ = @import("analytics_runtime.zig");
+    _ = @import("lucid_runtime.zig");
     _ = @import("retrieval.zig");
     _ = @import("lifecycle.zig");
     _ = @import("providers.zig");
     _ = @import("redis.zig");
     _ = @import("agent_memory_runtime.zig");
+    _ = @import("markdown_adapter.zig");
     _ = @import("artifacts.zig");
     _ = @import("extraction.zig");
     _ = @import("worker.zig");

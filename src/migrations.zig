@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const expected_schema_version: i64 = 17;
+pub const expected_schema_version: i64 = 20;
 
 pub const Migration = struct {
     version: i64,
@@ -26,6 +26,9 @@ pub const migration_manifest = [_]Migration{
     .{ .version = 15, .name = "agent_memory_writer_identity", .checksum = "np-015-agent-memory-writer-identity" },
     .{ .version = 16, .name = "job_leases", .checksum = "np-016-job-leases" },
     .{ .version = 17, .name = "vector_outbox_leases", .checksum = "np-017-vector-outbox-leases" },
+    .{ .version = 18, .name = "artifact_structured_fields", .checksum = "np-018-artifact-structured-fields" },
+    .{ .version = 19, .name = "primitive_lifecycle_overlay", .checksum = "np-019-primitive-lifecycle-overlay" },
+    .{ .version = 20, .name = "sqlite_full_text_coverage", .checksum = "np-020-sqlite-full-text-coverage" },
 };
 
 pub fn expectedMigration(version: i64) ?Migration {
@@ -102,6 +105,7 @@ pub const sqlite_schema =
     \\  source_ids_json TEXT NOT NULL DEFAULT '[]',
     \\  related_entities_json TEXT NOT NULL DEFAULT '[]',
     \\  permissions_json TEXT NOT NULL DEFAULT '[]',
+    \\  fields_json TEXT NOT NULL DEFAULT '{}',
     \\  summary TEXT,
     \\  agent_summary TEXT
     \\);
@@ -120,6 +124,7 @@ pub const sqlite_schema =
     \\  updated_at_ms INTEGER NOT NULL
     \\);
     \\CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_type_name_scope ON entities(type, lower(name), scope);
+    \\CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(id UNINDEXED, type, name, aliases, description, metadata);
     \\CREATE TABLE IF NOT EXISTS memory_atoms (
     \\  id TEXT PRIMARY KEY,
     \\  subject_entity_id TEXT,
@@ -187,6 +192,7 @@ pub const sqlite_schema =
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_entity_id);
     \\CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_entity_id);
+    \\CREATE VIRTUAL TABLE IF NOT EXISTS relations_fts USING fts5(id UNINDEXED, relation_type, from_name, to_name, text);
     \\CREATE TABLE IF NOT EXISTS context_packs (
     \\  id TEXT PRIMARY KEY,
     \\  purpose TEXT NOT NULL,
@@ -203,6 +209,7 @@ pub const sqlite_schema =
     \\  token_budget INTEGER NOT NULL DEFAULT 12000,
     \\  created_at_ms INTEGER NOT NULL
     \\);
+    \\CREATE VIRTUAL TABLE IF NOT EXISTS context_packs_fts USING fts5(id UNINDEXED, purpose, target, query_text, generated_summary);
     \\CREATE TABLE IF NOT EXISTS agent_memory_items (
     \\  id TEXT PRIMARY KEY,
     \\  key TEXT NOT NULL,
@@ -219,6 +226,7 @@ pub const sqlite_schema =
     \\CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_memory_key_session_actor ON agent_memory_items(key, coalesce(session_id, ''), actor_id);
     \\CREATE INDEX IF NOT EXISTS idx_agent_memory_actor_session ON agent_memory_items(actor_id, session_id, timestamp_ms);
     \\CREATE INDEX IF NOT EXISTS idx_agent_memory_writer ON agent_memory_items(writer_actor_id, timestamp_ms);
+    \\CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5(id UNINDEXED, key, category, session_id, content);
     \\CREATE TABLE IF NOT EXISTS session_messages (
     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
     \\  session_id TEXT NOT NULL,
@@ -228,6 +236,7 @@ pub const sqlite_schema =
     \\  created_at_ms INTEGER NOT NULL
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_session_messages_session_actor ON session_messages(session_id, actor_id, id);
+    \\CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(id UNINDEXED, session_id, actor_id, role, content);
     \\CREATE TABLE IF NOT EXISTS session_usage (
     \\  session_id TEXT NOT NULL,
     \\  actor_id TEXT NOT NULL,
@@ -263,12 +272,23 @@ pub const sqlite_schema =
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_memory_feed_events_scope_id ON memory_feed_events(scope, id);
     \\CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_feed_events_dedupe_key ON memory_feed_events(dedupe_key) WHERE dedupe_key IS NOT NULL;
+    \\CREATE VIRTUAL TABLE IF NOT EXISTS memory_feed_events_fts USING fts5(id UNINDEXED, event_type, operation, object_type, object_id, payload, dedupe_key);
     \\CREATE TABLE IF NOT EXISTS memory_feed_state (
     \\  id INTEGER PRIMARY KEY CHECK (id = 1),
     \\  cursor_floor INTEGER NOT NULL DEFAULT 0,
     \\  updated_at_ms INTEGER NOT NULL
     \\);
     \\INSERT OR IGNORE INTO memory_feed_state (id, cursor_floor, updated_at_ms) VALUES (1, 0, strftime('%s','now') * 1000);
+    \\CREATE TABLE IF NOT EXISTS primitive_lifecycle (
+    \\  object_type TEXT NOT NULL,
+    \\  object_id TEXT NOT NULL,
+    \\  status TEXT NOT NULL DEFAULT 'active',
+    \\  actor_id TEXT,
+    \\  payload_json TEXT NOT NULL DEFAULT '{}',
+    \\  updated_at_ms INTEGER NOT NULL,
+    \\  PRIMARY KEY (object_type, object_id)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_primitive_lifecycle_type_status ON primitive_lifecycle(object_type, status);
     \\CREATE TABLE IF NOT EXISTS response_cache (
     \\  cache_key TEXT NOT NULL,
     \\  response_json TEXT NOT NULL,
@@ -354,6 +374,8 @@ pub const sqlite_schema =
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (13, 'context_pack_result_refs', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (14, 'memory_feed_lifecycle', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (15, 'agent_memory_writer_identity', strftime('%s','now') * 1000);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (19, 'primitive_lifecycle_overlay', strftime('%s','now') * 1000);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (20, 'sqlite_full_text_coverage', strftime('%s','now') * 1000);
 ;
 
 pub const postgres_schema =
@@ -422,9 +444,10 @@ pub const postgres_schema =
     \\  source_ids_json jsonb NOT NULL DEFAULT '[]',
     \\  related_entities_json jsonb NOT NULL DEFAULT '[]',
     \\  permissions_json jsonb NOT NULL DEFAULT '[]',
+    \\  fields_json jsonb NOT NULL DEFAULT '{}',
     \\  summary text,
     \\  agent_summary text,
-    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(body,''))) STORED
+    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(body,'') || ' ' || coalesce(fields_json::text,''))) STORED
     \\);
     \\CREATE INDEX IF NOT EXISTS artifacts_search_idx ON artifacts USING gin(search_tsv);
     \\CREATE TABLE IF NOT EXISTS entities (
@@ -592,6 +615,16 @@ pub const postgres_schema =
     \\  updated_at_ms bigint NOT NULL
     \\);
     \\INSERT INTO memory_feed_state (id, cursor_floor, updated_at_ms) VALUES (1, 0, (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (id) DO NOTHING;
+    \\CREATE TABLE IF NOT EXISTS primitive_lifecycle (
+    \\  object_type text NOT NULL,
+    \\  object_id text NOT NULL,
+    \\  status text NOT NULL DEFAULT 'active',
+    \\  actor_id text,
+    \\  payload_json jsonb NOT NULL DEFAULT '{}',
+    \\  updated_at_ms bigint NOT NULL,
+    \\  PRIMARY KEY (object_type, object_id)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS primitive_lifecycle_type_status_idx ON primitive_lifecycle(object_type, status);
     \\CREATE TABLE IF NOT EXISTS response_cache (
     \\  cache_key text NOT NULL,
     \\  response_json jsonb NOT NULL,
@@ -678,6 +711,8 @@ pub const postgres_schema =
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (13, 'context_pack_result_refs', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (14, 'memory_feed_lifecycle', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (15, 'agent_memory_writer_identity', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (19, 'primitive_lifecycle_overlay', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (20, 'sqlite_full_text_coverage', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
 ;
 
 test "sqlite migration includes core primitive tables and indexes" {
@@ -687,8 +722,11 @@ test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS policy_scopes") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS artifacts") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS entities") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS relations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS relations_fts USING fts5") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS context_packs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS context_packs_fts USING fts5") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "included_result_refs_json TEXT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS memory_atoms") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS memory_atoms_fts USING fts5") != null);
@@ -697,15 +735,20 @@ test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS vector_outbox") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "idx_vector_outbox_status_locked") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS agent_memory_items") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_memory_key_session_actor") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "writer_actor_id TEXT NOT NULL DEFAULT ''") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "idx_agent_memory_writer") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS compat_memories") == null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS session_messages") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS session_usage") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS audit_events") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS memory_feed_events") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS memory_feed_events_fts USING fts5") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "idx_memory_feed_events_dedupe_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS primitive_lifecycle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "idx_primitive_lifecycle_type_status") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS response_cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS semantic_cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "scopes_json TEXT NOT NULL DEFAULT '[]'") != null);
@@ -720,6 +763,8 @@ test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'cache_actor_isolation'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'native_agent_memory'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'agent_memory_writer_identity'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'primitive_lifecycle_overlay'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'sqlite_full_text_coverage'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'context_pack_acl'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "actor_isolated INTEGER NOT NULL DEFAULT 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "checksum TEXT NOT NULL DEFAULT ''") != null);
@@ -754,6 +799,8 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "vector_outbox_status_locked_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS memory_feed_events") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "memory_feed_events_dedupe_key_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS primitive_lifecycle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "primitive_lifecycle_type_status_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS response_cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS semantic_cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb") != null);
@@ -768,6 +815,8 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'cache_actor_isolation'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'native_agent_memory'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'agent_memory_writer_identity'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'primitive_lifecycle_overlay'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'sqlite_full_text_coverage'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'context_pack_acl'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "actor_isolated boolean NOT NULL DEFAULT false") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "checksum text NOT NULL DEFAULT ''") != null);

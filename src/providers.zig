@@ -52,7 +52,7 @@ pub const ProviderDescriptor = struct {
 pub const provider_descriptors = [_]ProviderDescriptor{
     .{ .name = "local-deterministic", .role = "offline deterministic embeddings and fallback retrieval", .status = "built_in", .protocol = "none", .env_prefix = "" },
     .{ .name = "openai-compatible-embeddings", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
-    .{ .name = "openai-compatible-chat", .role = "ask synthesis and optional reranking", .status = "built_in", .protocol = "POST /chat/completions", .env_prefix = "NULLPANTRY_LLM_" },
+    .{ .name = "openai-compatible-chat", .role = "ask synthesis, structured extraction, and optional reranking", .status = "built_in", .protocol = "POST /chat/completions", .env_prefix = "NULLPANTRY_LLM_" },
     .{ .name = "ollama", .role = "local provider via OpenAI-compatible endpoint", .status = "compatible", .protocol = "configure Ollama OpenAI compatibility base URL", .env_prefix = "NULLPANTRY_EMBEDDING_|NULLPANTRY_LLM_" },
     .{ .name = "voyage", .role = "embedding provider via OpenAI-compatible response shape", .status = "compatible", .protocol = "POST /embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "gemini", .role = "external model provider adapter target", .status = "contract", .protocol = "provider adapter", .env_prefix = "NULLPANTRY_PROVIDER_" },
@@ -95,11 +95,15 @@ pub fn embedText(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []con
 }
 
 pub fn completeAnswer(allocator: std.mem.Allocator, cfg: CompletionConfig, prompt: []const u8) !CompletionResult {
+    return completeWithSystem(allocator, cfg, "Answer only from the supplied context. Include no facts that are not supported by cited context. Say I don't know when evidence is insufficient.", prompt);
+}
+
+pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: CompletionConfig, system_prompt: []const u8, prompt: []const u8) !CompletionResult {
     if (!cfg.enabled()) return error.ProviderUnavailable;
     return .{
         .provider = "openai-compatible",
         .model = cfg.model orelse "unknown",
-        .content = try callOpenAICompatibleChat(allocator, cfg, prompt),
+        .content = try callOpenAICompatibleChat(allocator, cfg, system_prompt, prompt),
     };
 }
 
@@ -125,7 +129,7 @@ fn callOpenAICompatibleEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingCon
     return parseEmbeddingResponse(allocator, response);
 }
 
-fn callOpenAICompatibleChat(allocator: std.mem.Allocator, cfg: CompletionConfig, prompt: []const u8) ![]const u8 {
+fn callOpenAICompatibleChat(allocator: std.mem.Allocator, cfg: CompletionConfig, system_prompt: []const u8, prompt: []const u8) ![]const u8 {
     const url = try providerUrl(allocator, cfg.base_url.?, "/chat/completions");
     defer allocator.free(url);
 
@@ -133,7 +137,9 @@ fn callOpenAICompatibleChat(allocator: std.mem.Allocator, cfg: CompletionConfig,
     errdefer payload.deinit(allocator);
     try payload.appendSlice(allocator, "{\"model\":");
     try json.appendString(&payload, allocator, cfg.model.?);
-    try payload.appendSlice(allocator, ",\"temperature\":0,\"messages\":[{\"role\":\"system\",\"content\":\"Answer only from the supplied context. Include no facts that are not supported by cited context. Say I don't know when evidence is insufficient.\"},{\"role\":\"user\",\"content\":");
+    try payload.appendSlice(allocator, ",\"temperature\":0,\"messages\":[{\"role\":\"system\",\"content\":");
+    try json.appendString(&payload, allocator, system_prompt);
+    try payload.appendSlice(allocator, "},{\"role\":\"user\",\"content\":");
     try json.appendString(&payload, allocator, prompt);
     try payload.appendSlice(allocator, "}]}");
     const body = try payload.toOwnedSlice(allocator);

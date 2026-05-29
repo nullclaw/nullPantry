@@ -15,6 +15,9 @@ pub const RunOptions = struct {
     embedding_api_key: ?[]const u8 = null,
     embedding_model: ?[]const u8 = null,
     embedding_dimensions: usize = 64,
+    llm_base_url: ?[]const u8 = null,
+    llm_api_key: ?[]const u8 = null,
+    llm_model: ?[]const u8 = null,
     provider_timeout_secs: u32 = 30,
     actor_id: []const u8 = "system:worker",
 };
@@ -89,9 +92,12 @@ pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job:
         const job_options = ExtractionJobOptions{
             .create_artifact = jobBoolOption(allocator, job.input_json, "create_artifact", true),
             .extract_memory = if (std.mem.eql(u8, job.job_type, "extract_memory")) true else jobBoolOption(allocator, job.input_json, "extract_memory", true),
+            .use_llm_extraction = jobBoolOption(allocator, job.input_json, "use_llm_extraction", false) or jobBoolOption(allocator, job.input_json, "structured_extraction", false),
+            .strict_llm_extraction = jobBoolOption(allocator, job.input_json, "strict_llm_extraction", false),
+            .storage_route = try jobStorageRouteOption(allocator, job.input_json),
         };
         const extracted = try extractSource(allocator, store, source, options, job_options);
-        return try std.fmt.allocPrint(allocator, "{{\"source_id\":\"{s}\",\"artifact_count\":{d},\"memory_atom_count\":{d},\"entity_count\":{d},\"vector_chunk_count\":{d}}}", .{ source.id, extracted.artifact_count, extracted.memory_atom_count, extracted.entity_count, extracted.vector_chunk_count });
+        return try std.fmt.allocPrint(allocator, "{{\"source_id\":\"{s}\",\"artifact_count\":{d},\"memory_atom_count\":{d},\"entity_count\":{d},\"relation_count\":{d},\"vector_chunk_count\":{d},\"extraction_provider\":\"{s}\",\"extraction_fallback\":{s}}}", .{ source.id, extracted.artifact_count, extracted.memory_atom_count, extracted.entity_count, extracted.relation_count, extracted.vector_chunk_count, extracted.extraction_provider, if (extracted.extraction_fallback) "true" else "false" });
     }
     return error.UnsupportedJob;
 }
@@ -139,12 +145,18 @@ const ExtractionCounts = struct {
     artifact_count: usize = 0,
     memory_atom_count: usize = 0,
     entity_count: usize = 0,
+    relation_count: usize = 0,
     vector_chunk_count: usize = 0,
+    extraction_provider: []const u8 = "heuristic",
+    extraction_fallback: bool = false,
 };
 
 const ExtractionJobOptions = struct {
     create_artifact: bool = true,
     extract_memory: bool = true,
+    use_llm_extraction: bool = false,
+    strict_llm_extraction: bool = false,
+    storage_route: store_mod.AgentMemoryStorageRoute = .{},
 };
 
 fn jobBoolOption(allocator: std.mem.Allocator, input_json: []const u8, name: []const u8, fallback: bool) bool {
@@ -155,6 +167,31 @@ fn jobBoolOption(allocator: std.mem.Allocator, input_json: []const u8, name: []c
     return switch (value) {
         .bool => |b| b,
         else => fallback,
+    };
+}
+
+fn jobStorageRouteOption(allocator: std.mem.Allocator, input_json: []const u8) !store_mod.AgentMemoryStorageRoute {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, input_json, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    const obj = parsed.value.object;
+    if (json.stringField(obj, "storage")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
+    if (json.stringField(obj, "store")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
+    if (json.stringField(obj, "target_store")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
+    const value = obj.get("stores") orelse return .{};
+    return switch (value) {
+        .string => |s| store_mod.AgentMemoryStorageRoute.parse(s),
+        .array => |items| blk: {
+            var stores = try allocator.alloc([]const u8, items.items.len);
+            var count: usize = 0;
+            for (items.items) |item| {
+                if (item != .string) continue;
+                stores[count] = item.string;
+                count += 1;
+            }
+            break :blk store_mod.AgentMemoryStorageRoute.fromStores(stores[0..count]);
+        },
+        else => .{},
     };
 }
 
@@ -182,34 +219,117 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
             .summary = summary,
             .agent_summary = agent_summary,
             .actor_id = options.actor_id,
+            .storage_route = job_options.storage_route,
         };
     }
 
     var atom_inputs: std.ArrayListUnmanaged(store_mod.MemoryAtomInput) = .empty;
+    var relation_inputs: std.ArrayListUnmanaged(store_mod.ExtractedRelationInput) = .empty;
     if (job_options.extract_memory) {
-        var lines = std.mem.splitScalar(u8, source.content, '\n');
-        var offset: usize = 0;
-        var line_no: usize = 1;
-        while (lines.next()) |line| : ({
-            offset += line.len + 1;
-            line_no += 1;
-        }) {
-            const parsed = extraction.parseMemoryLine(line) orelse continue;
-            const evidence_ranges_json = try extraction.evidenceRangeJson(allocator, source.id, offset, offset + line.len, line_no);
-            try atom_inputs.append(allocator, .{
-                .subject_entity_id = null,
-                .predicate = parsed.predicate,
-                .object = parsed.object,
-                .text = parsed.text,
-                .scope = source.scope,
-                .confidence = parsed.confidence,
-                .source_ids_json = source_ids_json,
-                .evidence_ranges_json = evidence_ranges_json,
-                .created_by = "agent",
-                .permissions_json = source.permissions_json,
-                .tags_json = parsed.tags_json,
-                .actor_id = options.actor_id,
-            });
+        var structured_done = false;
+        if (job_options.use_llm_extraction) {
+            const prompt = try extraction.memoryExtractionPrompt(allocator, source.title, source.source_type, source.content);
+            const completion: ?providers.CompletionResult = blk: {
+                const result = providers.completeWithSystem(allocator, .{
+                    .base_url = options.llm_base_url,
+                    .api_key = options.llm_api_key,
+                    .model = options.llm_model,
+                    .timeout_secs = options.provider_timeout_secs,
+                }, "Return only valid JSON for the requested NullPantry extraction schema. Do not include markdown fences unless the model cannot avoid them. Extract only source-grounded memory atoms and relations.", prompt) catch |err| {
+                    if (job_options.strict_llm_extraction) return err;
+                    counts.extraction_fallback = true;
+                    break :blk null;
+                };
+                break :blk result;
+            };
+            if (completion) |result| {
+                const parsed_memories: ?[]extraction.ParsedMemory = blk: {
+                    const memories = extraction.parseStructuredMemoryResponse(allocator, result.content) catch |err| {
+                        if (job_options.strict_llm_extraction) return err;
+                        counts.extraction_fallback = true;
+                        break :blk null;
+                    };
+                    break :blk memories;
+                };
+                if (parsed_memories) |memories| {
+                    structured_done = true;
+                    counts.extraction_provider = result.provider;
+                    for (memories) |parsed| {
+                        const evidence_ranges_json = try extraction.evidenceRangeForText(allocator, source.id, source.content, parsed.evidence orelse parsed.text);
+                        try atom_inputs.append(allocator, .{
+                            .subject_entity_id = null,
+                            .predicate = parsed.predicate,
+                            .object = parsed.object,
+                            .text = parsed.text,
+                            .scope = source.scope,
+                            .confidence = parsed.confidence,
+                            .source_ids_json = source_ids_json,
+                            .evidence_ranges_json = evidence_ranges_json,
+                            .created_by = "agent",
+                            .permissions_json = source.permissions_json,
+                            .tags_json = parsed.tags_json,
+                            .actor_id = options.actor_id,
+                            .storage_route = job_options.storage_route,
+                        });
+                    }
+                    const parsed_relations = extraction.parseStructuredRelationsResponse(allocator, result.content) catch &.{};
+                    for (parsed_relations) |parsed| {
+                        try relation_inputs.append(allocator, .{
+                            .from_entity_name = parsed.from_name,
+                            .relation_type = parsed.relation_type,
+                            .to_entity_name = parsed.to_name,
+                            .source_ids_json = source_ids_json,
+                            .scope = source.scope,
+                            .permissions_json = source.permissions_json,
+                            .confidence = parsed.confidence,
+                            .status = "proposed",
+                            .actor_id = options.actor_id,
+                        });
+                    }
+                }
+            }
+        }
+        if (!structured_done) {
+            counts.extraction_provider = "heuristic";
+            var lines = std.mem.splitScalar(u8, source.content, '\n');
+            var offset: usize = 0;
+            var line_no: usize = 1;
+            while (lines.next()) |line| : ({
+                offset += line.len + 1;
+                line_no += 1;
+            }) {
+                if (extraction.parseMemoryLine(line)) |parsed| {
+                    const evidence_ranges_json = try extraction.evidenceRangeJson(allocator, source.id, offset, offset + line.len, line_no);
+                    try atom_inputs.append(allocator, .{
+                        .subject_entity_id = null,
+                        .predicate = parsed.predicate,
+                        .object = parsed.object,
+                        .text = parsed.text,
+                        .scope = source.scope,
+                        .confidence = parsed.confidence,
+                        .source_ids_json = source_ids_json,
+                        .evidence_ranges_json = evidence_ranges_json,
+                        .created_by = "agent",
+                        .permissions_json = source.permissions_json,
+                        .tags_json = parsed.tags_json,
+                        .actor_id = options.actor_id,
+                        .storage_route = job_options.storage_route,
+                    });
+                }
+                if (extraction.parseRelationLine(line)) |relation| {
+                    try relation_inputs.append(allocator, .{
+                        .from_entity_name = relation.from_name,
+                        .relation_type = relation.relation_type,
+                        .to_entity_name = relation.to_name,
+                        .source_ids_json = source_ids_json,
+                        .scope = source.scope,
+                        .permissions_json = source.permissions_json,
+                        .confidence = relation.confidence,
+                        .status = "proposed",
+                        .actor_id = options.actor_id,
+                    });
+                }
+            }
         }
     }
 
@@ -219,11 +339,13 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
         .entity_names_json = entity_names_json,
         .artifact = artifact_input,
         .atoms = atom_inputs.items,
+        .relations = relation_inputs.items,
         .actor_id = options.actor_id,
     });
     counts.entity_count = applied.entities.len;
     counts.artifact_count = if (applied.artifact != null) 1 else 0;
     counts.memory_atom_count = applied.atoms.len;
+    counts.relation_count = applied.relations.len;
 
     counts.vector_chunk_count += try upsertVector(allocator, store, options, "source", source.id, source.content, source.scope, source.permissions_json);
     if (applied.artifact) |artifact| {
@@ -370,6 +492,27 @@ test "worker processes vector outbox and queued hygiene job" {
     try std.testing.expectEqual(@as(usize, 1), result.jobs_succeeded);
 }
 
+test "worker job execution scopes are unique" {
+    const job = store_mod.Job{
+        .id = "job_scope_unique",
+        .job_type = "scan_conflicts",
+        .status = "queued",
+        .scope = "project:nullpantry",
+        .permissions_json = "[\"project:nullpantry\",\"team:memory\"]",
+        .object_type = "",
+        .object_id = "",
+        .input_json = "{}",
+        .result_json = "{}",
+        .error_text = null,
+        .attempts = 0,
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+    };
+    const scopes = try jobExecutionScopesJson(std.testing.allocator, job);
+    defer std.testing.allocator.free(scopes);
+    try std.testing.expectEqualStrings("[\"project:nullpantry\",\"team:memory\"]", scopes);
+}
+
 test "worker persists embed outbox before provider call and replays locally" {
     var store = try store_mod.Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -408,4 +551,71 @@ test "worker persists embed outbox before provider call and replays locally" {
         if (std.mem.eql(u8, result_item.id, source.id)) saw_source = true;
     }
     try std.testing.expect(saw_source);
+}
+
+test "worker llm extraction falls back to heuristic unless strict" {
+    var store = try store_mod.Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = try store.createSource(alloc, .{
+        .source_type = "transcript",
+        .title = "Worker LLM fallback",
+        .content = "Decision: worker fallback uses heuristic extraction",
+        .scope = "public",
+    });
+    const fallback_job = try store.createJob(alloc, .{
+        .job_type = "ingest",
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+        .object_type = "source",
+        .object_id = source.id,
+        .input_json = "{\"create_artifact\":false,\"use_llm_extraction\":true}",
+    });
+
+    const fallback_result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]", .outbox_limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), fallback_result.jobs_succeeded);
+    const fallback_finished = (try store.getJob(alloc, fallback_job.id)).?;
+    try std.testing.expectEqualStrings("succeeded", fallback_finished.status);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_finished.result_json, "\"extraction_provider\":\"heuristic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_finished.result_json, "\"extraction_fallback\":true") != null);
+
+    const search = try store.search(alloc, .{
+        .query = "worker fallback heuristic",
+        .scopes_json = "[\"public\"]",
+        .limit = 10,
+        .use_vector = false,
+    });
+    var saw_atom = false;
+    for (search) |result_item| {
+        if (std.mem.eql(u8, result_item.result_type, "memory_atom") and
+            std.mem.indexOf(u8, result_item.text, "worker fallback uses heuristic extraction") != null)
+        {
+            saw_atom = true;
+        }
+    }
+    try std.testing.expect(saw_atom);
+
+    const strict_source = try store.createSource(alloc, .{
+        .source_type = "transcript",
+        .title = "Worker LLM strict",
+        .content = "Decision: strict worker extraction fails without provider",
+        .scope = "public",
+    });
+    const strict_job = try store.createJob(alloc, .{
+        .job_type = "ingest",
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+        .object_type = "source",
+        .object_id = strict_source.id,
+        .input_json = "{\"create_artifact\":false,\"use_llm_extraction\":true,\"strict_llm_extraction\":true}",
+    });
+
+    const strict_result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]", .outbox_limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), strict_result.jobs_failed);
+    const strict_finished = (try store.getJob(alloc, strict_job.id)).?;
+    try std.testing.expectEqualStrings("failed", strict_finished.status);
+    try std.testing.expect(std.mem.indexOf(u8, strict_finished.error_text orelse "", "ProviderUnavailable") != null);
 }
