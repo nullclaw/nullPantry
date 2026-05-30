@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ids = @import("ids.zig");
 const json = @import("json_util.zig");
 const domain = @import("domain.zig");
@@ -11,6 +12,7 @@ pub const BackendKind = enum {
     native,
     memory_lru,
     redis,
+    api,
 
     pub fn parse(raw: []const u8) BackendKind {
         if (std.ascii.eqlIgnoreCase(raw, "none")) return .none;
@@ -18,6 +20,9 @@ pub const BackendKind = enum {
         if (std.ascii.eqlIgnoreCase(raw, "memory_lru")) return .memory_lru;
         if (std.ascii.eqlIgnoreCase(raw, "in_memory")) return .memory_lru;
         if (std.ascii.eqlIgnoreCase(raw, "redis")) return .redis;
+        if (std.ascii.eqlIgnoreCase(raw, "api")) return .api;
+        if (std.ascii.eqlIgnoreCase(raw, "http")) return .api;
+        if (std.ascii.eqlIgnoreCase(raw, "nullpantry_api")) return .api;
         return .native;
     }
 
@@ -27,6 +32,7 @@ pub const BackendKind = enum {
             .native => "native",
             .memory_lru => "memory_lru",
             .redis => "redis",
+            .api => "api",
         };
     }
 };
@@ -39,10 +45,20 @@ pub const MemoryConfig = struct {
     ttl_seconds: ?u32 = null,
 };
 
+pub const ApiConfig = struct {
+    base_url: ?[]const u8 = null,
+    token: ?[]const u8 = null,
+    actor_scopes_json: []const u8 = "[\"admin\"]",
+    actor_capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
+    timeout_secs: u32 = 30,
+    max_response_bytes: usize = 2 * 1024 * 1024,
+};
+
 pub const Config = struct {
     backend: BackendKind = .native,
     memory: MemoryConfig = .{},
     redis: redis.Config = .{},
+    api: ApiConfig = .{},
 };
 
 pub const NamedConfig = struct {
@@ -90,6 +106,7 @@ pub const Runtime = union(BackendKind) {
     native,
     memory_lru: MemoryAgentMemory,
     redis: RedisAgentMemory,
+    api: ApiAgentMemory,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Runtime {
         return switch (config.backend) {
@@ -97,6 +114,7 @@ pub const Runtime = union(BackendKind) {
             .native => .native,
             .memory_lru => .{ .memory_lru = MemoryAgentMemory.init(allocator, config.memory) },
             .redis => .{ .redis = RedisAgentMemory.init(allocator, config.redis) },
+            .api => .{ .api = try ApiAgentMemory.init(allocator, config.api) },
         };
     }
 
@@ -106,6 +124,7 @@ pub const Runtime = union(BackendKind) {
             .native => {},
             .memory_lru => |*engine| engine.deinit(),
             .redis => |*engine| engine.deinit(),
+            .api => |*engine| engine.deinit(),
         }
     }
 
@@ -119,6 +138,7 @@ pub const Runtime = union(BackendKind) {
             .native => "native",
             .memory_lru => "memory_lru",
             .redis => "redis",
+            .api => "api",
         };
     }
 
@@ -128,6 +148,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.store(allocator, input),
             .redis => |*engine| engine.store(allocator, input),
+            .api => |*engine| engine.store(allocator, input),
         };
     }
 
@@ -137,6 +158,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.get(allocator, key, session_id, actor_id),
             .redis => |*engine| engine.get(allocator, key, session_id, actor_id),
+            .api => |*engine| engine.get(allocator, key, session_id, actor_id),
         };
     }
 
@@ -146,6 +168,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.getVisible(allocator, key, session_id, actor_id, scopes_json),
             .redis => |*engine| engine.getVisible(allocator, key, session_id, actor_id, scopes_json),
+            .api => |*engine| engine.getVisible(allocator, key, session_id, actor_id, scopes_json),
         };
     }
 
@@ -155,6 +178,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.list(allocator, category, session_id, actor_id),
             .redis => |*engine| engine.list(allocator, category, session_id, actor_id),
+            .api => |*engine| engine.list(allocator, category, session_id, actor_id),
         };
     }
 
@@ -164,6 +188,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.listVisible(allocator, category, session_id, actor_id, scopes_json),
             .redis => |*engine| engine.listVisible(allocator, category, session_id, actor_id, scopes_json),
+            .api => |*engine| engine.listVisible(allocator, category, session_id, actor_id, scopes_json),
         };
     }
 
@@ -173,6 +198,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.search(allocator, query, limit, session_id, scopes_json, actor_id),
             .redis => |*engine| engine.search(allocator, query, limit, session_id, scopes_json, actor_id),
+            .api => |*engine| engine.search(allocator, query, limit, session_id, scopes_json, actor_id),
         };
     }
 
@@ -182,6 +208,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.delete(key, session_id, actor_id, writer_actor_id),
             .redis => |*engine| engine.delete(key, session_id, actor_id, writer_actor_id),
+            .api => |*engine| engine.delete(key, session_id, actor_id, writer_actor_id),
         };
     }
 
@@ -191,6 +218,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.count(actor_id, scopes_json),
             .redis => |*engine| engine.count(actor_id, scopes_json),
+            .api => |*engine| engine.count(actor_id, scopes_json),
         };
     }
 
@@ -200,6 +228,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.saveMessage(session_id, role, content, actor_id),
             .redis => |*engine| engine.saveMessage(session_id, role, content, actor_id),
+            .api => |*engine| engine.saveMessage(session_id, role, content, actor_id),
         };
     }
 
@@ -209,6 +238,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.loadMessages(allocator, session_id, actor_id),
             .redis => |*engine| engine.loadMessages(allocator, session_id, actor_id),
+            .api => |*engine| engine.loadMessages(allocator, session_id, actor_id),
         };
     }
 
@@ -218,6 +248,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.clearMessages(session_id, actor_id),
             .redis => |*engine| engine.clearMessages(session_id, actor_id),
+            .api => |*engine| engine.clearMessages(session_id, actor_id),
         };
     }
 
@@ -227,6 +258,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.clearAutoSaved(session_id, actor_id),
             .redis => |*engine| engine.clearAutoSaved(session_id, actor_id),
+            .api => |*engine| engine.clearAutoSaved(session_id, actor_id),
         };
     }
 
@@ -236,6 +268,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.saveUsage(session_id, total_tokens, actor_id),
             .redis => |*engine| engine.saveUsage(session_id, total_tokens, actor_id),
+            .api => |*engine| engine.saveUsage(session_id, total_tokens, actor_id),
         };
     }
 
@@ -245,6 +278,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.deleteUsage(session_id, actor_id),
             .redis => |*engine| engine.deleteUsage(session_id, actor_id),
+            .api => |*engine| engine.deleteUsage(session_id, actor_id),
         };
     }
 
@@ -254,6 +288,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.loadUsage(session_id, actor_id),
             .redis => |*engine| engine.loadUsage(session_id, actor_id),
+            .api => |*engine| engine.loadUsage(session_id, actor_id),
         };
     }
 
@@ -263,6 +298,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.listSessions(allocator, limit, offset, actor_id),
             .redis => |*engine| engine.listSessions(allocator, limit, offset, actor_id),
+            .api => |*engine| engine.listSessions(allocator, limit, offset, actor_id),
         };
     }
 
@@ -272,6 +308,7 @@ pub const Runtime = union(BackendKind) {
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.history(allocator, session_id, limit, offset, actor_id),
             .redis => |*engine| engine.history(allocator, session_id, limit, offset, actor_id),
+            .api => |*engine| engine.history(allocator, session_id, limit, offset, actor_id),
         };
     }
 };
@@ -1532,6 +1569,670 @@ pub const RedisAgentMemory = struct {
     }
 };
 
+const ApiHttpResponse = struct {
+    status: std.http.Status,
+    body: []u8,
+};
+
+pub const ApiAgentMemory = struct {
+    allocator: std.mem.Allocator,
+    config: ApiConfig,
+
+    pub fn init(allocator: std.mem.Allocator, config: ApiConfig) !ApiAgentMemory {
+        if (config.base_url == null or std.mem.trim(u8, config.base_url.?, " \t\r\n").len == 0) return error.MissingApiBackendUrl;
+        return .{ .allocator = allocator, .config = config };
+    }
+
+    pub fn deinit(_: *ApiAgentMemory) void {}
+
+    pub fn store(self: *ApiAgentMemory, allocator: std.mem.Allocator, input: Input) !domain.AgentMemory {
+        const actor = try access.requiredActorId(input.writer_actor_id orelse input.actor_id);
+        const encoded_key = try percentEncode(allocator, input.key);
+        defer allocator.free(encoded_key);
+        const path = try std.fmt.allocPrint(allocator, "/agent-memory/{s}", .{encoded_key});
+        defer allocator.free(path);
+
+        const body = try agentMemoryStorePayload(allocator, input);
+        defer allocator.free(body);
+        const response = try self.request(allocator, .PUT, path, "", actor, null, body);
+        defer allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return (try parseAgentMemoryWrapper(allocator, response.body, "memory")) orelse error.AgentMemoryStorageUnavailable;
+    }
+
+    pub fn get(self: *ApiAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
+        const actor = actor_id orelse return null;
+        const scope = sharedScopeFromOwner(actor);
+        const scopes = if (scope) |s| try scopesJson(allocator, &.{s}) else try allocator.dupe(u8, "[]");
+        defer allocator.free(scopes);
+        return self.getWithScopes(allocator, key, session_id, actor, scopes, scope);
+    }
+
+    pub fn getVisible(self: *ApiAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
+        return self.getWithScopes(allocator, key, session_id, actor_id, scopes_json, null);
+    }
+
+    pub fn list(self: *ApiAgentMemory, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
+        const actor = actor_id orelse return allocator.alloc(domain.AgentMemory, 0);
+        return self.listVisible(allocator, category, session_id, actor, "[]");
+    }
+
+    pub fn listVisible(self: *ApiAgentMemory, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
+        var all: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+        errdefer {
+            for (all.items) |*entry| freeAgentMemory(allocator, entry);
+            all.deinit(allocator);
+        }
+
+        var offset: usize = 0;
+        const page_size: usize = 500;
+        while (true) {
+            const query = try agentMemoryListQuery(allocator, category, session_id, page_size, offset);
+            defer allocator.free(query);
+            const response = try self.request(allocator, .GET, "/agent-memory", query, actor_id, scopes_json, "");
+            defer allocator.free(response.body);
+            if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+            const page = try parseAgentMemoryArrayWrapper(allocator, response.body, "memories");
+            defer allocator.free(page);
+            const page_len = page.len;
+            for (page) |entry| try all.append(allocator, entry);
+            if (page_len < page_size) break;
+            offset += page_size;
+        }
+        sortAgentMemory(all.items);
+        return all.toOwnedSlice(allocator);
+    }
+
+    pub fn search(self: *ApiAgentMemory, allocator: std.mem.Allocator, query_text: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
+        const actor = actor_id orelse return allocator.alloc(domain.AgentMemory, 0);
+        if (limit == 0) return allocator.alloc(domain.AgentMemory, 0);
+        const body = try agentMemorySearchPayload(allocator, query_text, @min(limit, 100), session_id, scopes_json);
+        defer allocator.free(body);
+        const response = try self.request(allocator, .POST, "/agent-memory/search", "", actor, scopes_json, body);
+        defer allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        const out = try parseAgentMemoryArrayWrapper(allocator, response.body, "memories");
+        if (out.len > limit) {
+            for (out[limit..]) |*entry| freeAgentMemory(allocator, entry);
+            return allocator.realloc(out, limit);
+        }
+        return out;
+    }
+
+    pub fn delete(self: *ApiAgentMemory, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        const actor = writer_actor_id orelse actor_id orelse return false;
+        const encoded_key = try percentEncode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const path = try std.fmt.allocPrint(self.allocator, "/agent-memory/{s}", .{encoded_key});
+        defer self.allocator.free(path);
+        const scope = if (actor_id) |owner| sharedScopeFromOwner(owner) else null;
+        const query = try agentMemoryExactQuery(self.allocator, session_id, scope);
+        defer self.allocator.free(query);
+        const response = try self.request(self.allocator, .DELETE, path, query, actor, self.config.actor_scopes_json, "");
+        defer self.allocator.free(response.body);
+        if (response.status == .not_found) return false;
+        if (response.status != .ok and response.status != .no_content) return error.AgentMemoryStorageUnavailable;
+        return true;
+    }
+
+    pub fn count(self: *ApiAgentMemory, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
+        const actor = actor_id orelse "";
+        const response = try self.request(self.allocator, .GET, "/agent-memory/count", "", actor, scopes_json, "");
+        defer self.allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return @intCast(parseJsonU64(response.body, "count", 0));
+    }
+
+    pub fn saveMessage(self: *ApiAgentMemory, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
+        const actor = try access.requiredActorId(actor_id);
+        const path = try sessionPath(self.allocator, session_id, "/messages");
+        defer self.allocator.free(path);
+        const scopes = try sessionScopesJson(self.allocator, session_id, true);
+        defer self.allocator.free(scopes);
+        const body = try messagePayload(self.allocator, role, content, ids.nowMs());
+        defer self.allocator.free(body);
+        const response = try self.request(self.allocator, .POST, path, "", actor, scopes, body);
+        defer self.allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+    }
+
+    pub fn loadMessages(self: *ApiAgentMemory, allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8) ![]Message {
+        const actor = actor_id orelse return allocator.alloc(Message, 0);
+        const path = try sessionPath(allocator, session_id, "/messages");
+        defer allocator.free(path);
+        const scopes = try sessionScopesJson(allocator, session_id, false);
+        defer allocator.free(scopes);
+        const response = try self.request(allocator, .GET, path, "", actor, scopes, "");
+        defer allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return parseMessagesWrapper(allocator, response.body);
+    }
+
+    pub fn clearMessages(self: *ApiAgentMemory, session_id: []const u8, actor_id: ?[]const u8) !void {
+        const actor = actor_id orelse return;
+        const path = try sessionPath(self.allocator, session_id, "/messages");
+        defer self.allocator.free(path);
+        const scopes = try sessionScopesJson(self.allocator, session_id, true);
+        defer self.allocator.free(scopes);
+        const response = try self.request(self.allocator, .DELETE, path, "", actor, scopes, "");
+        defer self.allocator.free(response.body);
+        if (response.status != .ok and response.status != .no_content) return error.AgentMemoryStorageUnavailable;
+    }
+
+    pub fn clearAutoSaved(self: *ApiAgentMemory, session_id: ?[]const u8, actor_id: ?[]const u8) !void {
+        const actor = actor_id orelse return;
+        const query = if (session_id) |sid| blk: {
+            const encoded = try percentEncode(self.allocator, sid);
+            defer self.allocator.free(encoded);
+            break :blk try std.fmt.allocPrint(self.allocator, "session_id={s}", .{encoded});
+        } else try self.allocator.dupe(u8, "");
+        defer self.allocator.free(query);
+        const scopes = if (session_id) |sid| try sessionScopesJson(self.allocator, sid, true) else try allocatorSessionAllScopesJson(self.allocator, true);
+        defer self.allocator.free(scopes);
+        const response = try self.request(self.allocator, .DELETE, "/agent-sessions/auto-saved", query, actor, scopes, "");
+        defer self.allocator.free(response.body);
+        if (response.status != .ok and response.status != .no_content) return error.AgentMemoryStorageUnavailable;
+    }
+
+    pub fn saveUsage(self: *ApiAgentMemory, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8) !void {
+        const actor = try access.requiredActorId(actor_id);
+        const path = try sessionPath(self.allocator, session_id, "/usage");
+        defer self.allocator.free(path);
+        const scopes = try sessionScopesJson(self.allocator, session_id, true);
+        defer self.allocator.free(scopes);
+        const body = try std.fmt.allocPrint(self.allocator, "{{\"total_tokens\":{d}}}", .{total_tokens});
+        defer self.allocator.free(body);
+        const response = try self.request(self.allocator, .PUT, path, "", actor, scopes, body);
+        defer self.allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+    }
+
+    pub fn deleteUsage(self: *ApiAgentMemory, session_id: []const u8, actor_id: ?[]const u8) !bool {
+        const actor = actor_id orelse return false;
+        const path = try sessionPath(self.allocator, session_id, "/usage");
+        defer self.allocator.free(path);
+        const scopes = try sessionScopesJson(self.allocator, session_id, true);
+        defer self.allocator.free(scopes);
+        const response = try self.request(self.allocator, .DELETE, path, "", actor, scopes, "");
+        defer self.allocator.free(response.body);
+        if (response.status == .not_found) return false;
+        if (response.status != .ok and response.status != .no_content) return error.AgentMemoryStorageUnavailable;
+        return true;
+    }
+
+    pub fn loadUsage(self: *ApiAgentMemory, session_id: []const u8, actor_id: ?[]const u8) !?u64 {
+        const actor = actor_id orelse return null;
+        const path = try sessionPath(self.allocator, session_id, "/usage");
+        defer self.allocator.free(path);
+        const scopes = try sessionScopesJson(self.allocator, session_id, false);
+        defer self.allocator.free(scopes);
+        const response = try self.request(self.allocator, .GET, path, "", actor, scopes, "");
+        defer self.allocator.free(response.body);
+        if (response.status == .not_found) return null;
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return parseJsonU64(response.body, "total_tokens", 0);
+    }
+
+    pub fn listSessions(self: *ApiAgentMemory, allocator: std.mem.Allocator, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryList {
+        const actor = actor_id orelse return .{ .total = 0, .sessions = try allocator.alloc(SessionInfo, 0) };
+        const scopes = try allocatorSessionAllScopesJson(allocator, false);
+        defer allocator.free(scopes);
+        const query = try std.fmt.allocPrint(allocator, "limit={d}&offset={d}", .{ limit, offset });
+        defer allocator.free(query);
+        const response = try self.request(allocator, .GET, "/agent-sessions", query, actor, scopes, "");
+        defer allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return parseHistoryList(allocator, response.body);
+    }
+
+    pub fn history(self: *ApiAgentMemory, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryShow {
+        const actor = actor_id orelse return .{ .total = 0, .messages = try allocator.alloc(Message, 0) };
+        const path = try sessionPath(allocator, session_id, "");
+        defer allocator.free(path);
+        const scopes = try sessionScopesJson(allocator, session_id, false);
+        defer allocator.free(scopes);
+        const query = try std.fmt.allocPrint(allocator, "limit={d}&offset={d}", .{ limit, offset });
+        defer allocator.free(query);
+        const response = try self.request(allocator, .GET, path, query, actor, scopes, "");
+        defer allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return parseHistoryShow(allocator, response.body);
+    }
+
+    fn getWithScopes(self: *ApiAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, explicit_scope: ?[]const u8) !?domain.AgentMemory {
+        const encoded_key = try percentEncode(allocator, key);
+        defer allocator.free(encoded_key);
+        const path = try std.fmt.allocPrint(allocator, "/agent-memory/{s}", .{encoded_key});
+        defer allocator.free(path);
+        const query = try agentMemoryExactQuery(allocator, session_id, explicit_scope);
+        defer allocator.free(query);
+        const response = try self.request(allocator, .GET, path, query, actor_id, scopes_json, "");
+        defer allocator.free(response.body);
+        if (response.status == .not_found) return null;
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return try parseAgentMemoryWrapper(allocator, response.body, "memory");
+    }
+
+    fn request(self: *ApiAgentMemory, allocator: std.mem.Allocator, method: std.http.Method, path: []const u8, query: []const u8, actor_id: ?[]const u8, scopes_json: ?[]const u8, payload: []const u8) !ApiHttpResponse {
+        const url = try apiBackendUrl(allocator, self.config.base_url.?, path, query);
+        defer allocator.free(url);
+        return requestApiJson(allocator, method, url, self.config, actor_id, scopes_json, payload);
+    }
+};
+
+fn agentMemoryStorePayload(allocator: std.mem.Allocator, input: Input) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"content\":");
+    try json.appendString(&out, allocator, input.content);
+    try out.appendSlice(allocator, ",\"category\":");
+    try json.appendString(&out, allocator, input.category);
+    try out.appendSlice(allocator, ",\"session_id\":");
+    try json.appendNullableString(&out, allocator, input.session_id);
+    try out.appendSlice(allocator, ",\"scope\":");
+    try json.appendNullableString(&out, allocator, input.scope);
+    try out.appendSlice(allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(&out, allocator, input.permissions_json, "[]");
+    try out.appendSlice(allocator, ",\"metadata\":");
+    try json.appendRawJsonOr(&out, allocator, input.metadata_json, "{}");
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+fn agentMemorySearchPayload(allocator: std.mem.Allocator, query_text: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"query\":");
+    try json.appendString(&out, allocator, query_text);
+    try out.print(allocator, ",\"limit\":{d},\"session_id\":", .{limit});
+    try json.appendNullableString(&out, allocator, session_id);
+    try out.appendSlice(allocator, ",\"scopes\":");
+    try json.appendRawJsonOr(&out, allocator, scopes_json, "[]");
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+fn agentMemoryListQuery(allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, limit: usize, offset: usize) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var first = true;
+    try appendQueryUsize(allocator, &out, &first, "limit", limit);
+    try appendQueryUsize(allocator, &out, &first, "offset", offset);
+    if (category) |value| try appendQueryString(allocator, &out, &first, "category", value);
+    if (session_id) |value| try appendQueryString(allocator, &out, &first, "session_id", value);
+    return out.toOwnedSlice(allocator);
+}
+
+fn agentMemoryExactQuery(allocator: std.mem.Allocator, session_id: ?[]const u8, scope: ?[]const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var first = true;
+    if (session_id) |value| try appendQueryString(allocator, &out, &first, "session_id", value);
+    if (scope) |value| try appendQueryString(allocator, &out, &first, "scope", value);
+    return out.toOwnedSlice(allocator);
+}
+
+fn sessionPath(allocator: std.mem.Allocator, session_id: []const u8, suffix: []const u8) ![]u8 {
+    const encoded = try percentEncode(allocator, session_id);
+    defer allocator.free(encoded);
+    return std.fmt.allocPrint(allocator, "/agent-sessions/{s}{s}", .{ encoded, suffix });
+}
+
+fn sharedScopeFromOwner(actor_id: []const u8) ?[]const u8 {
+    const prefix = "shared:";
+    if (!std.mem.startsWith(u8, actor_id, prefix)) return null;
+    return actor_id[prefix.len..];
+}
+
+fn scopesJson(allocator: std.mem.Allocator, scopes: []const []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (scopes, 0..) |scope, i| {
+        if (i > 0) try out.append(allocator, ',');
+        try json.appendString(&out, allocator, scope);
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+fn sessionScopesJson(allocator: std.mem.Allocator, session_id: []const u8, write: bool) ![]u8 {
+    const read_scope = try std.fmt.allocPrint(allocator, "session:{s}", .{session_id});
+    defer allocator.free(read_scope);
+    if (!write) return scopesJson(allocator, &.{read_scope});
+    const write_scope = try std.fmt.allocPrint(allocator, "write:session:{s}", .{session_id});
+    defer allocator.free(write_scope);
+    return scopesJson(allocator, &.{ read_scope, write_scope });
+}
+
+fn allocatorSessionAllScopesJson(allocator: std.mem.Allocator, write: bool) ![]u8 {
+    return if (write) scopesJson(allocator, &.{ "session:*", "write:session:*" }) else scopesJson(allocator, &.{"session:*"});
+}
+
+fn appendQueryUsize(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: usize) !void {
+    if (!first.*) try out.append(allocator, '&');
+    first.* = false;
+    try out.print(allocator, "{s}={d}", .{ name, value });
+}
+
+fn appendQueryString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: []const u8) !void {
+    const encoded = try percentEncode(allocator, value);
+    defer allocator.free(encoded);
+    if (!first.*) try out.append(allocator, '&');
+    first.* = false;
+    try out.appendSlice(allocator, name);
+    try out.append(allocator, '=');
+    try out.appendSlice(allocator, encoded);
+}
+
+fn apiBackendUrl(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8, query: []const u8) ![]u8 {
+    var end = base_url.len;
+    while (end > 0 and base_url[end - 1] == '/') : (end -= 1) {}
+    const trimmed = base_url[0..end];
+    const versioned = std.mem.endsWith(u8, trimmed, "/v1");
+    const separator = if (path.len > 0 and path[0] == '/') "" else "/";
+    if (query.len > 0) {
+        if (versioned) return std.fmt.allocPrint(allocator, "{s}{s}{s}?{s}", .{ trimmed, separator, path, query });
+        return std.fmt.allocPrint(allocator, "{s}/v1{s}{s}?{s}", .{ trimmed, separator, path, query });
+    }
+    if (versioned) return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ trimmed, separator, path });
+    return std.fmt.allocPrint(allocator, "{s}/v1{s}{s}", .{ trimmed, separator, path });
+}
+
+fn requestApiJson(allocator: std.mem.Allocator, method: std.http.Method, url: []const u8, cfg: ApiConfig, actor_id: ?[]const u8, scopes_json: ?[]const u8, payload: []const u8) !ApiHttpResponse {
+    var auth_header: ?[]u8 = null;
+    defer if (auth_header) |h| allocator.free(h);
+
+    var extra_headers_buf: [4]std.http.Header = undefined;
+    var header_count: usize = 0;
+    if (cfg.token) |token| {
+        auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+        extra_headers_buf[header_count] = .{ .name = "Authorization", .value = auth_header.? };
+        header_count += 1;
+    }
+    if (actor_id) |actor| {
+        if (actor.len > 0) {
+            extra_headers_buf[header_count] = .{ .name = "X-NullPantry-Actor-Id", .value = actor };
+            header_count += 1;
+        }
+    }
+    extra_headers_buf[header_count] = .{ .name = "X-NullPantry-Actor-Scopes", .value = scopes_json orelse cfg.actor_scopes_json };
+    header_count += 1;
+    extra_headers_buf[header_count] = .{ .name = "X-NullPantry-Actor-Capabilities", .value = cfg.actor_capabilities_json };
+    header_count += 1;
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = compat.io() };
+    defer client.deinit();
+
+    const uri = std.Uri.parse(url) catch return error.AgentMemoryStorageUnavailable;
+    var req = client.request(method, uri, .{
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .accept_encoding = .omit,
+            .connection = .{ .override = "close" },
+        },
+        .extra_headers = extra_headers_buf[0..header_count],
+    }) catch return error.AgentMemoryStorageUnavailable;
+    defer req.deinit();
+
+    applyApiSocketTimeout(req.connection, cfg.timeout_secs);
+
+    if (method.requestHasBody()) {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var body_writer = req.sendBodyUnflushed(&.{}) catch return error.AgentMemoryStorageUnavailable;
+        body_writer.writer.writeAll(payload) catch return error.AgentMemoryStorageUnavailable;
+        body_writer.end() catch return error.AgentMemoryStorageUnavailable;
+        req.connection.?.flush() catch return error.AgentMemoryStorageUnavailable;
+    } else {
+        req.sendBodiless() catch return error.AgentMemoryStorageUnavailable;
+    }
+
+    var response = req.receiveHead(&.{}) catch return error.AgentMemoryStorageUnavailable;
+    const reader = response.reader(&.{});
+    const read_limit = if (cfg.max_response_bytes == std.math.maxInt(usize)) cfg.max_response_bytes else cfg.max_response_bytes + 1;
+    const body = reader.allocRemaining(allocator, .limited(read_limit)) catch return error.AgentMemoryStorageUnavailable;
+    if (body.len > cfg.max_response_bytes) {
+        allocator.free(body);
+        return error.AgentMemoryResponseTooLarge;
+    }
+    return .{ .status = response.head.status, .body = body };
+}
+
+fn applyApiSocketTimeout(connection: ?*std.http.Client.Connection, timeout_secs: u32) void {
+    if (timeout_secs == 0) return;
+    switch (builtin.target.os.tag) {
+        .windows => {},
+        else => {
+            const timeout = std.posix.timeval{ .sec = @intCast(@max(timeout_secs, 1)), .usec = 0 };
+            if (connection) |conn| {
+                const handle = conn.stream_reader.stream.socket.handle;
+                std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+                std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+            }
+        },
+    }
+}
+
+fn parseAgentMemoryWrapper(allocator: std.mem.Allocator, body: []const u8, field: []const u8) !?domain.AgentMemory {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.AgentMemoryStorageUnavailable;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get(field) orelse return null;
+    return agentMemoryFromJsonValue(allocator, value);
+}
+
+fn parseAgentMemoryArrayWrapper(allocator: std.mem.Allocator, body: []const u8, field: []const u8) ![]domain.AgentMemory {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.AgentMemoryStorageUnavailable;
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.alloc(domain.AgentMemory, 0);
+    const value = parsed.value.object.get(field) orelse return allocator.alloc(domain.AgentMemory, 0);
+    if (value != .array) return allocator.alloc(domain.AgentMemory, 0);
+    var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+    errdefer {
+        for (out.items) |*entry| freeAgentMemory(allocator, entry);
+        out.deinit(allocator);
+    }
+    for (value.array.items) |item| {
+        if (try agentMemoryFromJsonValue(allocator, item)) |entry| {
+            try out.append(allocator, entry);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn agentMemoryFromJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !?domain.AgentMemory {
+    if (value != .object) return null;
+    const obj = value.object;
+    const id_value = jsonStringishField(obj, &.{"id"}) orelse return null;
+    const key_value = jsonStringishField(obj, &.{"key"}) orelse return null;
+    const owner_value = jsonStringishField(obj, &.{ "actor_id", "owner_id" }) orelse return null;
+    const id_value_owned = try allocator.dupe(u8, id_value);
+    errdefer allocator.free(id_value_owned);
+    const key = try allocator.dupe(u8, key_value);
+    errdefer allocator.free(key);
+    const content = try allocator.dupe(u8, jsonStringishField(obj, &.{"content"}) orelse "");
+    errdefer allocator.free(content);
+    const category = try allocator.dupe(u8, jsonStringishField(obj, &.{"category"}) orelse "core");
+    errdefer allocator.free(category);
+    const timestamp = try allocator.dupe(u8, jsonStringishField(obj, &.{"timestamp"}) orelse "0");
+    errdefer allocator.free(timestamp);
+    const session_id = try jsonNullableStringishField(allocator, obj, &.{"session_id"});
+    errdefer if (session_id) |sid| allocator.free(sid);
+    const owner = try allocator.dupe(u8, owner_value);
+    errdefer allocator.free(owner);
+    const writer = try allocator.dupe(u8, jsonStringishField(obj, &.{ "writer_actor_id", "created_by_actor_id" }) orelse owner_value);
+    errdefer allocator.free(writer);
+    const scope = try allocator.dupe(u8, jsonStringishField(obj, &.{"scope"}) orelse "");
+    errdefer allocator.free(scope);
+    const permissions = try jsonRawField(allocator, obj, &.{ "permissions", "permissions_json" }, "[]");
+    errdefer allocator.free(permissions);
+    return .{
+        .id = id_value_owned,
+        .key = key,
+        .content = content,
+        .category = category,
+        .timestamp = timestamp,
+        .session_id = session_id,
+        .actor_id = owner,
+        .writer_actor_id = writer,
+        .scope = scope,
+        .permissions_json = permissions,
+        .score = json.floatField(obj, "score"),
+    };
+}
+
+fn parseMessagesWrapper(allocator: std.mem.Allocator, body: []const u8) ![]Message {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.AgentMemoryStorageUnavailable;
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.alloc(Message, 0);
+    const value = parsed.value.object.get("messages") orelse return allocator.alloc(Message, 0);
+    return parseMessagesArray(allocator, value);
+}
+
+fn parseHistoryList(allocator: std.mem.Allocator, body: []const u8) !HistoryList {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.AgentMemoryStorageUnavailable;
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .total = 0, .sessions = try allocator.alloc(SessionInfo, 0) };
+    const obj = parsed.value.object;
+    const value = obj.get("sessions") orelse return .{ .total = parseJsonU64(body, "total", 0), .sessions = try allocator.alloc(SessionInfo, 0) };
+    if (value != .array) return .{ .total = parseJsonU64(body, "total", 0), .sessions = try allocator.alloc(SessionInfo, 0) };
+    var out: std.ArrayListUnmanaged(SessionInfo) = .empty;
+    errdefer {
+        for (out.items) |*info| freeSessionInfo(allocator, info);
+        out.deinit(allocator);
+    }
+    for (value.array.items) |item| {
+        if (item != .object) continue;
+        const session_id = jsonStringishField(item.object, &.{"session_id"}) orelse continue;
+        try out.append(allocator, .{
+            .session_id = try allocator.dupe(u8, session_id),
+            .message_count = jsonU64Field(item.object, "message_count", 0),
+            .first_message_at = jsonI64Field(item.object, "first_message_at", 0),
+            .last_message_at = jsonI64Field(item.object, "last_message_at", 0),
+        });
+    }
+    return .{ .total = jsonU64Field(obj, "total", out.items.len), .sessions = try out.toOwnedSlice(allocator) };
+}
+
+fn parseHistoryShow(allocator: std.mem.Allocator, body: []const u8) !HistoryShow {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.AgentMemoryStorageUnavailable;
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .total = 0, .messages = try allocator.alloc(Message, 0) };
+    const obj = parsed.value.object;
+    const value = obj.get("messages") orelse return .{ .total = jsonU64Field(obj, "total", 0), .messages = try allocator.alloc(Message, 0) };
+    const messages = try parseMessagesArray(allocator, value);
+    return .{ .total = jsonU64Field(obj, "total", messages.len), .messages = messages };
+}
+
+fn parseMessagesArray(allocator: std.mem.Allocator, value: std.json.Value) ![]Message {
+    if (value != .array) return allocator.alloc(Message, 0);
+    var out: std.ArrayListUnmanaged(Message) = .empty;
+    errdefer {
+        for (out.items) |*message| freeMessage(allocator, message);
+        out.deinit(allocator);
+    }
+    for (value.array.items) |item| {
+        if (item != .object) continue;
+        const role = try allocator.dupe(u8, jsonStringishField(item.object, &.{"role"}) orelse "");
+        errdefer allocator.free(role);
+        const content = try allocator.dupe(u8, jsonStringishField(item.object, &.{"content"}) orelse "");
+        errdefer allocator.free(content);
+        try out.append(allocator, .{
+            .role = role,
+            .content = content,
+            .created_at_ms = jsonI64Field(item.object, "created_at_ms", jsonI64Field(item.object, "created_at", 0)),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn jsonStringishField(obj: std.json.ObjectMap, names: []const []const u8) ?[]const u8 {
+    for (names) |name| {
+        const value = obj.get(name) orelse continue;
+        switch (value) {
+            .string => |s| return s,
+            .integer, .float, .bool => continue,
+            else => continue,
+        }
+    }
+    return null;
+}
+
+fn jsonNullableStringishField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, names: []const []const u8) !?[]u8 {
+    for (names) |name| {
+        const value = obj.get(name) orelse continue;
+        switch (value) {
+            .null => return null,
+            .string => |s| {
+                if (s.len == 0) return null;
+                return try allocator.dupe(u8, s);
+            },
+            else => continue,
+        }
+    }
+    return null;
+}
+
+fn jsonRawField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, names: []const []const u8, fallback: []const u8) ![]u8 {
+    for (names) |name| {
+        const value = obj.get(name) orelse continue;
+        if (std.mem.eql(u8, name, "permissions_json")) {
+            if (value == .string) return allocator.dupe(u8, value.string);
+        }
+        return json.jsonFromValue(allocator, value);
+    }
+    return allocator.dupe(u8, fallback);
+}
+
+fn jsonU64Field(obj: std.json.ObjectMap, name: []const u8, fallback: u64) u64 {
+    const value = obj.get(name) orelse return fallback;
+    return switch (value) {
+        .integer => |n| @intCast(@max(n, 0)),
+        .float => |f| if (f < 0) fallback else @intFromFloat(f),
+        .string => |s| std.fmt.parseInt(u64, s, 10) catch fallback,
+        else => fallback,
+    };
+}
+
+fn jsonI64Field(obj: std.json.ObjectMap, name: []const u8, fallback: i64) i64 {
+    const value = obj.get(name) orelse return fallback;
+    return switch (value) {
+        .integer => |n| n,
+        .float => |f| @intFromFloat(f),
+        .string => |s| std.fmt.parseInt(i64, s, 10) catch fallback,
+        else => fallback,
+    };
+}
+
+fn parseJsonU64(body: []const u8, field: []const u8, fallback: u64) u64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return fallback;
+    defer parsed.deinit();
+    if (parsed.value != .object) return fallback;
+    return jsonU64Field(parsed.value.object, field, fallback);
+}
+
+fn percentEncode(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const digits = "0123456789ABCDEF";
+    for (raw) |ch| {
+        const unreserved = (ch >= 'a' and ch <= 'z') or
+            (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or
+            ch == '-' or ch == '_' or ch == '.' or ch == '~';
+        if (unreserved) {
+            try out.append(allocator, ch);
+        } else {
+            try out.append(allocator, '%');
+            try out.append(allocator, digits[ch >> 4]);
+            try out.append(allocator, digits[ch & 0x0f]);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn expectRedisSimple(resp: redis.RespValue, expected: []const u8) !void {
     return switch (resp) {
         .simple_string => |value| if (std.mem.eql(u8, value, expected)) {} else error.UnexpectedRedisResponse,
@@ -1786,7 +2487,34 @@ test "agent memory runtime parses backend names" {
     try std.testing.expectEqual(BackendKind.memory_lru, BackendKind.parse("memory"));
     try std.testing.expectEqual(BackendKind.memory_lru, BackendKind.parse("memory_lru"));
     try std.testing.expectEqual(BackendKind.redis, BackendKind.parse("redis"));
+    try std.testing.expectEqual(BackendKind.api, BackendKind.parse("api"));
+    try std.testing.expectEqual(BackendKind.api, BackendKind.parse("http"));
     try std.testing.expectEqual(BackendKind.native, BackendKind.parse("sqlite"));
+}
+
+test "agent memory api backend builds urls and parses memory responses" {
+    const url_root = try apiBackendUrl(std.testing.allocator, "https://pantry.example", "/agent-memory/key", "limit=1");
+    defer std.testing.allocator.free(url_root);
+    try std.testing.expectEqualStrings("https://pantry.example/v1/agent-memory/key?limit=1", url_root);
+
+    const url_v1 = try apiBackendUrl(std.testing.allocator, "https://pantry.example/v1/", "/agent-memory/key", "");
+    defer std.testing.allocator.free(url_v1);
+    try std.testing.expectEqualStrings("https://pantry.example/v1/agent-memory/key", url_v1);
+
+    const encoded = try percentEncode(std.testing.allocator, "team pref/ru");
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings("team%20pref%2Fru", encoded);
+
+    const parsed = (try parseAgentMemoryWrapper(std.testing.allocator,
+        \\{"memory":{"id":"m1","key":"pref","content":"value","category":"core","timestamp":"42","session_id":null,"owner_id":"agent:a","created_by_actor_id":"agent:b","scope":"agent:agent:a","permissions":["agent:a"],"score":0.7}}
+    , "memory")).?;
+    defer {
+        var copy = parsed;
+        freeAgentMemory(std.testing.allocator, &copy);
+    }
+    try std.testing.expectEqualStrings("agent:a", parsed.actor_id);
+    try std.testing.expectEqualStrings("agent:b", parsed.writer_actor_id);
+    try std.testing.expectEqualStrings("[\"agent:a\"]", parsed.permissions_json);
 }
 
 test "named runtime registry rejects reserved duplicate and native stores" {

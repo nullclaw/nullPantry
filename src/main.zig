@@ -45,6 +45,7 @@ const RuntimeConfig = struct {
     agent_memory_backend: agent_memory_runtime.BackendKind = .native,
     memory_config: agent_memory_runtime.MemoryConfig = .{},
     redis_config: redis_mod.Config = .{},
+    api_agent_memory_config: agent_memory_runtime.ApiConfig = .{},
     agent_memory_store_configs: []const agent_memory_runtime.NamedConfig = &.{},
     vector_backend: vector_runtime.Config = .{},
     analytics_backend: analytics_runtime.Config = .{},
@@ -73,6 +74,7 @@ pub fn main(init: std.process.Init) !void {
             .backend = cfg.agent_memory_backend,
             .memory = cfg.memory_config,
             .redis = cfg.redis_config,
+            .api = cfg.api_agent_memory_config,
         },
         .agent_memory_stores = cfg.agent_memory_store_configs,
         .vector_backend = cfg.vector_backend,
@@ -285,6 +287,27 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_BACKEND")) |backend| {
         cfg.agent_memory_backend = agent_memory_runtime.BackendKind.parse(backend);
     } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_API_URL")) |url| {
+        cfg.api_agent_memory_config.base_url = url;
+        cfg.agent_memory_backend = .api;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_API_TOKEN")) |token| {
+        cfg.api_agent_memory_config.token = token;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_API_SCOPES")) |scopes| {
+        cfg.api_agent_memory_config.actor_scopes_json = scopes;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_API_CAPABILITIES")) |capabilities| {
+        cfg.api_agent_memory_config.actor_capabilities_json = capabilities;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_API_TIMEOUT_SECS")) |secs| {
+        defer allocator.free(secs);
+        cfg.api_agent_memory_config.timeout_secs = std.fmt.parseInt(u32, secs, 10) catch cfg.api_agent_memory_config.timeout_secs;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_API_MAX_RESPONSE_BYTES")) |bytes| {
+        defer allocator.free(bytes);
+        cfg.api_agent_memory_config.max_response_bytes = std.fmt.parseInt(usize, bytes, 10) catch cfg.api_agent_memory_config.max_response_bytes;
+    } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_MEMORY_LRU_MAX_ENTRIES")) |max_entries| {
         defer allocator.free(max_entries);
         cfg.memory_config.max_entries = std.fmt.parseInt(usize, max_entries, 10) catch cfg.memory_config.max_entries;
@@ -495,6 +518,25 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--agent-memory-backend") and i + 1 < args.len) {
             i += 1;
             cfg.agent_memory_backend = agent_memory_runtime.BackendKind.parse(args[i]);
+        } else if (std.mem.eql(u8, arg, "--agent-memory-api-url") and i + 1 < args.len) {
+            i += 1;
+            cfg.api_agent_memory_config.base_url = args[i];
+            cfg.agent_memory_backend = .api;
+        } else if (std.mem.eql(u8, arg, "--agent-memory-api-token") and i + 1 < args.len) {
+            i += 1;
+            cfg.api_agent_memory_config.token = args[i];
+        } else if (std.mem.eql(u8, arg, "--agent-memory-api-scopes") and i + 1 < args.len) {
+            i += 1;
+            cfg.api_agent_memory_config.actor_scopes_json = args[i];
+        } else if (std.mem.eql(u8, arg, "--agent-memory-api-capabilities") and i + 1 < args.len) {
+            i += 1;
+            cfg.api_agent_memory_config.actor_capabilities_json = args[i];
+        } else if (std.mem.eql(u8, arg, "--agent-memory-api-timeout-secs") and i + 1 < args.len) {
+            i += 1;
+            cfg.api_agent_memory_config.timeout_secs = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--agent-memory-api-max-response-bytes") and i + 1 < args.len) {
+            i += 1;
+            cfg.api_agent_memory_config.max_response_bytes = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--memory-lru-max-entries") and i + 1 < args.len) {
             i += 1;
             cfg.memory_config.max_entries = try std.fmt.parseInt(usize, args[i], 10);
@@ -615,6 +657,25 @@ fn parseAgentMemoryStoreConfigsJson(allocator: std.mem.Allocator, raw: []const u
             config.redis = try redis_mod.parseUrl(allocator, url);
             config.backend = .redis;
         }
+        if (jsonStringField(item.object, "api_url") orelse jsonStringField(item.object, "base_url") orelse jsonStringField(item.object, "url")) |url| {
+            config.api.base_url = try allocator.dupe(u8, url);
+            config.backend = .api;
+        }
+        if (jsonStringField(item.object, "api_token") orelse jsonStringField(item.object, "token")) |token| {
+            config.api.token = try allocator.dupe(u8, token);
+        }
+        if (jsonStringField(item.object, "api_scopes") orelse jsonStringField(item.object, "actor_scopes")) |scopes| {
+            config.api.actor_scopes_json = try allocator.dupe(u8, scopes);
+        }
+        if (jsonStringField(item.object, "api_capabilities") orelse jsonStringField(item.object, "actor_capabilities")) |capabilities| {
+            config.api.actor_capabilities_json = try allocator.dupe(u8, capabilities);
+        }
+        if (jsonIntField(item.object, "api_timeout_secs") orelse jsonIntField(item.object, "timeout_secs")) |secs| {
+            if (config.backend == .api) config.api.timeout_secs = @intCast(@max(secs, 0));
+        }
+        if (jsonIntField(item.object, "api_max_response_bytes") orelse jsonIntField(item.object, "max_response_bytes")) |bytes| {
+            if (config.backend == .api) config.api.max_response_bytes = @intCast(@max(bytes, 0));
+        }
         if (jsonStringField(item.object, "redis_key_prefix")) |prefix| {
             config.redis.key_prefix = try allocator.dupe(u8, prefix);
         } else if (jsonStringField(item.object, "key_prefix")) |prefix| {
@@ -660,6 +721,9 @@ fn parseAgentMemoryStoreSpec(allocator: std.mem.Allocator, raw: []const u8) !age
     if (std.mem.startsWith(u8, value, "redis://")) {
         config.redis = try redis_mod.parseUrl(allocator, value);
         config.backend = .redis;
+    } else if (std.mem.startsWith(u8, value, "http://") or std.mem.startsWith(u8, value, "https://")) {
+        config.api.base_url = try allocator.dupe(u8, value);
+        config.backend = .api;
     } else {
         config.backend = try parseNamedAgentMemoryBackend(value);
     }
@@ -672,6 +736,9 @@ fn parseNamedAgentMemoryBackend(raw: []const u8) !agent_memory_runtime.BackendKi
     if (std.ascii.eqlIgnoreCase(raw, "memory_lru")) return .memory_lru;
     if (std.ascii.eqlIgnoreCase(raw, "in_memory")) return .memory_lru;
     if (std.ascii.eqlIgnoreCase(raw, "redis")) return .redis;
+    if (std.ascii.eqlIgnoreCase(raw, "api")) return .api;
+    if (std.ascii.eqlIgnoreCase(raw, "http")) return .api;
+    if (std.ascii.eqlIgnoreCase(raw, "nullpantry_api")) return .api;
     return error.InvalidAgentMemoryStore;
 }
 
@@ -714,6 +781,7 @@ fn printUsage() void {
         \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--token-principals JSON] [--actor-scopes JSON] [--actor-capabilities JSON] [--worker-scopes JSON] [--worker-capabilities JSON] [--trust-actor-headers]
         \\       nullpantry --backend postgres --postgres-url URL [--token TOKEN|--token-principals JSON]
         \\       nullpantry --agent-memory-backend redis --redis-url redis://:pass@host:6379/0
+        \\       nullpantry --agent-memory-backend api --agent-memory-api-url https://pantry.internal --agent-memory-api-token TOKEN
         \\       nullpantry --vector-backend qdrant --vector-base-url http://127.0.0.1:6333 --vector-collection nullpantry_vectors
         \\       nullpantry --vector-backend lancedb --lancedb-uri .nullpantry/lancedb --lancedb-table nullpantry_vectors
         \\       nullpantry --analytics-backend clickhouse --analytics-base-url http://127.0.0.1:8123 --analytics-table nullpantry_events
@@ -738,6 +806,12 @@ fn printUsage() void {
         \\  NULLPANTRY_WORKER_INTERVAL_MS
         \\  NULLPANTRY_TRUST_ACTOR_HEADERS
         \\  NULLPANTRY_AGENT_MEMORY_BACKEND
+        \\  NULLPANTRY_AGENT_MEMORY_API_URL
+        \\  NULLPANTRY_AGENT_MEMORY_API_TOKEN
+        \\  NULLPANTRY_AGENT_MEMORY_API_SCOPES
+        \\  NULLPANTRY_AGENT_MEMORY_API_CAPABILITIES
+        \\  NULLPANTRY_AGENT_MEMORY_API_TIMEOUT_SECS
+        \\  NULLPANTRY_AGENT_MEMORY_API_MAX_RESPONSE_BYTES
         \\  NULLPANTRY_AGENT_MEMORY_STORES
         \\  NULLPANTRY_MEMORY_LRU_MAX_ENTRIES
         \\  NULLPANTRY_MEMORY_LRU_MAX_MESSAGES
@@ -866,6 +940,35 @@ test "agent memory memory_lru backend can be bounded from args" {
     try std.testing.expectEqual(@as(u32, 300), cfg.memory_config.ttl_seconds.?);
 }
 
+test "agent memory api backend can be configured from args" {
+    const args = [_][:0]const u8{
+        "nullpantry",
+        "--agent-memory-backend",
+        "api",
+        "--agent-memory-api-url",
+        "https://pantry.example/v1",
+        "--agent-memory-api-token",
+        "gateway-token",
+        "--agent-memory-api-scopes",
+        "[\"project:nullpantry\"]",
+        "--agent-memory-api-capabilities",
+        "[\"read\",\"write\"]",
+        "--agent-memory-api-timeout-secs",
+        "9",
+        "--agent-memory-api-max-response-bytes",
+        "123456",
+    };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+
+    try std.testing.expectEqual(agent_memory_runtime.BackendKind.api, cfg.agent_memory_backend);
+    try std.testing.expectEqualStrings("https://pantry.example/v1", cfg.api_agent_memory_config.base_url.?);
+    try std.testing.expectEqualStrings("gateway-token", cfg.api_agent_memory_config.token.?);
+    try std.testing.expectEqualStrings("[\"project:nullpantry\"]", cfg.api_agent_memory_config.actor_scopes_json);
+    try std.testing.expectEqualStrings("[\"read\",\"write\"]", cfg.api_agent_memory_config.actor_capabilities_json);
+    try std.testing.expectEqual(@as(u32, 9), cfg.api_agent_memory_config.timeout_secs);
+    try std.testing.expectEqual(@as(usize, 123456), cfg.api_agent_memory_config.max_response_bytes);
+}
+
 test "named agent memory stores can be configured from args and json" {
     const args = [_][:0]const u8{
         "nullpantry",
@@ -873,24 +976,32 @@ test "named agent memory stores can be configured from args and json" {
         "scratch=memory_lru",
         "--agent-memory-store",
         "shared=redis://127.0.0.1:6379/4",
+        "--agent-memory-store",
+        "remote=https://pantry.example",
     };
     const cfg = try parseArgs(std.testing.allocator, &args);
     defer std.testing.allocator.free(cfg.agent_memory_store_configs);
     defer std.testing.allocator.free(cfg.agent_memory_store_configs[0].name);
     defer std.testing.allocator.free(cfg.agent_memory_store_configs[1].name);
     defer std.testing.allocator.free(cfg.agent_memory_store_configs[1].config.redis.host);
+    defer std.testing.allocator.free(cfg.agent_memory_store_configs[2].name);
+    defer std.testing.allocator.free(cfg.agent_memory_store_configs[2].config.api.base_url.?);
 
-    try std.testing.expectEqual(@as(usize, 2), cfg.agent_memory_store_configs.len);
+    try std.testing.expectEqual(@as(usize, 3), cfg.agent_memory_store_configs.len);
     try std.testing.expectEqualStrings("scratch", cfg.agent_memory_store_configs[0].name);
     try std.testing.expectEqual(agent_memory_runtime.BackendKind.memory_lru, cfg.agent_memory_store_configs[0].config.backend);
     try std.testing.expectEqualStrings("shared", cfg.agent_memory_store_configs[1].name);
     try std.testing.expectEqual(agent_memory_runtime.BackendKind.redis, cfg.agent_memory_store_configs[1].config.backend);
     try std.testing.expectEqual(@as(u8, 4), cfg.agent_memory_store_configs[1].config.redis.db_index);
+    try std.testing.expectEqualStrings("remote", cfg.agent_memory_store_configs[2].name);
+    try std.testing.expectEqual(agent_memory_runtime.BackendKind.api, cfg.agent_memory_store_configs[2].config.backend);
+    try std.testing.expectEqualStrings("https://pantry.example", cfg.agent_memory_store_configs[2].config.api.base_url.?);
 
     const parsed = try parseAgentMemoryStoreConfigsJson(std.testing.allocator,
         \\[
         \\  {"name":"fast","backend":"memory_lru","max_entries":32,"max_messages":64,"max_usage_entries":8,"max_bytes":2048,"ttl_seconds":120},
-        \\  {"name":"team","redis_url":"redis://127.0.0.1:6379/5","key_prefix":"team-memory","ttl_seconds":30}
+        \\  {"name":"team","redis_url":"redis://127.0.0.1:6379/5","key_prefix":"team-memory","ttl_seconds":30},
+        \\  {"name":"remote","api_url":"https://pantry.example/v1","api_token":"gateway","api_timeout_secs":11,"api_max_response_bytes":65536}
         \\]
     );
     defer std.testing.allocator.free(parsed);
@@ -898,8 +1009,11 @@ test "named agent memory stores can be configured from args and json" {
     defer std.testing.allocator.free(parsed[1].name);
     defer std.testing.allocator.free(parsed[1].config.redis.host);
     defer std.testing.allocator.free(parsed[1].config.redis.key_prefix);
+    defer std.testing.allocator.free(parsed[2].name);
+    defer std.testing.allocator.free(parsed[2].config.api.base_url.?);
+    defer std.testing.allocator.free(parsed[2].config.api.token.?);
 
-    try std.testing.expectEqual(@as(usize, 2), parsed.len);
+    try std.testing.expectEqual(@as(usize, 3), parsed.len);
     try std.testing.expectEqualStrings("fast", parsed[0].name);
     try std.testing.expectEqual(agent_memory_runtime.BackendKind.memory_lru, parsed[0].config.backend);
     try std.testing.expectEqual(@as(usize, 32), parsed[0].config.memory.max_entries);
@@ -911,6 +1025,12 @@ test "named agent memory stores can be configured from args and json" {
     try std.testing.expectEqual(agent_memory_runtime.BackendKind.redis, parsed[1].config.backend);
     try std.testing.expectEqualStrings("team-memory", parsed[1].config.redis.key_prefix);
     try std.testing.expectEqual(@as(u32, 30), parsed[1].config.redis.ttl_seconds.?);
+    try std.testing.expectEqualStrings("remote", parsed[2].name);
+    try std.testing.expectEqual(agent_memory_runtime.BackendKind.api, parsed[2].config.backend);
+    try std.testing.expectEqualStrings("https://pantry.example/v1", parsed[2].config.api.base_url.?);
+    try std.testing.expectEqualStrings("gateway", parsed[2].config.api.token.?);
+    try std.testing.expectEqual(@as(u32, 11), parsed[2].config.api.timeout_secs);
+    try std.testing.expectEqual(@as(usize, 65536), parsed[2].config.api.max_response_bytes);
 
     try std.testing.expectError(error.InvalidAgentMemoryStore, parseAgentMemoryStoreSpec(std.testing.allocator, "bad=native"));
     try std.testing.expectError(error.InvalidAgentMemoryStore, parseAgentMemoryStoreSpec(std.testing.allocator, "bad=typo"));
