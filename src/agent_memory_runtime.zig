@@ -6,6 +6,7 @@ const domain = @import("domain.zig");
 const access = @import("access.zig");
 const compat = @import("compat.zig");
 const redis = @import("redis.zig");
+const agent_memory_reducer = @import("agent_memory_reducer.zig");
 
 pub const BackendKind = enum {
     none,
@@ -76,6 +77,7 @@ pub const Input = struct {
     metadata_json: []const u8 = "{}",
     actor_id: ?[]const u8 = null,
     writer_actor_id: ?[]const u8 = null,
+    operation: domain.AgentMemoryOperation = .put,
 };
 
 pub const Message = struct {
@@ -428,6 +430,10 @@ pub const MemoryAgentMemory = struct {
         defer allocator.free(scope);
         const permissions = try access.agentMemoryPermissions(allocator, owner_actor, input.scope, input.permissions_json);
         defer allocator.free(permissions);
+        const existing_idx = self.findEntryIndex(owner_actor, input.session_id, input.key);
+        const existing_content = if (existing_idx) |idx| self.entries.items[idx].entry.content else null;
+        const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, existing_content, input.content);
+        defer allocator.free(reduced_content);
         _ = try self.delete(input.key, input.session_id, owner_actor, writer_actor);
 
         const timestamp = ids.nowMs();
@@ -440,7 +446,7 @@ pub const MemoryAgentMemory = struct {
         var stored = domain.AgentMemory{
             .id = entry_id,
             .key = try self.allocator.dupe(u8, input.key),
-            .content = try self.allocator.dupe(u8, input.content),
+            .content = try self.allocator.dupe(u8, reduced_content),
             .category = try self.allocator.dupe(u8, input.category),
             .timestamp = timestamp_text,
             .session_id = if (input.session_id) |sid| try self.allocator.dupe(u8, sid) else null,
@@ -953,6 +959,8 @@ pub const RedisAgentMemory = struct {
         defer old_hash.deinit(self.allocator);
         var old_entry = try self.agentMemoryFromHash(self.allocator, old_hash);
         defer if (old_entry) |*entry| freeAgentMemory(self.allocator, entry);
+        const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, if (old_entry) |entry| entry.content else null, input.content);
+        defer allocator.free(reduced_content);
 
         const global = try self.globalIndexKey(allocator);
         defer allocator.free(global);
@@ -972,7 +980,7 @@ pub const RedisAgentMemory = struct {
             "HSET",             entry_key,
             "id",               entry_id,
             "key",              input.key,
-            "content",          input.content,
+            "content",          reduced_content,
             "category",         input.category,
             "timestamp",        timestamp_text,
             "session_id",       input.session_id orelse "",
@@ -1445,6 +1453,7 @@ pub const RedisAgentMemory = struct {
         const writer = hashField(fields, "writer_actor_id") orelse owner;
         const scope = hashField(fields, "scope") orelse "";
         const permissions = hashField(fields, "permissions_json") orelse "[]";
+        const store_name = hashField(fields, "store") orelse "";
         const out_id = try allocator.dupe(u8, id_value);
         errdefer allocator.free(out_id);
         const out_key = try allocator.dupe(u8, key);
@@ -1465,6 +1474,8 @@ pub const RedisAgentMemory = struct {
         errdefer allocator.free(out_scope);
         const out_permissions = try allocator.dupe(u8, permissions);
         errdefer allocator.free(out_permissions);
+        const out_store = try allocator.dupe(u8, store_name);
+        errdefer allocator.free(out_store);
         return .{
             .id = out_id,
             .key = out_key,
@@ -1476,6 +1487,7 @@ pub const RedisAgentMemory = struct {
             .writer_actor_id = out_writer,
             .scope = out_scope,
             .permissions_json = out_permissions,
+            .store = out_store,
         };
     }
 
@@ -1586,6 +1598,7 @@ pub const ApiAgentMemory = struct {
     pub fn deinit(_: *ApiAgentMemory) void {}
 
     pub fn store(self: *ApiAgentMemory, allocator: std.mem.Allocator, input: Input) !domain.AgentMemory {
+        if (input.operation != .put) return self.applyAgentMemoryReducer(allocator, input);
         const actor = try access.requiredActorId(input.writer_actor_id orelse input.actor_id);
         const encoded_key = try percentEncode(allocator, input.key);
         defer allocator.free(encoded_key);
@@ -1598,6 +1611,18 @@ pub const ApiAgentMemory = struct {
         defer allocator.free(response.body);
         if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
         return (try parseAgentMemoryWrapper(allocator, response.body, "memory")) orelse error.AgentMemoryStorageUnavailable;
+    }
+
+    fn applyAgentMemoryReducer(self: *ApiAgentMemory, allocator: std.mem.Allocator, input: Input) !domain.AgentMemory {
+        const actor = try access.requiredActorId(input.writer_actor_id orelse input.actor_id);
+        const owner_actor = try access.agentMemoryOwner(allocator, actor, input.scope);
+        defer allocator.free(owner_actor);
+        const body = try agentMemoryApplyPayload(allocator, input, actor);
+        defer allocator.free(body);
+        const response = try self.request(allocator, .POST, "/memory/apply", "", actor, null, body);
+        defer allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return (try self.get(allocator, input.key, input.session_id, owner_actor)) orelse error.AgentMemoryStorageUnavailable;
     }
 
     pub fn get(self: *ApiAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
@@ -1646,7 +1671,7 @@ pub const ApiAgentMemory = struct {
     pub fn search(self: *ApiAgentMemory, allocator: std.mem.Allocator, query_text: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
         const actor = actor_id orelse return allocator.alloc(domain.AgentMemory, 0);
         if (limit == 0) return allocator.alloc(domain.AgentMemory, 0);
-        const body = try agentMemorySearchPayload(allocator, query_text, @min(limit, 100), session_id, scopes_json);
+        const body = try agentMemorySearchPayload(allocator, query_text, limit, session_id, scopes_json);
         defer allocator.free(body);
         const response = try self.request(allocator, .POST, "/agent-memory/search", "", actor, scopes_json, body);
         defer allocator.free(response.body);
@@ -1836,6 +1861,45 @@ fn agentMemoryStorePayload(allocator: std.mem.Allocator, input: Input) ![]u8 {
     try out.appendSlice(allocator, ",\"metadata\":");
     try json.appendRawJsonOr(&out, allocator, input.metadata_json, "{}");
     try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+fn agentMemoryApplyPayload(allocator: std.mem.Allocator, input: Input, actor_id: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"event_type\":\"agent_memory.");
+    try out.appendSlice(allocator, input.operation.name());
+    try out.appendSlice(allocator, "\",\"operation\":\"");
+    try out.appendSlice(allocator, input.operation.name());
+    try out.appendSlice(allocator, "\",\"object_type\":\"agent_memory\",\"actor_id\":");
+    try json.appendString(&out, allocator, actor_id);
+    try out.appendSlice(allocator, ",\"payload\":{\"key\":");
+    try json.appendString(&out, allocator, input.key);
+    try out.appendSlice(allocator, ",\"category\":");
+    try json.appendString(&out, allocator, input.category);
+    try out.appendSlice(allocator, ",\"session_id\":");
+    try json.appendNullableString(&out, allocator, input.session_id);
+    try out.appendSlice(allocator, ",\"scope\":");
+    try json.appendNullableString(&out, allocator, input.scope);
+    try out.appendSlice(allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(&out, allocator, input.permissions_json, "[]");
+    try out.appendSlice(allocator, ",\"metadata\":");
+    try json.appendRawJsonOr(&out, allocator, input.metadata_json, "{}");
+    switch (input.operation) {
+        .put => {
+            try out.appendSlice(allocator, ",\"content\":");
+            try json.appendString(&out, allocator, input.content);
+        },
+        .merge_string_set => {
+            try out.appendSlice(allocator, ",\"values\":");
+            try json.appendRawJsonOr(&out, allocator, input.content, "[]");
+        },
+        .merge_object => {
+            try out.appendSlice(allocator, ",\"object\":");
+            try json.appendRawJsonOr(&out, allocator, input.content, "{}");
+        },
+    }
+    try out.appendSlice(allocator, "}}");
     return out.toOwnedSlice(allocator);
 }
 
@@ -2068,6 +2132,8 @@ fn agentMemoryFromJsonValue(allocator: std.mem.Allocator, value: std.json.Value)
     errdefer allocator.free(scope);
     const permissions = try jsonRawField(allocator, obj, &.{ "permissions", "permissions_json" }, "[]");
     errdefer allocator.free(permissions);
+    const store = try allocator.dupe(u8, jsonStringishField(obj, &.{ "store", "storage" }) orelse "");
+    errdefer allocator.free(store);
     return .{
         .id = id_value_owned,
         .key = key,
@@ -2079,6 +2145,7 @@ fn agentMemoryFromJsonValue(allocator: std.mem.Allocator, value: std.json.Value)
         .writer_actor_id = writer,
         .scope = scope,
         .permissions_json = permissions,
+        .store = store,
         .score = json.floatField(obj, "score"),
     };
 }
@@ -2355,6 +2422,7 @@ fn detachAgentMemory(entry: *domain.AgentMemory) void {
     entry.writer_actor_id = "";
     entry.scope = "";
     entry.permissions_json = "";
+    entry.store = "";
 }
 
 pub fn freeAgentMemory(allocator: std.mem.Allocator, entry: *domain.AgentMemory) void {
@@ -2369,6 +2437,7 @@ pub fn freeAgentMemory(allocator: std.mem.Allocator, entry: *domain.AgentMemory)
     if (entry.writer_actor_id.len > 0) allocator.free(entry.writer_actor_id);
     if (entry.scope.len > 0) allocator.free(entry.scope);
     if (entry.permissions_json.len > 0) allocator.free(entry.permissions_json);
+    if (entry.store.len > 0) allocator.free(entry.store);
     detachAgentMemory(entry);
 }
 
@@ -2408,6 +2477,7 @@ fn cloneAgentMemory(allocator: std.mem.Allocator, entry: domain.AgentMemory) !do
         .writer_actor_id = try allocator.dupe(u8, if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id),
         .scope = try allocator.dupe(u8, entry.scope),
         .permissions_json = try allocator.dupe(u8, entry.permissions_json),
+        .store = try allocator.dupe(u8, entry.store),
         .score = entry.score,
     };
 }

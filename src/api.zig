@@ -20,6 +20,8 @@ const markdown_adapter = @import("markdown_adapter.zig");
 const markdown_filesystem = @import("markdown_filesystem.zig");
 const compat = @import("compat.zig");
 const graph_mod = @import("graph.zig");
+const agent_memory_reducer = @import("agent_memory_reducer.zig");
+const agent_memory_runtime = @import("agent_memory_runtime.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -2738,27 +2740,45 @@ fn retrievalPlan(ctx: *Context, body: []const u8) HttpResponse {
     const query = json.stringField(obj, "query") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing query");
     const has_vector_index = (ctx.store.countVectorChunks() catch 0) > 0;
     const allow_reranker = (json.boolField(obj, "allow_reranker") orelse false) and ctx.llm_base_url != null and ctx.llm_model != null;
-    const plan = retrieval.buildPlan(ctx.allocator, query, has_vector_index, allow_reranker) catch return serverError(ctx);
+    var plan = retrieval.buildPlan(ctx.allocator, query, has_vector_index, allow_reranker) catch return serverError(ctx);
+    defer plan.deinit(ctx.allocator);
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    out.appendSlice(ctx.allocator, "{\"plan\":{\"use_keyword\":") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, if (plan.use_keyword) "true" else "false") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, ",\"use_vector\":") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, if (plan.use_vector) "true" else "false") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, ",\"use_graph\":") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, if (plan.use_graph) "true" else "false") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, ",\"use_reranker\":") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, if (plan.use_reranker) "true" else "false") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, ",\"expanded_query\":") catch return serverError(ctx);
-    json.appendString(&out, ctx.allocator, plan.expanded_query) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "{\"plan\":{") catch return serverError(ctx);
+    appendRetrievalPlanFields(ctx, &out, plan) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn appendRetrievalPlanFields(ctx: *Context, out: *std.ArrayListUnmanaged(u8), plan: retrieval.RetrievalPlan) !void {
+    try out.appendSlice(ctx.allocator, "\"use_keyword\":");
+    try out.appendSlice(ctx.allocator, if (plan.use_keyword) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"use_vector\":");
+    try out.appendSlice(ctx.allocator, if (plan.use_vector) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"use_graph\":");
+    try out.appendSlice(ctx.allocator, if (plan.use_graph) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"use_reranker\":");
+    try out.appendSlice(ctx.allocator, if (plan.use_reranker) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"query_expanded\":");
+    try out.appendSlice(ctx.allocator, if (plan.query_expanded) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"expanded_query\":");
+    try json.appendString(out, ctx.allocator, plan.expanded_query);
+    try out.appendSlice(ctx.allocator, ",\"keyword_query\":");
+    try json.appendString(out, ctx.allocator, plan.keyword_query);
+    try out.appendSlice(ctx.allocator, ",\"websearch_query\":");
+    try json.appendString(out, ctx.allocator, plan.websearch_query);
+    try out.appendSlice(ctx.allocator, ",\"expansion_terms\":");
+    try out.appendSlice(ctx.allocator, plan.expansion_terms_json);
+    try out.appendSlice(ctx.allocator, ",\"expansion_reasons\":");
+    try out.appendSlice(ctx.allocator, plan.expansion_reasons_json);
+    try out.appendSlice(ctx.allocator, ",\"intent_hints\":");
+    try out.appendSlice(ctx.allocator, plan.intent_hints_json);
 }
 
 fn appendRetrievalStages(ctx: *Context, out: *std.ArrayListUnmanaged(u8), input: store_mod.SearchInput, plan: retrieval.RetrievalPlan, llm_rerank_effective: bool) !void {
     try out.appendSlice(ctx.allocator, ",\"stages\":[");
     var first = true;
     try appendStage(ctx, out, &first, "acl_filter");
-    if (plan.expanded_query.len != input.query.len or !std.mem.eql(u8, plan.expanded_query, input.query)) try appendStage(ctx, out, &first, "query_expansion");
+    if (plan.query_expanded) try appendStage(ctx, out, &first, "query_expansion");
     if (plan.use_keyword) try appendStage(ctx, out, &first, "keyword");
     if (input.use_vector and input.query_embedding_json != null and plan.use_vector) {
         try appendStage(ctx, out, &first, "vector_ann");
@@ -2797,7 +2817,8 @@ fn retrievalSearch(ctx: *Context, body: []const u8) HttpResponse {
     input.use_vector = input.use_vector and use_vector and has_vector_index;
     input.allow_reranker = allow_reranker;
     const llm_rerank_effective = allow_reranker and ctx.llm_base_url != null and ctx.llm_model != null;
-    const plan = retrieval.buildPlan(ctx.allocator, query, input.use_vector, llm_rerank_effective) catch return serverError(ctx);
+    var plan = retrieval.buildPlan(ctx.allocator, query, input.use_vector, llm_rerank_effective) catch return serverError(ctx);
+    defer plan.deinit(ctx.allocator);
     var results = ctx.store.search(ctx.allocator, input) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -2805,16 +2826,8 @@ fn retrievalSearch(ctx: *Context, body: []const u8) HttpResponse {
     results = maybeLlmRerankResults(ctx, query, results, allow_reranker) catch results;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    out.appendSlice(ctx.allocator, "{\"plan\":{\"use_keyword\":") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, if (plan.use_keyword) "true" else "false") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, ",\"use_vector\":") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, if (plan.use_vector) "true" else "false") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, ",\"use_graph\":") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, if (plan.use_graph) "true" else "false") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, ",\"use_reranker\":") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, if (plan.use_reranker) "true" else "false") catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, ",\"expanded_query\":") catch return serverError(ctx);
-    json.appendString(&out, ctx.allocator, plan.expanded_query) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "{\"plan\":{") catch return serverError(ctx);
+    appendRetrievalPlanFields(ctx, &out, plan) catch return serverError(ctx);
     appendRetrievalStages(ctx, &out, input, plan, llm_rerank_effective) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, "},\"results\":") catch return serverError(ctx);
     appendSearchArray(ctx, &out, results) catch return serverError(ctx);
@@ -3341,12 +3354,12 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
         return error.Forbidden;
     }
 
-    const content = if (std.mem.eql(u8, operation, "merge_string_set"))
-        try mergeAgentMemoryStringSet(ctx, key, session_id, obj, owner_actor_id, route)
-    else if (std.mem.eql(u8, operation, "merge_object"))
-        try mergeAgentMemoryObject(ctx, key, session_id, obj, owner_actor_id, route)
-    else
-        json.stringField(obj, "content") orelse json.stringField(obj, "text") orelse try rawField(ctx.allocator, obj, "value", "{}");
+    const memory_operation = domain.AgentMemoryOperation.parse(operation);
+    const content = switch (memory_operation) {
+        .put => json.stringField(obj, "content") orelse json.stringField(obj, "text") orelse try rawField(ctx.allocator, obj, "value", "{}"),
+        .merge_string_set => try agent_memory_reducer.stringSetPatchFromObject(ctx.allocator, obj),
+        .merge_object => try agent_memory_reducer.objectPatchFromObject(ctx.allocator, obj),
+    };
 
     return .{ .input = .{
         .key = key,
@@ -3358,114 +3371,8 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch "{}",
         .actor_id = owner_actor_id,
         .writer_actor_id = event_actor_id,
+        .operation = memory_operation,
     }, .route = route };
-}
-
-fn mergeAgentMemoryStringSet(ctx: *Context, key: []const u8, session_id: ?[]const u8, obj: std.json.ObjectMap, owner_actor_id: []const u8, route: store_mod.AgentMemoryStorageRoute) ![]const u8 {
-    var values: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer values.deinit(ctx.allocator);
-    if (ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, route) catch null) |existing| {
-        try appendStringSetValues(ctx.allocator, &values, existing.content);
-    }
-    if (obj.get("values")) |value| {
-        try appendStringValue(ctx.allocator, &values, value);
-    } else if (obj.get("value")) |value| {
-        try appendStringValue(ctx.allocator, &values, value);
-    } else if (json.stringField(obj, "content")) |content| {
-        try appendUniqueString(ctx.allocator, &values, content);
-    } else if (json.stringField(obj, "text")) |text| {
-        try appendUniqueString(ctx.allocator, &values, text);
-    } else {
-        return error.InvalidPayload;
-    }
-    std.mem.sort([]const u8, values.items, {}, stringLessThan);
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(ctx.allocator);
-    try out.append(ctx.allocator, '[');
-    var last: ?[]const u8 = null;
-    var written: usize = 0;
-    for (values.items) |value| {
-        if (last != null and std.mem.eql(u8, last.?, value)) continue;
-        if (written > 0) try out.append(ctx.allocator, ',');
-        try json.appendString(&out, ctx.allocator, value);
-        last = value;
-        written += 1;
-    }
-    try out.append(ctx.allocator, ']');
-    return out.toOwnedSlice(ctx.allocator);
-}
-
-fn appendStringSetValues(allocator: std.mem.Allocator, values: *std.ArrayListUnmanaged([]const u8), content: []const u8) !void {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
-        if (content.len > 0) try appendUniqueString(allocator, values, content);
-        return;
-    };
-    defer parsed.deinit();
-    try appendStringValue(allocator, values, parsed.value);
-}
-
-fn appendStringValue(allocator: std.mem.Allocator, values: *std.ArrayListUnmanaged([]const u8), value: std.json.Value) !void {
-    switch (value) {
-        .string => |s| try appendUniqueString(allocator, values, s),
-        .array => |items| for (items.items) |item| {
-            if (item == .string) try appendUniqueString(allocator, values, item.string);
-        },
-        else => return error.InvalidPayload,
-    }
-}
-
-fn appendUniqueString(allocator: std.mem.Allocator, values: *std.ArrayListUnmanaged([]const u8), value: []const u8) !void {
-    for (values.items) |existing| {
-        if (std.mem.eql(u8, existing, value)) return;
-    }
-    try values.append(allocator, value);
-}
-
-fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.order(u8, a, b) == .lt;
-}
-
-fn mergeAgentMemoryObject(ctx: *Context, key: []const u8, session_id: ?[]const u8, obj: std.json.ObjectMap, owner_actor_id: []const u8, route: store_mod.AgentMemoryStorageRoute) ![]const u8 {
-    var existing_parsed: ?std.json.Parsed(std.json.Value) = null;
-    defer if (existing_parsed) |*parsed| parsed.deinit();
-    var existing_obj: ?std.json.ObjectMap = null;
-    if (ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, route) catch null) |existing| {
-        existing_parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, existing.content, .{}) catch null;
-        if (existing_parsed) |parsed| {
-            if (parsed.value == .object) existing_obj = parsed.value.object;
-        }
-    }
-    const patch_value = obj.get("object") orelse obj.get("value") orelse return error.InvalidPayload;
-    if (patch_value != .object) return error.InvalidPayload;
-    const patch_obj = patch_value.object;
-
-    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer keys.deinit(ctx.allocator);
-    if (existing_obj) |map| {
-        var it = map.iterator();
-        while (it.next()) |entry| try appendUniqueString(ctx.allocator, &keys, entry.key_ptr.*);
-    }
-    var patch_it = patch_obj.iterator();
-    while (patch_it.next()) |entry| try appendUniqueString(ctx.allocator, &keys, entry.key_ptr.*);
-    std.mem.sort([]const u8, keys.items, {}, stringLessThan);
-
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(ctx.allocator);
-    try out.append(ctx.allocator, '{');
-    for (keys.items, 0..) |item_key, i| {
-        if (i > 0) try out.append(ctx.allocator, ',');
-        try json.appendString(&out, ctx.allocator, item_key);
-        try out.append(ctx.allocator, ':');
-        if (patch_obj.get(item_key)) |value| {
-            try out.appendSlice(ctx.allocator, try json.jsonFromValue(ctx.allocator, value));
-        } else if (existing_obj) |map| {
-            if (map.get(item_key)) |value| try out.appendSlice(ctx.allocator, try json.jsonFromValue(ctx.allocator, value)) else try out.appendSlice(ctx.allocator, "null");
-        } else {
-            try out.appendSlice(ctx.allocator, "null");
-        }
-    }
-    try out.append(ctx.allocator, '}');
-    return out.toOwnedSlice(ctx.allocator);
 }
 
 fn lifecycleDiagnostics(ctx: *Context) HttpResponse {
@@ -4341,7 +4248,12 @@ fn agentMemoryStoreKey(ctx: *Context, key: []const u8, body: []const u8) HttpRes
 
 fn agentMemoryStoreParsed(ctx: *Context, key: []const u8, obj: std.json.ObjectMap) HttpResponse {
     if (!(hasCapability(ctx, "write") or hasCapability(ctx, "propose"))) return forbidden(ctx);
-    const content = json.stringField(obj, "content") orelse json.stringField(obj, "text") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing content");
+    const operation = domain.AgentMemoryOperation.parse(json.stringField(obj, "operation") orelse "put");
+    const content = switch (operation) {
+        .put => json.stringField(obj, "content") orelse json.stringField(obj, "text") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing content"),
+        .merge_string_set => agent_memory_reducer.stringSetPatchFromObject(ctx.allocator, obj) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid string-set merge payload"),
+        .merge_object => agent_memory_reducer.objectPatchFromObject(ctx.allocator, obj) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid object merge payload"),
+    };
     const session_id = json.nullableStringField(obj, "session_id");
     if (session_id) |sid| {
         if (!agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
@@ -4365,6 +4277,7 @@ fn agentMemoryStoreParsed(ctx: *Context, key: []const u8, obj: std.json.ObjectMa
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch return serverError(ctx),
         .actor_id = owner_actor_id,
         .writer_actor_id = ctx.actor_id,
+        .operation = operation,
     }, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -4420,7 +4333,7 @@ fn agentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
         };
         appendMissingAgentMemoryEntries(ctx.allocator, &entries, global) catch return serverError(ctx);
     }
-    dedupeAgentMemoryEntries(&entries);
+    dedupeAgentMemoryEntries(ctx.allocator, &entries);
     return agentMemoryEntriesResponseFiltered(ctx, entries.items, include_internal, limit, offset);
 }
 
@@ -4440,19 +4353,19 @@ fn agentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     const include_internal = json.boolField(obj, "include_internal") orelse false;
     const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-    const primary = ctx.store.agentMemorySearchRouted(ctx.allocator, query, 100, session_id, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
+    const primary = ctx.store.agentMemorySearchRouted(ctx.allocator, query, limit, session_id, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
     appendAgentMemoryEntries(ctx.allocator, &entries, primary) catch return serverError(ctx);
     if (include_global and session_id != null) {
-        const global = ctx.store.agentMemorySearchRouted(ctx.allocator, query, 100, null, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
+        const global = ctx.store.agentMemorySearchRouted(ctx.allocator, query, limit, null, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
         };
         appendMissingAgentMemoryEntries(ctx.allocator, &entries, global) catch return serverError(ctx);
     }
-    dedupeAgentMemoryEntries(&entries);
+    dedupeAgentMemoryEntries(ctx.allocator, &entries);
     return agentMemoryEntriesResponseFiltered(ctx, entries.items, include_internal, limit, 0);
 }
 
@@ -4492,7 +4405,7 @@ fn agentMemoryCount(ctx: *Context, query: []const u8) HttpResponse {
     };
     var list: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
     appendAgentMemoryEntries(ctx.allocator, &list, entries) catch return serverError(ctx);
-    dedupeAgentMemoryEntries(&list);
+    dedupeAgentMemoryEntries(ctx.allocator, &list);
     const count = list.items.len;
     const body = std.fmt.allocPrint(ctx.allocator, "{{\"count\":{d}}}", .{count}) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = body };
@@ -4504,26 +4417,45 @@ fn appendAgentMemoryEntries(allocator: std.mem.Allocator, out: *std.ArrayListUnm
 
 fn appendMissingAgentMemoryEntries(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), entries: []domain.AgentMemory) !void {
     for (entries) |entry| {
-        if (agentMemoryContainsKey(out.items, entry.key)) continue;
+        if (agentMemoryContains(out.items, entry)) {
+            var skipped = entry;
+            agent_memory_runtime.freeAgentMemory(allocator, &skipped);
+            continue;
+        }
         try out.append(allocator, entry);
     }
 }
 
-fn dedupeAgentMemoryEntries(entries: *std.ArrayListUnmanaged(domain.AgentMemory)) void {
+fn dedupeAgentMemoryEntries(allocator: std.mem.Allocator, entries: *std.ArrayListUnmanaged(domain.AgentMemory)) void {
     var write: usize = 0;
     for (entries.items, 0..) |entry, read| {
-        if (agentMemoryContainsKey(entries.items[0..write], entry.key)) continue;
+        if (agentMemoryContains(entries.items[0..write], entry)) {
+            var duplicate = entry;
+            agent_memory_runtime.freeAgentMemory(allocator, &duplicate);
+            continue;
+        }
         if (write != read) entries.items[write] = entry;
         write += 1;
     }
     entries.shrinkRetainingCapacity(write);
 }
 
-fn agentMemoryContainsKey(entries: []const domain.AgentMemory, key: []const u8) bool {
+fn agentMemoryContains(entries: []const domain.AgentMemory, needle: domain.AgentMemory) bool {
     for (entries) |entry| {
-        if (std.mem.eql(u8, entry.key, key)) return true;
+        if (!std.mem.eql(u8, entry.key, needle.key)) continue;
+        if (!std.mem.eql(u8, entry.actor_id, needle.actor_id)) continue;
+        if (!optionalStringEql(entry.session_id, needle.session_id)) continue;
+        if (!std.mem.eql(u8, entry.scope, needle.scope)) continue;
+        if (!std.mem.eql(u8, entry.store, needle.store)) continue;
+        return true;
     }
     return false;
+}
+
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 fn agentMemoryStorageTargetFromObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !store_mod.AgentMemoryStorageRoute {
@@ -4900,6 +4832,9 @@ fn feedEventObjectVisibleToActor(ctx: *Context, event: store_mod.FeedEvent) bool
     if (std.mem.eql(u8, event.object_type, "context_pack")) {
         _ = (ctx.store.contextPackLifecycleTarget(ctx.allocator, event.object_id, ctx.actor_id, ctx.actor_scopes_json) catch return false) orelse return true;
         return true;
+    }
+    if (std.mem.eql(u8, event.object_type, "agent_memory")) {
+        return feedRecordVisibleToActor(ctx, event.scope, event.permissions_json);
     }
     return true;
 }
@@ -5824,7 +5759,7 @@ fn resolveVectorAcl(ctx: *Context, object_type: []const u8, object_id: []const u
 fn positiveLimit(value: ?i64, default_value: usize) usize {
     const raw = value orelse return default_value;
     if (raw <= 0) return default_value;
-    return @intCast(@min(raw, 100));
+    return @intCast(@min(raw, 500));
 }
 
 fn parseLimit(value: ?[]const u8, default_value: usize) usize {
@@ -6525,8 +6460,9 @@ test "api memory feed merges shared team agent memory deterministically" {
     try std.testing.expect(std.mem.indexOf(u8, default_b.body, "\"created_by_actor_id\":\"agent:b\"") != null);
     const list_b = handleRequest(&ctx, "GET", "/v1/agent-memory", "", "GET /v1/agent-memory HTTP/1.1\r\nAuthorization: Bearer agent-b\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", list_b.status);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, list_b.body, "\"key\":\"team.tools\""));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, list_b.body, "\"key\":\"team.tools\""));
     try std.testing.expect(std.mem.indexOf(u8, list_b.body, "agent b private tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_b.body, "[\\\"postgres\\\",\\\"zig\\\"]") != null);
     const scoped_b = handleRequest(&ctx, "GET", "/v1/agent-memory/team.tools?scope=team:alpha", "", "GET /v1/agent-memory/team.tools?scope=team:alpha HTTP/1.1\r\nAuthorization: Bearer agent-b\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", scoped_b.status);
     try std.testing.expect(std.mem.indexOf(u8, scoped_b.body, "[\\\"postgres\\\",\\\"zig\\\"]") != null);
@@ -6867,6 +6803,9 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"use_vector\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"use_graph\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"use_reranker\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"query_expanded\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"expansion_terms\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"adr\"") != null);
 
     const embed_resp = handleRequest(&ctx, "POST", "/v1/vector/embed", "{\"text\":\"agent memory\",\"dimensions\":4}", "");
     try std.testing.expectEqualStrings("200 OK", embed_resp.status);

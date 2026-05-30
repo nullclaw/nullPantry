@@ -278,6 +278,7 @@ pub const AgentMemory = struct {
     writer_actor_id: []const u8 = "",
     scope: []const u8,
     permissions_json: []const u8 = "[]",
+    store: []const u8 = "",
     score: ?f64 = null,
 
     pub fn writeJson(self: AgentMemory, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
@@ -303,9 +304,35 @@ pub const AgentMemory = struct {
         try json.appendString(out, allocator, self.scope);
         try out.appendSlice(allocator, ",\"permissions\":");
         try json.appendRawJsonOr(out, allocator, self.permissions_json, "[]");
+        if (self.store.len > 0) {
+            try out.appendSlice(allocator, ",\"store\":");
+            try json.appendString(out, allocator, self.store);
+            try out.appendSlice(allocator, ",\"storage\":");
+            try json.appendString(out, allocator, self.store);
+        }
         try out.appendSlice(allocator, ",\"score\":");
         if (self.score) |s| try out.print(allocator, "{d}", .{s}) else try out.appendSlice(allocator, "null");
         try out.append(allocator, '}');
+    }
+};
+
+pub const AgentMemoryOperation = enum {
+    put,
+    merge_object,
+    merge_string_set,
+
+    pub fn parse(raw: []const u8) AgentMemoryOperation {
+        if (std.mem.eql(u8, raw, "merge_object")) return .merge_object;
+        if (std.mem.eql(u8, raw, "merge_string_set")) return .merge_string_set;
+        return .put;
+    }
+
+    pub fn name(self: AgentMemoryOperation) []const u8 {
+        return switch (self) {
+            .put => "put",
+            .merge_object => "merge_object",
+            .merge_string_set => "merge_string_set",
+        };
     }
 };
 

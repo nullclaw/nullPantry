@@ -1200,6 +1200,7 @@ test {
     _ = @import("providers.zig");
     _ = @import("redis.zig");
     _ = @import("agent_memory_runtime.zig");
+    _ = @import("agent_memory_reducer.zig");
     _ = @import("markdown_adapter.zig");
     _ = @import("markdown_filesystem.zig");
     _ = @import("artifacts.zig");

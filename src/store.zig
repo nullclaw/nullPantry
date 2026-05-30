@@ -12,6 +12,7 @@ const context_pack = @import("context_pack.zig");
 const postgres_transport = @import("postgres.zig");
 const access = @import("access.zig");
 const agent_memory_runtime = @import("agent_memory_runtime.zig");
+const agent_memory_reducer = @import("agent_memory_reducer.zig");
 const vector_runtime = @import("vector_runtime.zig");
 const analytics_runtime = @import("analytics_runtime.zig");
 const lucid_runtime = @import("lucid_runtime.zig");
@@ -1041,7 +1042,8 @@ pub const Store = struct {
         for (primary) |result| try results.append(allocator, result);
 
         if (use_store_vector_path and input.use_vector and input.query.len > 0) {
-            const plan = try retrieval_mod.buildPlan(allocator, input.query, input.use_vector, input.allow_reranker);
+            var plan = try retrieval_mod.buildPlan(allocator, input.query, input.use_vector, input.allow_reranker);
+            defer plan.deinit(allocator);
             if (plan.use_vector or input.strict_vector) {
                 try self.appendVectorSearchResults(allocator, input, plan.expanded_query, results);
             }
@@ -1793,7 +1795,7 @@ pub const Store = struct {
     }
 
     fn agentMemoryStoreInRuntime(self: *Store, allocator: std.mem.Allocator, runtime: *agent_memory_runtime.Runtime, input: AgentMemoryInput, store_name: []const u8) !domain.AgentMemory {
-        const entry = try runtime.store(allocator, .{
+        var entry = try runtime.store(allocator, .{
             .key = input.key,
             .content = input.content,
             .category = input.category,
@@ -1803,7 +1805,9 @@ pub const Store = struct {
             .metadata_json = input.metadata_json,
             .actor_id = input.actor_id,
             .writer_actor_id = input.writer_actor_id,
+            .operation = input.operation,
         });
+        try tagAgentMemoryStore(allocator, &entry, store_name);
         errdefer {
             var cleanup = entry;
             agent_memory_runtime.freeAgentMemory(allocator, &cleanup);
@@ -1815,10 +1819,11 @@ pub const Store = struct {
     }
 
     fn agentMemoryStoreNative(self: *Store, allocator: std.mem.Allocator, input: AgentMemoryInput) !domain.AgentMemory {
-        const entry = try switch (self.backend) {
+        var entry = try switch (self.backend) {
             .sqlite => |*s| s.agentMemoryStore(allocator, input),
             .postgres => |*p| p.agentMemoryStore(allocator, input),
         };
+        try tagAgentMemoryStore(allocator, &entry, "native");
         errdefer {
             var cleanup = entry;
             agent_memory_runtime.freeAgentMemory(allocator, &cleanup);
@@ -2144,7 +2149,11 @@ pub const Store = struct {
     }
 
     pub fn agentMemoryGet(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
-        if (self.agent_memory.isExternal()) return self.agent_memory.get(allocator, key, session_id, actor_id);
+        if (self.agent_memory.isExternal()) {
+            var entry = try self.agent_memory.get(allocator, key, session_id, actor_id);
+            if (entry) |*value| try tagAgentMemoryStore(allocator, value, "runtime");
+            return entry;
+        }
         return self.agentMemoryGetNative(allocator, key, session_id, actor_id);
     }
 
@@ -2152,15 +2161,32 @@ pub const Store = struct {
         return switch (route.target) {
             .primary => self.agentMemoryGet(allocator, key, session_id, actor_id),
             .native => self.agentMemoryGetNative(allocator, key, session_id, actor_id),
-            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.get(allocator, key, session_id, actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).get(allocator, key, session_id, actor_id),
+            .runtime => blk: {
+                if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
+                var entry = try self.agent_memory.get(allocator, key, session_id, actor_id);
+                if (entry) |*value| try tagAgentMemoryStore(allocator, value, "runtime");
+                break :blk entry;
+            },
+            .named => blk: {
+                var entry = try (try self.namedAgentMemoryRuntime(route)).get(allocator, key, session_id, actor_id);
+                if (entry) |*value| try tagAgentMemoryStore(allocator, value, route.name orelse "named");
+                break :blk entry;
+            },
             .subset => self.agentMemoryGetSubset(allocator, key, session_id, actor_id, route),
             .all => blk: {
                 if (self.agent_memory.isExternal()) {
-                    if (try self.agent_memory.get(allocator, key, session_id, actor_id)) |entry| break :blk entry;
+                    if (try self.agent_memory.get(allocator, key, session_id, actor_id)) |raw| {
+                        var entry = raw;
+                        try tagAgentMemoryStore(allocator, &entry, "runtime");
+                        break :blk entry;
+                    }
                 }
                 for (self.agent_memory_stores.stores.items) |*named| {
-                    if (try named.runtime.get(allocator, key, session_id, actor_id)) |entry| break :blk entry;
+                    if (try named.runtime.get(allocator, key, session_id, actor_id)) |raw| {
+                        var entry = raw;
+                        try tagAgentMemoryStore(allocator, &entry, named.name);
+                        break :blk entry;
+                    }
                 }
                 break :blk try self.agentMemoryGetNative(allocator, key, session_id, actor_id);
             },
@@ -2168,14 +2194,20 @@ pub const Store = struct {
     }
 
     fn agentMemoryGetNative(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
-        return switch (self.backend) {
+        var entry = try switch (self.backend) {
             .sqlite => |*s| s.agentMemoryGet(allocator, key, session_id, actor_id),
             .postgres => |*p| p.agentMemoryGet(allocator, key, session_id, actor_id),
         };
+        if (entry) |*value| try tagAgentMemoryStore(allocator, value, "native");
+        return entry;
     }
 
     pub fn agentMemoryGetVisible(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
-        if (self.agent_memory.isExternal()) return self.agent_memory.getVisible(allocator, key, session_id, actor_id, scopes_json);
+        if (self.agent_memory.isExternal()) {
+            var entry = try self.agent_memory.getVisible(allocator, key, session_id, actor_id, scopes_json);
+            if (entry) |*value| try tagAgentMemoryStore(allocator, value, "runtime");
+            return entry;
+        }
         return self.agentMemoryGetVisibleNative(allocator, key, session_id, actor_id, scopes_json);
     }
 
@@ -2183,15 +2215,32 @@ pub const Store = struct {
         return switch (route.target) {
             .primary => self.agentMemoryGetVisible(allocator, key, session_id, actor_id, scopes_json),
             .native => self.agentMemoryGetVisibleNative(allocator, key, session_id, actor_id, scopes_json),
-            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.getVisible(allocator, key, session_id, actor_id, scopes_json) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).getVisible(allocator, key, session_id, actor_id, scopes_json),
+            .runtime => blk: {
+                if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
+                var entry = try self.agent_memory.getVisible(allocator, key, session_id, actor_id, scopes_json);
+                if (entry) |*value| try tagAgentMemoryStore(allocator, value, "runtime");
+                break :blk entry;
+            },
+            .named => blk: {
+                var entry = try (try self.namedAgentMemoryRuntime(route)).getVisible(allocator, key, session_id, actor_id, scopes_json);
+                if (entry) |*value| try tagAgentMemoryStore(allocator, value, route.name orelse "named");
+                break :blk entry;
+            },
             .subset => self.agentMemoryGetVisibleSubset(allocator, key, session_id, actor_id, scopes_json, route),
             .all => blk: {
                 if (self.agent_memory.isExternal()) {
-                    if (try self.agent_memory.getVisible(allocator, key, session_id, actor_id, scopes_json)) |entry| break :blk entry;
+                    if (try self.agent_memory.getVisible(allocator, key, session_id, actor_id, scopes_json)) |raw| {
+                        var entry = raw;
+                        try tagAgentMemoryStore(allocator, &entry, "runtime");
+                        break :blk entry;
+                    }
                 }
                 for (self.agent_memory_stores.stores.items) |*named| {
-                    if (try named.runtime.getVisible(allocator, key, session_id, actor_id, scopes_json)) |entry| break :blk entry;
+                    if (try named.runtime.getVisible(allocator, key, session_id, actor_id, scopes_json)) |raw| {
+                        var entry = raw;
+                        try tagAgentMemoryStore(allocator, &entry, named.name);
+                        break :blk entry;
+                    }
                 }
                 break :blk try self.agentMemoryGetVisibleNative(allocator, key, session_id, actor_id, scopes_json);
             },
@@ -2199,26 +2248,38 @@ pub const Store = struct {
     }
 
     fn agentMemoryGetVisibleNative(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
-        return switch (self.backend) {
+        var entry = try switch (self.backend) {
             .sqlite => |*s| s.agentMemoryGetVisible(allocator, key, session_id, actor_id, scopes_json),
             .postgres => |*p| p.agentMemoryGetVisible(allocator, key, session_id, actor_id, scopes_json),
         };
+        if (entry) |*value| try tagAgentMemoryStore(allocator, value, "native");
+        return entry;
     }
 
     pub fn agentMemoryList(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
-        if (self.agent_memory.isExternal()) return self.agent_memory.list(allocator, category, session_id, actor_id);
+        if (self.agent_memory.isExternal()) {
+            const entries = try self.agent_memory.list(allocator, category, session_id, actor_id);
+            try tagAgentMemorySliceStore(allocator, entries, "runtime");
+            return entries;
+        }
         return self.agentMemoryListNative(allocator, category, session_id, actor_id);
     }
 
     fn agentMemoryListNative(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
-        return switch (self.backend) {
+        const entries = try switch (self.backend) {
             .sqlite => |*s| s.agentMemoryList(allocator, category, session_id, actor_id),
             .postgres => |*p| p.agentMemoryList(allocator, category, session_id, actor_id),
         };
+        try tagAgentMemorySliceStore(allocator, entries, "native");
+        return entries;
     }
 
     pub fn agentMemoryListVisible(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
-        if (self.agent_memory.isExternal()) return self.agent_memory.listVisible(allocator, category, session_id, actor_id, scopes_json);
+        if (self.agent_memory.isExternal()) {
+            const entries = try self.agent_memory.listVisible(allocator, category, session_id, actor_id, scopes_json);
+            try tagAgentMemorySliceStore(allocator, entries, "runtime");
+            return entries;
+        }
         return self.agentMemoryListVisibleNative(allocator, category, session_id, actor_id, scopes_json);
     }
 
@@ -2226,22 +2287,37 @@ pub const Store = struct {
         return switch (route.target) {
             .primary => self.agentMemoryListVisible(allocator, category, session_id, actor_id, scopes_json),
             .native => self.agentMemoryListVisibleNative(allocator, category, session_id, actor_id, scopes_json),
-            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.listVisible(allocator, category, session_id, actor_id, scopes_json) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).listVisible(allocator, category, session_id, actor_id, scopes_json),
+            .runtime => blk: {
+                if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
+                const entries = try self.agent_memory.listVisible(allocator, category, session_id, actor_id, scopes_json);
+                try tagAgentMemorySliceStore(allocator, entries, "runtime");
+                break :blk entries;
+            },
+            .named => blk: {
+                const entries = try (try self.namedAgentMemoryRuntime(route)).listVisible(allocator, category, session_id, actor_id, scopes_json);
+                try tagAgentMemorySliceStore(allocator, entries, route.name orelse "named");
+                break :blk entries;
+            },
             .subset => self.agentMemoryListVisibleSubset(allocator, category, session_id, actor_id, scopes_json, route),
             .all => self.agentMemoryListVisibleAll(allocator, category, session_id, actor_id, scopes_json),
         };
     }
 
     fn agentMemoryListVisibleNative(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
-        return switch (self.backend) {
+        const entries = try switch (self.backend) {
             .sqlite => |*s| s.agentMemoryListVisible(allocator, category, session_id, actor_id, scopes_json),
             .postgres => |*p| p.agentMemoryListVisible(allocator, category, session_id, actor_id, scopes_json),
         };
+        try tagAgentMemorySliceStore(allocator, entries, "native");
+        return entries;
     }
 
     pub fn agentMemorySearch(self: *Store, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
-        if (self.agent_memory.isExternal()) return self.agent_memory.search(allocator, query, limit, session_id, scopes_json, actor_id);
+        if (self.agent_memory.isExternal()) {
+            const entries = try self.agent_memory.search(allocator, query, limit, session_id, scopes_json, actor_id);
+            try tagAgentMemorySliceStore(allocator, entries, "runtime");
+            return entries;
+        }
         return self.agentMemorySearchNative(allocator, query, limit, session_id, scopes_json, actor_id);
     }
 
@@ -2249,18 +2325,29 @@ pub const Store = struct {
         return switch (route.target) {
             .primary => self.agentMemorySearch(allocator, query, limit, session_id, scopes_json, actor_id),
             .native => self.agentMemorySearchNative(allocator, query, limit, session_id, scopes_json, actor_id),
-            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.search(allocator, query, limit, session_id, scopes_json, actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).search(allocator, query, limit, session_id, scopes_json, actor_id),
+            .runtime => blk: {
+                if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
+                const entries = try self.agent_memory.search(allocator, query, limit, session_id, scopes_json, actor_id);
+                try tagAgentMemorySliceStore(allocator, entries, "runtime");
+                break :blk entries;
+            },
+            .named => blk: {
+                const entries = try (try self.namedAgentMemoryRuntime(route)).search(allocator, query, limit, session_id, scopes_json, actor_id);
+                try tagAgentMemorySliceStore(allocator, entries, route.name orelse "named");
+                break :blk entries;
+            },
             .subset => self.agentMemorySearchSubset(allocator, query, limit, session_id, scopes_json, actor_id, route),
             .all => self.agentMemorySearchAll(allocator, query, limit, session_id, scopes_json, actor_id),
         };
     }
 
     fn agentMemorySearchNative(self: *Store, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
-        return switch (self.backend) {
+        const entries = try switch (self.backend) {
             .sqlite => |*s| s.agentMemorySearch(allocator, query, limit, session_id, scopes_json, actor_id),
             .postgres => |*p| p.agentMemorySearch(allocator, query, limit, session_id, scopes_json, actor_id),
         };
+        try tagAgentMemorySliceStore(allocator, entries, "native");
+        return entries;
     }
 
     fn agentMemoryListVisibleAll(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
@@ -2269,11 +2356,13 @@ pub const Store = struct {
         if (self.agent_memory.isExternal()) {
             const runtime = try self.agent_memory.listVisible(allocator, category, session_id, actor_id, scopes_json);
             defer allocator.free(runtime);
+            try tagAgentMemorySliceStore(allocator, runtime, "runtime");
             try appendAgentMemorySlice(allocator, &out, runtime);
         }
         for (self.agent_memory_stores.stores.items) |*named| {
             const runtime = try named.runtime.listVisible(allocator, category, session_id, actor_id, scopes_json);
             defer allocator.free(runtime);
+            try tagAgentMemorySliceStore(allocator, runtime, named.name);
             try appendMissingAgentMemorySlice(allocator, &out, runtime);
         }
         const native = try self.agentMemoryListVisibleNative(allocator, category, session_id, actor_id, scopes_json);
@@ -2288,11 +2377,13 @@ pub const Store = struct {
         if (self.agent_memory.isExternal()) {
             const runtime = try self.agent_memory.search(allocator, query, limit, session_id, scopes_json, actor_id);
             defer allocator.free(runtime);
+            try tagAgentMemorySliceStore(allocator, runtime, "runtime");
             try appendAgentMemorySlice(allocator, &out, runtime);
         }
         for (self.agent_memory_stores.stores.items) |*named| {
             const runtime = try named.runtime.search(allocator, query, limit, session_id, scopes_json, actor_id);
             defer allocator.free(runtime);
+            try tagAgentMemorySliceStore(allocator, runtime, named.name);
             try appendMissingAgentMemorySlice(allocator, &out, runtime);
         }
         const native = try self.agentMemorySearchNative(allocator, query, limit, session_id, scopes_json, actor_id);
@@ -3460,11 +3551,21 @@ pub const AgentMemoryInput = struct {
     metadata_json: []const u8 = "{}",
     actor_id: ?[]const u8 = null,
     writer_actor_id: ?[]const u8 = null,
+    operation: domain.AgentMemoryOperation = .put,
     suppress_feed: bool = false,
 };
 
 fn appendAgentMemorySlice(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), entries: []domain.AgentMemory) !void {
     for (entries) |entry| try out.append(allocator, entry);
+}
+
+fn tagAgentMemoryStore(allocator: std.mem.Allocator, entry: *domain.AgentMemory, store_name: []const u8) !void {
+    if (entry.store.len > 0) allocator.free(entry.store);
+    entry.store = try allocator.dupe(u8, store_name);
+}
+
+fn tagAgentMemorySliceStore(allocator: std.mem.Allocator, entries: []domain.AgentMemory, store_name: []const u8) !void {
+    for (entries) |*entry| try tagAgentMemoryStore(allocator, entry, store_name);
 }
 
 fn appendMissingAgentMemorySlice(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), entries: []domain.AgentMemory) !void {
@@ -3483,6 +3584,8 @@ fn agentMemorySliceContains(entries: []const domain.AgentMemory, needle: domain.
         if (!std.mem.eql(u8, entry.key, needle.key)) continue;
         if (!std.mem.eql(u8, entry.actor_id, needle.actor_id)) continue;
         if (!optionalStringEql(entry.session_id, needle.session_id)) continue;
+        if (!std.mem.eql(u8, entry.scope, needle.scope)) continue;
+        if (!std.mem.eql(u8, entry.store, needle.store)) continue;
         return true;
     }
     return false;
@@ -5259,35 +5362,42 @@ pub const SQLiteStore = struct {
 
     pub fn search(self: *Self, allocator: std.mem.Allocator, input: SearchInput) ![]domain.SearchResult {
         const limit = @max(@as(usize, 1), @min(input.limit, 100));
-        const plan = try retrieval_mod.buildPlan(allocator, input.query, input.use_vector, input.allow_reranker);
-        const fts_query = try buildFtsQuery(allocator, input.query);
+        var plan = try retrieval_mod.buildPlan(allocator, input.query, input.use_vector, input.allow_reranker);
+        defer plan.deinit(allocator);
+        var keyword_input = input;
+        keyword_input.query = plan.keyword_query;
+        const fts_query = try buildFtsQuery(allocator, keyword_input.query);
+        defer allocator.free(fts_query);
+        const original_fts_query = try buildFtsQuery(allocator, input.query);
+        defer allocator.free(original_fts_query);
         const use_fts = fts_query.len > 0;
+        const use_original_fts = original_fts_query.len > 0;
         var keyword_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         errdefer keyword_results.deinit(allocator);
 
-        try self.searchMemoryAtoms(allocator, input, fts_query, use_fts, &keyword_results);
+        try self.searchMemoryAtoms(allocator, keyword_input, fts_query, use_fts, &keyword_results);
         try self.searchSpaces(allocator, input, &keyword_results);
         try self.searchPolicyScopes(allocator, input, &keyword_results);
-        try self.searchSources(allocator, input, fts_query, use_fts, &keyword_results);
-        try self.searchArtifacts(allocator, input, fts_query, use_fts, &keyword_results);
-        try self.searchEntities(allocator, input, fts_query, use_fts, &keyword_results);
-        try self.searchRelations(allocator, input, fts_query, use_fts, &keyword_results);
-        try self.searchContextPacks(allocator, input, fts_query, use_fts, &keyword_results);
-        try self.searchFeedEvents(allocator, input, fts_query, use_fts, &keyword_results);
-        try self.searchAgentMemories(allocator, input, fts_query, use_fts, &keyword_results);
+        try self.searchSources(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+        try self.searchArtifacts(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+        try self.searchEntities(allocator, input, original_fts_query, use_original_fts, &keyword_results);
+        try self.searchRelations(allocator, input, original_fts_query, use_original_fts, &keyword_results);
+        try self.searchContextPacks(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+        try self.searchFeedEvents(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+        try self.searchAgentMemories(allocator, keyword_input, fts_query, use_fts, &keyword_results);
         if (input.include_sessions) {
-            try self.searchSessionMessages(allocator, input, fts_query, use_fts, &keyword_results);
+            try self.searchSessionMessages(allocator, keyword_input, fts_query, use_fts, &keyword_results);
         }
         if (keyword_results.items.len == 0 and use_fts) {
-            try self.searchMemoryAtoms(allocator, input, "", false, &keyword_results);
-            try self.searchSources(allocator, input, "", false, &keyword_results);
-            try self.searchArtifacts(allocator, input, "", false, &keyword_results);
+            try self.searchMemoryAtoms(allocator, keyword_input, "", false, &keyword_results);
+            try self.searchSources(allocator, keyword_input, "", false, &keyword_results);
+            try self.searchArtifacts(allocator, keyword_input, "", false, &keyword_results);
             try self.searchEntities(allocator, input, "", false, &keyword_results);
             try self.searchRelations(allocator, input, "", false, &keyword_results);
-            try self.searchContextPacks(allocator, input, "", false, &keyword_results);
-            try self.searchFeedEvents(allocator, input, "", false, &keyword_results);
-            try self.searchAgentMemories(allocator, input, "", false, &keyword_results);
-            if (input.include_sessions) try self.searchSessionMessages(allocator, input, "", false, &keyword_results);
+            try self.searchContextPacks(allocator, keyword_input, "", false, &keyword_results);
+            try self.searchFeedEvents(allocator, keyword_input, "", false, &keyword_results);
+            try self.searchAgentMemories(allocator, keyword_input, "", false, &keyword_results);
+            if (input.include_sessions) try self.searchSessionMessages(allocator, keyword_input, "", false, &keyword_results);
         }
 
         sortSearchResults(keyword_results.items);
@@ -5415,6 +5525,7 @@ pub const SQLiteStore = struct {
             const imported_at_ms = c.sqlite3_column_int64(stmt, 5);
             const metadata = try columnText(allocator, stmt, 6);
             if (std.mem.indexOf(u8, metadata, "\"native\":\"agent_memory\"") != null) continue;
+            if (std.mem.indexOf(u8, metadata, "\"native\":\"agent_memory_runtime\"") != null) continue;
             const status = try self.primitiveLifecycleStatus(allocator, "source", id_text);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
@@ -7019,23 +7130,27 @@ pub const SQLiteStore = struct {
         const writer_actor_id = input.writer_actor_id orelse owner_actor_id;
         const scope = try agentMemoryScope(allocator, owner_actor_id, input.session_id, input.scope);
         const effective_permissions = try agentMemoryPermissions(allocator, owner_actor_id, input.scope, input.permissions_json);
+        const existing_content = try self.agentMemoryContentInTx(allocator, input.key, input.session_id, owner_actor_id);
+        defer if (existing_content) |content| allocator.free(content);
+        const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, existing_content, input.content);
+        defer allocator.free(reduced_content);
         const source_title = try std.fmt.allocPrint(allocator, "Agent memory: {s}", .{input.key});
         const source = try self.createSource(allocator, .{
             .source_type = "agent_observation",
             .title = source_title,
-            .content = input.content,
+            .content = reduced_content,
             .scope = scope,
             .permissions_json = effective_permissions,
             .metadata_json = "{\"native\":\"agent_memory\"}",
             .actor_id = writer_actor_id,
         });
         const source_ids = try singleJsonString(allocator, source.id);
-        const evidence = try evidenceRangeJson(allocator, source.id, input.content.len, "agent_memory");
+        const evidence = try evidenceRangeJson(allocator, source.id, reduced_content.len, "agent_memory");
         const status = domain.defaultMemoryStatus("agent", scope);
         const atom = try self.createMemoryAtom(allocator, .{
             .predicate = "agent.memory",
             .object = input.key,
-            .text = input.content,
+            .text = reduced_content,
             .scope = scope,
             .confidence = 0.8,
             .status = status,
@@ -7062,9 +7177,19 @@ pub const SQLiteStore = struct {
         _ = c.sqlite3_bind_int64(stmt, 10, atom.created_at_ms);
         bindText(stmt, 11, input.metadata_json);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
-        try self.upsertAgentMemoryFts(id, input.key, input.category, input.session_id, input.content);
+        try self.upsertAgentMemoryFts(id, input.key, input.category, input.session_id, reduced_content);
         try self.insertAuditActor("agent_memory.upserted", writer_actor_id, "agent_memory", id);
         return (try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id)).?;
+    }
+
+    fn agentMemoryContentInTx(self: *Self, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, owner_actor_id: ?[]const u8) !?[]u8 {
+        const stmt = try self.prepare("SELECT ma.text FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.key = ?1 AND " ++ sqlite_agent_session_actor_where_ami ++ " ORDER BY ami.timestamp_ms DESC LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key);
+        bindNullableText(stmt, 2, session_id);
+        bindNullableText(stmt, 3, owner_actor_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try columnText(allocator, stmt, 0);
     }
 
     fn agentMemoryDeleteExact(self: *Self, key: []const u8, session_id: ?[]const u8, owner_actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !void {
@@ -8859,11 +8984,14 @@ pub const PostgresStore = struct {
 
     pub fn search(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput) ![]domain.SearchResult {
         const limit = @max(@as(usize, 1), @min(input.limit, 100));
-        const plan = try retrieval_mod.buildPlan(allocator, input.query, input.use_vector, input.allow_reranker);
+        var plan = try retrieval_mod.buildPlan(allocator, input.query, input.use_vector, input.allow_reranker);
+        defer plan.deinit(allocator);
+        var semantic_input = input;
+        semantic_input.query = plan.websearch_query;
         var keyword_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         errdefer keyword_results.deinit(allocator);
 
-        try self.searchPgKeywordCandidates(allocator, input, &keyword_results);
+        try self.searchPgKeywordCandidates(allocator, input, semantic_input, &keyword_results);
         pgSortSearchResults(keyword_results.items);
 
         var vector_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
@@ -8878,18 +9006,18 @@ pub const PostgresStore = struct {
         return try self.fusePgSearchResults(allocator, input, keyword_results.items, vector_results.items, limit);
     }
 
-    fn searchPgKeywordCandidates(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        try self.searchPgMemoryAtoms(allocator, input, results);
+    fn searchPgKeywordCandidates(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, semantic_input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        try self.searchPgMemoryAtoms(allocator, semantic_input, results);
         try self.searchPgSpaces(allocator, input, results);
         try self.searchPgPolicyScopes(allocator, input, results);
-        try self.searchPgSources(allocator, input, results);
-        try self.searchPgArtifacts(allocator, input, results);
+        try self.searchPgSources(allocator, semantic_input, results);
+        try self.searchPgArtifacts(allocator, semantic_input, results);
         try self.searchPgEntities(allocator, input, results);
         try self.searchPgRelations(allocator, input, results);
-        try self.searchPgContextPacks(allocator, input, results);
-        try self.searchPgFeedEvents(allocator, input, results);
-        try self.searchPgAgentMemories(allocator, input, results);
-        if (input.include_sessions) try self.searchPgSessions(allocator, input, results);
+        try self.searchPgContextPacks(allocator, semantic_input, results);
+        try self.searchPgFeedEvents(allocator, semantic_input, results);
+        try self.searchPgAgentMemories(allocator, semantic_input, results);
+        if (input.include_sessions) try self.searchPgSessions(allocator, semantic_input, results);
     }
 
     fn fusePgSearchResults(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, keyword_results: []const domain.SearchResult, vector_results: []const domain.SearchResult, limit: usize) ![]domain.SearchResult {
@@ -9629,12 +9757,16 @@ pub const PostgresStore = struct {
     pub fn agentMemoryStore(self: *PostgresStore, allocator: std.mem.Allocator, input: AgentMemoryInput) !domain.AgentMemory {
         const owner_actor_id = try requiredActorId(input.actor_id);
         const writer_actor_id = input.writer_actor_id orelse owner_actor_id;
+        var existing = try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id);
+        defer if (existing) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+        const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, if (existing) |entry| entry.content else null, input.content);
+        defer allocator.free(reduced_content);
         const source_title = try std.fmt.allocPrint(allocator, "Agent memory: {s}", .{input.key});
         const source_id = try ids.make(allocator, "src_");
         const atom_id = try ids.make(allocator, "mem_");
         const item_id = try ids.make(allocator, "agm_");
         const source_ids = try singleJsonString(allocator, source_id);
-        const evidence = try evidenceRangeJson(allocator, source_id, input.content.len, "agent_memory");
+        const evidence = try evidenceRangeJson(allocator, source_id, reduced_content.len, "agent_memory");
         const now = ids.nowMs();
         const scope = try agentMemoryScope(allocator, owner_actor_id, input.session_id, input.scope);
         const effective_permissions = try agentMemoryPermissions(allocator, owner_actor_id, input.scope, input.permissions_json);
@@ -9645,8 +9777,8 @@ pub const PostgresStore = struct {
         try sql.appendSlice(allocator, "BEGIN; ");
         try sql.print(allocator, "UPDATE memory_atoms SET status = 'deprecated' WHERE id IN (SELECT memory_atom_id FROM agent_memory_items WHERE key = {s} AND {s}); ", .{ try sqlString(allocator, input.key), session_filter });
         try sql.print(allocator, "DELETE FROM agent_memory_items WHERE key = {s} AND {s}; ", .{ try sqlString(allocator, input.key), session_filter });
-        try sql.print(allocator, "INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json) VALUES ({s},'agent_observation',{s},NULL,{s},NULL,'[]'::jsonb,{s},{s},{d},{d},NULL,NULL,'[]'::jsonb,'{{\"native\":\"agent_memory\"}}'::jsonb); ", .{ try sqlString(allocator, source_id), try sqlString(allocator, source_title), try sqlString(allocator, input.content), try sqlJsonb(allocator, effective_permissions), try sqlString(allocator, scope), now, now });
-        try sql.print(allocator, "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) VALUES ({s},NULL,'agent.memory',{s},{s},{s},0.8,{s},{s},{s},'agent',{d},NULL,NULL,NULL,NULL,{s},'[\"agent_memory\"]'::jsonb); ", .{ try sqlString(allocator, atom_id), try sqlString(allocator, input.key), try sqlString(allocator, input.content), try sqlString(allocator, scope), try sqlString(allocator, status), try sqlJsonb(allocator, source_ids), try sqlJsonb(allocator, evidence), now, try sqlJsonb(allocator, effective_permissions) });
+        try sql.print(allocator, "INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json) VALUES ({s},'agent_observation',{s},NULL,{s},NULL,'[]'::jsonb,{s},{s},{d},{d},NULL,NULL,'[]'::jsonb,'{{\"native\":\"agent_memory\"}}'::jsonb); ", .{ try sqlString(allocator, source_id), try sqlString(allocator, source_title), try sqlString(allocator, reduced_content), try sqlJsonb(allocator, effective_permissions), try sqlString(allocator, scope), now, now });
+        try sql.print(allocator, "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) VALUES ({s},NULL,'agent.memory',{s},{s},{s},0.8,{s},{s},{s},'agent',{d},NULL,NULL,NULL,NULL,{s},'[\"agent_memory\"]'::jsonb); ", .{ try sqlString(allocator, atom_id), try sqlString(allocator, input.key), try sqlString(allocator, reduced_content), try sqlString(allocator, scope), try sqlString(allocator, status), try sqlJsonb(allocator, source_ids), try sqlJsonb(allocator, evidence), now, try sqlJsonb(allocator, effective_permissions) });
         try sql.print(allocator, "INSERT INTO agent_memory_items (id,key,session_id,actor_id,writer_actor_id,scope,permissions_json,memory_atom_id,category,timestamp_ms,metadata_json) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{s}); ", .{ try sqlString(allocator, item_id), try sqlString(allocator, input.key), try sqlNullableString(allocator, input.session_id), try sqlString(allocator, owner_actor_id), try sqlString(allocator, writer_actor_id), try sqlString(allocator, scope), try sqlJsonb(allocator, effective_permissions), try sqlString(allocator, atom_id), try sqlString(allocator, input.category), now, try sqlJsonb(allocator, input.metadata_json) });
         try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('source.created',{s},'source',{s},'{{}}'::jsonb,{d}); ", .{ try sqlString(allocator, writer_actor_id), try sqlString(allocator, source_id), now });
         try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_atom.created',{s},'memory_atom',{s},'{{}}'::jsonb,{d}); ", .{ try sqlString(allocator, writer_actor_id), try sqlString(allocator, atom_id), now });
@@ -10834,6 +10966,7 @@ fn pgScoreText(query: []const u8, text: []const u8) f64 {
     var it = std.mem.tokenizeAny(u8, query, " \t\r\n.,;:/\\-_*\"'");
     while (it.next()) |token| {
         if (token.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(token, "OR") or std.ascii.eqlIgnoreCase(token, "AND") or std.ascii.eqlIgnoreCase(token, "NOT")) continue;
         if (std.ascii.indexOfIgnoreCase(text, token) != null) score += 1.0;
     }
     return score;
@@ -11185,6 +11318,33 @@ test "sqlite storage creates and searches memory atoms" {
     });
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings(atom.id, results[0].id);
+}
+
+test "sqlite search applies query expansion to keyword retrieval" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const atom = try store.createMemoryAtom(alloc, .{
+        .text = "ADR rationale: use context packs as the serving boundary.",
+        .scope = "public",
+        .created_by = "human",
+        .status = "verified",
+    });
+
+    const results = try store.search(alloc, .{
+        .query = "decision",
+        .scopes_json = "[\"public\"]",
+        .limit = 5,
+        .use_vector = false,
+    });
+    var saw_atom = false;
+    for (results) |result| {
+        if (std.mem.eql(u8, result.id, atom.id)) saw_atom = true;
+    }
+    try std.testing.expect(saw_atom);
 }
 
 test "sqlite primitive creates fail closed when audit is unavailable" {

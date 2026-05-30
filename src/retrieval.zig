@@ -1,4 +1,5 @@
 const std = @import("std");
+const json = @import("json_util.zig");
 const vector = @import("vector.zig");
 
 pub const RankedItem = struct {
@@ -20,6 +21,22 @@ pub const RetrievalPlan = struct {
     use_graph: bool,
     use_reranker: bool,
     expanded_query: []const u8,
+    keyword_query: []const u8,
+    websearch_query: []const u8,
+    expansion_terms_json: []const u8,
+    expansion_reasons_json: []const u8,
+    intent_hints_json: []const u8,
+    query_expanded: bool,
+
+    pub fn deinit(self: *RetrievalPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.expanded_query);
+        allocator.free(self.keyword_query);
+        allocator.free(self.websearch_query);
+        allocator.free(self.expansion_terms_json);
+        allocator.free(self.expansion_reasons_json);
+        allocator.free(self.intent_hints_json);
+        self.* = undefined;
+    }
 };
 
 pub fn reciprocalRankFusion(allocator: std.mem.Allocator, lists: []const []const RankedItem, k: f64, limit: usize) ![]RankedItem {
@@ -106,32 +123,307 @@ pub fn mmrSelect(allocator: std.mem.Allocator, query_embedding: []const f32, can
     return out;
 }
 
+const QueryExpansion = struct {
+    expanded_query: []const u8,
+    keyword_query: []const u8,
+    websearch_query: []const u8,
+    terms_json: []const u8,
+    reasons_json: []const u8,
+    intents_json: []const u8,
+    changed: bool,
+
+    fn deinit(self: *QueryExpansion, allocator: std.mem.Allocator) void {
+        allocator.free(self.expanded_query);
+        allocator.free(self.keyword_query);
+        allocator.free(self.websearch_query);
+        allocator.free(self.terms_json);
+        allocator.free(self.reasons_json);
+        allocator.free(self.intents_json);
+        self.* = undefined;
+    }
+};
+
 pub fn expandQuery(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, query);
-    const lower = try std.ascii.allocLowerString(allocator, query);
-    defer allocator.free(lower);
-    if (std.mem.indexOf(u8, lower, "pantry") != null and std.mem.indexOf(u8, lower, "memory") == null) {
-        try out.appendSlice(allocator, " memory knowledge context");
-    }
-    if (std.mem.indexOf(u8, lower, "incident") != null) {
-        try out.appendSlice(allocator, " event outage runbook");
-    }
-    if (std.mem.indexOf(u8, lower, "decision") != null) {
-        try out.appendSlice(allocator, " adr rationale consequence");
-    }
-    return out.toOwnedSlice(allocator);
+    const expansion = try expandQueryDetailed(allocator, query);
+    allocator.free(expansion.keyword_query);
+    allocator.free(expansion.websearch_query);
+    allocator.free(expansion.terms_json);
+    allocator.free(expansion.reasons_json);
+    allocator.free(expansion.intents_json);
+    return @constCast(expansion.expanded_query);
 }
 
 pub fn buildPlan(allocator: std.mem.Allocator, query: []const u8, has_vector_index: bool, allow_reranker: bool) !RetrievalPlan {
+    var expansion = try expandQueryDetailed(allocator, query);
+    errdefer expansion.deinit(allocator);
     return .{
         .use_keyword = true,
         .use_vector = has_vectorIndexWorthy(query) and has_vector_index,
         .use_graph = hasEntityHint(query),
         .use_reranker = allow_reranker,
-        .expanded_query = try expandQuery(allocator, query),
+        .expanded_query = expansion.expanded_query,
+        .keyword_query = expansion.keyword_query,
+        .websearch_query = expansion.websearch_query,
+        .expansion_terms_json = expansion.terms_json,
+        .expansion_reasons_json = expansion.reasons_json,
+        .intent_hints_json = expansion.intents_json,
+        .query_expanded = expansion.changed,
     };
+}
+
+fn expandQueryDetailed(allocator: std.mem.Allocator, query: []const u8) !QueryExpansion {
+    const lower = try std.ascii.allocLowerString(allocator, query);
+    defer allocator.free(lower);
+
+    var terms: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer terms.deinit(allocator);
+    defer freeStringList(allocator, terms.items);
+
+    var reasons: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer reasons.deinit(allocator);
+    defer freeStringList(allocator, reasons.items);
+
+    var intents: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer intents.deinit(allocator);
+    defer freeStringList(allocator, intents.items);
+
+    try appendDomainExpansions(allocator, lower, &terms, &reasons, &intents);
+    try appendIdentifierExpansions(allocator, query, &terms, &reasons, &intents);
+
+    const expanded_query = try buildExpandedQuery(allocator, query, terms.items);
+    errdefer allocator.free(expanded_query);
+    const keyword_query = try allocator.dupe(u8, expanded_query);
+    errdefer allocator.free(keyword_query);
+    const websearch_query = try buildWebsearchQuery(allocator, query, terms.items);
+    errdefer allocator.free(websearch_query);
+    const terms_json = try buildStringArrayJson(allocator, terms.items);
+    errdefer allocator.free(terms_json);
+    const reasons_json = try buildReasonArrayJson(allocator, terms.items, reasons.items);
+    errdefer allocator.free(reasons_json);
+    const intents_json = try buildStringArrayJson(allocator, intents.items);
+    errdefer allocator.free(intents_json);
+
+    return .{
+        .expanded_query = expanded_query,
+        .keyword_query = keyword_query,
+        .websearch_query = websearch_query,
+        .terms_json = terms_json,
+        .reasons_json = reasons_json,
+        .intents_json = intents_json,
+        .changed = terms.items.len > 0,
+    };
+}
+
+fn appendDomainExpansions(
+    allocator: std.mem.Allocator,
+    lower_query: []const u8,
+    terms: *std.ArrayListUnmanaged([]const u8),
+    reasons: *std.ArrayListUnmanaged([]const u8),
+    intents: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    if (containsAny(lower_query, &[_][]const u8{ "pantry", "confluence", "wiki", "rag", "knowledge base", "база знаний", "память" })) {
+        try appendIntent(allocator, intents, "knowledge_context");
+        try appendTerms(allocator, terms, reasons, &[_][]const u8{ "memory", "knowledge", "context", "source", "artifact", "citation", "retrieval" }, "nullpantry_knowledge");
+    }
+    if (containsAny(lower_query, &[_][]const u8{ "decision", "adr", "rfc", "architecture decision", "решени" })) {
+        try appendIntent(allocator, intents, "decision");
+        try appendTerms(allocator, terms, reasons, &[_][]const u8{ "decision", "adr", "rationale", "alternative", "consequence", "accepted", "rejected", "superseded" }, "decision");
+    }
+    if (containsAny(lower_query, &[_][]const u8{ "incident", "outage", "postmortem", "инцидент", "авари" })) {
+        try appendIntent(allocator, intents, "incident");
+        try appendTerms(allocator, terms, reasons, &[_][]const u8{ "incident", "event", "outage", "postmortem", "root cause", "mitigation", "timeline", "runbook" }, "incident");
+    }
+    if (containsAny(lower_query, &[_][]const u8{ "runbook", "recipe", "playbook", "procedure", "ранбук", "рецепт" })) {
+        try appendIntent(allocator, intents, "runbook");
+        try appendTerms(allocator, terms, reasons, &[_][]const u8{ "runbook", "recipe", "playbook", "procedure", "checklist", "operations" }, "runbook");
+    }
+    if (containsAny(lower_query, &[_][]const u8{ "meeting", "transcript", "call", "встреч", "транскрипт" })) {
+        try appendIntent(allocator, intents, "meeting");
+        try appendTerms(allocator, terms, reasons, &[_][]const u8{ "meeting", "transcript", "notes", "summary", "action item", "participant", "decision" }, "meeting");
+    }
+    if (containsAny(lower_query, &[_][]const u8{ "ticket", "issue", "task", "jira", "тикет", "задач" })) {
+        try appendIntent(allocator, intents, "ticket");
+        try appendTerms(allocator, terms, reasons, &[_][]const u8{ "ticket", "issue", "task", "requirement", "implementation", "owner" }, "ticket");
+    }
+    if (containsAny(lower_query, &[_][]const u8{ "fresh", "stale", "deprecated", "superseded", "conflict", "verify", "актуаль", "устар" })) {
+        try appendIntent(allocator, intents, "lifecycle");
+        try appendTerms(allocator, terms, reasons, &[_][]const u8{ "fresh", "stale", "deprecated", "superseded", "conflict", "verified", "review" }, "lifecycle");
+    }
+    if (containsAny(lower_query, &[_][]const u8{ "api", "service", "repo", "repository", "owner", "endpoint", "сервис", "репозитор" })) {
+        try appendIntent(allocator, intents, "entity_lookup");
+        try appendTerms(allocator, terms, reasons, &[_][]const u8{ "api", "service", "endpoint", "contract", "repo", "repository", "owner", "maintainer" }, "entity_lookup");
+    }
+}
+
+fn appendIdentifierExpansions(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    terms: *std.ArrayListUnmanaged([]const u8),
+    reasons: *std.ArrayListUnmanaged([]const u8),
+    intents: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var it = std.mem.tokenizeAny(u8, query, " \t\r\n.,;()[]{}<>!?\"'");
+    while (it.next()) |token| {
+        if (token.len < 2) continue;
+        if (ticketLike(token)) {
+            try appendIntent(allocator, intents, "ticket");
+            try appendTerm(allocator, terms, reasons, token, "ticket_id");
+            try appendTerms(allocator, terms, reasons, &[_][]const u8{ "ticket", "issue", "task" }, "ticket_id");
+        }
+        if (camelOrAcronymLike(token)) {
+            try appendIntent(allocator, intents, "entity_lookup");
+            try appendIdentifierParts(allocator, token, terms, reasons, "identifier_parts");
+        }
+        if (std.mem.indexOfScalar(u8, token, ':')) |colon| {
+            if (colon > 0 and colon + 1 < token.len) {
+                try appendIntent(allocator, intents, "scoped_lookup");
+                try appendTerm(allocator, terms, reasons, token[0..colon], "scope_prefix");
+                try appendIdentifierParts(allocator, token[colon + 1 ..], terms, reasons, "scope_value");
+            }
+        }
+        if (std.mem.indexOfScalar(u8, token, '/')) |_| {
+            try appendIntent(allocator, intents, "repository");
+            try appendTerms(allocator, terms, reasons, &[_][]const u8{ "repo", "repository" }, "path_like_identifier");
+            var part_it = std.mem.splitScalar(u8, token, '/');
+            while (part_it.next()) |part| try appendIdentifierParts(allocator, part, terms, reasons, "path_part");
+        }
+    }
+}
+
+fn appendIdentifierParts(
+    allocator: std.mem.Allocator,
+    token: []const u8,
+    terms: *std.ArrayListUnmanaged([]const u8),
+    reasons: *std.ArrayListUnmanaged([]const u8),
+    reason: []const u8,
+) !void {
+    if (token.len == 0) return;
+    var start: usize = 0;
+    var i: usize = 1;
+    while (i < token.len) : (i += 1) {
+        const prev = token[i - 1];
+        const ch = token[i];
+        const next = if (i + 1 < token.len) token[i + 1] else 0;
+        const boundary = (std.ascii.isLower(prev) and std.ascii.isUpper(ch)) or
+            (std.ascii.isAlphabetic(prev) and std.ascii.isDigit(ch)) or
+            (std.ascii.isDigit(prev) and std.ascii.isAlphabetic(ch)) or
+            (std.ascii.isUpper(prev) and std.ascii.isUpper(ch) and next != 0 and std.ascii.isLower(next));
+        if (!boundary) continue;
+        try appendTerm(allocator, terms, reasons, token[start..i], reason);
+        start = i;
+    }
+    try appendTerm(allocator, terms, reasons, token[start..], reason);
+}
+
+fn appendTerms(
+    allocator: std.mem.Allocator,
+    terms: *std.ArrayListUnmanaged([]const u8),
+    reasons: *std.ArrayListUnmanaged([]const u8),
+    values: []const []const u8,
+    reason: []const u8,
+) !void {
+    for (values) |value| try appendTerm(allocator, terms, reasons, value, reason);
+}
+
+fn appendTerm(
+    allocator: std.mem.Allocator,
+    terms: *std.ArrayListUnmanaged([]const u8),
+    reasons: *std.ArrayListUnmanaged([]const u8),
+    raw_term: []const u8,
+    reason: []const u8,
+) !void {
+    if (terms.items.len >= 64) return;
+    const trimmed = std.mem.trim(u8, raw_term, " \t\r\n.,;:/\\-_*\"'()[]{}<>!?");
+    if (trimmed.len < 2 or trimmed.len > 80) return;
+    for (terms.items) |existing| {
+        if (std.ascii.eqlIgnoreCase(existing, trimmed)) return;
+    }
+    const owned_term = try normalizeTerm(allocator, trimmed);
+    errdefer allocator.free(owned_term);
+    const owned_reason = try allocator.dupe(u8, reason);
+    errdefer allocator.free(owned_reason);
+    try terms.append(allocator, owned_term);
+    errdefer _ = terms.pop();
+    try reasons.append(allocator, owned_reason);
+}
+
+fn appendIntent(allocator: std.mem.Allocator, intents: *std.ArrayListUnmanaged([]const u8), raw_intent: []const u8) !void {
+    for (intents.items) |existing| {
+        if (std.mem.eql(u8, existing, raw_intent)) return;
+    }
+    try intents.append(allocator, try allocator.dupe(u8, raw_intent));
+}
+
+fn normalizeTerm(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = try allocator.alloc(u8, raw.len);
+    for (raw, 0..) |ch, i| {
+        out[i] = if (ch < 0x80) std.ascii.toLower(ch) else ch;
+    }
+    return out;
+}
+
+fn buildExpandedQuery(allocator: std.mem.Allocator, query: []const u8, terms: []const []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, query);
+    for (terms) |term| {
+        if (term.len == 0) continue;
+        if (out.items.len > 0) try out.append(allocator, ' ');
+        try out.appendSlice(allocator, term);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildWebsearchQuery(allocator: std.mem.Allocator, query: []const u8, terms: []const []const u8) ![]u8 {
+    if (terms.len == 0) return allocator.dupe(u8, query);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (query.len > 0) try out.appendSlice(allocator, query);
+    for (terms) |term| {
+        if (term.len == 0) continue;
+        if (out.items.len > 0) try out.appendSlice(allocator, " OR ");
+        try out.appendSlice(allocator, term);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildStringArrayJson(allocator: std.mem.Allocator, values: []const []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try out.append(allocator, ',');
+        try json.appendString(&out, allocator, value);
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildReasonArrayJson(allocator: std.mem.Allocator, terms: []const []const u8, reasons: []const []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (terms, 0..) |term, i| {
+        if (i > 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, "{\"term\":");
+        try json.appendString(&out, allocator, term);
+        try out.appendSlice(allocator, ",\"reason\":");
+        try json.appendString(&out, allocator, if (i < reasons.len) reasons[i] else "query_expansion");
+        try out.append(allocator, '}');
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+fn freeStringList(allocator: std.mem.Allocator, list: []const []const u8) void {
+    for (list) |item| allocator.free(item);
+}
+
+fn containsAny(haystack: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, haystack, needle) != null) return true;
+    }
+    return false;
 }
 
 fn has_vectorIndexWorthy(query: []const u8) bool {
@@ -230,21 +522,38 @@ test "retrieval MMR diversifies selections" {
 }
 
 test "retrieval query expansion and plan expose stages" {
-    const plan = try buildPlan(std.testing.allocator, "NullPantry decision", true, true);
-    defer std.testing.allocator.free(plan.expanded_query);
+    var plan = try buildPlan(std.testing.allocator, "NullPantry decision", true, true);
+    defer plan.deinit(std.testing.allocator);
     try std.testing.expect(plan.use_keyword);
     try std.testing.expect(plan.use_vector);
     try std.testing.expect(plan.use_graph);
     try std.testing.expect(plan.use_reranker);
     try std.testing.expect(std.mem.indexOf(u8, plan.expanded_query, "adr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.keyword_query, "rationale") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.websearch_query, " OR adr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.expansion_terms_json, "\"adr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.expansion_reasons_json, "\"reason\":\"decision\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.intent_hints_json, "\"decision\"") != null);
+    try std.testing.expect(plan.query_expanded);
 }
 
 test "retrieval plan enables graph for tickets repos and service-like names" {
-    const a = try buildPlan(std.testing.allocator, "ABC-123 owner", true, false);
-    defer std.testing.allocator.free(a.expanded_query);
+    var a = try buildPlan(std.testing.allocator, "ABC-123 owner", true, false);
+    defer a.deinit(std.testing.allocator);
     try std.testing.expect(a.use_graph);
+    try std.testing.expect(std.mem.indexOf(u8, a.expanded_query, "ticket") != null);
 
-    const b = try buildPlan(std.testing.allocator, "AuthService incident", true, false);
-    defer std.testing.allocator.free(b.expanded_query);
+    var b = try buildPlan(std.testing.allocator, "AuthService incident", true, false);
+    defer b.deinit(std.testing.allocator);
     try std.testing.expect(b.use_graph);
+    try std.testing.expect(std.mem.indexOf(u8, b.expanded_query, "auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b.expanded_query, "outage") != null);
+}
+
+test "retrieval query expansion covers Russian product vocabulary" {
+    var plan = try buildPlan(std.testing.allocator, "почему это решение устарело", false, false);
+    defer plan.deinit(std.testing.allocator);
+    try std.testing.expect(plan.query_expanded);
+    try std.testing.expect(std.mem.indexOf(u8, plan.expanded_query, "adr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.expanded_query, "stale") != null);
 }
