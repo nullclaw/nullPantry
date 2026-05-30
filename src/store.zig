@@ -4185,11 +4185,15 @@ pub const SQLiteStore = struct {
         try self.rebuildSqliteFtsIndexes();
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (20, 'sqlite_full_text_coverage', 'np-020-sqlite-full-text-coverage', strftime('%s','now') * 1000)");
         try self.exec("UPDATE schema_migrations SET name = 'sqlite_full_text_coverage', checksum = 'np-020-sqlite-full-text-coverage' WHERE version = 20");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (21, 'postgres_full_text_coverage', 'np-021-postgres-full-text-coverage', strftime('%s','now') * 1000)");
+        try self.exec("UPDATE schema_migrations SET name = 'postgres_full_text_coverage', checksum = 'np-021-postgres-full-text-coverage' WHERE version = 21");
         try self.exec("COMMIT");
     }
 
     fn rebuildSqliteFtsIndexes(self: *Self) !void {
         try self.exec(
+            \\CREATE VIRTUAL TABLE IF NOT EXISTS spaces_fts USING fts5(id UNINDEXED, name, title, description, metadata);
+            \\CREATE VIRTUAL TABLE IF NOT EXISTS policy_scopes_fts USING fts5(scope UNINDEXED, visibility, owner, metadata);
             \\CREATE VIRTUAL TABLE IF NOT EXISTS sources_fts USING fts5(id UNINDEXED, title, content);
             \\CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts USING fts5(id UNINDEXED, title, body);
             \\CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(id UNINDEXED, type, name, aliases, description, metadata);
@@ -4197,8 +4201,12 @@ pub const SQLiteStore = struct {
             \\CREATE VIRTUAL TABLE IF NOT EXISTS relations_fts USING fts5(id UNINDEXED, relation_type, from_name, to_name, text);
             \\CREATE VIRTUAL TABLE IF NOT EXISTS context_packs_fts USING fts5(id UNINDEXED, purpose, target, query_text, generated_summary);
             \\CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5(id UNINDEXED, key, category, session_id, content);
-            \\CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(id UNINDEXED, session_id, actor_id, role, content);
+            \\CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(id UNINDEXED, session_id, role, content);
             \\CREATE VIRTUAL TABLE IF NOT EXISTS memory_feed_events_fts USING fts5(id UNINDEXED, event_type, operation, object_type, object_id, payload, dedupe_key);
+            \\DELETE FROM spaces_fts;
+            \\INSERT INTO spaces_fts (id,name,title,description,metadata) SELECT id,name,title,coalesce(description,''),metadata_json FROM spaces;
+            \\DELETE FROM policy_scopes_fts;
+            \\INSERT INTO policy_scopes_fts (scope,visibility,owner,metadata) SELECT scope,visibility,coalesce(owner,''),metadata_json FROM policy_scopes;
             \\DELETE FROM sources_fts;
             \\INSERT INTO sources_fts (id,title,content) SELECT id,title,content FROM sources;
             \\DELETE FROM artifacts_fts;
@@ -4221,7 +4229,7 @@ pub const SQLiteStore = struct {
             \\  FROM agent_memory_items ami
             \\  JOIN memory_atoms ma ON ma.id = ami.memory_atom_id;
             \\DELETE FROM session_messages_fts;
-            \\INSERT INTO session_messages_fts (id,session_id,actor_id,role,content) SELECT CAST(id AS TEXT),session_id,actor_id,role,content FROM session_messages;
+            \\INSERT INTO session_messages_fts (id,session_id,role,content) SELECT CAST(id AS TEXT),session_id,role,content FROM session_messages;
             \\DELETE FROM memory_feed_events_fts;
             \\INSERT INTO memory_feed_events_fts (id,event_type,operation,object_type,object_id,payload,dedupe_key)
             \\  SELECT CAST(id AS TEXT),event_type,operation,object_type,object_id,payload_json,coalesce(dedupe_key,'') FROM memory_feed_events;
@@ -4429,8 +4437,10 @@ pub const SQLiteStore = struct {
         _ = c.sqlite3_bind_int64(stmt, 8, now);
         _ = c.sqlite3_bind_int64(stmt, 9, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+        const space = Space{ .id = id, .name = input.name, .title = input.title, .description = input.description, .scope = input.scope, .permissions_json = input.permissions_json, .metadata_json = input.metadata_json, .created_at_ms = now, .updated_at_ms = now };
+        try self.upsertSpaceFts(space);
         try self.insertAuditActor("space.created", input.actor_id, "space", id);
-        return .{ .id = id, .name = input.name, .title = input.title, .description = input.description, .scope = input.scope, .permissions_json = input.permissions_json, .metadata_json = input.metadata_json, .created_at_ms = now, .updated_at_ms = now };
+        return space;
     }
 
     pub fn getSpace(self: *Self, allocator: std.mem.Allocator, id: []const u8) !?Space {
@@ -4482,8 +4492,10 @@ pub const SQLiteStore = struct {
         _ = c.sqlite3_bind_int64(stmt, 8, now);
         _ = c.sqlite3_bind_int64(stmt, 9, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+        const policy = (try self.getPolicyScope(allocator, input.scope)).?;
+        try self.upsertPolicyScopeFts(policy);
         try self.insertAuditActor("policy_scope.upserted", input.actor_id, "policy_scope", input.scope);
-        return (try self.getPolicyScope(allocator, input.scope)).?;
+        return policy;
     }
 
     pub fn getPolicyScope(self: *Self, allocator: std.mem.Allocator, scope: []const u8) !?PolicyScope {
@@ -5145,6 +5157,33 @@ pub const SQLiteStore = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
     }
 
+    fn upsertSpaceFts(self: *Self, space: Space) !void {
+        try self.deleteFtsRow("spaces_fts", space.id);
+        const stmt = try self.prepare("INSERT INTO spaces_fts (id,name,title,description,metadata) VALUES (?1,?2,?3,?4,?5)");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, space.id);
+        bindText(stmt, 2, space.name);
+        bindText(stmt, 3, space.title);
+        bindText(stmt, 4, space.description orelse "");
+        bindText(stmt, 5, space.metadata_json);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+    }
+
+    fn upsertPolicyScopeFts(self: *Self, policy: PolicyScope) !void {
+        const stmt_del = try self.prepare("DELETE FROM policy_scopes_fts WHERE scope = ?1");
+        defer _ = c.sqlite3_finalize(stmt_del);
+        bindText(stmt_del, 1, policy.scope);
+        if (c.sqlite3_step(stmt_del) != c.SQLITE_DONE) return error.DeleteFailed;
+
+        const stmt = try self.prepare("INSERT INTO policy_scopes_fts (scope,visibility,owner,metadata) VALUES (?1,?2,?3,?4)");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, policy.scope);
+        bindText(stmt, 2, policy.visibility);
+        bindText(stmt, 3, policy.owner orelse "");
+        bindText(stmt, 4, policy.metadata_json);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+    }
+
     fn upsertEntityFts(self: *Self, entity: domain.Entity) !void {
         try self.deleteFtsRow("entities_fts", entity.id);
         const stmt = try self.prepare("INSERT INTO entities_fts (id,type,name,aliases,description,metadata) VALUES (?1,?2,?3,?4,?5,?6)");
@@ -5196,15 +5235,14 @@ pub const SQLiteStore = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
     }
 
-    fn upsertSessionMessageFts(self: *Self, id: []const u8, session_id: []const u8, actor_id: []const u8, role: []const u8, content: []const u8) !void {
+    fn upsertSessionMessageFts(self: *Self, id: []const u8, session_id: []const u8, role: []const u8, content: []const u8) !void {
         try self.deleteFtsRow("session_messages_fts", id);
-        const stmt = try self.prepare("INSERT INTO session_messages_fts (id,session_id,actor_id,role,content) VALUES (?1,?2,?3,?4,?5)");
+        const stmt = try self.prepare("INSERT INTO session_messages_fts (id,session_id,role,content) VALUES (?1,?2,?3,?4)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         bindText(stmt, 2, session_id);
-        bindText(stmt, 3, actor_id);
-        bindText(stmt, 4, role);
-        bindText(stmt, 5, content);
+        bindText(stmt, 3, role);
+        bindText(stmt, 4, content);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
     }
 
@@ -5376,8 +5414,8 @@ pub const SQLiteStore = struct {
         errdefer keyword_results.deinit(allocator);
 
         try self.searchMemoryAtoms(allocator, keyword_input, fts_query, use_fts, &keyword_results);
-        try self.searchSpaces(allocator, input, &keyword_results);
-        try self.searchPolicyScopes(allocator, input, &keyword_results);
+        try self.searchSpaces(allocator, input, original_fts_query, use_original_fts, &keyword_results);
+        try self.searchPolicyScopes(allocator, input, original_fts_query, use_original_fts, &keyword_results);
         try self.searchSources(allocator, keyword_input, fts_query, use_fts, &keyword_results);
         try self.searchArtifacts(allocator, keyword_input, fts_query, use_fts, &keyword_results);
         try self.searchEntities(allocator, input, original_fts_query, use_original_fts, &keyword_results);
@@ -5390,6 +5428,8 @@ pub const SQLiteStore = struct {
         }
         if (keyword_results.items.len == 0 and use_fts) {
             try self.searchMemoryAtoms(allocator, keyword_input, "", false, &keyword_results);
+            try self.searchSpaces(allocator, input, "", false, &keyword_results);
+            try self.searchPolicyScopes(allocator, input, "", false, &keyword_results);
             try self.searchSources(allocator, keyword_input, "", false, &keyword_results);
             try self.searchArtifacts(allocator, keyword_input, "", false, &keyword_results);
             try self.searchEntities(allocator, input, "", false, &keyword_results);
@@ -5472,9 +5512,13 @@ pub const SQLiteStore = struct {
         }
     }
 
-    fn searchSpaces(self: *Self, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const stmt = try self.prepare("SELECT id,name,title,description,scope,permissions_json,updated_at_ms FROM spaces ORDER BY updated_at_ms DESC");
+    fn searchSpaces(self: *Self, allocator: std.mem.Allocator, input: SearchInput, fts_query: []const u8, use_fts: bool, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const stmt = if (use_fts)
+            try self.prepare("SELECT s.id,s.name,s.title,s.description,s.scope,s.permissions_json,s.metadata_json,s.updated_at_ms,bm25(spaces_fts) FROM spaces_fts JOIN spaces s ON s.id = spaces_fts.id WHERE spaces_fts MATCH ?1 ORDER BY bm25(spaces_fts)")
+        else
+            try self.prepare("SELECT id,name,title,description,scope,permissions_json,metadata_json,updated_at_ms FROM spaces ORDER BY updated_at_ms DESC");
         defer _ = c.sqlite3_finalize(stmt);
+        if (use_fts) bindText(stmt, 1, fts_query);
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const id_text = try columnText(allocator, stmt, 0);
             const name = try columnText(allocator, stmt, 1);
@@ -5482,18 +5526,23 @@ pub const SQLiteStore = struct {
             const description = try columnTextNullable(allocator, stmt, 3);
             const scope = try columnText(allocator, stmt, 4);
             const permissions = try columnText(allocator, stmt, 5);
-            const updated_at_ms = c.sqlite3_column_int64(stmt, 6);
+            const metadata = try columnText(allocator, stmt, 6);
+            const updated_at_ms = c.sqlite3_column_int64(stmt, 7);
             if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
-            const text = if (description) |d| try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ name, title, d }) else try std.fmt.allocPrint(allocator, "{s} {s}", .{ name, title });
-            const relevance = scoreText(input.query, text);
-            if (input.query.len > 0 and relevance <= 0) continue;
+            const text = if (description) |d| try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ name, title, d, metadata }) else try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ name, title, metadata });
+            const relevance = if (use_fts) @max(0.0, 6.0 - c.sqlite3_column_double(stmt, 8)) else scoreText(input.query, text);
+            if (!use_fts and input.query.len > 0 and relevance <= 0) continue;
             try results.append(allocator, .{ .id = id_text, .result_type = "space", .title = title, .text = text, .scope = scope, .status = "active", .score = relevance + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "space", scope, permissions, input.actor_id), .created_at_ms = updated_at_ms, .confidence = 0.7 });
         }
     }
 
-    fn searchPolicyScopes(self: *Self, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const stmt = try self.prepare("SELECT scope,visibility,permissions_json,owner,metadata_json,updated_at_ms FROM policy_scopes ORDER BY updated_at_ms DESC");
+    fn searchPolicyScopes(self: *Self, allocator: std.mem.Allocator, input: SearchInput, fts_query: []const u8, use_fts: bool, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        const stmt = if (use_fts)
+            try self.prepare("SELECT p.scope,p.visibility,p.permissions_json,p.owner,p.metadata_json,p.updated_at_ms,bm25(policy_scopes_fts) FROM policy_scopes_fts JOIN policy_scopes p ON p.scope = policy_scopes_fts.scope WHERE policy_scopes_fts MATCH ?1 ORDER BY bm25(policy_scopes_fts)")
+        else
+            try self.prepare("SELECT scope,visibility,permissions_json,owner,metadata_json,updated_at_ms FROM policy_scopes ORDER BY updated_at_ms DESC");
         defer _ = c.sqlite3_finalize(stmt);
+        if (use_fts) bindText(stmt, 1, fts_query);
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const scope = try columnText(allocator, stmt, 0);
             const visibility = try columnText(allocator, stmt, 1);
@@ -5503,8 +5552,8 @@ pub const SQLiteStore = struct {
             const updated_at_ms = c.sqlite3_column_int64(stmt, 5);
             if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
             const text = if (owner) |o| try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ scope, visibility, o, metadata }) else try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ scope, visibility, metadata });
-            const relevance = scoreText(input.query, text);
-            if (input.query.len > 0 and relevance <= 0) continue;
+            const relevance = if (use_fts) @max(0.0, 6.0 - c.sqlite3_column_double(stmt, 6)) else scoreText(input.query, text);
+            if (!use_fts and input.query.len > 0 and relevance <= 0) continue;
             try results.append(allocator, .{ .id = scope, .result_type = "policy_scope", .title = scope, .text = text, .scope = scope, .status = visibility, .score = relevance + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", scope, permissions, input.actor_id), .created_at_ms = updated_at_ms, .confidence = 0.7 });
         }
     }
@@ -7433,7 +7482,7 @@ pub const SQLiteStore = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
         var id_buf: [32]u8 = undefined;
         const id_text = try std.fmt.bufPrint(&id_buf, "{d}", .{c.sqlite3_last_insert_rowid(self.db)});
-        try self.upsertSessionMessageFts(id_text, session_id, actor, role, content);
+        try self.upsertSessionMessageFts(id_text, session_id, role, content);
     }
 
     pub fn loadMessages(self: *Self, allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8) ![]Message {
@@ -8080,6 +8129,28 @@ pub const PostgresStore = struct {
             \\CREATE INDEX IF NOT EXISTS session_messages_session_actor_idx ON session_messages(session_id, actor_id, id);
             \\ALTER TABLE session_usage DROP CONSTRAINT IF EXISTS session_usage_pkey;
             \\ALTER TABLE session_usage ADD PRIMARY KEY (session_id, actor_id);
+            \\ALTER TABLE spaces ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(name,'') || ' ' || coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(metadata_json::text,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS spaces_search_idx ON spaces USING gin(search_tsv);
+            \\ALTER TABLE policy_scopes ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(scope,'') || ' ' || coalesce(visibility,'') || ' ' || coalesce(owner,'') || ' ' || coalesce(metadata_json::text,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS policy_scopes_search_idx ON policy_scopes USING gin(search_tsv);
+            \\ALTER TABLE sources ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(content,'') || ' ' || coalesce(raw_content_uri,'') || ' ' || coalesce(author,'') || ' ' || coalesce(participants_json::text,'') || ' ' || coalesce(metadata_json::text,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS sources_search_idx ON sources USING gin(search_tsv);
+            \\ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(body,'') || ' ' || coalesce(fields_json::text,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS artifacts_search_idx ON artifacts USING gin(search_tsv);
+            \\ALTER TABLE entities ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(type,'') || ' ' || coalesce(name,'') || ' ' || coalesce(aliases_json::text,'') || ' ' || coalesce(description,'') || ' ' || coalesce(metadata_json::text,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS entities_search_idx ON entities USING gin(search_tsv);
+            \\ALTER TABLE memory_atoms ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(text,'') || ' ' || coalesce(predicate,'') || ' ' || coalesce(object,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS memory_atoms_search_idx ON memory_atoms USING gin(search_tsv);
+            \\ALTER TABLE relations ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(relation_type,'') || ' ' || coalesce(from_entity_id,'') || ' ' || coalesce(to_entity_id,'') || ' ' || coalesce(source_ids_json::text,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS relations_search_idx ON relations USING gin(search_tsv);
+            \\ALTER TABLE context_packs ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(purpose,'') || ' ' || coalesce(target,'') || ' ' || coalesce(query_text,'') || ' ' || coalesce(generated_summary,'') || ' ' || coalesce(included_result_refs_json::text,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS context_packs_search_idx ON context_packs USING gin(search_tsv);
+            \\ALTER TABLE agent_memory_items ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(key,'') || ' ' || coalesce(category,'') || ' ' || coalesce(session_id,'') || ' ' || coalesce(metadata_json::text,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS agent_memory_search_idx ON agent_memory_items USING gin(search_tsv);
+            \\ALTER TABLE session_messages ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(session_id,'') || ' ' || coalesce(role,'') || ' ' || coalesce(content,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS session_messages_search_idx ON session_messages USING gin(search_tsv);
+            \\ALTER TABLE memory_feed_events ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(event_type,'') || ' ' || coalesce(operation,'') || ' ' || coalesce(object_type,'') || ' ' || coalesce(object_id,'') || ' ' || coalesce(dedupe_key,'') || ' ' || coalesce(causality_json::text,'') || ' ' || coalesce(payload_json::text,''))) STORED;
+            \\CREATE INDEX IF NOT EXISTS memory_feed_events_search_idx ON memory_feed_events USING gin(search_tsv);
             \\UPDATE schema_migrations SET name = 'core_primitives', checksum = 'np-001-core-primitives' WHERE version = 1;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (2, 'security_and_retrieval_hardening', 'np-002-security-retrieval', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (3, 'runtime_lifecycle_cache', 'np-003-runtime-lifecycle-cache', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
@@ -8142,6 +8213,8 @@ pub const PostgresStore = struct {
             \\UPDATE schema_migrations SET name = 'primitive_lifecycle_overlay', checksum = 'np-019-primitive-lifecycle-overlay' WHERE version = 19;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (20, 'sqlite_full_text_coverage', 'np-020-sqlite-full-text-coverage', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
             \\UPDATE schema_migrations SET name = 'sqlite_full_text_coverage', checksum = 'np-020-sqlite-full-text-coverage' WHERE version = 20;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (21, 'postgres_full_text_coverage', 'np-021-postgres-full-text-coverage', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\UPDATE schema_migrations SET name = 'postgres_full_text_coverage', checksum = 'np-021-postgres-full-text-coverage' WHERE version = 21;
             \\COMMIT;
         );
         try self.runSql(
@@ -10165,7 +10238,10 @@ pub const PostgresStore = struct {
 
     fn searchPgSpaces(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const visible_sql = try pgRecordVisibleSql(allocator, "scope", "permissions_json", input.scopes_json, input.actor_id);
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,name,title,description,scope,permissions_json,metadata_json,created_at_ms,updated_at_ms FROM spaces WHERE ({s}) ORDER BY updated_at_ms DESC LIMIT {d}", .{ visible_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        const inner = if (input.query.len > 0) blk: {
+            const q = try sqlString(allocator, input.query);
+            break :blk try std.fmt.allocPrint(allocator, "SELECT id,name,title,description,scope,permissions_json,metadata_json,created_at_ms,updated_at_ms FROM spaces WHERE ({s}) AND search_tsv @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, updated_at_ms DESC LIMIT {d}", .{ visible_sql, q, q, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        } else try std.fmt.allocPrint(allocator, "SELECT id,name,title,description,scope,permissions_json,metadata_json,created_at_ms,updated_at_ms FROM spaces WHERE ({s}) ORDER BY updated_at_ms DESC LIMIT {d}", .{ visible_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value != .array) return;
@@ -10182,7 +10258,10 @@ pub const PostgresStore = struct {
 
     fn searchPgPolicyScopes(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const visible_sql = try pgRecordVisibleSql(allocator, "scope", "permissions_json", input.scopes_json, input.actor_id);
-        const inner = try std.fmt.allocPrint(allocator, "SELECT scope,visibility,permissions_json,owner,ttl_ms,review_after_ms,metadata_json,created_at_ms,updated_at_ms FROM policy_scopes WHERE ({s}) ORDER BY updated_at_ms DESC LIMIT {d}", .{ visible_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        const inner = if (input.query.len > 0) blk: {
+            const q = try sqlString(allocator, input.query);
+            break :blk try std.fmt.allocPrint(allocator, "SELECT scope,visibility,permissions_json,owner,ttl_ms,review_after_ms,metadata_json,created_at_ms,updated_at_ms FROM policy_scopes WHERE ({s}) AND search_tsv @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, updated_at_ms DESC LIMIT {d}", .{ visible_sql, q, q, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        } else try std.fmt.allocPrint(allocator, "SELECT scope,visibility,permissions_json,owner,ttl_ms,review_after_ms,metadata_json,created_at_ms,updated_at_ms FROM policy_scopes WHERE ({s}) ORDER BY updated_at_ms DESC LIMIT {d}", .{ visible_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value != .array) return;
@@ -10202,7 +10281,7 @@ pub const PostgresStore = struct {
         const visible_sql = try pgRecordVisibleSql(allocator, "scope", "permissions_json", input.scopes_json, input.actor_id);
         const inner = if (input.query.len > 0) blk: {
             const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, "SELECT id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json FROM sources WHERE ({s}) AND to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(content,'')) @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(content,'')), websearch_to_tsquery('simple',{s})) DESC, imported_at_ms DESC LIMIT {d}", .{ visible_sql, q, q, candidate_limit });
+            break :blk try std.fmt.allocPrint(allocator, "SELECT id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json FROM sources WHERE ({s}) AND search_tsv @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, imported_at_ms DESC LIMIT {d}", .{ visible_sql, q, q, candidate_limit });
         } else try std.fmt.allocPrint(allocator, "SELECT id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json FROM sources WHERE ({s}) ORDER BY imported_at_ms DESC LIMIT {d}", .{ visible_sql, candidate_limit });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
@@ -10226,7 +10305,7 @@ pub const PostgresStore = struct {
         const status_sql = if (input.include_deprecated) "" else " AND status NOT IN ('rejected','deprecated','superseded')";
         const inner = if (input.query.len > 0) blk: {
             const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, "SELECT id,type,title,body,status,owner,space_id,version,created_at_ms,updated_at_ms,last_verified_at_ms,scope,source_ids_json,related_entities_json,permissions_json,fields_json,summary,agent_summary FROM artifacts WHERE ({s}){s} AND to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(body,'') || ' ' || coalesce(fields_json::text,'')) @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(body,'') || ' ' || coalesce(fields_json::text,'')), websearch_to_tsquery('simple',{s})) DESC, updated_at_ms DESC LIMIT {d}", .{ visible_sql, status_sql, q, q, candidate_limit });
+            break :blk try std.fmt.allocPrint(allocator, "SELECT id,type,title,body,status,owner,space_id,version,created_at_ms,updated_at_ms,last_verified_at_ms,scope,source_ids_json,related_entities_json,permissions_json,fields_json,summary,agent_summary FROM artifacts WHERE ({s}){s} AND search_tsv @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, updated_at_ms DESC LIMIT {d}", .{ visible_sql, status_sql, q, q, candidate_limit });
         } else try std.fmt.allocPrint(allocator, "SELECT id,type,title,body,status,owner,space_id,version,created_at_ms,updated_at_ms,last_verified_at_ms,scope,source_ids_json,related_entities_json,permissions_json,fields_json,summary,agent_summary FROM artifacts WHERE ({s}){s} ORDER BY updated_at_ms DESC LIMIT {d}", .{ visible_sql, status_sql, candidate_limit });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
@@ -10248,7 +10327,10 @@ pub const PostgresStore = struct {
 
     fn searchPgEntities(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const visible_sql = try pgRecordVisibleSql(allocator, "scope", "permissions_json", input.scopes_json, input.actor_id);
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,type,name,aliases_json,description,canonical_artifact_id,scope,permissions_json,metadata_json,created_at_ms,updated_at_ms FROM entities WHERE ({s}) ORDER BY updated_at_ms DESC LIMIT {d}", .{ visible_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        const inner = if (input.query.len > 0) blk: {
+            const q = try sqlString(allocator, input.query);
+            break :blk try std.fmt.allocPrint(allocator, "SELECT id,type,name,aliases_json,description,canonical_artifact_id,scope,permissions_json,metadata_json,created_at_ms,updated_at_ms FROM entities WHERE ({s}) AND search_tsv @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, updated_at_ms DESC LIMIT {d}", .{ visible_sql, q, q, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        } else try std.fmt.allocPrint(allocator, "SELECT id,type,name,aliases_json,description,canonical_artifact_id,scope,permissions_json,metadata_json,created_at_ms,updated_at_ms FROM entities WHERE ({s}) ORDER BY updated_at_ms DESC LIMIT {d}", .{ visible_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value != .array) return;
@@ -10270,7 +10352,10 @@ pub const PostgresStore = struct {
         const from_visible = try pgRecordVisibleSql(allocator, "coalesce(fe.scope,'')", "coalesce(fe.permissions_json,'[]'::jsonb)", input.scopes_json, input.actor_id);
         const to_visible = try pgRecordVisibleSql(allocator, "coalesce(te.scope,'')", "coalesce(te.permissions_json,'[]'::jsonb)", input.scopes_json, input.actor_id);
         const status_sql = if (input.include_deprecated) "" else " AND r.status NOT IN ('rejected','deprecated','superseded')";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT r.id,r.from_entity_id,r.relation_type,r.to_entity_id,r.source_ids_json,r.scope,r.permissions_json,r.confidence,r.status,r.created_at_ms,coalesce(fe.name,'') AS from_name,coalesce(te.name,'') AS to_name,coalesce(fe.scope,'') AS from_scope,coalesce(fe.permissions_json,'[]'::jsonb) AS from_permissions_json,coalesce(te.scope,'') AS to_scope,coalesce(te.permissions_json,'[]'::jsonb) AS to_permissions_json FROM relations r LEFT JOIN entities fe ON fe.id = r.from_entity_id LEFT JOIN entities te ON te.id = r.to_entity_id WHERE ({s}) AND ({s}) AND ({s}){s} ORDER BY r.created_at_ms DESC LIMIT {d}", .{ relation_visible, from_visible, to_visible, status_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        const inner = if (input.query.len > 0) blk: {
+            const q = try sqlString(allocator, input.query);
+            break :blk try std.fmt.allocPrint(allocator, "SELECT r.id,r.from_entity_id,r.relation_type,r.to_entity_id,r.source_ids_json,r.scope,r.permissions_json,r.confidence,r.status,r.created_at_ms,coalesce(fe.name,'') AS from_name,coalesce(te.name,'') AS to_name,coalesce(fe.scope,'') AS from_scope,coalesce(fe.permissions_json,'[]'::jsonb) AS from_permissions_json,coalesce(te.scope,'') AS to_scope,coalesce(te.permissions_json,'[]'::jsonb) AS to_permissions_json FROM relations r LEFT JOIN entities fe ON fe.id = r.from_entity_id LEFT JOIN entities te ON te.id = r.to_entity_id WHERE ({s}) AND ({s}) AND ({s}){s} AND (r.search_tsv @@ websearch_to_tsquery('simple',{s}) OR coalesce(fe.search_tsv, ''::tsvector) @@ websearch_to_tsquery('simple',{s}) OR coalesce(te.search_tsv, ''::tsvector) @@ websearch_to_tsquery('simple',{s})) ORDER BY greatest(ts_rank_cd(r.search_tsv, websearch_to_tsquery('simple',{s})), ts_rank_cd(coalesce(fe.search_tsv, ''::tsvector), websearch_to_tsquery('simple',{s})), ts_rank_cd(coalesce(te.search_tsv, ''::tsvector), websearch_to_tsquery('simple',{s}))) DESC, r.created_at_ms DESC LIMIT {d}", .{ relation_visible, from_visible, to_visible, status_sql, q, q, q, q, q, q, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        } else try std.fmt.allocPrint(allocator, "SELECT r.id,r.from_entity_id,r.relation_type,r.to_entity_id,r.source_ids_json,r.scope,r.permissions_json,r.confidence,r.status,r.created_at_ms,coalesce(fe.name,'') AS from_name,coalesce(te.name,'') AS to_name,coalesce(fe.scope,'') AS from_scope,coalesce(fe.permissions_json,'[]'::jsonb) AS from_permissions_json,coalesce(te.scope,'') AS to_scope,coalesce(te.permissions_json,'[]'::jsonb) AS to_permissions_json FROM relations r LEFT JOIN entities fe ON fe.id = r.from_entity_id LEFT JOIN entities te ON te.id = r.to_entity_id WHERE ({s}) AND ({s}) AND ({s}){s} ORDER BY r.created_at_ms DESC LIMIT {d}", .{ relation_visible, from_visible, to_visible, status_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value != .array) return;
@@ -10298,7 +10383,10 @@ pub const PostgresStore = struct {
             try std.fmt.allocPrint(allocator, "(actor_isolated = false OR actor_id = {s})", .{try sqlString(allocator, actor)})
         else
             "actor_isolated = false";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated,generated_summary,token_budget,created_at_ms FROM context_packs WHERE {s} ORDER BY created_at_ms DESC LIMIT {d}", .{ actor_filter, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        const inner = if (input.query.len > 0) blk: {
+            const q = try sqlString(allocator, input.query);
+            break :blk try std.fmt.allocPrint(allocator, "SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated,generated_summary,token_budget,created_at_ms FROM context_packs WHERE {s} AND search_tsv @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, created_at_ms DESC LIMIT {d}", .{ actor_filter, q, q, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        } else try std.fmt.allocPrint(allocator, "SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated,generated_summary,token_budget,created_at_ms FROM context_packs WHERE {s} ORDER BY created_at_ms DESC LIMIT {d}", .{ actor_filter, pgSearchCandidateLimit(input.limit, 20, 5000) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value != .array) return;
@@ -10422,7 +10510,10 @@ pub const PostgresStore = struct {
     fn searchPgFeedEvents(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const visible_sql = try pgRecordVisibleSql(allocator, "scope", "permissions_json", input.scopes_json, input.actor_id);
         const status_sql = if (input.include_deprecated) "" else " AND status <> 'rejected'";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms,compacted_at_ms FROM memory_feed_events WHERE ({s}){s} ORDER BY id ASC LIMIT {d}", .{ visible_sql, status_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        const inner = if (input.query.len > 0) blk: {
+            const q = try sqlString(allocator, input.query);
+            break :blk try std.fmt.allocPrint(allocator, "SELECT id,event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms,compacted_at_ms FROM memory_feed_events WHERE ({s}){s} AND search_tsv @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, id ASC LIMIT {d}", .{ visible_sql, status_sql, q, q, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        } else try std.fmt.allocPrint(allocator, "SELECT id,event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms,compacted_at_ms FROM memory_feed_events WHERE ({s}){s} ORDER BY id ASC LIMIT {d}", .{ visible_sql, status_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value != .array) return;
@@ -10453,9 +10544,13 @@ pub const PostgresStore = struct {
         const status_sql = if (input.include_deprecated) "" else " AND ma.status NOT IN ('rejected','deprecated','superseded')";
         const query_filter = if (input.query.len > 0) blk: {
             const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, " AND to_tsvector('simple', coalesce(ami.key,'') || ' ' || coalesce(ami.category,'') || ' ' || coalesce(ma.text,'')) @@ websearch_to_tsquery('simple',{s})", .{q});
+            break :blk try std.fmt.allocPrint(allocator, " AND (ami.search_tsv @@ websearch_to_tsquery('simple',{s}) OR ma.search_tsv @@ websearch_to_tsquery('simple',{s}))", .{ q, q });
         } else "";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT ami.id,ami.key,ami.category,ami.session_id,ami.timestamp_ms,ami.actor_id,ami.scope,ami.permissions_json,ma.id AS memory_atom_id,ma.text,ma.status,ma.confidence,ma.source_ids_json FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE {s}{s}{s}{s} ORDER BY ami.timestamp_ms DESC LIMIT {d}", .{ actor_filter, session_filter, status_sql, query_filter, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        const order_sql = if (input.query.len > 0) blk: {
+            const q = try sqlString(allocator, input.query);
+            break :blk try std.fmt.allocPrint(allocator, "greatest(ts_rank_cd(ami.search_tsv, websearch_to_tsquery('simple',{s})), ts_rank_cd(ma.search_tsv, websearch_to_tsquery('simple',{s}))) DESC, ami.timestamp_ms DESC", .{ q, q });
+        } else "ami.timestamp_ms DESC";
+        const inner = try std.fmt.allocPrint(allocator, "SELECT ami.id,ami.key,ami.category,ami.session_id,ami.timestamp_ms,ami.actor_id,ami.scope,ami.permissions_json,ma.id AS memory_atom_id,ma.text,ma.status,ma.confidence,ma.source_ids_json FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE {s}{s}{s}{s} ORDER BY {s} LIMIT {d}", .{ actor_filter, session_filter, status_sql, query_filter, order_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value != .array) return;
@@ -10506,9 +10601,13 @@ pub const PostgresStore = struct {
             "";
         const query_filter = if (input.query.len > 0) blk: {
             const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, " AND to_tsvector('simple', coalesce(session_id,'') || ' ' || coalesce(role,'') || ' ' || coalesce(content,'')) @@ websearch_to_tsquery('simple',{s})", .{q});
+            break :blk try std.fmt.allocPrint(allocator, " AND search_tsv @@ websearch_to_tsquery('simple',{s})", .{q});
         } else "";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,session_id,actor_id,role,content,created_at_ms FROM session_messages WHERE {s}{s}{s} ORDER BY id DESC LIMIT {d}", .{ actor_filter, session_filter, query_filter, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        const order_sql = if (input.query.len > 0) blk: {
+            const q = try sqlString(allocator, input.query);
+            break :blk try std.fmt.allocPrint(allocator, "ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, id DESC", .{q});
+        } else "id DESC";
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,session_id,actor_id,role,content,created_at_ms FROM session_messages WHERE {s}{s}{s} ORDER BY {s} LIMIT {d}", .{ actor_filter, session_filter, query_filter, order_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value != .array) return;
@@ -12258,6 +12357,8 @@ test "sqlite global search covers operational first-class groups" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
+    const space = try store.createSpace(alloc, .{ .name = "roadmap-space", .title = "Roadmap Space", .description = "roadmap space", .scope = "public", .metadata_json = "{\"topic\":\"roadmap\"}" });
+    const policy = try store.upsertPolicyScope(alloc, .{ .scope = "project:roadmap", .visibility = "workspace", .owner = "roadmap-owner", .metadata_json = "{\"topic\":\"roadmap policy\"}" });
     const source = try store.createSource(alloc, .{ .title = "Roadmap transcript", .content = "roadmap source", .scope = "public" });
     const artifact = try store.createArtifact(alloc, .{ .title = "Roadmap artifact", .body = "roadmap artifact", .status = "accepted" });
     const atom = try store.createMemoryAtom(alloc, .{
@@ -12273,8 +12374,12 @@ test "sqlite global search covers operational first-class groups" {
     _ = try store.appendFeedEvent(.{ .event_type = "roadmap.feed", .object_type = "memory_atom", .object_id = atom.id, .scope = "public", .payload_json = "{\"text\":\"roadmap feed\"}" });
     _ = try store.agentMemoryStore(alloc, .{ .key = "roadmap.native", .content = "roadmap native agent memory", .category = "core", .actor_id = "agent:roadmap" });
     try store.saveMessage("sess_roadmap", "user", "roadmap session message", "agent:roadmap");
+    _ = space;
+    _ = policy;
     _ = artifact;
 
+    try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM spaces_fts"));
+    try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM policy_scopes_fts"));
     try std.testing.expectEqual(@as(i64, 2), try testingSqliteCount(&store, "SELECT COUNT(*) FROM entities_fts"));
     try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM relations_fts"));
     try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM context_packs_fts"));
@@ -12288,13 +12393,19 @@ test "sqlite global search covers operational first-class groups" {
     var saw_feed = false;
     var saw_agent_memory = false;
     var saw_session = false;
+    var saw_space = false;
+    var saw_policy = false;
     for (results) |result| {
+        if (std.mem.eql(u8, result.result_type, "space")) saw_space = true;
+        if (std.mem.eql(u8, result.result_type, "policy_scope")) saw_policy = true;
         if (std.mem.eql(u8, result.result_type, "relation")) saw_relation = true;
         if (std.mem.eql(u8, result.result_type, "context_pack")) saw_context_pack = true;
         if (std.mem.eql(u8, result.result_type, "feed_event")) saw_feed = true;
         if (std.mem.eql(u8, result.result_type, "agent_memory")) saw_agent_memory = true;
         if (std.mem.eql(u8, result.result_type, "session_message")) saw_session = true;
     }
+    try std.testing.expect(saw_space);
+    try std.testing.expect(saw_policy);
     try std.testing.expect(saw_relation);
     try std.testing.expect(saw_context_pack);
     try std.testing.expect(saw_feed);

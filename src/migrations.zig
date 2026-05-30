@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const expected_schema_version: i64 = 20;
+pub const expected_schema_version: i64 = 21;
 
 pub const Migration = struct {
     version: i64,
@@ -29,6 +29,7 @@ pub const migration_manifest = [_]Migration{
     .{ .version = 18, .name = "artifact_structured_fields", .checksum = "np-018-artifact-structured-fields" },
     .{ .version = 19, .name = "primitive_lifecycle_overlay", .checksum = "np-019-primitive-lifecycle-overlay" },
     .{ .version = 20, .name = "sqlite_full_text_coverage", .checksum = "np-020-sqlite-full-text-coverage" },
+    .{ .version = 21, .name = "postgres_full_text_coverage", .checksum = "np-021-postgres-full-text-coverage" },
 };
 
 pub fn expectedMigration(version: i64) ?Migration {
@@ -60,6 +61,7 @@ pub const sqlite_schema =
     \\  updated_at_ms INTEGER NOT NULL
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_spaces_scope ON spaces(scope);
+    \\CREATE VIRTUAL TABLE IF NOT EXISTS spaces_fts USING fts5(id UNINDEXED, name, title, description, metadata);
     \\CREATE TABLE IF NOT EXISTS policy_scopes (
     \\  scope TEXT PRIMARY KEY,
     \\  visibility TEXT NOT NULL DEFAULT 'workspace',
@@ -71,6 +73,7 @@ pub const sqlite_schema =
     \\  created_at_ms INTEGER NOT NULL,
     \\  updated_at_ms INTEGER NOT NULL
     \\);
+    \\CREATE VIRTUAL TABLE IF NOT EXISTS policy_scopes_fts USING fts5(scope UNINDEXED, visibility, owner, metadata);
     \\CREATE TABLE IF NOT EXISTS sources (
     \\  id TEXT PRIMARY KEY,
     \\  type TEXT NOT NULL,
@@ -236,7 +239,7 @@ pub const sqlite_schema =
     \\  created_at_ms INTEGER NOT NULL
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_session_messages_session_actor ON session_messages(session_id, actor_id, id);
-    \\CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(id UNINDEXED, session_id, actor_id, role, content);
+    \\CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(id UNINDEXED, session_id, role, content);
     \\CREATE TABLE IF NOT EXISTS session_usage (
     \\  session_id TEXT NOT NULL,
     \\  actor_id TEXT NOT NULL,
@@ -376,6 +379,7 @@ pub const sqlite_schema =
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (15, 'agent_memory_writer_identity', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (19, 'primitive_lifecycle_overlay', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (20, 'sqlite_full_text_coverage', strftime('%s','now') * 1000);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (21, 'postgres_full_text_coverage', strftime('%s','now') * 1000);
 ;
 
 pub const postgres_schema =
@@ -397,9 +401,11 @@ pub const postgres_schema =
     \\  permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb,
     \\  metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     \\  created_at_ms bigint NOT NULL,
-    \\  updated_at_ms bigint NOT NULL
+    \\  updated_at_ms bigint NOT NULL,
+    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(name,'') || ' ' || coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(metadata_json::text,''))) STORED
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_spaces_scope ON spaces(scope);
+    \\CREATE INDEX IF NOT EXISTS spaces_search_idx ON spaces USING gin(search_tsv);
     \\CREATE TABLE IF NOT EXISTS policy_scopes (
     \\  scope text PRIMARY KEY,
     \\  visibility text NOT NULL DEFAULT 'workspace',
@@ -409,8 +415,10 @@ pub const postgres_schema =
     \\  review_after_ms bigint,
     \\  metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     \\  created_at_ms bigint NOT NULL,
-    \\  updated_at_ms bigint NOT NULL
+    \\  updated_at_ms bigint NOT NULL,
+    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(scope,'') || ' ' || coalesce(visibility,'') || ' ' || coalesce(owner,'') || ' ' || coalesce(metadata_json::text,''))) STORED
     \\);
+    \\CREATE INDEX IF NOT EXISTS policy_scopes_search_idx ON policy_scopes USING gin(search_tsv);
     \\CREATE TABLE IF NOT EXISTS sources (
     \\  id text PRIMARY KEY,
     \\  type text NOT NULL,
@@ -426,8 +434,10 @@ pub const postgres_schema =
     \\  checksum text,
     \\  language text,
     \\  related_entities_json jsonb NOT NULL DEFAULT '[]',
-    \\  metadata_json jsonb NOT NULL DEFAULT '{}'
+    \\  metadata_json jsonb NOT NULL DEFAULT '{}',
+    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(content,'') || ' ' || coalesce(raw_content_uri,'') || ' ' || coalesce(author,'') || ' ' || coalesce(participants_json::text,'') || ' ' || coalesce(metadata_json::text,''))) STORED
     \\);
+    \\CREATE INDEX IF NOT EXISTS sources_search_idx ON sources USING gin(search_tsv);
     \\CREATE TABLE IF NOT EXISTS artifacts (
     \\  id text PRIMARY KEY,
     \\  type text NOT NULL,
@@ -461,9 +471,11 @@ pub const postgres_schema =
     \\  permissions_json jsonb NOT NULL DEFAULT '[]',
     \\  metadata_json jsonb NOT NULL DEFAULT '{}',
     \\  created_at_ms bigint NOT NULL,
-    \\  updated_at_ms bigint NOT NULL
+    \\  updated_at_ms bigint NOT NULL,
+    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(type,'') || ' ' || coalesce(name,'') || ' ' || coalesce(aliases_json::text,'') || ' ' || coalesce(description,'') || ' ' || coalesce(metadata_json::text,''))) STORED
     \\);
     \\CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx ON entities(type, lower(name), scope);
+    \\CREATE INDEX IF NOT EXISTS entities_search_idx ON entities USING gin(search_tsv);
     \\CREATE TABLE IF NOT EXISTS memory_atoms (
     \\  id text PRIMARY KEY,
     \\  subject_entity_id text,
@@ -531,11 +543,13 @@ pub const postgres_schema =
     \\  permissions_json jsonb NOT NULL DEFAULT '[]',
     \\  confidence double precision NOT NULL DEFAULT 0.5,
     \\  status text NOT NULL DEFAULT 'proposed',
-    \\  created_at_ms bigint NOT NULL
+    \\  created_at_ms bigint NOT NULL,
+    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(relation_type,'') || ' ' || coalesce(from_entity_id,'') || ' ' || coalesce(to_entity_id,'') || ' ' || coalesce(source_ids_json::text,''))) STORED
     \\);
     \\CREATE INDEX IF NOT EXISTS relations_from_idx ON relations(from_entity_id);
     \\CREATE INDEX IF NOT EXISTS relations_to_idx ON relations(to_entity_id);
     \\CREATE INDEX IF NOT EXISTS relations_type_status_idx ON relations(relation_type, status);
+    \\CREATE INDEX IF NOT EXISTS relations_search_idx ON relations USING gin(search_tsv);
     \\CREATE TABLE IF NOT EXISTS context_packs (
     \\  id text PRIMARY KEY,
     \\  purpose text NOT NULL,
@@ -550,8 +564,10 @@ pub const postgres_schema =
     \\  actor_isolated boolean NOT NULL DEFAULT false,
     \\  generated_summary text NOT NULL,
     \\  token_budget bigint NOT NULL DEFAULT 12000,
-    \\  created_at_ms bigint NOT NULL
+    \\  created_at_ms bigint NOT NULL,
+    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(purpose,'') || ' ' || coalesce(target,'') || ' ' || coalesce(query_text,'') || ' ' || coalesce(generated_summary,'') || ' ' || coalesce(included_result_refs_json::text,''))) STORED
     \\);
+    \\CREATE INDEX IF NOT EXISTS context_packs_search_idx ON context_packs USING gin(search_tsv);
     \\CREATE TABLE IF NOT EXISTS agent_memory_items (
     \\  id text PRIMARY KEY,
     \\  key text NOT NULL,
@@ -563,20 +579,24 @@ pub const postgres_schema =
     \\  memory_atom_id text NOT NULL,
     \\  category text NOT NULL DEFAULT 'core',
     \\  timestamp_ms bigint NOT NULL,
-    \\  metadata_json jsonb NOT NULL DEFAULT '{}'
+    \\  metadata_json jsonb NOT NULL DEFAULT '{}',
+    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(key,'') || ' ' || coalesce(category,'') || ' ' || coalesce(session_id,'') || ' ' || coalesce(metadata_json::text,''))) STORED
     \\);
     \\CREATE UNIQUE INDEX IF NOT EXISTS agent_memory_key_session_actor_idx ON agent_memory_items(key, coalesce(session_id, ''), actor_id);
     \\CREATE INDEX IF NOT EXISTS agent_memory_actor_session_idx ON agent_memory_items(actor_id, session_id, timestamp_ms);
     \\CREATE INDEX IF NOT EXISTS agent_memory_writer_idx ON agent_memory_items(writer_actor_id, timestamp_ms);
+    \\CREATE INDEX IF NOT EXISTS agent_memory_search_idx ON agent_memory_items USING gin(search_tsv);
     \\CREATE TABLE IF NOT EXISTS session_messages (
     \\  id bigserial PRIMARY KEY,
     \\  session_id text NOT NULL,
     \\  actor_id text NOT NULL,
     \\  role text NOT NULL,
     \\  content text NOT NULL,
-    \\  created_at_ms bigint NOT NULL
+    \\  created_at_ms bigint NOT NULL,
+    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(session_id,'') || ' ' || coalesce(role,'') || ' ' || coalesce(content,''))) STORED
     \\);
     \\CREATE INDEX IF NOT EXISTS session_messages_session_actor_idx ON session_messages(session_id, actor_id, id);
+    \\CREATE INDEX IF NOT EXISTS session_messages_search_idx ON session_messages USING gin(search_tsv);
     \\CREATE TABLE IF NOT EXISTS session_usage (
     \\  session_id text NOT NULL,
     \\  actor_id text NOT NULL,
@@ -608,10 +628,12 @@ pub const postgres_schema =
     \\  status text NOT NULL DEFAULT 'pending',
     \\  created_at_ms bigint NOT NULL,
     \\  applied_at_ms bigint,
-    \\  compacted_at_ms bigint
+    \\  compacted_at_ms bigint,
+    \\  search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(event_type,'') || ' ' || coalesce(operation,'') || ' ' || coalesce(object_type,'') || ' ' || coalesce(object_id,'') || ' ' || coalesce(dedupe_key,'') || ' ' || coalesce(causality_json::text,'') || ' ' || coalesce(payload_json::text,''))) STORED
     \\);
     \\CREATE INDEX IF NOT EXISTS memory_feed_events_scope_id_idx ON memory_feed_events(scope, id);
     \\CREATE UNIQUE INDEX IF NOT EXISTS memory_feed_events_dedupe_key_idx ON memory_feed_events(dedupe_key) WHERE dedupe_key IS NOT NULL;
+    \\CREATE INDEX IF NOT EXISTS memory_feed_events_search_idx ON memory_feed_events USING gin(search_tsv);
     \\CREATE TABLE IF NOT EXISTS memory_feed_state (
     \\  id integer PRIMARY KEY CHECK (id = 1),
     \\  cursor_floor bigint NOT NULL DEFAULT 0,
@@ -716,13 +738,16 @@ pub const postgres_schema =
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (15, 'agent_memory_writer_identity', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (19, 'primitive_lifecycle_overlay', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (20, 'sqlite_full_text_coverage', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (21, 'postgres_full_text_coverage', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
 ;
 
 test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS sources") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS schema_migrations") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS spaces") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS spaces_fts USING fts5") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS policy_scopes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS policy_scopes_fts USING fts5") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS artifacts") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS entities") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5") != null);
@@ -831,6 +856,14 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "dimensions = 1536") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "vector_cosine_ops") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "USING gin(search_tsv)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "sources_search_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "entities_search_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "relations_search_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "context_packs_search_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "agent_memory_search_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "session_messages_search_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "memory_feed_events_search_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'postgres_full_text_coverage'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS entities_type_name_scope_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE UNIQUE INDEX IF NOT EXISTS agent_memory_key_session_actor_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE INDEX IF NOT EXISTS agent_memory_writer_idx") != null);
