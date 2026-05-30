@@ -31,8 +31,17 @@ pub const BackendKind = enum {
     }
 };
 
+pub const MemoryConfig = struct {
+    max_entries: usize = 4096,
+    max_messages: usize = 4096,
+    max_usage_entries: usize = 4096,
+    max_bytes: usize = 0,
+    ttl_seconds: ?u32 = null,
+};
+
 pub const Config = struct {
     backend: BackendKind = .native,
+    memory: MemoryConfig = .{},
     redis: redis.Config = .{},
 };
 
@@ -86,7 +95,7 @@ pub const Runtime = union(BackendKind) {
         return switch (config.backend) {
             .none => .none,
             .native => .native,
-            .memory_lru => .{ .memory_lru = MemoryAgentMemory.init(allocator) },
+            .memory_lru => .{ .memory_lru = MemoryAgentMemory.init(allocator, config.memory) },
             .redis => .{ .redis = RedisAgentMemory.init(allocator, config.redis) },
         };
     }
@@ -336,26 +345,35 @@ const MemorySessionMessage = struct {
     role: []const u8,
     content: []const u8,
     created_at_ms: i64,
+    last_access_ms: i64,
 };
 
 const MemoryUsage = struct {
     actor_id: []const u8,
     session_id: []const u8,
     total_tokens: u64,
+    updated_at_ms: i64,
+    last_access_ms: i64,
+};
+
+const MemoryEntry = struct {
+    entry: domain.AgentMemory,
+    last_access_ms: i64,
 };
 
 pub const MemoryAgentMemory = struct {
     allocator: std.mem.Allocator,
-    entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty,
+    config: MemoryConfig = .{},
+    entries: std.ArrayListUnmanaged(MemoryEntry) = .empty,
     messages: std.ArrayListUnmanaged(MemorySessionMessage) = .empty,
     usage: std.ArrayListUnmanaged(MemoryUsage) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator) MemoryAgentMemory {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator, config: MemoryConfig) MemoryAgentMemory {
+        return .{ .allocator = allocator, .config = config };
     }
 
     pub fn deinit(self: *MemoryAgentMemory) void {
-        for (self.entries.items) |*entry| freeAgentMemory(self.allocator, entry);
+        for (self.entries.items) |*entry| freeAgentMemory(self.allocator, &entry.entry);
         self.entries.deinit(self.allocator);
         for (self.messages.items) |*message| freeMemorySessionMessage(self.allocator, message);
         self.messages.deinit(self.allocator);
@@ -364,6 +382,7 @@ pub const MemoryAgentMemory = struct {
     }
 
     pub fn store(self: *MemoryAgentMemory, allocator: std.mem.Allocator, input: Input) !domain.AgentMemory {
+        self.purgeExpired();
         const request_actor = try access.requiredActorId(input.actor_id);
         const owner_actor = try access.agentMemoryOwner(allocator, request_actor, input.scope);
         defer allocator.free(owner_actor);
@@ -376,10 +395,12 @@ pub const MemoryAgentMemory = struct {
 
         const timestamp = ids.nowMs();
         const timestamp_text = try std.fmt.allocPrint(self.allocator, "{d}", .{timestamp});
-        errdefer self.allocator.free(timestamp_text);
+        var timestamp_owned = true;
+        errdefer if (timestamp_owned) self.allocator.free(timestamp_text);
         const entry_id = try memoryEntryId(self.allocator, owner_actor, input.session_id, input.key);
-        errdefer self.allocator.free(entry_id);
-        const stored = domain.AgentMemory{
+        var entry_id_owned = true;
+        errdefer if (entry_id_owned) self.allocator.free(entry_id);
+        var stored = domain.AgentMemory{
             .id = entry_id,
             .key = try self.allocator.dupe(u8, input.key),
             .content = try self.allocator.dupe(u8, input.content),
@@ -391,32 +412,45 @@ pub const MemoryAgentMemory = struct {
             .scope = try self.allocator.dupe(u8, scope),
             .permissions_json = try self.allocator.dupe(u8, permissions),
         };
+        timestamp_owned = false;
+        entry_id_owned = false;
+        var stored_owned = true;
         errdefer {
-            var cleanup = stored;
-            freeAgentMemory(self.allocator, &cleanup);
+            if (stored_owned) freeAgentMemory(self.allocator, &stored);
         }
-        try self.entries.append(self.allocator, stored);
-        return cloneAgentMemory(allocator, stored);
+        try self.entries.append(self.allocator, .{ .entry = stored, .last_access_ms = timestamp });
+        stored_owned = false;
+        errdefer {
+            var removed = self.entries.orderedRemove(self.entries.items.len - 1);
+            freeAgentMemory(self.allocator, &removed.entry);
+        }
+        const result = try cloneAgentMemory(allocator, stored);
+        self.enforceLimits();
+        return result;
     }
 
     pub fn get(self: *MemoryAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
+        self.purgeExpired();
         const owner = actor_id orelse return null;
         const idx = self.findEntryIndex(owner, session_id, key) orelse return null;
-        return try cloneAgentMemory(allocator, self.entries.items[idx]);
+        self.entries.items[idx].last_access_ms = ids.nowMs();
+        return try cloneAgentMemory(allocator, self.entries.items[idx].entry);
     }
 
     pub fn getVisible(self: *MemoryAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
         const all = try self.listVisible(allocator, null, session_id, actor_id, scopes_json);
-        defer allocator.free(all);
+        defer {
+            for (all) |*entry| freeAgentMemory(allocator, entry);
+            allocator.free(all);
+        }
         for (all) |*entry| {
             if (std.mem.eql(u8, entry.key, key)) {
                 const result = entry.*;
+                self.touchEntryById(result.id, ids.nowMs());
                 detachAgentMemory(entry);
-                for (all) |*other| freeAgentMemory(allocator, other);
                 return result;
             }
         }
-        for (all) |*entry| freeAgentMemory(allocator, entry);
         return null;
     }
 
@@ -432,9 +466,16 @@ pub const MemoryAgentMemory = struct {
         const actor = actor_id orelse return allocator.alloc(domain.AgentMemory, 0);
         if (limit == 0) return allocator.alloc(domain.AgentMemory, 0);
         const all = try self.listVisible(allocator, null, session_id, actor, scopes_json);
-        defer allocator.free(all);
+        defer {
+            for (all) |*entry| freeAgentMemory(allocator, entry);
+            allocator.free(all);
+        }
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer {
+            for (out.items) |*entry| freeAgentMemory(allocator, entry);
+            out.deinit(allocator);
+        }
+        const access_time = ids.nowMs();
         for (all) |*entry| {
             if (out.items.len >= @max(@as(usize, 1), limit)) break;
             const score = scoreText(query, entry.key) + scoreText(query, entry.content);
@@ -442,23 +483,25 @@ pub const MemoryAgentMemory = struct {
             var copy = entry.*;
             copy.score = score + 0.5;
             try out.append(allocator, copy);
+            self.touchEntryById(entry.id, access_time);
             detachAgentMemory(entry);
         }
-        for (all) |*entry| freeAgentMemory(allocator, entry);
         sortAgentMemory(out.items);
         if (out.items.len > limit) out.shrinkRetainingCapacity(limit);
         return out.toOwnedSlice(allocator);
     }
 
     pub fn delete(self: *MemoryAgentMemory, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, _: ?[]const u8) !bool {
+        self.purgeExpired();
         const owner = actor_id orelse return false;
         const idx = self.findEntryIndex(owner, session_id, key) orelse return false;
         var removed = self.entries.orderedRemove(idx);
-        freeAgentMemory(self.allocator, &removed);
+        freeAgentMemory(self.allocator, &removed.entry);
         return true;
     }
 
     pub fn count(self: *MemoryAgentMemory, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
+        self.purgeExpired();
         if (actor_id) |actor| {
             const visible = try self.listVisible(self.allocator, null, null, actor, scopes_json);
             defer {
@@ -471,27 +514,37 @@ pub const MemoryAgentMemory = struct {
     }
 
     pub fn saveMessage(self: *MemoryAgentMemory, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
+        self.purgeExpired();
         const actor = try access.requiredActorId(actor_id);
+        const now = ids.nowMs();
         const stored = MemorySessionMessage{
             .actor_id = try self.allocator.dupe(u8, actor),
             .session_id = try self.allocator.dupe(u8, session_id),
             .role = try self.allocator.dupe(u8, role),
             .content = try self.allocator.dupe(u8, content),
-            .created_at_ms = ids.nowMs(),
+            .created_at_ms = now,
+            .last_access_ms = now,
         };
         errdefer {
             var cleanup = stored;
             freeMemorySessionMessage(self.allocator, &cleanup);
         }
         try self.messages.append(self.allocator, stored);
+        self.enforceLimits();
     }
 
     pub fn loadMessages(self: *MemoryAgentMemory, allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8) ![]Message {
+        self.purgeExpired();
         const actor = actor_id orelse return allocator.alloc(Message, 0);
         var out: std.ArrayListUnmanaged(Message) = .empty;
-        errdefer out.deinit(allocator);
-        for (self.messages.items) |message| {
+        errdefer {
+            for (out.items) |*message| freeMessage(allocator, message);
+            out.deinit(allocator);
+        }
+        const access_time = ids.nowMs();
+        for (self.messages.items) |*message| {
             if (!std.mem.eql(u8, message.actor_id, actor) or !std.mem.eql(u8, message.session_id, session_id)) continue;
+            message.last_access_ms = access_time;
             try out.append(allocator, .{
                 .role = try allocator.dupe(u8, message.role),
                 .content = try allocator.dupe(u8, message.content),
@@ -502,6 +555,7 @@ pub const MemoryAgentMemory = struct {
     }
 
     pub fn clearMessages(self: *MemoryAgentMemory, session_id: []const u8, actor_id: ?[]const u8) !void {
+        self.purgeExpired();
         const actor = actor_id orelse return;
         var i: usize = 0;
         while (i < self.messages.items.len) {
@@ -515,6 +569,7 @@ pub const MemoryAgentMemory = struct {
     }
 
     pub fn clearAutoSaved(self: *MemoryAgentMemory, session_id: ?[]const u8, actor_id: ?[]const u8) !void {
+        self.purgeExpired();
         const actor = actor_id orelse return;
         var i: usize = 0;
         while (i < self.messages.items.len) {
@@ -532,24 +587,32 @@ pub const MemoryAgentMemory = struct {
     }
 
     pub fn saveUsage(self: *MemoryAgentMemory, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8) !void {
+        self.purgeExpired();
         const actor = try access.requiredActorId(actor_id);
+        const now = ids.nowMs();
         if (self.findUsageIndex(actor, session_id)) |idx| {
             self.usage.items[idx].total_tokens = total_tokens;
+            self.usage.items[idx].updated_at_ms = now;
+            self.usage.items[idx].last_access_ms = now;
             return;
         }
         const stored = MemoryUsage{
             .actor_id = try self.allocator.dupe(u8, actor),
             .session_id = try self.allocator.dupe(u8, session_id),
             .total_tokens = total_tokens,
+            .updated_at_ms = now,
+            .last_access_ms = now,
         };
         errdefer {
             var cleanup = stored;
             freeMemoryUsage(self.allocator, &cleanup);
         }
         try self.usage.append(self.allocator, stored);
+        self.enforceLimits();
     }
 
     pub fn deleteUsage(self: *MemoryAgentMemory, session_id: []const u8, actor_id: ?[]const u8) !bool {
+        self.purgeExpired();
         const actor = actor_id orelse return false;
         const idx = self.findUsageIndex(actor, session_id) orelse return false;
         var removed = self.usage.orderedRemove(idx);
@@ -558,12 +621,15 @@ pub const MemoryAgentMemory = struct {
     }
 
     pub fn loadUsage(self: *MemoryAgentMemory, session_id: []const u8, actor_id: ?[]const u8) !?u64 {
+        self.purgeExpired();
         const actor = actor_id orelse return null;
         const idx = self.findUsageIndex(actor, session_id) orelse return null;
+        self.usage.items[idx].last_access_ms = ids.nowMs();
         return self.usage.items[idx].total_tokens;
     }
 
     pub fn listSessions(self: *MemoryAgentMemory, allocator: std.mem.Allocator, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryList {
+        self.purgeExpired();
         const actor = actor_id orelse return .{ .total = 0, .sessions = try allocator.alloc(SessionInfo, 0) };
         var all_sessions: std.ArrayListUnmanaged(SessionInfo) = .empty;
         errdefer {
@@ -629,9 +695,14 @@ pub const MemoryAgentMemory = struct {
     };
 
     fn listInternal(self: *MemoryAgentMemory, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8, visible: ?VisibleFilter, visible_only: bool) ![]domain.AgentMemory {
+        self.purgeExpired();
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
-        for (self.entries.items) |entry| {
+        errdefer {
+            for (out.items) |*entry| freeAgentMemory(allocator, entry);
+            out.deinit(allocator);
+        }
+        for (self.entries.items) |wrapped| {
+            const entry = wrapped.entry;
             if (actor_id) |actor| if (!std.mem.eql(u8, entry.actor_id, actor)) continue;
             if (category) |cat| if (!std.mem.eql(u8, entry.category, cat)) continue;
             if (session_id) |sid| {
@@ -648,13 +719,154 @@ pub const MemoryAgentMemory = struct {
     }
 
     fn findEntryIndex(self: *MemoryAgentMemory, actor_id: []const u8, session_id: ?[]const u8, key: []const u8) ?usize {
-        for (self.entries.items, 0..) |entry, i| {
+        for (self.entries.items, 0..) |wrapped, i| {
+            const entry = wrapped.entry;
             if (!std.mem.eql(u8, entry.actor_id, actor_id)) continue;
             if (!std.mem.eql(u8, entry.key, key)) continue;
             if (!sameOptionalString(entry.session_id, session_id)) continue;
             return i;
         }
         return null;
+    }
+
+    fn touchEntryById(self: *MemoryAgentMemory, id: []const u8, at_ms: i64) void {
+        for (self.entries.items) |*wrapped| {
+            if (std.mem.eql(u8, wrapped.entry.id, id)) {
+                wrapped.last_access_ms = at_ms;
+                return;
+            }
+        }
+    }
+
+    fn purgeExpired(self: *MemoryAgentMemory) void {
+        const ttl = self.config.ttl_seconds orelse return;
+        if (ttl == 0) return;
+        const cutoff = ids.nowMs() - (@as(i64, @intCast(ttl)) * 1000);
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (parseMemoryTimestamp(self.entries.items[i].entry.timestamp) <= cutoff) {
+                var removed = self.entries.orderedRemove(i);
+                freeAgentMemory(self.allocator, &removed.entry);
+                continue;
+            }
+            i += 1;
+        }
+        i = 0;
+        while (i < self.messages.items.len) {
+            if (self.messages.items[i].created_at_ms <= cutoff) {
+                var removed = self.messages.orderedRemove(i);
+                freeMemorySessionMessage(self.allocator, &removed);
+                continue;
+            }
+            i += 1;
+        }
+        i = 0;
+        while (i < self.usage.items.len) {
+            if (self.usage.items[i].updated_at_ms <= cutoff) {
+                var removed = self.usage.orderedRemove(i);
+                freeMemoryUsage(self.allocator, &removed);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn enforceLimits(self: *MemoryAgentMemory) void {
+        self.purgeExpired();
+        while (self.config.max_entries > 0 and self.entries.items.len > self.config.max_entries) {
+            if (!self.evictLeastRecentEntry()) break;
+        }
+        while (self.config.max_messages > 0 and self.messages.items.len > self.config.max_messages) {
+            if (!self.evictLeastRecentMessage()) break;
+        }
+        while (self.config.max_usage_entries > 0 and self.usage.items.len > self.config.max_usage_entries) {
+            if (!self.evictLeastRecentUsage()) break;
+        }
+        while (self.config.max_bytes > 0 and self.approxMemoryBytes() > self.config.max_bytes) {
+            if (!self.evictLeastRecentAny()) break;
+        }
+    }
+
+    fn evictLeastRecentEntry(self: *MemoryAgentMemory) bool {
+        if (self.entries.items.len == 0) return false;
+        var idx: usize = 0;
+        var oldest = self.entries.items[0].last_access_ms;
+        for (self.entries.items[1..], 1..) |entry, i| {
+            if (entry.last_access_ms < oldest) {
+                oldest = entry.last_access_ms;
+                idx = i;
+            }
+        }
+        var removed = self.entries.orderedRemove(idx);
+        freeAgentMemory(self.allocator, &removed.entry);
+        return true;
+    }
+
+    fn evictLeastRecentMessage(self: *MemoryAgentMemory) bool {
+        if (self.messages.items.len == 0) return false;
+        var idx: usize = 0;
+        var oldest = self.messages.items[0].last_access_ms;
+        for (self.messages.items[1..], 1..) |message, i| {
+            if (message.last_access_ms < oldest) {
+                oldest = message.last_access_ms;
+                idx = i;
+            }
+        }
+        var removed = self.messages.orderedRemove(idx);
+        freeMemorySessionMessage(self.allocator, &removed);
+        return true;
+    }
+
+    fn evictLeastRecentUsage(self: *MemoryAgentMemory) bool {
+        if (self.usage.items.len == 0) return false;
+        var idx: usize = 0;
+        var oldest = self.usage.items[0].last_access_ms;
+        for (self.usage.items[1..], 1..) |item, i| {
+            if (item.last_access_ms < oldest) {
+                oldest = item.last_access_ms;
+                idx = i;
+            }
+        }
+        var removed = self.usage.orderedRemove(idx);
+        freeMemoryUsage(self.allocator, &removed);
+        return true;
+    }
+
+    fn evictLeastRecentAny(self: *MemoryAgentMemory) bool {
+        var kind: enum { none, entry, message, usage } = .none;
+        var oldest: i64 = 0;
+        for (self.entries.items) |entry| {
+            if (kind == .none or entry.last_access_ms < oldest) {
+                kind = .entry;
+                oldest = entry.last_access_ms;
+            }
+        }
+        for (self.messages.items) |message| {
+            if (kind == .none or message.last_access_ms < oldest) {
+                kind = .message;
+                oldest = message.last_access_ms;
+            }
+        }
+        for (self.usage.items) |item| {
+            if (kind == .none or item.last_access_ms < oldest) {
+                kind = .usage;
+                oldest = item.last_access_ms;
+            }
+        }
+        return switch (kind) {
+            .none => false,
+            .entry => self.evictLeastRecentEntry(),
+            .message => self.evictLeastRecentMessage(),
+            .usage => self.evictLeastRecentUsage(),
+        };
+    }
+
+    fn approxMemoryBytes(self: *MemoryAgentMemory) usize {
+        var total: usize = 0;
+        for (self.entries.items) |entry| total += agentMemoryByteSize(entry.entry);
+        for (self.messages.items) |message| total += messageByteSize(message);
+        for (self.usage.items) |item| total += usageByteSize(item);
+        return total;
     }
 
     fn findUsageIndex(self: *MemoryAgentMemory, actor_id: []const u8, session_id: []const u8) ?usize {
@@ -1512,18 +1724,44 @@ fn memoryEntryId(allocator: std.mem.Allocator, actor: []const u8, session_id: ?[
     return std.fmt.allocPrint(allocator, "agm_{x}", .{hash_value});
 }
 
+fn parseMemoryTimestamp(raw: []const u8) i64 {
+    return std.fmt.parseInt(i64, raw, 10) catch 0;
+}
+
+fn agentMemoryByteSize(entry: domain.AgentMemory) usize {
+    return entry.id.len +
+        entry.key.len +
+        entry.content.len +
+        entry.category.len +
+        entry.timestamp.len +
+        (if (entry.session_id) |sid| sid.len else 0) +
+        entry.actor_id.len +
+        entry.writer_actor_id.len +
+        entry.scope.len +
+        entry.permissions_json.len +
+        128;
+}
+
+fn messageByteSize(message: MemorySessionMessage) usize {
+    return message.actor_id.len + message.session_id.len + message.role.len + message.content.len + 48;
+}
+
+fn usageByteSize(usage: MemoryUsage) usize {
+    return usage.actor_id.len + usage.session_id.len + 40;
+}
+
 fn freeMemorySessionMessage(allocator: std.mem.Allocator, message: *MemorySessionMessage) void {
     if (message.actor_id.len > 0) allocator.free(message.actor_id);
     if (message.session_id.len > 0) allocator.free(message.session_id);
     if (message.role.len > 0) allocator.free(message.role);
     if (message.content.len > 0) allocator.free(message.content);
-    message.* = .{ .actor_id = "", .session_id = "", .role = "", .content = "", .created_at_ms = 0 };
+    message.* = .{ .actor_id = "", .session_id = "", .role = "", .content = "", .created_at_ms = 0, .last_access_ms = 0 };
 }
 
 fn freeMemoryUsage(allocator: std.mem.Allocator, usage: *MemoryUsage) void {
     if (usage.actor_id.len > 0) allocator.free(usage.actor_id);
     if (usage.session_id.len > 0) allocator.free(usage.session_id);
-    usage.* = .{ .actor_id = "", .session_id = "", .total_tokens = 0 };
+    usage.* = .{ .actor_id = "", .session_id = "", .total_tokens = 0, .updated_at_ms = 0, .last_access_ms = 0 };
 }
 
 fn findSessionInfo(items: []const SessionInfo, session_id: []const u8) ?usize {
@@ -1654,6 +1892,73 @@ test "memory_lru and none agent memory runtimes match agent memory contract" {
         std.testing.allocator.free(sessions.sessions);
     }
     try std.testing.expectEqual(@as(u64, 1), sessions.total);
+}
+
+test "memory_lru evicts least recently used agent memory entries" {
+    var runtime = try Runtime.init(std.testing.allocator, .{
+        .backend = .memory_lru,
+        .memory = .{ .max_entries = 2 },
+    });
+    defer runtime.deinit();
+
+    var first = try runtime.store(std.testing.allocator, .{ .key = "one", .content = "first", .actor_id = "agent:lru" });
+    defer freeAgentMemory(std.testing.allocator, &first);
+    var second = try runtime.store(std.testing.allocator, .{ .key = "two", .content = "second", .actor_id = "agent:lru" });
+    defer freeAgentMemory(std.testing.allocator, &second);
+
+    switch (runtime) {
+        .memory_lru => |*engine| {
+            engine.entries.items[engine.findEntryIndex("agent:lru", null, "one").?].last_access_ms = 1;
+            engine.entries.items[engine.findEntryIndex("agent:lru", null, "two").?].last_access_ms = 2;
+        },
+        else => unreachable,
+    }
+
+    var touched = (try runtime.get(std.testing.allocator, "one", null, "agent:lru")).?;
+    defer freeAgentMemory(std.testing.allocator, &touched);
+    var third = try runtime.store(std.testing.allocator, .{ .key = "three", .content = "third", .actor_id = "agent:lru" });
+    defer freeAgentMemory(std.testing.allocator, &third);
+
+    var one = (try runtime.get(std.testing.allocator, "one", null, "agent:lru")).?;
+    defer freeAgentMemory(std.testing.allocator, &one);
+    try std.testing.expectEqualStrings("first", one.content);
+    try std.testing.expect((try runtime.get(std.testing.allocator, "two", null, "agent:lru")) == null);
+    var three = (try runtime.get(std.testing.allocator, "three", null, "agent:lru")).?;
+    defer freeAgentMemory(std.testing.allocator, &three);
+    try std.testing.expectEqualStrings("third", three.content);
+}
+
+test "memory_lru expires entries messages and usage by ttl" {
+    var runtime = try Runtime.init(std.testing.allocator, .{
+        .backend = .memory_lru,
+        .memory = .{ .ttl_seconds = 1 },
+    });
+    defer runtime.deinit();
+
+    var stored = try runtime.store(std.testing.allocator, .{ .key = "temp", .content = "old", .actor_id = "agent:ttl" });
+    defer freeAgentMemory(std.testing.allocator, &stored);
+    try runtime.saveMessage("session", "user", "old message", "agent:ttl");
+    try runtime.saveUsage("session", 7, "agent:ttl");
+
+    switch (runtime) {
+        .memory_lru => |*engine| {
+            const idx = engine.findEntryIndex("agent:ttl", null, "temp").?;
+            engine.allocator.free(engine.entries.items[idx].entry.timestamp);
+            engine.entries.items[idx].entry.timestamp = try engine.allocator.dupe(u8, "0");
+            engine.entries.items[idx].last_access_ms = 0;
+            engine.messages.items[0].created_at_ms = 0;
+            engine.messages.items[0].last_access_ms = 0;
+            engine.usage.items[0].updated_at_ms = 0;
+            engine.usage.items[0].last_access_ms = 0;
+        },
+        else => unreachable,
+    }
+
+    try std.testing.expect((try runtime.get(std.testing.allocator, "temp", null, "agent:ttl")) == null);
+    const messages = try runtime.loadMessages(std.testing.allocator, "session", "agent:ttl");
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), messages.len);
+    try std.testing.expectEqual(@as(?u64, null), try runtime.loadUsage("session", "agent:ttl"));
 }
 
 test "redis agent memory contract when configured" {

@@ -43,6 +43,7 @@ const RuntimeConfig = struct {
     worker_interval_ms: u64 = 5000,
     trust_actor_headers: bool = false,
     agent_memory_backend: agent_memory_runtime.BackendKind = .native,
+    memory_config: agent_memory_runtime.MemoryConfig = .{},
     redis_config: redis_mod.Config = .{},
     agent_memory_store_configs: []const agent_memory_runtime.NamedConfig = &.{},
     vector_backend: vector_runtime.Config = .{},
@@ -70,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
     const store_options = store_mod.StoreOptions{
         .agent_memory = .{
             .backend = cfg.agent_memory_backend,
+            .memory = cfg.memory_config,
             .redis = cfg.redis_config,
         },
         .agent_memory_stores = cfg.agent_memory_store_configs,
@@ -283,6 +285,26 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_BACKEND")) |backend| {
         cfg.agent_memory_backend = agent_memory_runtime.BackendKind.parse(backend);
     } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_MEMORY_LRU_MAX_ENTRIES")) |max_entries| {
+        defer allocator.free(max_entries);
+        cfg.memory_config.max_entries = std.fmt.parseInt(usize, max_entries, 10) catch cfg.memory_config.max_entries;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_MEMORY_LRU_MAX_MESSAGES")) |max_messages| {
+        defer allocator.free(max_messages);
+        cfg.memory_config.max_messages = std.fmt.parseInt(usize, max_messages, 10) catch cfg.memory_config.max_messages;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_MEMORY_LRU_MAX_USAGE_ENTRIES")) |max_usage_entries| {
+        defer allocator.free(max_usage_entries);
+        cfg.memory_config.max_usage_entries = std.fmt.parseInt(usize, max_usage_entries, 10) catch cfg.memory_config.max_usage_entries;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_MEMORY_LRU_MAX_BYTES")) |max_bytes| {
+        defer allocator.free(max_bytes);
+        cfg.memory_config.max_bytes = std.fmt.parseInt(usize, max_bytes, 10) catch cfg.memory_config.max_bytes;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_MEMORY_LRU_TTL_SECONDS")) |ttl| {
+        defer allocator.free(ttl);
+        cfg.memory_config.ttl_seconds = std.fmt.parseInt(u32, ttl, 10) catch cfg.memory_config.ttl_seconds;
+    } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_REDIS_URL")) |url| {
         cfg.redis_config = try redis_mod.parseUrl(allocator, url);
         cfg.agent_memory_backend = .redis;
@@ -473,6 +495,21 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--agent-memory-backend") and i + 1 < args.len) {
             i += 1;
             cfg.agent_memory_backend = agent_memory_runtime.BackendKind.parse(args[i]);
+        } else if (std.mem.eql(u8, arg, "--memory-lru-max-entries") and i + 1 < args.len) {
+            i += 1;
+            cfg.memory_config.max_entries = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--memory-lru-max-messages") and i + 1 < args.len) {
+            i += 1;
+            cfg.memory_config.max_messages = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--memory-lru-max-usage-entries") and i + 1 < args.len) {
+            i += 1;
+            cfg.memory_config.max_usage_entries = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--memory-lru-max-bytes") and i + 1 < args.len) {
+            i += 1;
+            cfg.memory_config.max_bytes = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--memory-lru-ttl-seconds") and i + 1 < args.len) {
+            i += 1;
+            cfg.memory_config.ttl_seconds = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--redis-url") and i + 1 < args.len) {
             i += 1;
             cfg.redis_config = try redis_mod.parseUrl(allocator, args[i]);
@@ -583,10 +620,31 @@ fn parseAgentMemoryStoreConfigsJson(allocator: std.mem.Allocator, raw: []const u
         } else if (jsonStringField(item.object, "key_prefix")) |prefix| {
             config.redis.key_prefix = try allocator.dupe(u8, prefix);
         }
+        if (config.backend == .memory_lru) {
+            if (jsonIntField(item.object, "memory_max_entries") orelse jsonIntField(item.object, "max_entries")) |value| {
+                config.memory.max_entries = @intCast(@max(value, 0));
+            }
+            if (jsonIntField(item.object, "memory_max_messages") orelse jsonIntField(item.object, "max_messages")) |value| {
+                config.memory.max_messages = @intCast(@max(value, 0));
+            }
+            if (jsonIntField(item.object, "memory_max_usage_entries") orelse jsonIntField(item.object, "max_usage_entries")) |value| {
+                config.memory.max_usage_entries = @intCast(@max(value, 0));
+            }
+            if (jsonIntField(item.object, "memory_max_bytes") orelse jsonIntField(item.object, "max_bytes")) |value| {
+                config.memory.max_bytes = @intCast(@max(value, 0));
+            }
+            if (jsonIntField(item.object, "memory_ttl_seconds")) |ttl| {
+                config.memory.ttl_seconds = @intCast(@max(ttl, 0));
+            }
+        }
         if (jsonIntField(item.object, "redis_ttl_seconds")) |ttl| {
             config.redis.ttl_seconds = @intCast(@max(ttl, 0));
         } else if (jsonIntField(item.object, "ttl_seconds")) |ttl| {
-            config.redis.ttl_seconds = @intCast(@max(ttl, 0));
+            if (config.backend == .redis) {
+                config.redis.ttl_seconds = @intCast(@max(ttl, 0));
+            } else if (config.backend == .memory_lru) {
+                config.memory.ttl_seconds = @intCast(@max(ttl, 0));
+            }
         }
         configs[i] = .{ .name = try allocator.dupe(u8, name), .config = config };
     }
@@ -681,6 +739,11 @@ fn printUsage() void {
         \\  NULLPANTRY_TRUST_ACTOR_HEADERS
         \\  NULLPANTRY_AGENT_MEMORY_BACKEND
         \\  NULLPANTRY_AGENT_MEMORY_STORES
+        \\  NULLPANTRY_MEMORY_LRU_MAX_ENTRIES
+        \\  NULLPANTRY_MEMORY_LRU_MAX_MESSAGES
+        \\  NULLPANTRY_MEMORY_LRU_MAX_USAGE_ENTRIES
+        \\  NULLPANTRY_MEMORY_LRU_MAX_BYTES
+        \\  NULLPANTRY_MEMORY_LRU_TTL_SECONDS
         \\  NULLPANTRY_REDIS_URL
         \\  NULLPANTRY_REDIS_KEY_PREFIX
         \\  NULLPANTRY_REDIS_TTL_SECONDS
@@ -777,6 +840,32 @@ test "agent memory redis backend can be configured from args" {
     try std.testing.expectEqual(@as(u32, 60), cfg.redis_config.ttl_seconds.?);
 }
 
+test "agent memory memory_lru backend can be bounded from args" {
+    const args = [_][:0]const u8{
+        "nullpantry",
+        "--agent-memory-backend",
+        "memory_lru",
+        "--memory-lru-max-entries",
+        "64",
+        "--memory-lru-max-messages",
+        "128",
+        "--memory-lru-max-usage-entries",
+        "16",
+        "--memory-lru-max-bytes",
+        "4096",
+        "--memory-lru-ttl-seconds",
+        "300",
+    };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+
+    try std.testing.expectEqual(agent_memory_runtime.BackendKind.memory_lru, cfg.agent_memory_backend);
+    try std.testing.expectEqual(@as(usize, 64), cfg.memory_config.max_entries);
+    try std.testing.expectEqual(@as(usize, 128), cfg.memory_config.max_messages);
+    try std.testing.expectEqual(@as(usize, 16), cfg.memory_config.max_usage_entries);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.memory_config.max_bytes);
+    try std.testing.expectEqual(@as(u32, 300), cfg.memory_config.ttl_seconds.?);
+}
+
 test "named agent memory stores can be configured from args and json" {
     const args = [_][:0]const u8{
         "nullpantry",
@@ -800,7 +889,7 @@ test "named agent memory stores can be configured from args and json" {
 
     const parsed = try parseAgentMemoryStoreConfigsJson(std.testing.allocator,
         \\[
-        \\  {"name":"fast","backend":"memory_lru"},
+        \\  {"name":"fast","backend":"memory_lru","max_entries":32,"max_messages":64,"max_usage_entries":8,"max_bytes":2048,"ttl_seconds":120},
         \\  {"name":"team","redis_url":"redis://127.0.0.1:6379/5","key_prefix":"team-memory","ttl_seconds":30}
         \\]
     );
@@ -813,6 +902,11 @@ test "named agent memory stores can be configured from args and json" {
     try std.testing.expectEqual(@as(usize, 2), parsed.len);
     try std.testing.expectEqualStrings("fast", parsed[0].name);
     try std.testing.expectEqual(agent_memory_runtime.BackendKind.memory_lru, parsed[0].config.backend);
+    try std.testing.expectEqual(@as(usize, 32), parsed[0].config.memory.max_entries);
+    try std.testing.expectEqual(@as(usize, 64), parsed[0].config.memory.max_messages);
+    try std.testing.expectEqual(@as(usize, 8), parsed[0].config.memory.max_usage_entries);
+    try std.testing.expectEqual(@as(usize, 2048), parsed[0].config.memory.max_bytes);
+    try std.testing.expectEqual(@as(u32, 120), parsed[0].config.memory.ttl_seconds.?);
     try std.testing.expectEqualStrings("team", parsed[1].name);
     try std.testing.expectEqual(agent_memory_runtime.BackendKind.redis, parsed[1].config.backend);
     try std.testing.expectEqualStrings("team-memory", parsed[1].config.redis.key_prefix);
