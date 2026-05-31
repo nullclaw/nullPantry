@@ -11072,13 +11072,21 @@ pub const PostgresStore = struct {
 
     pub fn upsertConnectorCursor(self: *PostgresStore, allocator: std.mem.Allocator, input: ConnectorCursorInput) !ConnectorCursor {
         const now = ids.nowMs();
-        const sql = try std.fmt.allocPrint(
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        defer allocator.free(now_text);
+        const changed_text = try self.queryParamsText(
             allocator,
-            "INSERT INTO connector_cursors (connector,scope,cursor,config_json,permissions_json,updated_at_ms) VALUES ({s},{s},{s},{s},{s},{d}) ON CONFLICT(connector, scope) DO UPDATE SET cursor=excluded.cursor, config_json=excluded.config_json, permissions_json=excluded.permissions_json, updated_at_ms=excluded.updated_at_ms",
-            .{ try sqlString(allocator, input.connector), try sqlString(allocator, input.scope), try sqlString(allocator, input.cursor), try sqlJsonb(allocator, input.config_json), try sqlJsonb(allocator, input.permissions_json), now },
+            "WITH upserted AS (" ++
+                "INSERT INTO connector_cursors (connector,scope,cursor,config_json,permissions_json,updated_at_ms) " ++
+                "VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::bigint) " ++
+                "ON CONFLICT(connector, scope) DO UPDATE SET cursor=excluded.cursor, config_json=excluded.config_json, permissions_json=excluded.permissions_json, updated_at_ms=excluded.updated_at_ms " ++
+                "RETURNING connector" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'connector_cursor.upserted',$7,'connector',connector,'{}'::jsonb,$6::bigint FROM upserted RETURNING 1" ++
+                ") SELECT count(*)::text FROM upserted",
+            &.{ input.connector, input.scope, input.cursor, input.config_json, input.permissions_json, now_text, input.actor_id },
         );
-        try self.runSql(sql);
-        try self.insertAudit(allocator, "connector_cursor.upserted", input.actor_id, "connector", input.connector);
+        defer allocator.free(changed_text);
         return .{
             .connector = try allocator.dupe(u8, input.connector),
             .scope = try allocator.dupe(u8, input.scope),
@@ -11090,17 +11098,19 @@ pub const PostgresStore = struct {
     }
 
     pub fn getConnectorCursor(self: *PostgresStore, allocator: std.mem.Allocator, connector: []const u8, scope: []const u8) !?ConnectorCursor {
-        const inner = try std.fmt.allocPrint(allocator, "SELECT connector,scope,cursor,config_json,permissions_json,updated_at_ms FROM connector_cursors WHERE connector = {s} AND scope = {s} LIMIT 1", .{ try sqlString(allocator, connector), try sqlString(allocator, scope) });
-        const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
+        const parsed = try self.queryRowParamsJson(allocator, "SELECT connector,scope,cursor,config_json,permissions_json,updated_at_ms FROM connector_cursors WHERE connector = $1 AND scope = $2 LIMIT 1", &.{ connector, scope });
         defer parsed.deinit();
         if (parsed.value == .null) return null;
         return try readPgConnectorCursor(allocator, parsed.value.object);
     }
 
     pub fn listConnectorCursors(self: *PostgresStore, allocator: std.mem.Allocator, input: ConnectorCursorListInput) ![]ConnectorCursor {
-        const where_clause = if (input.connector) |connector| try std.fmt.allocPrint(allocator, "WHERE connector = {s}", .{try sqlString(allocator, connector)}) else "";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT connector,scope,cursor,config_json,permissions_json,updated_at_ms FROM connector_cursors {s} ORDER BY updated_at_ms DESC LIMIT {d}", .{ where_clause, @max(@as(usize, 1), @min(input.limit, 500)) });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{@max(@as(usize, 1), @min(input.limit, 500))});
+        defer allocator.free(limit_text);
+        const parsed = if (input.connector) |connector|
+            try self.queryArrayParamsJson(allocator, "SELECT connector,scope,cursor,config_json,permissions_json,updated_at_ms FROM connector_cursors WHERE connector = $1 ORDER BY updated_at_ms DESC LIMIT $2::bigint", &.{ connector, limit_text })
+        else
+            try self.queryArrayParamsJson(allocator, "SELECT connector,scope,cursor,config_json,permissions_json,updated_at_ms FROM connector_cursors ORDER BY updated_at_ms DESC LIMIT $1::bigint", &.{limit_text});
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(ConnectorCursor) = .empty;
         errdefer out.deinit(allocator);
@@ -14963,6 +14973,23 @@ test "postgres storage contract covers primitives when configured" {
     try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, unique) != null);
 
     try std.testing.expectEqual(migrations.expected_schema_version, try store.schemaVersion());
+
+    const cursor_connector = try std.fmt.allocPrint(alloc, "{s}.connector", .{unique});
+    const cursor = try store.upsertConnectorCursor(alloc, .{
+        .connector = cursor_connector,
+        .scope = "team:pg",
+        .cursor = "cursor-1",
+        .config_json = "{\"kind\":\"postgres-contract\"}",
+        .permissions_json = "[\"team:pg\"]",
+        .actor_id = "agent:pg-a",
+    });
+    try std.testing.expectEqualStrings("cursor-1", cursor.cursor);
+    const loaded_cursor = (try store.getConnectorCursor(alloc, cursor_connector, "team:pg")).?;
+    try std.testing.expectEqualStrings("{\"kind\":\"postgres-contract\"}", loaded_cursor.config_json);
+    const visible_cursors = try store.listConnectorCursors(alloc, .{ .connector = cursor_connector, .scopes_json = "[\"team:pg\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), visible_cursors.len);
+    const hidden_cursors = try store.listConnectorCursors(alloc, .{ .connector = cursor_connector, .scopes_json = "[\"public\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 0), hidden_cursors.len);
 
     const cache_key = try std.fmt.allocPrint(alloc, "{s}.response-cache", .{unique});
     try store.putResponseCache(.{
