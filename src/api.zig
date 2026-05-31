@@ -5250,11 +5250,24 @@ fn appendFeedEventForActor(ctx: *Context, out: *std.ArrayListUnmanaged(u8), even
 fn feedPayloadForActor(ctx: *Context, event: store_mod.FeedEvent) ![]const u8 {
     if (!feedEventObjectVisibleToActor(ctx, event)) return redactedFeedPayload();
     if (!try feedReferencedObjectsVisible(ctx, event.payload_json)) return redactedFeedPayload();
+    if (std.mem.eql(u8, event.object_type, "agent_memory") and try feedAgentMemoryPayloadIsInternal(ctx, event.payload_json)) return redactedFeedPayload();
     return event.payload_json;
 }
 
 fn redactedFeedPayload() []const u8 {
     return "{\"redacted\":true,\"reason\":\"inaccessible_payload_reference\"}";
+}
+
+fn feedAgentMemoryPayloadIsInternal(ctx: *Context, payload_json: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const key = json.stringField(parsed.value.object, "key") orelse "";
+    const content = json.stringField(parsed.value.object, "content") orelse "";
+    return domain.isInternalMemoryEntryKeyOrContent(key, content);
 }
 
 fn feedEventObjectVisibleToActor(ctx: *Context, event: store_mod.FeedEvent) bool {
@@ -8123,6 +8136,31 @@ test "api memory feed redacts payload references hidden from actor" {
     try std.testing.expectEqualStrings("200 OK", secret_search.status);
     try std.testing.expect(std.mem.indexOf(u8, secret_search.body, "classified summary") != null);
     try std.testing.expect(std.mem.indexOf(u8, secret_search.body, secret_source.id) != null);
+}
+
+test "api memory feed does not expose internal agent autosave payloads" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const actor = "agent:autosave";
+
+    _ = try store.agentMemoryStore(alloc, .{ .key = "autosave_user_1", .content = "internal autosave payload", .category = "conversation", .actor_id = actor });
+    var actor_ctx = Context{ .allocator = alloc, .store = &store, .actor_id = actor, .actor_scopes_json = "[]" };
+    const feed = handleRequest(&actor_ctx, "GET", "/v1/memory/events?limit=50", "", "");
+    try std.testing.expectEqualStrings("200 OK", feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "internal autosave payload") == null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "autosave_user_1") == null);
+
+    var admin_ctx = Context{ .allocator = alloc, .store = &store };
+    const manual_body = "{\"event_type\":\"agent_memory.put\",\"operation\":\"put\",\"object_type\":\"agent_memory\",\"object_id\":\"ami_legacy_internal\",\"scope\":\"agent:autosave\",\"permissions\":[\"actor:agent:autosave\"],\"payload\":{\"key\":\"autosave_user_1\",\"content\":\"manual internal autosave payload\",\"scope\":\"agent:autosave\"}}";
+    const manual = handleRequest(&admin_ctx, "POST", "/v1/memory/feed", manual_body, "");
+    try std.testing.expectEqualStrings("200 OK", manual.status);
+    const redacted = handleRequest(&actor_ctx, "GET", "/v1/memory/events?limit=50", "", "");
+    try std.testing.expectEqualStrings("200 OK", redacted.status);
+    try std.testing.expect(std.mem.indexOf(u8, redacted.body, "manual internal autosave payload") == null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted.body, "autosave_user_1") == null);
 }
 
 test "api memory apply supports deterministic agent memory merge reducers" {

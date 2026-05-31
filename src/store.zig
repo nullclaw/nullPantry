@@ -1912,6 +1912,7 @@ pub const Store = struct {
     }
 
     fn appendAgentMemoryFeedEvent(self: *Store, allocator: std.mem.Allocator, entry: domain.AgentMemory, store_name: []const u8, event_type: []const u8) !void {
+        if (domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) return;
         const payload = try agentMemoryFeedPayloadJson(allocator, store_name, entry);
         defer allocator.free(payload);
         _ = try self.appendFeedEvent(.{
