@@ -1,6 +1,16 @@
 const std = @import("std");
 const json = @import("json_util.zig");
 
+pub const runtime_command_role = "__runtime_command__";
+
+pub fn isRuntimeCommandRole(role: []const u8) bool {
+    return std.mem.eql(u8, role, runtime_command_role);
+}
+
+pub fn sessionMessageVisibleInHistory(role: []const u8) bool {
+    return !isRuntimeCommandRole(role);
+}
+
 pub const Source = struct {
     id: []const u8,
     source_type: []const u8,

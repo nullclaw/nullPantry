@@ -683,6 +683,7 @@ pub const MemoryAgentMemory = struct {
         }
         for (self.messages.items) |message| {
             if (!std.mem.eql(u8, message.actor_id, actor)) continue;
+            if (!domain.sessionMessageVisibleInHistory(message.role)) continue;
             if (findSessionInfo(all_sessions.items, message.session_id)) |idx| {
                 all_sessions.items[idx].message_count += 1;
                 all_sessions.items[idx].first_message_at = @min(all_sessions.items[idx].first_message_at, message.created_at_ms);
@@ -719,19 +720,21 @@ pub const MemoryAgentMemory = struct {
             for (messages) |*message| freeMessage(allocator, message);
             allocator.free(messages);
         }
-        const total = messages.len;
-        const start = @min(offset, messages.len);
-        const end = @min(messages.len, start + limit);
-        var out = try allocator.alloc(Message, end - start);
-        for (messages, 0..) |*message, i| {
-            if (i >= start and i < end) {
-                out[i - start] = message.*;
-                detachMessage(message);
-            } else {
-                freeMessage(allocator, message);
-            }
+        var total: usize = 0;
+        var out: std.ArrayListUnmanaged(Message) = .empty;
+        errdefer {
+            for (out.items) |*message| freeMessage(allocator, message);
+            out.deinit(allocator);
         }
-        return .{ .total = @intCast(total), .messages = out };
+        for (messages) |*message| {
+            if (!domain.sessionMessageVisibleInHistory(message.role)) continue;
+            if (total >= offset and out.items.len < limit) {
+                try out.append(allocator, message.*);
+                detachMessage(message);
+            }
+            total += 1;
+        }
+        return .{ .total = @intCast(total), .messages = try out.toOwnedSlice(allocator) };
     }
 
     const VisibleFilter = struct {
@@ -1246,8 +1249,9 @@ pub const RedisAgentMemory = struct {
         }
         for (values) |value| {
             const sid = value.asString() orelse continue;
-            const info = try self.sessionInfo(allocator, actor, sid);
-            try all_sessions.append(allocator, info);
+            if (try self.visibleSessionInfo(allocator, actor, sid)) |info| {
+                try all_sessions.append(allocator, info);
+            }
         }
         sortSessions(all_sessions.items);
         const total = all_sessions.items.len;
@@ -1272,19 +1276,21 @@ pub const RedisAgentMemory = struct {
             for (messages) |*message| freeMessage(allocator, message);
             allocator.free(messages);
         }
-        const total = messages.len;
-        const start = @min(offset, messages.len);
-        const end = @min(messages.len, start + limit);
-        var out = try allocator.alloc(Message, end - start);
-        for (messages, 0..) |*message, i| {
-            if (i >= start and i < end) {
-                out[i - start] = message.*;
-                detachMessage(message);
-            } else {
-                freeMessage(allocator, message);
-            }
+        var total: usize = 0;
+        var out: std.ArrayListUnmanaged(Message) = .empty;
+        errdefer {
+            for (out.items) |*message| freeMessage(allocator, message);
+            out.deinit(allocator);
         }
-        return .{ .total = @intCast(total), .messages = out };
+        for (messages) |*message| {
+            if (!domain.sessionMessageVisibleInHistory(message.role)) continue;
+            if (total >= offset and out.items.len < limit) {
+                try out.append(allocator, message.*);
+                detachMessage(message);
+            }
+            total += 1;
+        }
+        return .{ .total = @intCast(total), .messages = try out.toOwnedSlice(allocator) };
     }
 
     fn beginTransaction(self: *RedisAgentMemory) !void {
@@ -1493,20 +1499,27 @@ pub const RedisAgentMemory = struct {
         };
     }
 
-    fn sessionInfo(self: *RedisAgentMemory, allocator: std.mem.Allocator, actor: []const u8, session_id: []const u8) !SessionInfo {
-        const meta_key = try self.sessionMetaKey(allocator, actor, session_id);
-        defer allocator.free(meta_key);
-        var resp = try self.client.command(&.{ "HGETALL", meta_key });
-        defer resp.deinit(self.allocator);
-        const fields = switch (resp) {
-            .array => |maybe_items| maybe_items orelse &[_]redis.RespValue{},
-            else => &[_]redis.RespValue{},
-        };
+    fn visibleSessionInfo(self: *RedisAgentMemory, allocator: std.mem.Allocator, actor: []const u8, session_id: []const u8) !?SessionInfo {
+        const messages = try self.loadMessages(allocator, session_id, actor);
+        defer {
+            for (messages) |*message| freeMessage(allocator, message);
+            allocator.free(messages);
+        }
+        var visible_count: u64 = 0;
+        var first: i64 = std.math.maxInt(i64);
+        var last: i64 = 0;
+        for (messages) |message| {
+            if (!domain.sessionMessageVisibleInHistory(message.role)) continue;
+            visible_count += 1;
+            first = @min(first, message.created_at_ms);
+            last = @max(last, message.created_at_ms);
+        }
+        if (visible_count == 0) return null;
         return .{
             .session_id = try allocator.dupe(u8, session_id),
-            .message_count = parseU64(hashField(fields, "message_count"), 0),
-            .first_message_at = parseI64(hashField(fields, "first_message_at"), 0),
-            .last_message_at = parseI64(hashField(fields, "last_message_at"), 0),
+            .message_count = visible_count,
+            .first_message_at = first,
+            .last_message_at = last,
         };
     }
 
@@ -2376,16 +2389,6 @@ fn messagesFromResp(allocator: std.mem.Allocator, resp: redis.RespValue) ![]Mess
     return out.toOwnedSlice(allocator);
 }
 
-fn parseU64(raw: ?[]const u8, fallback: u64) u64 {
-    const value = raw orelse return fallback;
-    return std.fmt.parseInt(u64, value, 10) catch fallback;
-}
-
-fn parseI64(raw: ?[]const u8, fallback: i64) i64 {
-    const value = raw orelse return fallback;
-    return std.fmt.parseInt(i64, value, 10) catch fallback;
-}
-
 fn scoreText(query: []const u8, text: []const u8) f64 {
     if (query.len == 0) return 1.0;
     var score: f64 = 0.0;
@@ -2693,12 +2696,24 @@ test "memory_lru and none agent memory runtimes match agent memory contract" {
     }
     try std.testing.expectEqual(@as(usize, 1), a_messages.len);
     try std.testing.expectEqualStrings("hello from a", a_messages[0].content);
+    try runtime.saveMessage("sess", domain.runtime_command_role, "internal runtime command", "agent:a");
+    const history = try runtime.history(std.testing.allocator, "sess", 10, 0, "agent:a");
+    defer {
+        for (history.messages) |message| {
+            std.testing.allocator.free(message.role);
+            std.testing.allocator.free(message.content);
+        }
+        std.testing.allocator.free(history.messages);
+    }
+    try std.testing.expectEqual(@as(u64, 1), history.total);
+    try std.testing.expectEqualStrings("hello from a", history.messages[0].content);
     const sessions = try runtime.listSessions(std.testing.allocator, 10, 0, "agent:a");
     defer {
         for (sessions.sessions) |session| std.testing.allocator.free(session.session_id);
         std.testing.allocator.free(sessions.sessions);
     }
     try std.testing.expectEqual(@as(u64, 1), sessions.total);
+    try std.testing.expectEqual(@as(u64, 1), sessions.sessions[0].message_count);
 }
 
 test "memory_lru evicts least recently used agent memory entries" {
@@ -2874,6 +2889,7 @@ test "redis agent memory contract when configured" {
     }
     try std.testing.expectEqual(@as(usize, 1), a_messages.len);
     try std.testing.expectEqualStrings("hello from a", a_messages[0].content);
+    try runtime.saveMessage("sess", domain.runtime_command_role, "internal runtime command", "agent:a");
     try runtime.saveMessage("sess", "autosave_user", "draft", "agent:a");
     try runtime.saveMessage("sess", "assistant", "kept", "agent:a");
     try runtime.clearAutoSaved("sess", "agent:a");
@@ -2894,6 +2910,7 @@ test "redis agent memory contract when configured" {
         std.testing.allocator.free(sessions.sessions);
     }
     try std.testing.expectEqual(@as(u64, 1), sessions.total);
+    try std.testing.expectEqual(@as(u64, 2), sessions.sessions[0].message_count);
     try runtime.saveUsage("sess", 128, "agent:a");
     try std.testing.expectEqual(@as(?u64, 128), try runtime.loadUsage("sess", "agent:a"));
     try std.testing.expect(try runtime.deleteUsage("sess", "agent:a"));

@@ -49,6 +49,8 @@ const sqlite_agent_session_actor_where_ami =
     "((?2 IS NULL AND ami.session_id IS NULL AND " ++ sqlite_agent_actor_where_ami ++ ") OR (?2 IS NOT NULL AND ami.session_id = ?2 AND " ++ sqlite_agent_actor_where_ami ++ "))";
 const sqlite_agent_session_where_ami =
     "((?2 IS NULL AND ami.session_id IS NULL) OR (?2 IS NOT NULL AND ami.session_id = ?2))";
+const sqlite_session_history_visible_where =
+    "role <> '" ++ domain.runtime_command_role ++ "'";
 
 fn idOrMake(allocator: std.mem.Allocator, explicit_id: ?[]const u8, prefix: []const u8) ![]u8 {
     if (explicit_id) |value| return allocator.dupe(u8, value);
@@ -6144,9 +6146,9 @@ pub const SQLiteStore = struct {
 
     fn searchSessionMessages(self: *Self, allocator: std.mem.Allocator, input: SearchInput, fts_query: []const u8, use_fts: bool, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const stmt = if (use_fts)
-            try self.prepare("SELECT sm.id,sm.session_id,sm.actor_id,sm.role,sm.content,sm.created_at_ms,bm25(session_messages_fts) FROM session_messages_fts JOIN session_messages sm ON sm.id = CAST(session_messages_fts.id AS INTEGER) WHERE session_messages_fts MATCH ?1 ORDER BY bm25(session_messages_fts)")
+            try self.prepare("SELECT sm.id,sm.session_id,sm.actor_id,sm.role,sm.content,sm.created_at_ms,bm25(session_messages_fts) FROM session_messages_fts JOIN session_messages sm ON sm.id = CAST(session_messages_fts.id AS INTEGER) WHERE session_messages_fts MATCH ?1 AND sm." ++ sqlite_session_history_visible_where ++ " ORDER BY bm25(session_messages_fts)")
         else
-            try self.prepare("SELECT id,session_id,actor_id,role,content,created_at_ms,0 FROM session_messages ORDER BY id DESC");
+            try self.prepare("SELECT id,session_id,actor_id,role,content,created_at_ms,0 FROM session_messages WHERE " ++ sqlite_session_history_visible_where ++ " ORDER BY id DESC");
         defer _ = c.sqlite3_finalize(stmt);
         if (use_fts) bindText(stmt, 1, fts_query);
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
@@ -6158,6 +6160,7 @@ pub const SQLiteStore = struct {
             const actor_id = try columnTextNullable(allocator, stmt, 2);
             if (!actorMatches(input.actor_id, actor_id)) continue;
             const role = try columnText(allocator, stmt, 3);
+            if (!domain.sessionMessageVisibleInHistory(role)) continue;
             const content = try columnText(allocator, stmt, 4);
             const created_at_ms = c.sqlite3_column_int64(stmt, 5);
             if (!sessionVisibleForScopes(allocator, session_id, input.scopes_json)) continue;
@@ -7292,7 +7295,7 @@ pub const SQLiteStore = struct {
             .pending_feed_events = @intCast(try self.countSql("SELECT COUNT(*) FROM memory_feed_events WHERE status = 'pending' OR status = 'applying'")),
             .open_conflicts = @intCast(try self.countSql("SELECT COUNT(*) FROM knowledge_conflicts WHERE status = 'open'")),
             .agent_memories = @intCast(try self.countSql("SELECT COUNT(*) FROM agent_memory_items")),
-            .sessions = @intCast(try self.countSql("SELECT COUNT(*) FROM (SELECT session_id FROM session_messages GROUP BY session_id)")),
+            .sessions = @intCast(try self.countSql("SELECT COUNT(*) FROM (SELECT session_id FROM session_messages WHERE " ++ sqlite_session_history_visible_where ++ " GROUP BY session_id)")),
         };
     }
 
@@ -7996,12 +7999,12 @@ pub const SQLiteStore = struct {
     }
 
     pub fn listSessions(self: *Self, allocator: std.mem.Allocator, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryList {
-        const count_stmt = try self.prepare("SELECT COUNT(*) FROM (SELECT session_id FROM session_messages WHERE (?1 IS NULL OR actor_id = ?1) GROUP BY session_id)");
+        const count_stmt = try self.prepare("SELECT COUNT(*) FROM (SELECT session_id FROM session_messages WHERE (?1 IS NULL OR actor_id = ?1) AND " ++ sqlite_session_history_visible_where ++ " GROUP BY session_id)");
         defer _ = c.sqlite3_finalize(count_stmt);
         bindNullableText(count_stmt, 1, actor_id);
         var total: u64 = 0;
         if (c.sqlite3_step(count_stmt) == c.SQLITE_ROW) total = @intCast(c.sqlite3_column_int64(count_stmt, 0));
-        const stmt = try self.prepare("SELECT session_id, COUNT(*), MIN(created_at_ms), MAX(created_at_ms) FROM session_messages WHERE (?1 IS NULL OR actor_id = ?1) GROUP BY session_id ORDER BY MAX(created_at_ms) DESC LIMIT ?2 OFFSET ?3");
+        const stmt = try self.prepare("SELECT session_id, COUNT(*), MIN(created_at_ms), MAX(created_at_ms) FROM session_messages WHERE (?1 IS NULL OR actor_id = ?1) AND " ++ sqlite_session_history_visible_where ++ " GROUP BY session_id ORDER BY MAX(created_at_ms) DESC LIMIT ?2 OFFSET ?3");
         defer _ = c.sqlite3_finalize(stmt);
         bindNullableText(stmt, 1, actor_id);
         _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
@@ -8019,14 +8022,14 @@ pub const SQLiteStore = struct {
     }
 
     pub fn history(self: *Self, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryShow {
-        const count_stmt = try self.prepare("SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2)");
+        const count_stmt = try self.prepare("SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2) AND " ++ sqlite_session_history_visible_where);
         defer _ = c.sqlite3_finalize(count_stmt);
         bindText(count_stmt, 1, session_id);
         bindNullableText(count_stmt, 2, actor_id);
         var total: u64 = 0;
         if (c.sqlite3_step(count_stmt) == c.SQLITE_ROW) total = @intCast(c.sqlite3_column_int64(count_stmt, 0));
 
-        const stmt = try self.prepare("SELECT role, content, created_at_ms FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2) ORDER BY id ASC LIMIT ?3 OFFSET ?4");
+        const stmt = try self.prepare("SELECT role, content, created_at_ms FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR actor_id = ?2) AND " ++ sqlite_session_history_visible_where ++ " ORDER BY id ASC LIMIT ?3 OFFSET ?4");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, session_id);
         bindNullableText(stmt, 2, actor_id);
@@ -10249,7 +10252,7 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = "SELECT json_build_object('total_memory_atoms',(SELECT count(*) FROM memory_atoms),'stale_memory_atoms',(SELECT count(*) FROM memory_atoms WHERE status='stale'),'vector_outbox_pending',(SELECT count(*) FROM vector_outbox WHERE status='pending'),'lucid_projection_pending',(SELECT count(*) FROM jobs WHERE job_type='lucid_projection' AND (status='queued' OR status='running')),'lucid_projection_failed',(SELECT count(*) FROM jobs WHERE job_type='lucid_projection' AND status='failed'),'cache_entries',(SELECT count(*) FROM response_cache)+(SELECT count(*) FROM semantic_cache),'queued_jobs',(SELECT count(*) FROM jobs WHERE status='queued'),'running_jobs',(SELECT count(*) FROM jobs WHERE status='running'),'failed_jobs',(SELECT count(*) FROM jobs WHERE status='failed'),'pending_feed_events',(SELECT count(*) FROM memory_feed_events WHERE status='pending' OR status='applying'),'open_conflicts',(SELECT count(*) FROM knowledge_conflicts WHERE status='open'),'agent_memories',(SELECT count(*) FROM agent_memory_items),'sessions',(SELECT count(*) FROM (SELECT session_id FROM session_messages GROUP BY session_id) s))::text";
+        const sql = "SELECT json_build_object('total_memory_atoms',(SELECT count(*) FROM memory_atoms),'stale_memory_atoms',(SELECT count(*) FROM memory_atoms WHERE status='stale'),'vector_outbox_pending',(SELECT count(*) FROM vector_outbox WHERE status='pending'),'lucid_projection_pending',(SELECT count(*) FROM jobs WHERE job_type='lucid_projection' AND (status='queued' OR status='running')),'lucid_projection_failed',(SELECT count(*) FROM jobs WHERE job_type='lucid_projection' AND status='failed'),'cache_entries',(SELECT count(*) FROM response_cache)+(SELECT count(*) FROM semantic_cache),'queued_jobs',(SELECT count(*) FROM jobs WHERE status='queued'),'running_jobs',(SELECT count(*) FROM jobs WHERE status='running'),'failed_jobs',(SELECT count(*) FROM jobs WHERE status='failed'),'pending_feed_events',(SELECT count(*) FROM memory_feed_events WHERE status='pending' OR status='applying'),'open_conflicts',(SELECT count(*) FROM knowledge_conflicts WHERE status='open'),'agent_memories',(SELECT count(*) FROM agent_memory_items),'sessions',(SELECT count(*) FROM (SELECT session_id FROM session_messages WHERE role <> '" ++ domain.runtime_command_role ++ "' GROUP BY session_id) s))::text";
         const parsed = try self.queryJson(allocator, sql);
         defer parsed.deinit();
         const obj = parsed.value.object;
@@ -10669,10 +10672,11 @@ pub const PostgresStore = struct {
 
     pub fn listSessions(self: *PostgresStore, allocator: std.mem.Allocator, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryList {
         const actor_filter = try pgSessionActorFilter(allocator, "", actor_id);
-        const total_sql = try std.fmt.allocPrint(allocator, "SELECT count(*)::text FROM (SELECT session_id FROM session_messages WHERE {s} GROUP BY session_id) s", .{actor_filter});
+        const role_filter = try std.fmt.allocPrint(allocator, "role <> {s}", .{try sqlString(allocator, domain.runtime_command_role)});
+        const total_sql = try std.fmt.allocPrint(allocator, "SELECT count(*)::text FROM (SELECT session_id FROM session_messages WHERE {s} AND {s} GROUP BY session_id) s", .{ actor_filter, role_filter });
         const total_text = try self.queryText(allocator, total_sql);
         const total = std.fmt.parseInt(u64, total_text, 10) catch 0;
-        const inner = try std.fmt.allocPrint(allocator, "SELECT session_id, count(*) AS message_count, min(created_at_ms) AS first_message_at, max(created_at_ms) AS last_message_at FROM session_messages WHERE {s} GROUP BY session_id ORDER BY max(created_at_ms) DESC LIMIT {d} OFFSET {d}", .{ actor_filter, limit, offset });
+        const inner = try std.fmt.allocPrint(allocator, "SELECT session_id, count(*) AS message_count, min(created_at_ms) AS first_message_at, max(created_at_ms) AS last_message_at FROM session_messages WHERE {s} AND {s} GROUP BY session_id ORDER BY max(created_at_ms) DESC LIMIT {d} OFFSET {d}", .{ actor_filter, role_filter, limit, offset });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         var sessions: std.ArrayListUnmanaged(SessionInfo) = .empty;
@@ -10685,9 +10689,10 @@ pub const PostgresStore = struct {
 
     pub fn history(self: *PostgresStore, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryShow {
         const actor_filter = try pgSessionActorFilter(allocator, "", actor_id);
-        const count_sql = try std.fmt.allocPrint(allocator, "SELECT count(*)::text FROM session_messages WHERE session_id = {s} AND {s}", .{ try sqlString(allocator, session_id), actor_filter });
+        const role_filter = try std.fmt.allocPrint(allocator, "role <> {s}", .{try sqlString(allocator, domain.runtime_command_role)});
+        const count_sql = try std.fmt.allocPrint(allocator, "SELECT count(*)::text FROM session_messages WHERE session_id = {s} AND {s} AND {s}", .{ try sqlString(allocator, session_id), actor_filter, role_filter });
         const count_text = try self.queryText(allocator, count_sql);
-        const inner = try std.fmt.allocPrint(allocator, "SELECT role,content,created_at_ms FROM session_messages WHERE session_id = {s} AND {s} ORDER BY id ASC LIMIT {d} OFFSET {d}", .{ try sqlString(allocator, session_id), actor_filter, limit, offset });
+        const inner = try std.fmt.allocPrint(allocator, "SELECT role,content,created_at_ms FROM session_messages WHERE session_id = {s} AND {s} AND {s} ORDER BY id ASC LIMIT {d} OFFSET {d}", .{ try sqlString(allocator, session_id), actor_filter, role_filter, limit, offset });
         return .{ .total = std.fmt.parseInt(u64, count_text, 10) catch 0, .messages = try self.readMessagesArray(allocator, inner) };
     }
 
@@ -11303,6 +11308,7 @@ pub const PostgresStore = struct {
             try std.fmt.allocPrint(allocator, "actor_id = {s}", .{try sqlString(allocator, actor)})
         else
             "FALSE";
+        const role_filter = try std.fmt.allocPrint(allocator, " AND role <> {s}", .{try sqlString(allocator, domain.runtime_command_role)});
         const session_filter = if (input.session_id) |sid|
             try std.fmt.allocPrint(allocator, " AND session_id = {s}", .{try sqlString(allocator, sid)})
         else
@@ -11315,7 +11321,7 @@ pub const PostgresStore = struct {
             const q = try sqlString(allocator, input.query);
             break :blk try std.fmt.allocPrint(allocator, "ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, id DESC", .{q});
         } else "id DESC";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,session_id,actor_id,role,content,created_at_ms FROM session_messages WHERE {s}{s}{s} ORDER BY {s} LIMIT {d}", .{ actor_filter, session_filter, query_filter, order_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,session_id,actor_id,role,content,created_at_ms FROM session_messages WHERE {s}{s}{s}{s} ORDER BY {s} LIMIT {d}", .{ actor_filter, role_filter, session_filter, query_filter, order_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value != .array) return;
@@ -11328,10 +11334,12 @@ pub const PostgresStore = struct {
             if (!actorMatches(input.actor_id, json.stringField(item.object, "actor_id"))) continue;
             if (!sessionVisibleForScopes(allocator, session_id, input.scopes_json)) continue;
             const text = try dupStringField(allocator, item.object, "content", "");
-            const relevance = pgScoreText(input.query, text) + pgScoreText(input.query, session_id) + pgScoreText(input.query, json.stringField(item.object, "role") orelse "");
+            const role = json.stringField(item.object, "role") orelse "";
+            if (!domain.sessionMessageVisibleInHistory(role)) continue;
+            const relevance = pgScoreText(input.query, text) + pgScoreText(input.query, session_id) + pgScoreText(input.query, role);
             if (relevance <= 0 and input.query.len > 0) continue;
             const scope = try std.fmt.allocPrint(allocator, "session:{s}", .{session_id});
-            try results.append(allocator, .{ .id = try std.fmt.allocPrint(allocator, "session_msg_{d}", .{json.intField(item.object, "id") orelse 0}), .result_type = "session_message", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ session_id, json.stringField(item.object, "role") orelse "" }), .text = text, .scope = scope, .status = "active", .score = relevance + 0.1, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, "[]", input.actor_id), .actor_isolated = true, .created_at_ms = json.intField(item.object, "created_at_ms") orelse 0, .confidence = 0.45 });
+            try results.append(allocator, .{ .id = try std.fmt.allocPrint(allocator, "session_msg_{d}", .{json.intField(item.object, "id") orelse 0}), .result_type = "session_message", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ session_id, role }), .text = text, .scope = scope, .status = "active", .score = relevance + 0.1, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, "[]", input.actor_id), .actor_isolated = true, .created_at_ms = json.intField(item.object, "created_at_ms") orelse 0, .confidence = 0.45 });
         }
     }
 
@@ -13846,6 +13854,7 @@ test "native agent session history and usage are actor isolated" {
     const alloc = arena.allocator();
 
     try store.saveMessage("shared-session", "user", "Agent A session note", "agent:a");
+    try store.saveMessage("shared-session", domain.runtime_command_role, "Agent A runtime command", "agent:a");
     try store.saveMessage("shared-session", "user", "Agent B session note", "agent:b");
     try store.saveUsage("shared-session", 11, "agent:a");
     try store.saveUsage("shared-session", 22, "agent:b");
@@ -13853,6 +13862,9 @@ test "native agent session history and usage are actor isolated" {
     const a_history = try store.history(alloc, "shared-session", 10, 0, "agent:a");
     try std.testing.expectEqual(@as(u64, 1), a_history.total);
     try std.testing.expectEqualStrings("Agent A session note", a_history.messages[0].content);
+    const a_sessions = try store.listSessions(alloc, 10, 0, "agent:a");
+    try std.testing.expectEqual(@as(u64, 1), a_sessions.total);
+    try std.testing.expectEqual(@as(u64, 1), a_sessions.sessions[0].message_count);
     const b_history = try store.history(alloc, "shared-session", 10, 0, "agent:b");
     try std.testing.expectEqual(@as(u64, 1), b_history.total);
     try std.testing.expectEqualStrings("Agent B session note", b_history.messages[0].content);
@@ -13862,6 +13874,10 @@ test "native agent session history and usage are actor isolated" {
     const a_search = try store.search(alloc, .{ .query = "Agent B session", .scopes_json = "[\"session:shared-session\"]", .limit = 10, .include_sessions = true, .actor_id = "agent:a" });
     for (a_search) |result| {
         try std.testing.expect(std.mem.indexOf(u8, result.text, "Agent B session note") == null);
+    }
+    const internal_search = try store.search(alloc, .{ .query = "runtime command", .scopes_json = "[\"session:shared-session\"]", .limit = 10, .include_sessions = true, .actor_id = "agent:a" });
+    for (internal_search) |result| {
+        try std.testing.expect(std.mem.indexOf(u8, result.text, "Agent A runtime command") == null);
     }
 }
 

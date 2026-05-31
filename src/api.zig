@@ -7058,6 +7058,8 @@ test "api native agent sessions are actor isolated and scope gated" {
 
     const save_a = handleRequest(&ctx, "POST", "/v1/agent-sessions/shared/messages", "{\"role\":\"user\",\"content\":\"Agent A session note\"}", raw_a);
     try std.testing.expectEqualStrings("200 OK", save_a.status);
+    const save_internal = handleRequest(&ctx, "POST", "/v1/agent-sessions/shared/messages", "{\"role\":\"__runtime_command__\",\"content\":\"Internal runtime command secret\"}", raw_a);
+    try std.testing.expectEqualStrings("200 OK", save_internal.status);
     const save_b = handleRequest(&ctx, "POST", "/v1/agent-sessions/shared/messages", "{\"role\":\"user\",\"content\":\"Agent B session note\"}", raw_b);
     try std.testing.expectEqualStrings("200 OK", save_b.status);
     const save_all = handleRequest(&ctx, "POST", "/v1/agent-sessions/shared/messages", "{\"role\":\"assistant\",\"content\":\"Agent A routed all session note\",\"storage\":\"all\"}", raw_a);
@@ -7096,7 +7098,19 @@ test "api native agent sessions are actor isolated and scope gated" {
 
     const list_a = handleRequest(&ctx, "GET", "/v1/agent-sessions?limit=10", "", "GET /v1/agent-sessions HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", list_a.status);
+    var parsed_list_a = try std.json.parseFromSlice(std.json.Value, alloc, list_a.body, .{});
+    defer parsed_list_a.deinit();
     try std.testing.expect(std.mem.indexOf(u8, list_a.body, "\"total\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_a.body, "\"message_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_a.body, "Internal runtime command secret") == null);
+    const history_a = handleRequest(&ctx, "GET", "/v1/agent-sessions/shared", "", "GET /v1/agent-sessions/shared HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", history_a.status);
+    var parsed_history_a = try std.json.parseFromSlice(std.json.Value, alloc, history_a.body, .{});
+    defer parsed_history_a.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, history_a.body, "\"total\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history_a.body, "Agent A session note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history_a.body, "Agent A routed all session note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history_a.body, "Internal runtime command secret") == null);
     const list_a_all = handleRequest(&ctx, "GET", "/v1/agent-sessions?limit=10&storage=all", "", "GET /v1/agent-sessions?limit=10&storage=all HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", list_a_all.status);
     try std.testing.expect(std.mem.indexOf(u8, list_a_all.body, "\"total\":1") != null);
@@ -7108,6 +7122,9 @@ test "api native agent sessions are actor isolated and scope gated" {
     try std.testing.expectEqualStrings("200 OK", session_search_b.status);
     try std.testing.expect(std.mem.indexOf(u8, session_search_b.body, "Agent B session note") != null);
     try std.testing.expect(std.mem.indexOf(u8, session_search_b.body, "\"scope\":\"session:shared\"") != null);
+    const internal_search_a = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Internal runtime command secret\",\"scopes\":[\"session:shared\"],\"include_sessions\":true}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", internal_search_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, internal_search_a.body, "Internal runtime command secret") == null);
 }
 
 test "api single bearer token ignores actor header unless explicitly trusted" {
