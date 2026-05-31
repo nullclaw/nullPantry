@@ -332,6 +332,16 @@ pub const Runtime = union(BackendKind) {
         };
     }
 
+    pub fn patchStatus(self: *Runtime, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
+        return switch (self.*) {
+            .none => false,
+            .native => error.NativeAgentMemoryRuntime,
+            .memory_lru => |*engine| engine.patchStatus(key, session_id, actor_id, status, writer_actor_id),
+            .redis => |*engine| engine.patchStatus(key, session_id, actor_id, status, writer_actor_id),
+            .api => |*engine| engine.patchStatus(allocator, key, session_id, actor_id, status, writer_actor_id),
+        };
+    }
+
     pub fn count(self: *Runtime, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
         return switch (self.*) {
             .none => 0,
@@ -787,6 +797,17 @@ pub const MemoryAgentMemory = struct {
             i += 1;
         }
         return changed;
+    }
+
+    pub fn patchStatus(self: *MemoryAgentMemory, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, status: []const u8, _: ?[]const u8) !bool {
+        self.purgeExpired();
+        const owner = actor_id orelse return false;
+        const idx = self.findEntryIndex(owner, session_id, key) orelse return false;
+        const updated = try self.allocator.dupe(u8, status);
+        if (self.entries.items[idx].entry.status.len > 0) self.allocator.free(self.entries.items[idx].entry.status);
+        self.entries.items[idx].entry.status = updated;
+        self.entries.items[idx].last_access_ms = ids.nowMs();
+        return true;
     }
 
     pub fn count(self: *MemoryAgentMemory, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
@@ -1473,6 +1494,20 @@ pub const RedisAgentMemory = struct {
             else => {},
         };
         return false;
+    }
+
+    pub fn patchStatus(self: *RedisAgentMemory, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, status: []const u8, _: ?[]const u8) !bool {
+        const owner = actor_id orelse return false;
+        const entry_key = try self.entryKey(self.allocator, owner, session_id, key);
+        defer self.allocator.free(entry_key);
+        var existing_hash = try self.client.command(&.{ "HGETALL", entry_key });
+        defer existing_hash.deinit(self.allocator);
+        var existing = try self.agentMemoryFromHash(self.allocator, existing_hash);
+        defer if (existing) |*entry| freeAgentMemory(self.allocator, entry);
+        if (existing == null) return false;
+        var response = try self.client.command(&.{ "HSET", entry_key, "status", status });
+        defer response.deinit(self.allocator);
+        return true;
     }
 
     pub fn count(self: *RedisAgentMemory, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
@@ -2222,6 +2257,18 @@ pub const ApiAgentMemory = struct {
         return true;
     }
 
+    pub fn patchStatus(self: *ApiAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
+        const owner = actor_id orelse return false;
+        const actor = writer_actor_id orelse owner;
+        const body = try agentMemoryStatusApplyPayload(allocator, key, session_id, owner, actor, status);
+        defer allocator.free(body);
+        const response = try self.request(allocator, .POST, "/memory/apply", "", actor, self.config.actor_scopes_json, body);
+        defer allocator.free(response.body);
+        if (response.status == .not_found) return false;
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return true;
+    }
+
     pub fn count(self: *ApiAgentMemory, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
         const actor = actor_id orelse "";
         const response = try self.request(self.allocator, .GET, "/agent-memory/count", "", actor, scopes_json, "");
@@ -2523,6 +2570,40 @@ fn agentMemoryDeleteAllApplyPayload(allocator: std.mem.Allocator, key: []const u
     try json.appendString(&out, allocator, owner_actor_id);
     try out.appendSlice(allocator, "}}");
     return out.toOwnedSlice(allocator);
+}
+
+fn agentMemoryStatusApplyPayload(allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, writer_actor_id: []const u8, status: []const u8) ![]u8 {
+    const operation = agentMemoryLifecycleOperationForStatus(status);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"event_type\":\"agent_memory.");
+    try out.appendSlice(allocator, operation);
+    try out.appendSlice(allocator, "\",\"operation\":\"");
+    try out.appendSlice(allocator, operation);
+    try out.appendSlice(allocator, "\",\"object_type\":\"agent_memory\",\"actor_id\":");
+    try json.appendString(&out, allocator, writer_actor_id);
+    try out.appendSlice(allocator, ",\"payload\":{\"key\":");
+    try json.appendString(&out, allocator, key);
+    try out.appendSlice(allocator, ",\"session_id\":");
+    try json.appendNullableString(&out, allocator, session_id);
+    if (sharedScopeFromOwner(owner_actor_id)) |scope| {
+        try out.appendSlice(allocator, ",\"scope\":");
+        try json.appendString(&out, allocator, scope);
+    }
+    try out.appendSlice(allocator, ",\"owner_id\":");
+    try json.appendString(&out, allocator, owner_actor_id);
+    try out.appendSlice(allocator, ",\"status\":");
+    try json.appendString(&out, allocator, status);
+    try out.appendSlice(allocator, "}}");
+    return out.toOwnedSlice(allocator);
+}
+
+fn agentMemoryLifecycleOperationForStatus(status: []const u8) []const u8 {
+    if (std.mem.eql(u8, status, "verified")) return "verify";
+    if (std.mem.eql(u8, status, "stale")) return "mark_stale";
+    if (std.mem.eql(u8, status, "superseded")) return "supersede";
+    if (std.mem.eql(u8, status, "deprecated")) return "forget";
+    return "verify";
 }
 
 fn agentMemorySearchPayload(allocator: std.mem.Allocator, query_text: []const u8, limit: usize, session_id: ?[]const u8, include_sessions: bool, scopes_json: []const u8) ![]u8 {

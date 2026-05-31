@@ -2154,7 +2154,11 @@ pub const Store = struct {
     }
 
     fn patchAgentMemoryRuntimeStatus(self: *Store, allocator: std.mem.Allocator, runtime: *agent_memory_runtime.Runtime, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
-        var changed = try self.patchRuntimeAgentMemoryMirrorsStatus(allocator, store_name, key, session_id, owner_actor_id, status, writer_actor_id);
+        var changed = if (domain.isDefaultVisibleStatus(status))
+            try runtime.patchStatus(allocator, key, session_id, owner_actor_id, status, writer_actor_id)
+        else
+            false;
+        changed = (try self.patchRuntimeAgentMemoryMirrorsStatus(allocator, store_name, key, session_id, owner_actor_id, status, writer_actor_id)) or changed;
         if (!domain.isDefaultVisibleStatus(status)) {
             changed = (try runtime.delete(key, session_id, owner_actor_id, writer_actor_id)) or changed;
         } else if (!changed) {

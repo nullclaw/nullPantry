@@ -14550,6 +14550,18 @@ test "api memory apply supports agent memory lifecycle reducers" {
     try std.testing.expectEqualStrings("200 OK", scratch_before.status);
     try std.testing.expect(std.mem.indexOf(u8, scratch_before.body, "\"status\":\"proposed\"") != null);
 
+    const scratch_stale = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.mark_stale\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"scratch.lifecycle.pref\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_stale.status);
+    const scratch_stale_direct = handleRequest(&ctx, "GET", "/v1/agent-memory/scratch.lifecycle.pref?store=scratch&scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_stale_direct.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_stale_direct.body, "\"status\":\"stale\"") != null);
+
+    const scratch_verify = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.verify\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"scratch.lifecycle.pref\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_verify.status);
+    const scratch_verified_direct = handleRequest(&ctx, "GET", "/v1/agent-memory/scratch.lifecycle.pref?store=scratch&scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_verified_direct.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_verified_direct.body, "\"status\":\"verified\"") != null);
+
     const scratch_supersede = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.supersede\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"scratch.lifecycle.pref\",\"scope\":\"public\"}}", "");
     try std.testing.expectEqualStrings("200 OK", scratch_supersede.status);
     const scratch_after = handleRequest(&ctx, "GET", "/v1/agent-memory/scratch.lifecycle.pref?store=scratch&scope=public", "", "");
