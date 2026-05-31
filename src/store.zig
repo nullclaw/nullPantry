@@ -8604,9 +8604,10 @@ pub const SQLiteStore = struct {
         const all = try self.agentMemoryListVisible(allocator, null, session_id, request_actor, scopes_json);
         for (all) |entry| {
             if (out.items.len >= capped) break;
-            if (scoreText(query, entry.key) <= 0 and scoreText(query, entry.content) <= 0) continue;
+            const score = scoreText(query, entry.key) + scoreText(query, entry.content);
+            if (score <= 0 and query.len > 0) continue;
             var copy = entry;
-            copy.score = scoreText(query, entry.content) + 0.5;
+            copy.score = score + 0.5;
             try out.append(allocator, copy);
         }
         return out.toOwnedSlice(allocator);
@@ -11582,9 +11583,10 @@ pub const PostgresStore = struct {
         errdefer out.deinit(allocator);
         for (all) |entry| {
             if (out.items.len >= capped) break;
-            if (pgScoreText(query, entry.key) <= 0 and pgScoreText(query, entry.content) <= 0) continue;
+            const score = pgScoreText(query, entry.key) + pgScoreText(query, entry.content);
+            if (score <= 0 and query.len > 0) continue;
             var copy = entry;
-            copy.score = pgScoreText(query, entry.content) + 0.5;
+            copy.score = score + 0.5;
             try out.append(allocator, copy);
         }
         return out.toOwnedSlice(allocator);
@@ -16069,6 +16071,13 @@ test "native agent memory search preserves direct memories" {
     const results = try store.agentMemorySearch(alloc, "direct native", 1, null, "[]", actor);
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("pref.direct", results[0].key);
+
+    const visible_list = try store.agentMemorySearch(alloc, "", 10, null, "[]", actor);
+    try std.testing.expectEqual(@as(usize, 1), visible_list.len);
+    try std.testing.expectEqualStrings("pref.direct", visible_list[0].key);
+
+    const no_terms = try store.agentMemorySearch(alloc, "??? OR AND the", 10, null, "[]", actor);
+    try std.testing.expectEqual(@as(usize, 0), no_terms.len);
 }
 
 test "postgres storage contract covers primitives when configured" {
