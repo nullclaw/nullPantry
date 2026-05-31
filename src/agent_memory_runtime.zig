@@ -503,8 +503,7 @@ pub const RuntimeRegistry = struct {
         errdefer registry.deinit();
         for (configs) |config| {
             const name = std.mem.trim(u8, config.name, " \t\r\n");
-            if (name.len == 0) return error.InvalidAgentMemoryStoreName;
-            if (isReservedStoreName(name)) return error.InvalidAgentMemoryStoreName;
+            if (!isValidNamedStoreName(name)) return error.InvalidAgentMemoryStoreName;
             if (config.config.backend == .native) return error.InvalidAgentMemoryStoreBackend;
             if (registry.get(name) != null) return error.DuplicateAgentMemoryStoreName;
             const owned_name = try allocator.dupe(u8, name);
@@ -538,7 +537,17 @@ pub const RuntimeRegistry = struct {
     }
 };
 
-fn isReservedStoreName(name: []const u8) bool {
+pub fn isValidNamedStoreName(name: []const u8) bool {
+    if (name.len == 0 or isReservedStoreName(name)) return false;
+    if (!std.ascii.isAlphanumeric(name[0])) return false;
+    for (name[1..]) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.' or ch == ':') continue;
+        return false;
+    }
+    return true;
+}
+
+pub fn isReservedStoreName(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "primary") or
         std.ascii.eqlIgnoreCase(name, "default") or
         std.ascii.eqlIgnoreCase(name, "native") or
@@ -3552,6 +3561,17 @@ test "named runtime registry rejects reserved duplicate and native stores" {
     try std.testing.expectError(error.InvalidAgentMemoryStoreName, RuntimeRegistry.init(std.testing.allocator, &.{
         .{ .name = "native", .config = .{ .backend = .memory_lru } },
     }));
+    try std.testing.expectError(error.InvalidAgentMemoryStoreName, RuntimeRegistry.init(std.testing.allocator, &.{
+        .{ .name = "bad,name", .config = .{ .backend = .memory_lru } },
+    }));
+    try std.testing.expectError(error.InvalidAgentMemoryStoreName, RuntimeRegistry.init(std.testing.allocator, &.{
+        .{ .name = "bad store", .config = .{ .backend = .memory_lru } },
+    }));
+    try std.testing.expectError(error.InvalidAgentMemoryStoreName, RuntimeRegistry.init(std.testing.allocator, &.{
+        .{ .name = ".hidden", .config = .{ .backend = .memory_lru } },
+    }));
+    try std.testing.expect(isValidNamedStoreName("team:alpha"));
+    try std.testing.expect(isValidNamedStoreName("scratch-1.archive"));
     try std.testing.expectError(error.InvalidAgentMemoryStoreBackend, RuntimeRegistry.init(std.testing.allocator, &.{
         .{ .name = "scratch", .config = .{ .backend = .native } },
     }));

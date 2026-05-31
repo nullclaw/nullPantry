@@ -811,6 +811,7 @@ fn parseAgentMemoryStoreConfigsJson(allocator: std.mem.Allocator, raw: []const u
     for (items, 0..) |item, i| {
         if (item != .object) return error.InvalidAgentMemoryStores;
         const name = jsonStringField(item.object, "name") orelse return error.InvalidAgentMemoryStores;
+        if (!agent_memory_runtime.isValidNamedStoreName(name)) return error.InvalidAgentMemoryStores;
         const backend = jsonStringField(item.object, "backend") orelse "memory_lru";
         var config = agent_memory_runtime.Config{ .backend = try parseNamedAgentMemoryBackend(backend) };
         if (jsonStringField(item.object, "redis_url")) |url| {
@@ -880,6 +881,7 @@ fn parseAgentMemoryStoreSpec(allocator: std.mem.Allocator, raw: []const u8) !age
     const name = std.mem.trim(u8, raw[0..eq], " \t\r\n");
     const value = std.mem.trim(u8, raw[eq + 1 ..], " \t\r\n");
     if (name.len == 0 or value.len == 0) return error.InvalidAgentMemoryStore;
+    if (!agent_memory_runtime.isValidNamedStoreName(name)) return error.InvalidAgentMemoryStore;
     var config = agent_memory_runtime.Config{ .backend = undefined };
     if (std.mem.startsWith(u8, value, "redis://")) {
         config.redis = try redis_mod.parseUrl(allocator, value);
@@ -1260,6 +1262,13 @@ test "named agent memory stores can be configured from args and json" {
 
     try std.testing.expectError(error.InvalidAgentMemoryStore, parseAgentMemoryStoreSpec(std.testing.allocator, "bad=native"));
     try std.testing.expectError(error.InvalidAgentMemoryStore, parseAgentMemoryStoreSpec(std.testing.allocator, "bad=typo"));
+    try std.testing.expectError(error.InvalidAgentMemoryStore, parseAgentMemoryStoreSpec(std.testing.allocator, "bad,name=memory_lru"));
+    try std.testing.expectError(error.InvalidAgentMemoryStore, parseAgentMemoryStoreSpec(std.testing.allocator, "bad store=memory_lru"));
+    try std.testing.expectError(error.InvalidAgentMemoryStores, parseAgentMemoryStoreConfigsJson(std.testing.allocator,
+        \\[
+        \\  {"name":"bad,name","backend":"memory_lru"}
+        \\]
+    ));
 }
 
 test "external vector backend can be configured from args" {
