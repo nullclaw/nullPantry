@@ -1134,6 +1134,8 @@ pub const Store = struct {
             .scopes_json = input.scopes_json,
             .limit = @max(@as(usize, 20), input.limit),
             .include_deprecated = input.include_deprecated,
+            .include_sessions = input.include_sessions,
+            .session_id = input.session_id,
             .strict_external = input.strict_vector,
             .actor_id = input.actor_id,
         });
@@ -4185,6 +4187,8 @@ pub const VectorSearchInput = struct {
     scopes_json: []const u8 = "[\"admin\"]",
     limit: usize = 10,
     include_deprecated: bool = false,
+    include_sessions: bool = true,
+    session_id: ?[]const u8 = null,
     strict_external: bool = false,
     actor_id: ?[]const u8 = null,
 };
@@ -7478,7 +7482,16 @@ pub const SQLiteStore = struct {
             break :blk try vector_mod.embeddingToJson(allocator, embedding);
         };
         defer if (embedding_json_owned) allocator.free(embedding_json);
-        const matches = try self.vectorSearch(allocator, .{ .embedding_json = embedding_json, .scopes_json = input.scopes_json, .limit = @max(@as(usize, 20), input.limit), .include_deprecated = input.include_deprecated, .strict_external = input.strict_vector, .actor_id = input.actor_id });
+        const matches = try self.vectorSearch(allocator, .{
+            .embedding_json = embedding_json,
+            .scopes_json = input.scopes_json,
+            .limit = @max(@as(usize, 20), input.limit),
+            .include_deprecated = input.include_deprecated,
+            .include_sessions = input.include_sessions,
+            .session_id = input.session_id,
+            .strict_external = input.strict_vector,
+            .actor_id = input.actor_id,
+        });
         defer vector_mod.freeMatches(allocator, matches);
         for (matches) |match| {
             const result = try self.searchResultForVectorMatch(allocator, match, input);
@@ -7601,6 +7614,7 @@ pub const SQLiteStore = struct {
         }
         if (std.mem.eql(u8, match.object_type, "agent_memory")) {
             const entry = (try self.agentMemoryById(allocator, match.object_id)) orelse return null;
+            if (!agentMemorySessionAllowedForSearch(input.session_id, input.include_sessions, entry.session_id)) return null;
             if (!try self.agentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, input.scopes_json, input.actor_id)) return null;
             if (domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) return null;
             return .{
@@ -7965,7 +7979,7 @@ pub const SQLiteStore = struct {
             const embedding_json = try columnText(allocator, stmt, 7);
             defer allocator.free(permissions);
             defer allocator.free(embedding_json);
-            if (!try self.vectorChunkObjectVisible(allocator, object_type, object_id, scope, permissions, input.scopes_json, input.actor_id, input.include_deprecated)) {
+            if (!try self.vectorChunkObjectVisibleForSearchInput(allocator, object_type, object_id, scope, permissions, input)) {
                 allocator.free(id_text);
                 allocator.free(object_id);
                 allocator.free(object_type);
@@ -8006,7 +8020,7 @@ pub const SQLiteStore = struct {
         for (candidates) |candidate| {
             var chunk = (try self.getVectorChunk(allocator, candidate.vector_id)) orelse continue;
             defer deinitVectorChunk(allocator, &chunk);
-            if (!try self.vectorChunkObjectVisible(allocator, chunk.object_type, chunk.object_id, chunk.scope, chunk.permissions_json, input.scopes_json, input.actor_id, input.include_deprecated)) continue;
+            if (!try self.vectorChunkObjectVisibleForSearchInput(allocator, chunk.object_type, chunk.object_id, chunk.scope, chunk.permissions_json, input)) continue;
             try out.append(allocator, try vectorMatchFromChunk(allocator, chunk, candidate.score));
             if (out.items.len >= capped) break;
         }
@@ -8029,6 +8043,13 @@ pub const SQLiteStore = struct {
             .created_at_ms = c.sqlite3_column_int64(stmt, 11),
             .updated_at_ms = c.sqlite3_column_int64(stmt, 12),
         };
+    }
+
+    fn vectorChunkObjectVisibleForSearchInput(self: *Self, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_scope: []const u8, chunk_permissions: []const u8, input: VectorSearchInput) !bool {
+        if (!try self.vectorChunkObjectVisible(allocator, object_type, object_id, chunk_scope, chunk_permissions, input.scopes_json, input.actor_id, input.include_deprecated)) return false;
+        if (!std.mem.eql(u8, object_type, "agent_memory")) return true;
+        const entry = (try self.agentMemoryById(allocator, object_id)) orelse return false;
+        return agentMemorySessionAllowedForSearch(input.session_id, input.include_sessions, entry.session_id);
     }
 
     fn vectorChunkObjectVisible(self: *Self, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_scope: []const u8, chunk_permissions: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
@@ -11478,7 +11499,7 @@ pub const PostgresStore = struct {
                     defer allocator.free(permissions);
                     const object_id = try dupStringField(allocator, obj, "object_id", "");
                     const object_type = try dupStringField(allocator, obj, "object_type", "");
-                    if (!try self.vectorChunkObjectVisible(allocator, object_type, object_id, scope, permissions, input.scopes_json, input.actor_id, input.include_deprecated)) {
+                    if (!try self.vectorChunkObjectVisibleForSearchInput(allocator, object_type, object_id, scope, permissions, input)) {
                         allocator.free(scope);
                         allocator.free(object_id);
                         allocator.free(object_type);
@@ -11510,11 +11531,18 @@ pub const PostgresStore = struct {
         for (candidates) |candidate| {
             var chunk = (try self.getVectorChunk(allocator, candidate.vector_id)) orelse continue;
             defer deinitVectorChunk(allocator, &chunk);
-            if (!try self.vectorChunkObjectVisible(allocator, chunk.object_type, chunk.object_id, chunk.scope, chunk.permissions_json, input.scopes_json, input.actor_id, input.include_deprecated)) continue;
+            if (!try self.vectorChunkObjectVisibleForSearchInput(allocator, chunk.object_type, chunk.object_id, chunk.scope, chunk.permissions_json, input)) continue;
             try out.append(allocator, try vectorMatchFromChunk(allocator, chunk, candidate.score));
             if (out.items.len >= capped) break;
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    fn vectorChunkObjectVisibleForSearchInput(self: *PostgresStore, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_scope: []const u8, chunk_permissions: []const u8, input: VectorSearchInput) !bool {
+        if (!try self.vectorChunkObjectVisible(allocator, object_type, object_id, chunk_scope, chunk_permissions, input.scopes_json, input.actor_id, input.include_deprecated)) return false;
+        if (!std.mem.eql(u8, object_type, "agent_memory")) return true;
+        const entry = (try self.agentMemoryById(allocator, object_id)) orelse return false;
+        return agentMemorySessionAllowedForSearch(input.session_id, input.include_sessions, entry.session_id);
     }
 
     fn vectorChunkObjectVisible(self: *PostgresStore, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_scope: []const u8, chunk_permissions: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
@@ -13719,7 +13747,16 @@ pub const PostgresStore = struct {
             break :blk try vector_mod.embeddingToJson(allocator, embedding);
         };
         defer if (embedding_json_owned) allocator.free(embedding_json);
-        const matches = try self.vectorSearch(allocator, .{ .embedding_json = embedding_json, .scopes_json = input.scopes_json, .limit = @max(@as(usize, 20), input.limit), .include_deprecated = input.include_deprecated, .strict_external = input.strict_vector, .actor_id = input.actor_id });
+        const matches = try self.vectorSearch(allocator, .{
+            .embedding_json = embedding_json,
+            .scopes_json = input.scopes_json,
+            .limit = @max(@as(usize, 20), input.limit),
+            .include_deprecated = input.include_deprecated,
+            .include_sessions = input.include_sessions,
+            .session_id = input.session_id,
+            .strict_external = input.strict_vector,
+            .actor_id = input.actor_id,
+        });
         defer vector_mod.freeMatches(allocator, matches);
         for (matches) |match| {
             if (try self.searchResultForVectorMatch(allocator, match, input)) |result| try results.append(allocator, result);
@@ -13771,6 +13808,7 @@ pub const PostgresStore = struct {
         }
         if (std.mem.eql(u8, match.object_type, "agent_memory")) {
             const entry = (try self.agentMemoryById(allocator, match.object_id)) orelse return null;
+            if (!agentMemorySessionAllowedForSearch(input.session_id, input.include_sessions, entry.session_id)) return null;
             if (!try self.agentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, input.scopes_json, input.actor_id)) return null;
             if (domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) return null;
             return .{
@@ -14523,6 +14561,14 @@ fn filterSearchResultsByMinRelevance(allocator: std.mem.Allocator, ordered: []do
         return allocator.alloc(domain.SearchResult, 0);
     }
     return allocator.realloc(ordered, keep);
+}
+
+fn agentMemorySessionAllowedForSearch(search_session_id: ?[]const u8, include_sessions: bool, entry_session_id: ?[]const u8) bool {
+    if (search_session_id) |expected| {
+        const actual = entry_session_id orelse return false;
+        return std.mem.eql(u8, actual, expected);
+    }
+    return include_sessions or entry_session_id == null;
 }
 
 fn searchResultAllowedForSession(_: SearchInput, _: domain.SearchResult) bool {
@@ -15378,6 +15424,89 @@ test "sqlite vector search covers expanded NullPantry primitives" {
     try std.testing.expect(saw_relation);
     try std.testing.expect(saw_pack);
     try std.testing.expect(saw_agent_memory);
+}
+
+test "sqlite vector agent memory retrieval respects session filters" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const actor = "agent:session-vector";
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0, 0, 0 });
+    const global = try store.agentMemoryStore(alloc, .{
+        .key = "vector.global",
+        .content = "global vector-only agent memory",
+        .actor_id = actor,
+    });
+    const session = try store.agentMemoryStore(alloc, .{
+        .key = "vector.session",
+        .content = "session vector-only agent memory",
+        .session_id = "sess_vec",
+        .actor_id = actor,
+    });
+    _ = try store.upsertVectorChunk(alloc, .{
+        .object_type = "agent_memory",
+        .object_id = global.id,
+        .text = global.content,
+        .scope = global.scope,
+        .permissions_json = global.permissions_json,
+        .embedding_json = embedding,
+        .dimensions = 4,
+    });
+    _ = try store.upsertVectorChunk(alloc, .{
+        .object_type = "agent_memory",
+        .object_id = session.id,
+        .text = session.content,
+        .scope = session.scope,
+        .permissions_json = session.permissions_json,
+        .embedding_json = embedding,
+        .dimensions = 4,
+    });
+
+    const session_results = try store.search(alloc, .{
+        .query = "semantic-only-session-vector",
+        .scopes_json = "[\"session:sess_vec\"]",
+        .limit = 20,
+        .include_sessions = true,
+        .session_id = "sess_vec",
+        .use_vector = true,
+        .use_temporal_decay = false,
+        .use_mmr = false,
+        .query_embedding_json = embedding,
+        .actor_id = actor,
+    });
+    var saw_global = false;
+    var saw_session = false;
+    for (session_results) |result| {
+        if (!std.mem.eql(u8, result.result_type, "agent_memory")) continue;
+        if (std.mem.eql(u8, result.id, global.id)) saw_global = true;
+        if (std.mem.eql(u8, result.id, session.id)) saw_session = true;
+    }
+    try std.testing.expect(!saw_global);
+    try std.testing.expect(saw_session);
+
+    const global_results = try store.search(alloc, .{
+        .query = "semantic-only-session-vector",
+        .scopes_json = "[]",
+        .limit = 20,
+        .include_sessions = false,
+        .use_vector = true,
+        .use_temporal_decay = false,
+        .use_mmr = false,
+        .query_embedding_json = embedding,
+        .actor_id = actor,
+    });
+    saw_global = false;
+    saw_session = false;
+    for (global_results) |result| {
+        if (!std.mem.eql(u8, result.result_type, "agent_memory")) continue;
+        if (std.mem.eql(u8, result.id, global.id)) saw_global = true;
+        if (std.mem.eql(u8, result.id, session.id)) saw_session = true;
+    }
+    try std.testing.expect(saw_global);
+    try std.testing.expect(!saw_session);
 }
 
 test "sqlite search hides runtime agent memory source mirrors" {
