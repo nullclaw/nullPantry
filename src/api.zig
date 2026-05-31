@@ -3654,7 +3654,7 @@ fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
     const since_id = feedCursorFromQuery(query);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
-    const events = ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch |err| switch (err) {
+    const events = listCentralFeedEventsForRoute(ctx, since_id, limit, feed_scopes, false, storage_route) catch |err| switch (err) {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor; request a checkpoint"),
         else => return serverError(ctx),
     };
@@ -3668,7 +3668,7 @@ fn memoryFeedStatus(ctx: *Context, query: []const u8) HttpResponse {
         return runtimeMemoryFeedStatus(ctx, runtime);
     }
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
-    const status = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
+    const status = centralFeedStatusForRoute(ctx, feed_scopes, storage_route) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     status.writeJsonWithInstance(ctx.allocator, &out, ctx.feed_instance_id) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
@@ -3705,7 +3705,7 @@ fn memoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
     const status = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
     const since_id = feedCursorFromQuery(query);
     const limit = parseLimit(json.queryParam(query, "limit"), 500);
-    const events = ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = feed_scopes, .ignore_cursor_floor = true, .actor_id = ctx.actor_id }) catch |err| switch (err) {
+    const events = listCentralFeedEventsForRoute(ctx, since_id, limit, feed_scopes, true, storage_route) catch |err| switch (err) {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor"),
         else => return serverError(ctx),
     };
@@ -3729,13 +3729,130 @@ fn feedCursorFromQuery(query: []const u8) i64 {
 fn feedRuntimeForRoute(ctx: *Context, route: store_mod.AgentMemoryStorageRoute) !?*agent_memory_runtime.Runtime {
     return switch (route.target) {
         .primary, .native => null,
-        .runtime => if (ctx.store.agent_memory.isExternal()) &ctx.store.agent_memory else error.AgentMemoryStorageUnavailable,
+        .runtime => if (ctx.store.agent_memory.isExternal() and ctx.store.agent_memory.supportsFeed()) &ctx.store.agent_memory else null,
         .named => blk: {
             const name = route.name orelse return error.AgentMemoryStorageUnavailable;
-            break :blk ctx.store.agent_memory_stores.get(name) orelse return error.AgentMemoryStorageUnavailable;
+            const runtime = ctx.store.agent_memory_stores.get(name) orelse return error.AgentMemoryStorageUnavailable;
+            break :blk if (runtime.supportsFeed()) runtime else null;
         },
-        .subset, .all => error.AgentMemoryStorageUnavailable,
+        .subset, .all => null,
     };
+}
+
+fn centralFeedRouteNeedsFilter(route: store_mod.AgentMemoryStorageRoute) bool {
+    return switch (route.target) {
+        .primary, .all => false,
+        .native, .runtime, .named, .subset => true,
+    };
+}
+
+fn listCentralFeedEventsForRoute(ctx: *Context, since_id: i64, limit: usize, scopes_json: []const u8, ignore_cursor_floor: bool, route: store_mod.AgentMemoryStorageRoute) ![]store_mod.FeedEvent {
+    if (!centralFeedRouteNeedsFilter(route)) {
+        return ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = scopes_json, .ignore_cursor_floor = ignore_cursor_floor, .actor_id = ctx.actor_id });
+    }
+
+    const target_limit = @max(@as(usize, 1), @min(limit, 500));
+    var cursor = since_id;
+    var out: std.ArrayListUnmanaged(store_mod.FeedEvent) = .empty;
+    while (out.items.len < target_limit) {
+        const batch = try ctx.store.listFeedEvents(ctx.allocator, .{
+            .since_id = cursor,
+            .limit = 500,
+            .scopes_json = scopes_json,
+            .ignore_cursor_floor = ignore_cursor_floor,
+            .actor_id = ctx.actor_id,
+        });
+        if (batch.len == 0) break;
+        for (batch) |event| {
+            cursor = @max(cursor, event.id);
+            if (!feedEventMatchesStorageRoute(ctx, event, route)) continue;
+            try out.append(ctx.allocator, event);
+            if (out.items.len >= target_limit) break;
+        }
+        if (batch.len < 500) break;
+    }
+    return out.toOwnedSlice(ctx.allocator);
+}
+
+fn centralFeedStatusForRoute(ctx: *Context, scopes_json: []const u8, route: store_mod.AgentMemoryStorageRoute) !store_mod.FeedStatus {
+    const base = try ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = scopes_json, .actor_id = ctx.actor_id });
+    if (!centralFeedRouteNeedsFilter(route)) return base;
+
+    var filtered = store_mod.FeedStatus{
+        .cursor_floor = base.cursor_floor,
+        .max_event_id = base.max_event_id,
+        .visible_events = 0,
+        .pending_events = 0,
+        .applying_events = 0,
+        .applied_events = 0,
+    };
+    var cursor = base.cursor_floor;
+    while (true) {
+        const batch = try ctx.store.listFeedEvents(ctx.allocator, .{
+            .since_id = cursor,
+            .limit = 500,
+            .scopes_json = scopes_json,
+            .actor_id = ctx.actor_id,
+        });
+        if (batch.len == 0) break;
+        for (batch) |event| {
+            cursor = @max(cursor, event.id);
+            if (!feedEventMatchesStorageRoute(ctx, event, route)) continue;
+            filtered.visible_events += 1;
+            if (std.mem.eql(u8, event.status, "pending")) {
+                filtered.pending_events += 1;
+            } else if (std.mem.eql(u8, event.status, "applying")) {
+                filtered.applying_events += 1;
+            } else if (std.mem.eql(u8, event.status, "applied")) {
+                filtered.applied_events += 1;
+            }
+        }
+        if (batch.len < 500) break;
+    }
+    return filtered;
+}
+
+fn feedEventMatchesStorageRoute(ctx: *Context, event: store_mod.FeedEvent, route: store_mod.AgentMemoryStorageRoute) bool {
+    return switch (route.target) {
+        .primary, .all => true,
+        .native => feedEventMatchesStoreName(ctx, event, "native", true),
+        .runtime => feedEventMatchesStoreName(ctx, event, "runtime", false),
+        .named => blk: {
+            const name = route.name orelse break :blk false;
+            break :blk feedEventMatchesStoreName(ctx, event, name, false);
+        },
+        .subset => blk: {
+            for (route.stores) |store_name| {
+                if (feedEventMatchesStoreName(ctx, event, store_name, std.ascii.eqlIgnoreCase(store_name, "native"))) break :blk true;
+            }
+            break :blk false;
+        },
+    };
+}
+
+fn feedEventMatchesStoreName(ctx: *Context, event: store_mod.FeedEvent, store_name: []const u8, include_unrouted_native: bool) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, event.payload_json, .{}) catch return include_unrouted_native;
+    defer parsed.deinit();
+    if (parsed.value != .object) return include_unrouted_native;
+    const obj = parsed.value.object;
+    var routed = false;
+    if (json.stringField(obj, "store")) |value| {
+        routed = true;
+        if (std.ascii.eqlIgnoreCase(value, store_name)) return true;
+    }
+    if (json.stringField(obj, "storage")) |value| {
+        routed = true;
+        if (std.ascii.eqlIgnoreCase(value, "all") or std.ascii.eqlIgnoreCase(value, store_name)) return true;
+    }
+    if (obj.get("stores")) |stores| {
+        routed = true;
+        if (stores == .array) {
+            for (stores.array.items) |item| {
+                if (item == .string and std.ascii.eqlIgnoreCase(item.string, store_name)) return true;
+            }
+        }
+    }
+    return include_unrouted_native and !routed;
 }
 
 fn runtimeMemoryFeed(ctx: *Context, runtime: *agent_memory_runtime.Runtime, query: []const u8) HttpResponse {
@@ -4046,7 +4163,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     } else if (!canWriteRecord(ctx, scope, event_permissions_json)) return forbidden(ctx);
     var memory_input: ?store_mod.MemoryAtomInput = null;
     if (std.mem.eql(u8, object_type, "memory_atom")) {
-        memory_input = buildAppliedMemoryAtomInput(ctx, payload_json, scope, event_object_id) catch |err| switch (err) {
+        memory_input = buildAppliedMemoryAtomInput(ctx, payload_json, scope, event_object_id, storage_route) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.MissingText, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Memory apply payload must include text/content"),
             else => return serverError(ctx),
@@ -4059,7 +4176,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     var agent_memory_delete_all = false;
     var agent_memory_route: store_mod.AgentMemoryStorageRoute = .{};
     if (std.mem.eql(u8, object_type, "agent_memory")) {
-        const prepared = buildAppliedAgentMemoryInput(ctx, operation, payload_json, event_object_id, event_actor_id) catch |err| switch (err) {
+        const prepared = buildAppliedAgentMemoryInput(ctx, operation, payload_json, event_object_id, event_actor_id, storage_route) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.InternalAgentMemory => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be applied through the feed"),
             error.MissingKey, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Agent memory apply payload must include key/object_id and valid merge content"),
@@ -4077,7 +4194,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     }
     var session_message_input: ?AgentSessionMessageApplyInput = null;
     if (std.mem.eql(u8, object_type, "agent_session_message")) {
-        session_message_input = buildAppliedAgentSessionMessageInput(ctx, operation, payload_json, event_actor_id) catch |err| switch (err) {
+        session_message_input = buildAppliedAgentSessionMessageInput(ctx, operation, payload_json, event_actor_id, storage_route) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.InternalAgentSessionMessage => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be applied through the feed"),
             error.MissingRequiredField, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Session message feed payload must include session_id, role and content"),
@@ -4086,7 +4203,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     }
     var session_usage_input: ?AgentSessionUsageApplyInput = null;
     if (std.mem.eql(u8, object_type, "agent_session_usage")) {
-        session_usage_input = buildAppliedAgentSessionUsageInput(ctx, operation, payload_json, event_actor_id) catch |err| switch (err) {
+        session_usage_input = buildAppliedAgentSessionUsageInput(ctx, operation, payload_json, event_actor_id, storage_route) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.MissingRequiredField, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Session usage feed payload must include session_id and total_tokens"),
             else => return serverError(ctx),
@@ -4269,8 +4386,10 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
                 };
             };
         }
+        const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, input.route) catch return serverError(ctx);
+        defer ctx.allocator.free(event_payload_json);
         const event_id = if (reserved_event_id) |event_id| blk: {
-            if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, payload_json) catch return serverError(ctx))) {
+            if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, event_payload_json) catch return serverError(ctx))) {
                 return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event reservation was already consumed");
             }
             break :blk event_id;
@@ -4284,7 +4403,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
             .actor_id = event_actor_id,
             .dedupe_key = event_dedupe_key,
             .causality_json = causality_json,
-            .payload_json = payload_json,
+            .payload_json = event_payload_json,
             .status = "applied",
         }) catch return serverError(ctx);
         return appliedFeedObjectResponse(ctx, event_id, object_type, object_id, null);
@@ -4308,8 +4427,10 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
                 };
             };
         }
+        const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, input.route) catch return serverError(ctx);
+        defer ctx.allocator.free(event_payload_json);
         const event_id = if (reserved_event_id) |event_id| blk: {
-            if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, payload_json) catch return serverError(ctx))) {
+            if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, event_payload_json) catch return serverError(ctx))) {
                 return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event reservation was already consumed");
             }
             break :blk event_id;
@@ -4323,7 +4444,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
             .actor_id = event_actor_id,
             .dedupe_key = event_dedupe_key,
             .causality_json = causality_json,
-            .payload_json = payload_json,
+            .payload_json = event_payload_json,
             .status = "applied",
         }) catch return serverError(ctx);
         return appliedFeedObjectResponse(ctx, event_id, object_type, object_id, null);
@@ -4389,7 +4510,7 @@ fn feedIdOverride(obj: std.json.ObjectMap, event_object_id: ?[]const u8, prefix:
     return null;
 }
 
-fn buildAppliedMemoryAtomInput(ctx: *Context, payload_json: []const u8, fallback_scope: []const u8, event_object_id: ?[]const u8) !store_mod.MemoryAtomInput {
+fn buildAppliedMemoryAtomInput(ctx: *Context, payload_json: []const u8, fallback_scope: []const u8, event_object_id: ?[]const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !store_mod.MemoryAtomInput {
     const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
     // Returned input fields borrow slices from this request-arena parse tree.
     if (payload.value != .object) return error.InvalidPayload;
@@ -4414,7 +4535,7 @@ fn buildAppliedMemoryAtomInput(ctx: *Context, payload_json: []const u8, fallback
         .owner = json.nullableStringField(obj, "owner"),
         .permissions_json = permissions_json,
         .tags_json = rawField(ctx.allocator, obj, "tags", "[\"feed\"]") catch "[\"feed\"]",
-        .storage_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        .storage_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
     if (!canCreateMemoryAtom(ctx, input)) return error.Forbidden;
@@ -4519,7 +4640,7 @@ fn canProposeAgentSessionEvent(ctx: *Context, event_actor_id: []const u8, scope:
     return access.permissionsVisibleForActor(ctx.allocator, permissions_json, ctx.actor_scopes_json, event_actor_id);
 }
 
-fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_json: []const u8, object_id: ?[]const u8, event_actor_id: []const u8) !AgentMemoryApplyInput {
+fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_json: []const u8, object_id: ?[]const u8, event_actor_id: []const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !AgentMemoryApplyInput {
     const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
     // Returned input fields borrow slices from this request-arena parse tree.
     if (payload.value != .object) return error.InvalidPayload;
@@ -4530,7 +4651,7 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
     if (session_id) |sid| {
         if (!agentSessionWriteAllowed(ctx, sid)) return error.Forbidden;
     }
-    const route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    const route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route);
     const scope = json.nullableStringField(obj, "scope");
     const computed_owner_id = try access.agentMemoryOwner(ctx.allocator, event_actor_id, scope);
     const owner_actor_id = json.stringField(obj, "owner_id") orelse computed_owner_id;
@@ -4571,7 +4692,7 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
     }, .route = route };
 }
 
-fn buildAppliedAgentSessionMessageInput(ctx: *Context, operation: []const u8, payload_json: []const u8, event_actor_id: []const u8) !AgentSessionMessageApplyInput {
+fn buildAppliedAgentSessionMessageInput(ctx: *Context, operation: []const u8, payload_json: []const u8, event_actor_id: []const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !AgentSessionMessageApplyInput {
     const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
     // Returned input fields borrow slices from this request-arena parse tree.
     if (payload.value != .object) return error.InvalidPayload;
@@ -4584,7 +4705,7 @@ fn buildAppliedAgentSessionMessageInput(ctx: *Context, operation: []const u8, pa
     }
     const payload_actor = json.nullableStringField(obj, "actor_id") orelse event_actor_id;
     if (!std.mem.eql(u8, payload_actor, event_actor_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
-    const route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    const route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route);
     if (std.mem.eql(u8, operation, "delete_autosaved")) {
         return .{ .session_id = session_id, .actor_id = payload_actor, .delete_autosaved = true, .route = route };
     }
@@ -4605,7 +4726,7 @@ fn buildAppliedAgentSessionMessageInput(ctx: *Context, operation: []const u8, pa
     };
 }
 
-fn buildAppliedAgentSessionUsageInput(ctx: *Context, operation: []const u8, payload_json: []const u8, event_actor_id: []const u8) !AgentSessionUsageApplyInput {
+fn buildAppliedAgentSessionUsageInput(ctx: *Context, operation: []const u8, payload_json: []const u8, event_actor_id: []const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !AgentSessionUsageApplyInput {
     const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
     // Returned input fields borrow slices from this request-arena parse tree.
     if (payload.value != .object) return error.InvalidPayload;
@@ -4614,7 +4735,7 @@ fn buildAppliedAgentSessionUsageInput(ctx: *Context, operation: []const u8, payl
     if (!agentSessionWriteAllowed(ctx, session_id)) return error.Forbidden;
     const payload_actor = json.nullableStringField(obj, "actor_id") orelse event_actor_id;
     if (!std.mem.eql(u8, payload_actor, event_actor_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
-    const route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    const route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route);
     if (std.mem.eql(u8, operation, "delete") or std.mem.eql(u8, operation, "forget")) {
         return .{ .session_id = session_id, .actor_id = payload_actor, .delete_usage = true, .route = route };
     }
@@ -7252,12 +7373,20 @@ fn agentMemoryStorageTargetFromObject(allocator: std.mem.Allocator, obj: std.jso
     return .{};
 }
 
-fn agentMemoryStorageTargetFromObjectOrQuery(allocator: std.mem.Allocator, obj: std.json.ObjectMap, query: []const u8) !store_mod.AgentMemoryStorageRoute {
-    if (json.stringField(obj, "storage") != null or
+fn objectHasStorageTarget(obj: std.json.ObjectMap) bool {
+    return json.stringField(obj, "storage") != null or
         json.stringField(obj, "store") != null or
         json.stringField(obj, "target_store") != null or
-        obj.get("stores") != null)
-    {
+        obj.get("stores") != null;
+}
+
+fn agentMemoryStorageTargetFromObjectOrFallback(allocator: std.mem.Allocator, obj: std.json.ObjectMap, fallback: store_mod.AgentMemoryStorageRoute) !store_mod.AgentMemoryStorageRoute {
+    if (objectHasStorageTarget(obj)) return agentMemoryStorageTargetFromObject(allocator, obj);
+    return fallback;
+}
+
+fn agentMemoryStorageTargetFromObjectOrQuery(allocator: std.mem.Allocator, obj: std.json.ObjectMap, query: []const u8) !store_mod.AgentMemoryStorageRoute {
+    if (objectHasStorageTarget(obj)) {
         return agentMemoryStorageTargetFromObject(allocator, obj);
     }
     return agentMemoryStorageTargetFromQuery(allocator, query);
@@ -9857,35 +9986,74 @@ test "api memory feed endpoints honor named runtime route selection" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var ctx = Context{ .allocator = alloc, .store = &store };
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_id = "agent:route",
+        .actor_scopes_json = "[\"public\",\"write:public\",\"session:*\",\"write:session:*\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"delete\",\"export\",\"feed_apply\"]",
+    };
 
     const local_status = handleRequest(&ctx, "GET", "/v1/memory/status", "", "");
     try std.testing.expectEqualStrings("200 OK", local_status.status);
     try std.testing.expect(std.mem.indexOf(u8, local_status.body, "\"instance_id\"") != null);
 
+    const named_apply = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"feed.routed\",\"content\":\"Scratch routed feed apply\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", named_apply.status);
+
+    const scratch_get = handleRequest(&ctx, "GET", "/v1/agent-memory/feed.routed?store=scratch&scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_get.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_get.body, "Scratch routed feed apply") != null);
+
+    const native_get = handleRequest(&ctx, "GET", "/v1/agent-memory/feed.routed?storage=native&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", native_get.status);
+
+    const atom_apply = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"memory_atom.put\",\"object_type\":\"memory_atom\",\"scope\":\"public\",\"payload\":{\"text\":\"Scratch routed atom feed\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", atom_apply.status);
+
+    const session_apply = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_session_message.put\",\"object_type\":\"agent_session_message\",\"payload\":{\"session_id\":\"feed-route-session\",\"role\":\"user\",\"content\":\"Scratch routed session feed\",\"created_at_ms\":77}}", "");
+    try std.testing.expectEqualStrings("200 OK", session_apply.status);
+    const scratch_messages = handleRequest(&ctx, "GET", "/v1/agent-sessions/feed-route-session/messages?store=scratch", "", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_messages.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_messages.body, "Scratch routed session feed") != null);
+
+    const usage_apply = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_session_usage.put\",\"object_type\":\"agent_session_usage\",\"payload\":{\"session_id\":\"feed-route-session\",\"total_tokens\":123}}", "");
+    try std.testing.expectEqualStrings("200 OK", usage_apply.status);
+    const scratch_usage = handleRequest(&ctx, "GET", "/v1/agent-sessions/feed-route-session/usage?store=scratch", "", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_usage.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_usage.body, "\"total_tokens\":123") != null);
+
     const named_status = handleRequest(&ctx, "GET", "/v1/memory/status?store=scratch", "", "");
-    try std.testing.expectEqualStrings("400 Bad Request", named_status.status);
-    try std.testing.expect(std.mem.indexOf(u8, named_status.body, "storage_unavailable") != null);
+    try std.testing.expectEqualStrings("200 OK", named_status.status);
+    try std.testing.expect(std.mem.indexOf(u8, named_status.body, "\"visible_events\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_status.body, "\"visible_events\":0") == null);
 
     const named_feed = handleRequest(&ctx, "GET", "/v1/memory/events?store=scratch", "", "");
-    try std.testing.expectEqualStrings("400 Bad Request", named_feed.status);
-    try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "storage_unavailable") != null);
+    try std.testing.expectEqualStrings("200 OK", named_feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "\"store\":\"scratch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed feed apply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed atom feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed session feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "\"total_tokens\":123") != null);
+
+    const native_feed = handleRequest(&ctx, "GET", "/v1/memory/events?storage=native", "", "");
+    try std.testing.expectEqualStrings("200 OK", native_feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch routed feed apply") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch routed session feed") == null);
 
     const named_checkpoint = handleRequest(&ctx, "GET", "/v1/memory/checkpoint?store=scratch", "", "");
-    try std.testing.expectEqualStrings("400 Bad Request", named_checkpoint.status);
-    try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "storage_unavailable") != null);
+    try std.testing.expectEqualStrings("200 OK", named_checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "\"store\":\"scratch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch routed feed apply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch routed atom feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch routed session feed") != null);
 
     const named_compact = handleRequest(&ctx, "POST", "/v1/memory/compact?store=scratch", "{}", "");
-    try std.testing.expectEqualStrings("400 Bad Request", named_compact.status);
-    try std.testing.expect(std.mem.indexOf(u8, named_compact.body, "storage_unavailable") != null);
+    try std.testing.expectEqualStrings("200 OK", named_compact.status);
+    try std.testing.expect(std.mem.indexOf(u8, named_compact.body, "\"cursor_floor\"") != null);
 
     const named_restore = handleRequest(&ctx, "POST", "/v1/memory/checkpoint?store=scratch", "{\"events\":[]}", "");
-    try std.testing.expectEqualStrings("400 Bad Request", named_restore.status);
-    try std.testing.expect(std.mem.indexOf(u8, named_restore.body, "storage_unavailable") != null);
-
-    const named_apply = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"memory_atom.put\",\"object_type\":\"memory_atom\",\"payload\":{\"text\":\"must not apply through unsupported named feed\",\"scope\":\"public\"}}", "");
-    try std.testing.expectEqualStrings("400 Bad Request", named_apply.status);
-    try std.testing.expect(std.mem.indexOf(u8, named_apply.body, "storage_unavailable") != null);
+    try std.testing.expectEqualStrings("200 OK", named_restore.status);
 }
 
 test "api memory checkpoint restore preserves primitive named runtime mirrors" {

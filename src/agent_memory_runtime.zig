@@ -211,6 +211,13 @@ pub const Runtime = union(BackendKind) {
         };
     }
 
+    pub fn supportsFeed(self: *const Runtime) bool {
+        return switch (self.*) {
+            .api => true,
+            else => false,
+        };
+    }
+
     pub fn store(self: *Runtime, allocator: std.mem.Allocator, input: Input) !domain.AgentMemory {
         return switch (self.*) {
             .none => error.AgentMemoryStorageUnavailable,

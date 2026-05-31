@@ -259,10 +259,16 @@ fn domainPayloadJson(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn payloadWithStorageRouteJson(allocator: std.mem.Allocator, payload_json: []const u8, route: AgentMemoryStorageRoute) ![]const u8 {
+pub fn payloadWithStorageRouteJson(allocator: std.mem.Allocator, payload_json: []const u8, route: AgentMemoryStorageRoute) ![]const u8 {
     if (route.target == .primary) return allocator.dupe(u8, payload_json);
     const trimmed = std.mem.trim(u8, payload_json, " \t\r\n");
     if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') {
+        return allocator.dupe(u8, payload_json);
+    }
+    if (std.mem.indexOf(u8, trimmed, "\"store\"") != null or
+        std.mem.indexOf(u8, trimmed, "\"storage\"") != null or
+        std.mem.indexOf(u8, trimmed, "\"stores\"") != null)
+    {
         return allocator.dupe(u8, payload_json);
     }
 
@@ -2007,9 +2013,15 @@ pub const Store = struct {
 
     pub fn applyFeedMemoryAtomAtomic(self: *Store, allocator: std.mem.Allocator, input: FeedMemoryApplyInput) !FeedMemoryApplyResult {
         try self.ensureKnowledgePrimitiveMirrorRoute(input.prepared.atom.storage_route);
+        var routed_input = input;
+        var routed_event = input.event;
+        const event_payload_json = try payloadWithStorageRouteJson(allocator, input.event.payload_json, input.prepared.atom.storage_route);
+        defer allocator.free(event_payload_json);
+        routed_event.payload_json = event_payload_json;
+        routed_input.event = routed_event;
         const result = try switch (self.backend) {
-            .sqlite => |*s| s.applyFeedMemoryAtomAtomic(allocator, input),
-            .postgres => |*p| p.applyFeedMemoryAtomAtomic(allocator, input),
+            .sqlite => |*s| s.applyFeedMemoryAtomAtomic(allocator, routed_input),
+            .postgres => |*p| p.applyFeedMemoryAtomAtomic(allocator, routed_input),
         };
         if (input.prepared.atom.storage_route.target != .primary and !std.mem.eql(u8, result.atom.predicate, "agent.memory")) {
             try self.mirrorKnowledgePrimitive(allocator, .memory_atom, result.atom.id, result.atom.predicate, result.atom.text, result.atom.scope, result.atom.permissions_json, input.prepared.atom.actor_id, input.prepared.atom.storage_route);
@@ -2035,6 +2047,8 @@ pub const Store = struct {
         var object_id: []const u8 = input.delete_key orelse "agent_memory";
         var entry: ?domain.AgentMemory = null;
         var deleted = false;
+        const event_payload_json = try payloadWithStorageRouteJson(allocator, input.event.payload_json, route);
+        defer allocator.free(event_payload_json);
         if (input.input) |memory_input| {
             var auditable = memory_input;
             if (auditable.writer_actor_id == null) auditable.writer_actor_id = input.writer_actor_id orelse input.event.actor_id;
@@ -2051,7 +2065,7 @@ pub const Store = struct {
         }
 
         const event_id = if (input.reserved_event_id) |reserved| blk: {
-            if (!try self.markFeedEventApplied(reserved, input.event.object_type, object_id, input.event.payload_json)) return error.FeedReservationConsumed;
+            if (!try self.markFeedEventApplied(reserved, input.event.object_type, object_id, event_payload_json)) return error.FeedReservationConsumed;
             break :blk reserved;
         } else try self.appendFeedEvent(.{
             .event_type = input.event.event_type,
@@ -2063,7 +2077,7 @@ pub const Store = struct {
             .actor_id = input.event.actor_id,
             .dedupe_key = input.event.dedupe_key,
             .causality_json = input.event.causality_json,
-            .payload_json = input.event.payload_json,
+            .payload_json = event_payload_json,
             .status = "applied",
         });
         return .{ .event_id = event_id, .object_id = object_id, .entry = entry, .deleted = deleted };
