@@ -3134,7 +3134,7 @@ fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
     const since_id = if (json.queryParam(query, "since_id")) |raw| std.fmt.parseInt(i64, raw, 10) catch 0 else 0;
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
-    const events = ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = feed_scopes }) catch |err| switch (err) {
+    const events = ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch |err| switch (err) {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor; request a checkpoint"),
         else => return serverError(ctx),
     };
@@ -3144,7 +3144,7 @@ fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
 fn memoryFeedStatus(ctx: *Context) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
-    const status = ctx.store.feedStatus(ctx.allocator, feed_scopes) catch return serverError(ctx);
+    const status = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     status.writeJson(ctx.allocator, &out) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
@@ -3163,10 +3163,10 @@ fn memoryFeedCompact(ctx: *Context, body: []const u8) HttpResponse {
 fn memoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
     if (!(hasCapability(ctx, "read") and hasCapability(ctx, "export"))) return forbidden(ctx);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
-    const status = ctx.store.feedStatus(ctx.allocator, feed_scopes) catch return serverError(ctx);
+    const status = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
     const since_id = if (json.queryParam(query, "since_id")) |raw| std.fmt.parseInt(i64, raw, 10) catch 0 else 0;
     const limit = parseLimit(json.queryParam(query, "limit"), 500);
-    const events = ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = feed_scopes, .ignore_cursor_floor = true }) catch |err| switch (err) {
+    const events = ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = feed_scopes, .ignore_cursor_floor = true, .actor_id = ctx.actor_id }) catch |err| switch (err) {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor"),
         else => return serverError(ctx),
     };

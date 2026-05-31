@@ -1452,10 +1452,10 @@ pub const Store = struct {
         };
     }
 
-    pub fn feedStatus(self: *Store, allocator: std.mem.Allocator, scopes_json: []const u8) !FeedStatus {
+    pub fn feedStatus(self: *Store, allocator: std.mem.Allocator, input: FeedStatusInput) !FeedStatus {
         return switch (self.backend) {
-            .sqlite => |*s| s.feedStatus(allocator, scopes_json),
-            .postgres => |*p| p.feedStatus(allocator, scopes_json),
+            .sqlite => |*s| s.feedStatus(allocator, input),
+            .postgres => |*p| p.feedStatus(allocator, input),
         };
     }
 
@@ -1506,6 +1506,7 @@ pub const Store = struct {
             .limit = capped,
             .scopes_json = input.scopes_json,
             .ignore_cursor_floor = true,
+            .actor_id = input.actor_id,
         });
         var rows: std.ArrayListUnmanaged(analytics_runtime.Event) = .empty;
         errdefer rows.deinit(allocator);
@@ -3311,6 +3312,12 @@ pub const FeedListInput = struct {
     limit: usize = 100,
     scopes_json: []const u8 = "[\"admin\"]",
     ignore_cursor_floor: bool = false,
+    actor_id: ?[]const u8 = null,
+};
+
+pub const FeedStatusInput = struct {
+    scopes_json: []const u8 = "[\"admin\"]",
+    actor_id: ?[]const u8 = null,
 };
 
 pub const FeedEvent = struct {
@@ -7167,7 +7174,7 @@ pub const SQLiteStore = struct {
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const scope = try columnText(allocator, stmt, 5);
             const permissions = try columnText(allocator, stmt, 6);
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             try out.append(allocator, try readFeedEventWithScope(allocator, stmt, scope));
             if (out.items.len >= visible_limit) break;
         }
@@ -7181,7 +7188,7 @@ pub const SQLiteStore = struct {
         return c.sqlite3_column_int64(stmt, 0);
     }
 
-    pub fn feedStatus(self: *Self, allocator: std.mem.Allocator, scopes_json: []const u8) !FeedStatus {
+    pub fn feedStatus(self: *Self, allocator: std.mem.Allocator, input: FeedStatusInput) !FeedStatus {
         const floor = try self.feedCursorFloor();
         const max_id: i64 = @intCast(try self.countSql("SELECT coalesce(max(id), 0) FROM memory_feed_events"));
         const stmt = try self.prepare("SELECT scope,permissions_json,status FROM memory_feed_events WHERE id > ?1");
@@ -7194,7 +7201,7 @@ pub const SQLiteStore = struct {
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const scope = try columnText(allocator, stmt, 0);
             const permissions = try columnText(allocator, stmt, 1);
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const status = try columnText(allocator, stmt, 2);
             visible += 1;
             if (std.mem.eql(u8, status, "pending")) pending += 1 else if (std.mem.eql(u8, status, "applying")) applying += 1 else if (std.mem.eql(u8, status, "applied")) applied_count += 1;
@@ -10151,7 +10158,7 @@ pub const PostgresStore = struct {
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
             if (item != .object) continue;
             const event = try readPgFeedEvent(allocator, item.object);
-            if (!try self.recordVisibleWithPolicy(allocator, event.scope, event.permissions_json, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, event.scope, event.permissions_json, input.scopes_json, input.actor_id)) continue;
             try out.append(allocator, event);
             if (out.items.len >= visible_limit) break;
         };
@@ -10170,7 +10177,7 @@ pub const PostgresStore = struct {
         return std.fmt.parseInt(i64, text, 10) catch 0;
     }
 
-    pub fn feedStatus(self: *PostgresStore, allocator: std.mem.Allocator, scopes_json: []const u8) !FeedStatus {
+    pub fn feedStatus(self: *PostgresStore, allocator: std.mem.Allocator, input: FeedStatusInput) !FeedStatus {
         const floor = try self.feedCursorFloor(allocator);
         const max_text = try self.queryText(allocator, "SELECT coalesce(max(id), 0)::text FROM memory_feed_events");
         const max_id = std.fmt.parseInt(i64, max_text, 10) catch 0;
@@ -10185,7 +10192,7 @@ pub const PostgresStore = struct {
             if (item != .object) continue;
             const scope = json.stringField(item.object, "scope") orelse "workspace";
             const permissions = try rawJsonField(allocator, item.object, "permissions_json", "[]");
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const status = json.stringField(item.object, "status") orelse "";
             visible += 1;
             if (std.mem.eql(u8, status, "pending")) pending += 1 else if (std.mem.eql(u8, status, "applying")) applying += 1 else if (std.mem.eql(u8, status, "applied")) applied_count += 1;
@@ -13389,6 +13396,45 @@ test "sqlite memory feed append list and apply events are scope filtered" {
     try std.testing.expect(all[1].applied_at_ms != null);
 }
 
+test "sqlite memory feed visibility is actor-aware at store layer" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const actor = "agent:feed-a";
+    const other_actor = "agent:feed-b";
+    const actor_scope = try domain.defaultAgentMemoryScope(alloc, actor);
+    const actor_permissions = try domain.actorGrantJson(alloc, actor);
+
+    _ = try store.appendFeedEvent(.{
+        .event_type = "agent_memory.put",
+        .operation = "put",
+        .object_type = "agent_memory",
+        .object_id = "ami_actor_private",
+        .scope = actor_scope,
+        .permissions_json = actor_permissions,
+        .actor_id = actor,
+        .payload_json = "{\"key\":\"private.feed\",\"content\":\"actor private feed\"}",
+        .status = "applied",
+    });
+
+    const visible = try store.listFeedEvents(alloc, .{ .scopes_json = "[]", .actor_id = actor, .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), visible.len);
+    try std.testing.expectEqualStrings("ami_actor_private", visible[0].object_id);
+
+    const status = try store.feedStatus(alloc, .{ .scopes_json = "[]", .actor_id = actor });
+    try std.testing.expectEqual(@as(usize, 1), status.visible_events);
+    try std.testing.expectEqual(@as(usize, 1), status.applied_events);
+
+    const hidden = try store.listFeedEvents(alloc, .{ .scopes_json = "[]", .actor_id = other_actor, .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 0), hidden.len);
+
+    const hidden_status = try store.feedStatus(alloc, .{ .scopes_json = "[]", .actor_id = other_actor });
+    try std.testing.expectEqual(@as(usize, 0), hidden_status.visible_events);
+}
+
 test "sqlite direct primitive writes append applied feed events" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -14524,6 +14570,33 @@ test "postgres storage contract covers primitives when configured" {
         if (!std.mem.eql(u8, result.result_type, "feed_event")) continue;
         try std.testing.expect(std.mem.indexOf(u8, result.text, direct_source.id) == null);
         try std.testing.expect(std.mem.indexOf(u8, result.text, "Postgres direct feed source") == null);
+    }
+
+    const private_scope = try domain.defaultAgentMemoryScope(alloc, "agent:pg-private");
+    const private_permissions = try domain.actorGrantJson(alloc, "agent:pg-private");
+    const private_feed_id = try store.appendFeedEvent(.{
+        .event_type = "agent_memory.put",
+        .operation = "put",
+        .object_type = "agent_memory",
+        .object_id = try std.fmt.allocPrint(alloc, "{s}.pg.private", .{unique}),
+        .scope = private_scope,
+        .permissions_json = private_permissions,
+        .actor_id = "agent:pg-private",
+        .payload_json = "{\"key\":\"pg.private\",\"content\":\"postgres private feed\"}",
+        .status = "applied",
+    });
+    const private_visible = try store.listFeedEvents(alloc, .{ .since_id = private_feed_id - 1, .scopes_json = "[]", .actor_id = "agent:pg-private", .limit = 10 });
+    var saw_private = false;
+    for (private_visible) |event| {
+        if (event.id == private_feed_id) saw_private = true;
+    }
+    try std.testing.expect(saw_private);
+    const private_status = try store.feedStatus(alloc, .{ .scopes_json = "[]", .actor_id = "agent:pg-private" });
+    try std.testing.expect(private_status.visible_events >= 1);
+    try std.testing.expect(private_status.applied_events >= 1);
+    const private_hidden = try store.listFeedEvents(alloc, .{ .since_id = private_feed_id - 1, .scopes_json = "[]", .actor_id = "agent:pg-other", .limit = 10 });
+    for (private_hidden) |event| {
+        try std.testing.expect(event.id != private_feed_id);
     }
 
     const hidden_feed = try store.listFeedEvents(alloc, .{ .since_id = feed_id - 1, .scopes_json = "[\"public\"]", .limit = 10 });
