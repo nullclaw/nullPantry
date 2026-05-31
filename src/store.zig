@@ -1953,26 +1953,32 @@ pub const Store = struct {
 
     pub fn createContextPack(self: *Store, allocator: std.mem.Allocator, input: ContextPackInput) !ContextPackResult {
         try self.ensureKnowledgePrimitiveMirrorRoute(input.agent_memory_route);
-        const search_results = try self.search(allocator, .{
-            .query = input.query,
-            .limit = input.retrieval_limit,
-            .scopes_json = input.scopes_json,
-            .include_deprecated = input.include_deprecated,
-            .include_sessions = input.include_sessions,
-            .session_id = input.session_id,
-            .use_vector = input.use_vector,
-            .adaptive_retrieval = input.adaptive_retrieval,
-            .use_temporal_decay = input.use_temporal_decay,
-            .use_mmr = input.use_mmr,
-            .allow_reranker = input.allow_reranker,
-            .min_relevance = input.min_relevance,
-            .query_embedding_json = input.query_embedding_json,
-            .query_embedding_provider = input.query_embedding_provider,
-            .embedding_dimensions = input.embedding_dimensions,
-            .actor_id = input.actor_id,
-            .agent_memory_route = input.agent_memory_route,
-        });
-        defer allocator.free(search_results);
+        var owns_search_results = false;
+        const search_results = if (input.preselected_results) |results|
+            results
+        else blk: {
+            owns_search_results = true;
+            break :blk try self.search(allocator, .{
+                .query = input.query,
+                .limit = input.retrieval_limit,
+                .scopes_json = input.scopes_json,
+                .include_deprecated = input.include_deprecated,
+                .include_sessions = input.include_sessions,
+                .session_id = input.session_id,
+                .use_vector = input.use_vector,
+                .adaptive_retrieval = input.adaptive_retrieval,
+                .use_temporal_decay = input.use_temporal_decay,
+                .use_mmr = input.use_mmr,
+                .allow_reranker = input.allow_reranker,
+                .min_relevance = input.min_relevance,
+                .query_embedding_json = input.query_embedding_json,
+                .query_embedding_provider = input.query_embedding_provider,
+                .embedding_dimensions = input.embedding_dimensions,
+                .actor_id = input.actor_id,
+                .agent_memory_route = input.agent_memory_route,
+            });
+        };
+        defer if (owns_search_results) allocator.free(search_results);
         var routed_input = input;
         routed_input.preselected_results = search_results;
         const pack = try switch (self.backend) {

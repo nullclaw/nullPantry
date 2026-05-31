@@ -7,6 +7,27 @@ pub const Direction = enum {
     inbound,
 };
 
+pub const CommandKind = enum {
+    traverse,
+    path,
+    relations,
+};
+
+pub const Command = struct {
+    kind: CommandKind,
+    entity_id: ?[]u8 = null,
+    from_entity_id: ?[]u8 = null,
+    to_entity_id: ?[]u8 = null,
+    max_depth: usize = 1,
+
+    pub fn deinit(self: *Command, allocator: std.mem.Allocator) void {
+        if (self.entity_id) |value| allocator.free(value);
+        if (self.from_entity_id) |value| allocator.free(value);
+        if (self.to_entity_id) |value| allocator.free(value);
+        self.* = .{ .kind = .traverse };
+    }
+};
+
 pub const RelationTypeSpec = struct {
     name: []const u8,
     directed: bool = true,
@@ -43,6 +64,71 @@ pub fn directionName(direction: Direction) []const u8 {
         .outbound => "outbound",
         .inbound => "inbound",
     };
+}
+
+pub fn parseCommand(allocator: std.mem.Allocator, raw: []const u8) !?Command {
+    const query = std.mem.trim(u8, raw, " \t\r\n");
+    if (commandPayload(query, "kg:traverse:") orelse commandPayload(query, "graph:traverse:")) |payload| {
+        return try parseTraverseCommand(allocator, payload);
+    }
+    if (commandPayload(query, "kg:path:") orelse commandPayload(query, "graph:path:")) |payload| {
+        return try parsePathCommand(allocator, payload);
+    }
+    if (commandPayload(query, "kg:relations:") orelse commandPayload(query, "graph:relations:")) |payload| {
+        return try parseRelationsCommand(allocator, payload);
+    }
+    return null;
+}
+
+fn commandPayload(query: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, query, prefix)) return null;
+    return query[prefix.len..];
+}
+
+fn parseTraverseCommand(allocator: std.mem.Allocator, payload: []const u8) !Command {
+    const depth_sep = std.mem.lastIndexOfScalar(u8, payload, ':') orelse return error.InvalidGraphCommand;
+    if (depth_sep == 0 or depth_sep + 1 >= payload.len) return error.InvalidGraphCommand;
+    return .{
+        .kind = .traverse,
+        .entity_id = try decodeCommandSegment(allocator, payload[0..depth_sep]),
+        .max_depth = try parseCommandDepth(payload[depth_sep + 1 ..]),
+    };
+}
+
+fn parsePathCommand(allocator: std.mem.Allocator, payload: []const u8) !Command {
+    var it = std.mem.splitScalar(u8, payload, ':');
+    const from_raw = it.next() orelse return error.InvalidGraphCommand;
+    const to_raw = it.next() orelse return error.InvalidGraphCommand;
+    const depth_raw = it.next() orelse return error.InvalidGraphCommand;
+    if (it.next() != null or from_raw.len == 0 or to_raw.len == 0 or depth_raw.len == 0) return error.InvalidGraphCommand;
+    return .{
+        .kind = .path,
+        .from_entity_id = try decodeCommandSegment(allocator, from_raw),
+        .to_entity_id = try decodeCommandSegment(allocator, to_raw),
+        .max_depth = try parseCommandDepth(depth_raw),
+    };
+}
+
+fn parseRelationsCommand(allocator: std.mem.Allocator, payload: []const u8) !Command {
+    if (payload.len == 0 or std.mem.indexOfScalar(u8, payload, ':') != null) return error.InvalidGraphCommand;
+    return .{
+        .kind = .relations,
+        .entity_id = try decodeCommandSegment(allocator, payload),
+        .max_depth = 1,
+    };
+}
+
+fn decodeCommandSegment(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const decoded = try json.percentDecode(allocator, value);
+    errdefer allocator.free(decoded);
+    if (decoded.len == 0) return error.InvalidGraphCommand;
+    return decoded;
+}
+
+fn parseCommandDepth(value: []const u8) !usize {
+    const parsed = std.fmt.parseInt(usize, value, 10) catch return error.InvalidGraphCommand;
+    if (parsed == 0) return error.InvalidGraphCommand;
+    return parsed;
 }
 
 pub fn canonicalRelationType(value: []const u8) []const u8 {
@@ -143,4 +229,28 @@ test "graph direction and relation schema helpers" {
     try std.testing.expectError(error.InvalidRelationSchema, validateRelationShape("implements", "decision", "ticket"));
     try std.testing.expectEqualStrings("b", otherEntityIdForDirection("a", "b", "a", .outbound).?);
     try std.testing.expect(otherEntityIdForDirection("a", "b", "a", .inbound) == null);
+}
+
+test "graph command parser supports traverse path and relations" {
+    var traverse = (try parseCommand(std.testing.allocator, "kg:traverse:project%3ANullPantry:3")).?;
+    defer traverse.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandKind.traverse, traverse.kind);
+    try std.testing.expectEqualStrings("project:NullPantry", traverse.entity_id.?);
+    try std.testing.expectEqual(@as(usize, 3), traverse.max_depth);
+
+    var path = (try parseCommand(std.testing.allocator, "graph:path:a%2F1:b%2F2:4")).?;
+    defer path.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandKind.path, path.kind);
+    try std.testing.expectEqualStrings("a/1", path.from_entity_id.?);
+    try std.testing.expectEqualStrings("b/2", path.to_entity_id.?);
+    try std.testing.expectEqual(@as(usize, 4), path.max_depth);
+
+    var relations = (try parseCommand(std.testing.allocator, "kg:relations:agent%3Aalpha")).?;
+    defer relations.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandKind.relations, relations.kind);
+    try std.testing.expectEqualStrings("agent:alpha", relations.entity_id.?);
+    try std.testing.expectEqual(@as(usize, 1), relations.max_depth);
+
+    try std.testing.expect((try parseCommand(std.testing.allocator, "ordinary search")) == null);
+    try std.testing.expectError(error.InvalidGraphCommand, parseCommand(std.testing.allocator, "kg:path:a:b"));
 }

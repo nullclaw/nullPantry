@@ -1172,6 +1172,13 @@ fn graphQuery(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
+    if (json.stringField(obj, "query") orelse json.stringField(obj, "q")) |command_text| {
+        var command_opt = graph_mod.parseCommand(ctx.allocator, command_text) catch return badJson(ctx);
+        if (command_opt) |*command| {
+            defer command.deinit(ctx.allocator);
+            return graphCommandQuery(ctx, command.*, obj);
+        }
+    }
     const root_ids = graphRootEntityIds(ctx, obj) catch return badJson(ctx);
     if (root_ids.len == 0) return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing entity_id or entity_ids");
     const options = graphTraversalOptions(ctx, obj) catch |err| switch (err) {
@@ -1180,7 +1187,39 @@ fn graphQuery(ctx: *Context, body: []const u8) HttpResponse {
     };
     const depth = graphDepth(json.intField(obj, "depth"));
     const limit = positiveLimit(json.intField(obj, "limit"), 50);
+    return graphQueryFromRoots(ctx, root_ids, options, depth, limit);
+}
 
+fn graphCommandQuery(ctx: *Context, command: graph_mod.Command, obj: std.json.ObjectMap) HttpResponse {
+    var options = graphTraversalOptions(ctx, obj) catch |err| switch (err) {
+        error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
+        else => return serverError(ctx),
+    };
+    const limit = positiveLimit(json.intField(obj, "limit"), 50);
+    return switch (command.kind) {
+        .traverse => blk: {
+            const entity_id = command.entity_id orelse return badJson(ctx);
+            if (json.stringField(obj, "direction") == null) options.direction = .outbound;
+            const root_ids = [_][]const u8{entity_id};
+            break :blk graphQueryFromRoots(ctx, &root_ids, options, graphDepthFromSize(command.max_depth), limit);
+        },
+        .relations => blk: {
+            const entity_id = command.entity_id orelse return badJson(ctx);
+            const root_ids = [_][]const u8{entity_id};
+            break :blk graphQueryFromRoots(ctx, &root_ids, options, 1, limit);
+        },
+        .path => graphPathBetween(
+            ctx,
+            command.from_entity_id orelse return badJson(ctx),
+            command.to_entity_id orelse return badJson(ctx),
+            options,
+            graphDepthFromSize(command.max_depth),
+            positiveLimit(json.intField(obj, "limit"), 100),
+        ),
+    };
+}
+
+fn graphQueryFromRoots(ctx: *Context, root_ids: []const []const u8, options: GraphTraversalOptions, depth: usize, limit: usize) HttpResponse {
     var roots: std.ArrayListUnmanaged(domain.Entity) = .empty;
     var entities: std.ArrayListUnmanaged(domain.Entity) = .empty;
     var relations: std.ArrayListUnmanaged(domain.Relation) = .empty;
@@ -1227,6 +1266,24 @@ fn graphPath(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
+    if (json.stringField(obj, "query") orelse json.stringField(obj, "q")) |command_text| {
+        var command_opt = graph_mod.parseCommand(ctx.allocator, command_text) catch return badJson(ctx);
+        if (command_opt) |*command| {
+            defer command.deinit(ctx.allocator);
+            if (command.kind != .path) return badJson(ctx);
+            return graphPathBetween(
+                ctx,
+                command.from_entity_id orelse return badJson(ctx),
+                command.to_entity_id orelse return badJson(ctx),
+                graphTraversalOptions(ctx, obj) catch |err| switch (err) {
+                    error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
+                    else => return serverError(ctx),
+                },
+                graphDepthFromSize(command.max_depth),
+                positiveLimit(json.intField(obj, "limit"), 100),
+            );
+        }
+    }
     const from_entity_id = json.stringField(obj, "from_entity_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing from_entity_id");
     const to_entity_id = json.stringField(obj, "to_entity_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing to_entity_id");
     const options = graphTraversalOptions(ctx, obj) catch |err| switch (err) {
@@ -1235,7 +1292,10 @@ fn graphPath(ctx: *Context, body: []const u8) HttpResponse {
     };
     const max_depth = graphDepth(json.intField(obj, "max_depth"));
     const limit = positiveLimit(json.intField(obj, "limit"), 100);
+    return graphPathBetween(ctx, from_entity_id, to_entity_id, options, max_depth, limit);
+}
 
+fn graphPathBetween(ctx: *Context, from_entity_id: []const u8, to_entity_id: []const u8, options: GraphTraversalOptions, max_depth: usize, limit: usize) HttpResponse {
     const from = (ctx.store.getEntity(ctx.allocator, from_entity_id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "From entity not found");
     const to = (ctx.store.getEntity(ctx.allocator, to_entity_id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "To entity not found");
     const from_visible = visibleGraphEntity(ctx, from, options.include_deprecated) catch return serverError(ctx);
@@ -1384,6 +1444,198 @@ fn graphDepth(value: ?i64) usize {
     const raw = value orelse return 1;
     if (raw <= 0) return 1;
     return @intCast(@min(raw, 6));
+}
+
+fn graphDepthFromSize(value: usize) usize {
+    return @min(@max(value, @as(usize, 1)), @as(usize, 6));
+}
+
+fn graphCommandSearchResultsFromObject(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, limit: usize) !?[]domain.SearchResult {
+    var command_opt = try graph_mod.parseCommand(ctx.allocator, query);
+    if (command_opt == null) return null;
+    defer command_opt.?.deinit(ctx.allocator);
+
+    var options = try graphTraversalOptions(ctx, obj);
+    if (command_opt.?.kind == .traverse and json.stringField(obj, "direction") == null) {
+        options.direction = .outbound;
+    }
+    return try graphCommandSearchResults(ctx, command_opt.?, options, graphDepthFromSize(command_opt.?.max_depth), limit);
+}
+
+fn graphCommandSearchResults(ctx: *Context, command: graph_mod.Command, options: GraphTraversalOptions, depth: usize, limit: usize) ![]domain.SearchResult {
+    return switch (command.kind) {
+        .traverse => blk: {
+            const entity_id = command.entity_id orelse return error.InvalidGraphCommand;
+            const root_ids = [_][]const u8{entity_id};
+            break :blk try graphSearchFromRoots(ctx, &root_ids, options, depth, limit);
+        },
+        .relations => blk: {
+            const entity_id = command.entity_id orelse return error.InvalidGraphCommand;
+            const root_ids = [_][]const u8{entity_id};
+            break :blk try graphSearchFromRoots(ctx, &root_ids, options, 1, limit);
+        },
+        .path => try graphPathSearchResults(
+            ctx,
+            command.from_entity_id orelse return error.InvalidGraphCommand,
+            command.to_entity_id orelse return error.InvalidGraphCommand,
+            options,
+            depth,
+            limit,
+        ),
+    };
+}
+
+fn graphSearchFromRoots(ctx: *Context, root_ids: []const []const u8, options: GraphTraversalOptions, depth: usize, limit: usize) ![]domain.SearchResult {
+    var results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
+    errdefer results.deinit(ctx.allocator);
+    var frontier: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer frontier.deinit(ctx.allocator);
+
+    for (root_ids) |entity_id| {
+        const entity = (try ctx.store.getEntity(ctx.allocator, entity_id)) orelse continue;
+        if (!try visibleGraphEntity(ctx, entity, options.include_deprecated)) continue;
+        if (!graph_mod.entityMatchesTypeFilter(entity.entity_type, options.entity_types)) continue;
+        try appendGraphEntitySearchResult(ctx, &results, entity, 1.0, limit);
+        if (!stringInList(frontier.items, entity.id)) try frontier.append(ctx.allocator, entity.id);
+    }
+
+    var current_depth: usize = 0;
+    while (current_depth < depth and frontier.items.len > 0 and results.items.len < limit) : (current_depth += 1) {
+        var next: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (frontier.items) |current_entity_id| {
+            const raw_relations = try ctx.store.listEntityRelations(ctx.allocator, current_entity_id, limit);
+            for (raw_relations) |relation| {
+                const visible = try visibleGraphRelation(ctx, relation, options.include_deprecated);
+                if (visible == null) continue;
+                if (!graphRelationAllowed(visible.?.relation, options)) continue;
+                const other = otherEntityForTraversal(visible.?, current_entity_id, options) orelse continue;
+                const seen_other = graphSearchResultContains(results.items, "entity", other.id);
+                try appendGraphRelationSearchResult(ctx, &results, visible.?, 0.9, limit);
+                try appendGraphEntitySearchResult(ctx, &results, other, 0.85, limit);
+                if (!seen_other and results.items.len < limit and !stringInList(next.items, other.id)) {
+                    try next.append(ctx.allocator, other.id);
+                }
+                if (results.items.len >= limit) break;
+            }
+            if (results.items.len >= limit) break;
+        }
+        frontier = next;
+    }
+
+    return results.toOwnedSlice(ctx.allocator);
+}
+
+fn graphPathSearchResults(ctx: *Context, from_entity_id: []const u8, to_entity_id: []const u8, options: GraphTraversalOptions, max_depth: usize, limit: usize) ![]domain.SearchResult {
+    var results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
+    errdefer results.deinit(ctx.allocator);
+
+    const from = (try ctx.store.getEntity(ctx.allocator, from_entity_id)) orelse return results.toOwnedSlice(ctx.allocator);
+    const to = (try ctx.store.getEntity(ctx.allocator, to_entity_id)) orelse return results.toOwnedSlice(ctx.allocator);
+    if (!try visibleGraphEntity(ctx, from, options.include_deprecated)) return results.toOwnedSlice(ctx.allocator);
+    if (!try visibleGraphEntity(ctx, to, options.include_deprecated)) return results.toOwnedSlice(ctx.allocator);
+    if (!graph_mod.entityMatchesTypeFilter(from.entity_type, options.entity_types) or !graph_mod.entityMatchesTypeFilter(to.entity_type, options.entity_types)) return results.toOwnedSlice(ctx.allocator);
+
+    var parents: std.ArrayListUnmanaged(GraphParent) = .empty;
+    var frontier: std.ArrayListUnmanaged([]const u8) = .empty;
+    try parents.append(ctx.allocator, .{ .entity_id = from.id });
+    try frontier.append(ctx.allocator, from.id);
+    var found = std.mem.eql(u8, from.id, to.id);
+
+    search_path: for (0..max_depth) |_| {
+        if (found or frontier.items.len == 0 or parents.items.len >= limit) break;
+        var next: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (frontier.items) |current_entity_id| {
+            const raw_relations = try ctx.store.listEntityRelations(ctx.allocator, current_entity_id, limit);
+            for (raw_relations) |relation| {
+                const visible = try visibleGraphRelation(ctx, relation, options.include_deprecated);
+                if (visible == null) continue;
+                if (!graphRelationAllowed(visible.?.relation, options)) continue;
+                const other = otherEntityForTraversal(visible.?, current_entity_id, options) orelse continue;
+                if (parentIndex(parents.items, other.id) != null) continue;
+                try parents.append(ctx.allocator, .{ .entity_id = other.id, .previous_entity_id = current_entity_id, .relation_id = visible.?.relation.id });
+                if (std.mem.eql(u8, other.id, to.id)) {
+                    found = true;
+                    break :search_path;
+                }
+                try next.append(ctx.allocator, other.id);
+                if (parents.items.len >= limit) break :search_path;
+            }
+        }
+        frontier = next;
+    }
+    if (!found) return results.toOwnedSlice(ctx.allocator);
+
+    var entity_ids_rev: std.ArrayListUnmanaged([]const u8) = .empty;
+    var relation_ids_rev: std.ArrayListUnmanaged([]const u8) = .empty;
+    var current = to.id;
+    while (true) {
+        try entity_ids_rev.append(ctx.allocator, current);
+        const idx = parentIndex(parents.items, current) orelse break;
+        const parent = parents.items[idx];
+        if (parent.previous_entity_id == null) break;
+        if (parent.relation_id) |relation_id| try relation_ids_rev.append(ctx.allocator, relation_id);
+        current = parent.previous_entity_id.?;
+    }
+
+    var i = entity_ids_rev.items.len;
+    while (i > 0 and results.items.len < limit) {
+        i -= 1;
+        const entity = (try ctx.store.getEntity(ctx.allocator, entity_ids_rev.items[i])) orelse continue;
+        if (!try visibleGraphEntity(ctx, entity, options.include_deprecated)) continue;
+        try appendGraphEntitySearchResult(ctx, &results, entity, 1.0, limit);
+    }
+    i = relation_ids_rev.items.len;
+    while (i > 0 and results.items.len < limit) {
+        i -= 1;
+        const relation = (try ctx.store.getRelation(ctx.allocator, relation_ids_rev.items[i])) orelse continue;
+        const visible = try visibleGraphRelation(ctx, relation, options.include_deprecated);
+        if (visible == null) continue;
+        try appendGraphRelationSearchResult(ctx, &results, visible.?, 0.9, limit);
+    }
+
+    return results.toOwnedSlice(ctx.allocator);
+}
+
+fn appendGraphEntitySearchResult(ctx: *Context, out: *std.ArrayListUnmanaged(domain.SearchResult), entity: domain.Entity, score: f64, limit: usize) !void {
+    if (out.items.len >= limit or graphSearchResultContains(out.items, "entity", entity.id)) return;
+    const status = try ctx.store.primitiveLifecycleStatus(ctx.allocator, "entity", entity.id);
+    try out.append(ctx.allocator, .{
+        .id = try ctx.allocator.dupe(u8, entity.id),
+        .result_type = try ctx.allocator.dupe(u8, "entity"),
+        .title = try ctx.allocator.dupe(u8, entity.name),
+        .text = try ctx.allocator.dupe(u8, entity.description orelse entity.name),
+        .scope = try ctx.allocator.dupe(u8, entity.scope),
+        .status = try ctx.allocator.dupe(u8, status),
+        .score = score,
+        .source_ids_json = try ctx.allocator.dupe(u8, "[]"),
+        .created_at_ms = entity.updated_at_ms,
+        .confidence = 1.0,
+    });
+}
+
+fn appendGraphRelationSearchResult(ctx: *Context, out: *std.ArrayListUnmanaged(domain.SearchResult), visible: VisibleGraphRelation, score: f64, limit: usize) !void {
+    const relation = visible.relation;
+    if (out.items.len >= limit or graphSearchResultContains(out.items, "relation", relation.id)) return;
+    const text = try std.fmt.allocPrint(ctx.allocator, "{s} --{s}--> {s}", .{ visible.from.name, relation.relation_type, visible.to.name });
+    try out.append(ctx.allocator, .{
+        .id = try ctx.allocator.dupe(u8, relation.id),
+        .result_type = try ctx.allocator.dupe(u8, "relation"),
+        .title = try ctx.allocator.dupe(u8, relation.relation_type),
+        .text = text,
+        .scope = try ctx.allocator.dupe(u8, relation.scope),
+        .status = try ctx.allocator.dupe(u8, relation.status),
+        .score = score,
+        .source_ids_json = try sanitizeSourceIdsForActor(ctx, relation.source_ids_json),
+        .created_at_ms = ids.nowMs(),
+        .confidence = relation.confidence,
+    });
+}
+
+fn graphSearchResultContains(items: []const domain.SearchResult, result_type: []const u8, id: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.result_type, result_type) and std.mem.eql(u8, item.id, id)) return true;
+    }
+    return false;
 }
 
 fn entityInList(items: []const domain.Entity, id: []const u8) bool {
@@ -3234,10 +3486,13 @@ fn search(ctx: *Context, body: []const u8) HttpResponse {
             return .{ .status = "200 OK", .body = hit.response_json };
         }
     }
-    var results = ctx.store.search(ctx.allocator, input) catch |err| switch (err) {
+    var results = (graphCommandSearchResultsFromObject(ctx, obj, query, input.limit) catch |err| switch (err) {
+        error.InvalidGraphCommand, error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
+        else => return serverError(ctx),
+    }) orelse (ctx.store.search(ctx.allocator, input) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
-    };
+    });
     results = maybeLlmRerankResults(ctx, query, results, input.allow_reranker) catch results;
     const response = searchResponse(ctx, results);
     if (cache_ttl_ms > 0 and hasCapability(ctx, "write")) {
@@ -3599,10 +3854,19 @@ fn retrievalSearch(ctx: *Context, body: []const u8) HttpResponse {
     var plan = retrieval.buildPlanWithAdaptive(ctx.allocator, query, input.use_vector, llm_rerank_effective, .{ .enabled = input.adaptive_retrieval }) catch return serverError(ctx);
     plan.min_relevance = input.min_relevance;
     defer plan.deinit(ctx.allocator);
-    var results = ctx.store.search(ctx.allocator, input) catch |err| switch (err) {
-        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+    const graph_results = graphCommandSearchResultsFromObject(ctx, obj, query, input.limit) catch |err| switch (err) {
+        error.InvalidGraphCommand, error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
         else => return serverError(ctx),
     };
+    if (graph_results != null) {
+        plan.use_keyword = false;
+        plan.use_vector = false;
+        plan.use_graph = true;
+    }
+    var results = graph_results orelse (ctx.store.search(ctx.allocator, input) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    });
     results = maybeLlmRerankResults(ctx, query, results, allow_reranker) catch results;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -6685,10 +6949,13 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
             }
         }
     }
-    var results = ctx.store.search(ctx.allocator, input) catch |err| switch (err) {
+    var results = (graphCommandSearchResultsFromObject(ctx, obj, query, input.limit) catch |err| switch (err) {
+        error.InvalidGraphCommand, error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
+        else => return serverError(ctx),
+    }) orelse (ctx.store.search(ctx.allocator, input) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
-    };
+    });
     results = maybeLlmRerankResults(ctx, query, results, input.allow_reranker) catch results;
     const conflicts = if (include_conflicts)
         (if (scan_conflicts)
@@ -7077,6 +7344,10 @@ fn contextPack(ctx: *Context, body: []const u8) HttpResponse {
     const persist = json.boolField(obj, "persist") orelse (hasCapability(ctx, "write") or hasCapability(ctx, "propose"));
     if (persist and !hasCapability(ctx, "write") and !hasCapability(ctx, "propose")) return forbidden(ctx);
     const search_input = buildSearchInput(ctx, obj, query, positiveLimit(json.intField(obj, "limit"), 40), false) catch return serverError(ctx);
+    const preselected_results = graphCommandSearchResultsFromObject(ctx, obj, query, search_input.limit) catch |err| switch (err) {
+        error.InvalidGraphCommand, error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
+        else => return serverError(ctx),
+    };
     const pack = ctx.store.createContextPack(ctx.allocator, .{
         .purpose = json.stringField(obj, "purpose") orelse "task",
         .target = json.stringField(obj, "target") orelse "agent",
@@ -7099,6 +7370,7 @@ fn contextPack(ctx: *Context, body: []const u8) HttpResponse {
         .min_relevance = search_input.min_relevance,
         .actor_id = ctx.actor_id,
         .agent_memory_route = search_input.agent_memory_route,
+        .preselected_results = preselected_results,
     }) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -12767,6 +13039,54 @@ test "api graph neighbors and path are acl aware" {
     try std.testing.expectEqualStrings("200 OK", filtered_query.status);
     try std.testing.expect(std.mem.indexOf(u8, filtered_query.body, "Graph B") != null);
     try std.testing.expect(std.mem.indexOf(u8, filtered_query.body, "Graph C") == null);
+
+    const traverse_command_body = try std.fmt.allocPrint(alloc, "{{\"query\":\"kg:traverse:{s}:2\",\"limit\":20}}", .{a.id});
+    const traverse_command = handleRequest(&ctx, "POST", "/v1/graph/query", traverse_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", traverse_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, traverse_command.body, "\"direction\":\"outbound\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, traverse_command.body, "Graph B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, traverse_command.body, "Graph C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, traverse_command.body, "Graph D") == null);
+
+    const relations_command_body = try std.fmt.allocPrint(alloc, "{{\"query\":\"kg:relations:{s}\",\"limit\":20}}", .{b.id});
+    const relations_command = handleRequest(&ctx, "POST", "/v1/graph/query", relations_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", relations_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, relations_command.body, "depends_on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, relations_command.body, "implements") != null);
+
+    const path_command_body = try std.fmt.allocPrint(alloc, "{{\"query\":\"kg:path:{s}:{s}:3\"}}", .{ a.id, c.id });
+    const path_command = handleRequest(&ctx, "POST", "/v1/graph/query", path_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", path_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, path_command.body, "\"found\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path_command.body, "depends_on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path_command.body, "implements") != null);
+
+    const graph_path_command = handleRequest(&ctx, "POST", "/v1/graph/path", path_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", graph_path_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, graph_path_command.body, "\"found\":true") != null);
+
+    const search_command = handleRequest(&ctx, "POST", "/v1/search", path_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", search_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_command.body, "\"type\":\"entity\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_command.body, "\"type\":\"relation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_command.body, "Graph C") != null);
+
+    const retrieval_command = handleRequest(&ctx, "POST", "/v1/retrieval/search", path_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", retrieval_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, retrieval_command.body, "\"use_graph\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retrieval_command.body, "\"type\":\"relation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retrieval_command.body, "implements") != null);
+
+    const ask_command = handleRequest(&ctx, "POST", "/v1/ask", path_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", ask_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, ask_command.body, "Graph C") != null);
+
+    const context_command_body = try std.fmt.allocPrint(alloc, "{{\"query\":\"kg:path:{s}:{s}:3\",\"persist\":false,\"limit\":10}}", .{ a.id, c.id });
+    const context_command = handleRequest(&ctx, "POST", "/v1/context-packs", context_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", context_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, context_command.body, "\"persisted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_command.body, "Graph C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_command.body, "\"included_result_refs\"") != null);
 
     const secret_path_body = try std.fmt.allocPrint(alloc, "{{\"from_entity_id\":\"{s}\",\"to_entity_id\":\"{s}\",\"max_depth\":3}}", .{ a.id, secret.id });
     const secret_path = handleRequest(&ctx, "POST", "/v1/graph/path", secret_path_body, "");
