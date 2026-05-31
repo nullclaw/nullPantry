@@ -6,6 +6,7 @@ const json = @import("json_util.zig");
 const engines = @import("engines.zig");
 const retrieval = @import("retrieval.zig");
 const lifecycle = @import("lifecycle.zig");
+const summarizer = @import("summarizer.zig");
 const vector_mod = @import("vector.zig");
 const vector_text = @import("vector_text.zig");
 const analytics_runtime = @import("analytics_runtime.zig");
@@ -3857,26 +3858,65 @@ fn lifecycleSummarize(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
+    if (obj.get("llm_base_url") != null or obj.get("llm_api_key") != null or obj.get("llm_model") != null or obj.get("timeout_secs") != null) {
+        return json.errorResponse(ctx.allocator, 400, "bad_request", "Provider overrides are not allowed; configure providers on the server");
+    }
     const messages_value = obj.get("messages") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing messages");
     const arr = switch (messages_value) {
         .array => |a| a,
         else => return badJson(ctx),
     };
-    var messages: std.ArrayListUnmanaged([]const u8) = .empty;
+    var messages: std.ArrayListUnmanaged(summarizer.Message) = .empty;
     for (arr.items) |item| {
         switch (item) {
-            .string => |s| messages.append(ctx.allocator, s) catch return serverError(ctx),
-            .object => |message_obj| if (json.stringField(message_obj, "content")) |content| messages.append(ctx.allocator, content) catch return serverError(ctx),
+            .string => |s| messages.append(ctx.allocator, .{ .content = s }) catch return serverError(ctx),
+            .object => |message_obj| if (json.stringField(message_obj, "content")) |content| messages.append(ctx.allocator, .{
+                .role = json.stringField(message_obj, "role") orelse "",
+                .speaker = json.stringField(message_obj, "speaker") orelse json.stringField(message_obj, "author") orelse "",
+                .content = content,
+            }) catch return serverError(ctx),
             else => {},
         }
     }
     const max_chars: usize = @intCast(@max(json.intField(obj, "max_chars") orelse 4000, 1));
-    const summary = lifecycle.summarizeMessages(ctx.allocator, messages.items, max_chars) catch return serverError(ctx);
+    const summary = summarizer.summarizeMessages(ctx.allocator, messages.items, .{ .max_chars = max_chars }) catch return serverError(ctx);
+    var summary_text = summary.text;
+    var summary_provider = summary.provider;
+    var truncated = summary.truncated;
+
+    if (json.boolField(obj, "use_llm") orelse false) {
+        const prompt = summarizer.buildLlmPrompt(ctx.allocator, messages.items, max_chars) catch return serverError(ctx);
+        const system =
+            "Summarize only the supplied NullPantry messages. Preserve decisions, constraints, risks, action items, open questions, and durable facts. Cite message indexes as [message:N]. Say I don't know when the messages do not support a claim.";
+        if (providers.completeWithSystem(ctx.allocator, .{
+            .base_url = ctx.llm_base_url,
+            .api_key = ctx.llm_api_key,
+            .model = ctx.llm_model,
+            .timeout_secs = ctx.provider_timeout_secs,
+        }, system, prompt)) |completion| {
+            const trimmed = summarizer.trimUtf8WithSuffix(ctx.allocator, completion.content, max_chars) catch return serverError(ctx);
+            summary_text = trimmed.text;
+            summary_provider = completion.provider;
+            truncated = trimmed.truncated;
+        } else |_| {
+            if (json.boolField(obj, "strict_llm") orelse false) {
+                return json.errorResponse(ctx.allocator, 502, "provider_unavailable", "LLM summarizer provider is unavailable");
+            }
+        }
+    }
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"summary\":") catch return serverError(ctx);
-    json.appendString(&out, ctx.allocator, summary) catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, summary_text) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"summary_provider\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, summary_provider) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"message_count\":") catch return serverError(ctx);
-    out.print(ctx.allocator, "{d}}}", .{messages.items.len}) catch return serverError(ctx);
+    out.print(ctx.allocator, "{d}", .{summary.message_count}) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"truncated\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (truncated) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"sections\":") catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, summary.sections_json, "{}") catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
@@ -7185,9 +7225,19 @@ test "api lifecycle cache semantic cache summarize rollout and hygiene endpoints
     const cached_ask = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"cached retrieval\",\"scopes\":[\"public\"],\"cache_ttl_ms\":10000,\"use_semantic_cache\":true}", "");
     try std.testing.expectEqualStrings("200 OK", cached_ask.status);
 
-    const summary = handleRequest(&ctx, "POST", "/v1/lifecycle/summarize", "{\"messages\":[{\"content\":\"hello\"},{\"content\":\"world\"}],\"max_chars\":8}", "");
+    const summary = handleRequest(&ctx, "POST", "/v1/lifecycle/summarize", "{\"messages\":[{\"speaker\":\"Igor\",\"content\":\"Decision: NullPantry owns central summaries\"},{\"role\":\"assistant\",\"content\":\"TODO: add structured sections\\nRisk: stale summaries mislead agents\"}],\"max_chars\":1000}", "");
     try std.testing.expectEqualStrings("200 OK", summary.status);
-    try std.testing.expect(std.mem.indexOf(u8, summary.body, "hello\\nwo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary.body, "\"summary_provider\":\"extractive_structured\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary.body, "NullPantry owns central summaries") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary.body, "\"decisions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary.body, "\"action_items\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary.body, "\"speaker\":\"Igor\"") != null);
+
+    const summary_override = handleRequest(&ctx, "POST", "/v1/lifecycle/summarize", "{\"messages\":[\"x\"],\"llm_model\":\"client-model\"}", "");
+    try std.testing.expectEqualStrings("400 Bad Request", summary_override.status);
+
+    const strict_summary = handleRequest(&ctx, "POST", "/v1/lifecycle/summarize", "{\"messages\":[\"x\"],\"use_llm\":true,\"strict_llm\":true}", "");
+    try std.testing.expectEqualStrings("502 Bad Gateway", strict_summary.status);
 
     const rollout = handleRequest(&ctx, "POST", "/v1/lifecycle/rollout", "{\"key\":\"agent:a\",\"percent\":100}", "");
     try std.testing.expectEqualStrings("200 OK", rollout.status);

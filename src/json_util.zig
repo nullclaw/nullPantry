@@ -177,6 +177,7 @@ pub fn errorResponse(allocator: std.mem.Allocator, code: u16, code_text: []const
         404 => "404 Not Found",
         410 => "410 Gone",
         409 => "409 Conflict",
+        502 => "502 Bad Gateway",
         500 => "500 Internal Server Error",
         else => "400 Bad Request",
     };
