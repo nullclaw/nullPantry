@@ -20,9 +20,11 @@ pub const RunOptions = struct {
     embedding_provider: providers.EmbeddingProviderKind = .openai_compatible,
     embedding_fallbacks: []const providers.EmbeddingEndpointConfig = &.{},
     embedding_dimensions: usize = 64,
+    embedding_allow_insecure_http: bool = false,
     llm_base_url: ?[]const u8 = null,
     llm_api_key: ?[]const u8 = null,
     llm_model: ?[]const u8 = null,
+    llm_allow_insecure_http: bool = false,
     provider_timeout_secs: u32 = 30,
     provider_runtime: ?*providers.ProviderRuntime = null,
     actor_id: []const u8 = "system:worker",
@@ -248,6 +250,7 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
                     .api_key = options.llm_api_key,
                     .model = options.llm_model,
                     .timeout_secs = options.provider_timeout_secs,
+                    .allow_insecure_http = options.llm_allow_insecure_http,
                     .runtime = options.provider_runtime,
                 }, "Return only valid JSON for the requested NullPantry extraction schema. Do not include markdown fences unless the model cannot avoid them. Extract only source-grounded memory atoms and relations.", prompt) catch |err| {
                     if (job_options.strict_llm_extraction) return err;
@@ -412,6 +415,7 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
                 .model = options.embedding_model,
                 .dimensions = options.embedding_dimensions,
                 .timeout_secs = options.provider_timeout_secs,
+                .allow_insecure_http = options.embedding_allow_insecure_http,
                 .fallbacks = options.embedding_fallbacks,
                 .runtime = options.provider_runtime,
             }, chunk_text, options.embedding_dimensions) catch return count;
@@ -473,6 +477,7 @@ fn processEmbeddingOutboxEntry(allocator: std.mem.Allocator, store: *store_mod.S
         .model = options.embedding_model,
         .dimensions = dimensions,
         .timeout_secs = options.provider_timeout_secs,
+        .allow_insecure_http = options.embedding_allow_insecure_http,
         .fallbacks = options.embedding_fallbacks,
         .runtime = options.provider_runtime,
     }, text, dimensions);

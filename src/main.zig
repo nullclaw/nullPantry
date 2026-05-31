@@ -39,9 +39,11 @@ const RuntimeConfig = struct {
     embedding_provider: providers.EmbeddingProviderKind = .openai_compatible,
     embedding_fallbacks: []const providers.EmbeddingEndpointConfig = &.{},
     embedding_dimensions: usize = 64,
+    embedding_allow_insecure_http: bool = false,
     llm_base_url: ?[]const u8 = null,
     llm_api_key: ?[]const u8 = null,
     llm_model: ?[]const u8 = null,
+    llm_allow_insecure_http: bool = false,
     provider_timeout_secs: u32 = 30,
     provider_circuit_failure_threshold: u32 = 3,
     provider_circuit_cooldown_ms: i64 = 30_000,
@@ -178,9 +180,11 @@ fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
         .embedding_provider = state.cfg.embedding_provider,
         .embedding_fallbacks = state.cfg.embedding_fallbacks,
         .embedding_dimensions = state.cfg.embedding_dimensions,
+        .embedding_allow_insecure_http = state.cfg.embedding_allow_insecure_http,
         .llm_base_url = state.cfg.llm_base_url,
         .llm_api_key = state.cfg.llm_api_key,
         .llm_model = state.cfg.llm_model,
+        .llm_allow_insecure_http = state.cfg.llm_allow_insecure_http,
         .provider_timeout_secs = state.cfg.provider_timeout_secs,
         .provider_runtime = state.provider_runtime,
         .trust_actor_headers = state.cfg.trust_actor_headers,
@@ -217,9 +221,11 @@ fn workerLoop(state: *ServerState) void {
             .embedding_provider = state.cfg.embedding_provider,
             .embedding_fallbacks = state.cfg.embedding_fallbacks,
             .embedding_dimensions = state.cfg.embedding_dimensions,
+            .embedding_allow_insecure_http = state.cfg.embedding_allow_insecure_http,
             .llm_base_url = state.cfg.llm_base_url,
             .llm_api_key = state.cfg.llm_api_key,
             .llm_model = state.cfg.llm_model,
+            .llm_allow_insecure_http = state.cfg.llm_allow_insecure_http,
             .provider_timeout_secs = state.cfg.provider_timeout_secs,
             .provider_runtime = state.provider_runtime,
         }) catch |err| {
@@ -295,6 +301,20 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LLM_MODEL")) |model| {
         cfg.llm_model = model;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_PROVIDER_ALLOW_INSECURE_HTTP")) |value| {
+        defer allocator.free(value);
+        const allow = parseBool(value);
+        cfg.embedding_allow_insecure_http = allow;
+        cfg.llm_allow_insecure_http = allow;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_ALLOW_INSECURE_HTTP")) |value| {
+        defer allocator.free(value);
+        cfg.embedding_allow_insecure_http = parseBool(value);
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LLM_ALLOW_INSECURE_HTTP")) |value| {
+        defer allocator.free(value);
+        cfg.llm_allow_insecure_http = parseBool(value);
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_PROVIDER_TIMEOUT_SECS")) |secs| {
         cfg.provider_timeout_secs = std.fmt.parseInt(u32, secs, 10) catch cfg.provider_timeout_secs;
@@ -564,6 +584,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--embedding-dimensions") and i + 1 < args.len) {
             i += 1;
             cfg.embedding_dimensions = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--embedding-allow-insecure-http")) {
+            cfg.embedding_allow_insecure_http = true;
         } else if (std.mem.eql(u8, arg, "--llm-base-url") and i + 1 < args.len) {
             i += 1;
             cfg.llm_base_url = args[i];
@@ -573,6 +595,11 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--llm-model") and i + 1 < args.len) {
             i += 1;
             cfg.llm_model = args[i];
+        } else if (std.mem.eql(u8, arg, "--llm-allow-insecure-http")) {
+            cfg.llm_allow_insecure_http = true;
+        } else if (std.mem.eql(u8, arg, "--provider-allow-insecure-http")) {
+            cfg.embedding_allow_insecure_http = true;
+            cfg.llm_allow_insecure_http = true;
         } else if (std.mem.eql(u8, arg, "--provider-timeout-secs") and i + 1 < args.len) {
             i += 1;
             cfg.provider_timeout_secs = try std.fmt.parseInt(u32, args[i], 10);
@@ -727,6 +754,7 @@ fn embeddingConfigFromRuntime(cfg: RuntimeConfig) providers.EmbeddingConfig {
         .model = cfg.embedding_model,
         .dimensions = cfg.embedding_dimensions,
         .timeout_secs = cfg.provider_timeout_secs,
+        .allow_insecure_http = cfg.embedding_allow_insecure_http,
         .fallbacks = cfg.embedding_fallbacks,
     };
 }
@@ -737,6 +765,7 @@ fn completionConfigFromRuntime(cfg: RuntimeConfig) providers.CompletionConfig {
         .api_key = cfg.llm_api_key,
         .model = cfg.llm_model,
         .timeout_secs = cfg.provider_timeout_secs,
+        .allow_insecure_http = cfg.llm_allow_insecure_http,
     };
 }
 
@@ -912,9 +941,12 @@ fn printUsage() void {
         \\  NULLPANTRY_EMBEDDING_PROVIDER
         \\  NULLPANTRY_EMBEDDING_FALLBACKS
         \\  NULLPANTRY_EMBEDDING_DIMENSIONS
+        \\  NULLPANTRY_EMBEDDING_ALLOW_INSECURE_HTTP
         \\  NULLPANTRY_LLM_BASE_URL
         \\  NULLPANTRY_LLM_API_KEY
         \\  NULLPANTRY_LLM_MODEL
+        \\  NULLPANTRY_LLM_ALLOW_INSECURE_HTTP
+        \\  NULLPANTRY_PROVIDER_ALLOW_INSECURE_HTTP
         \\  NULLPANTRY_PROVIDER_TIMEOUT_SECS
         \\  NULLPANTRY_WORKER_INTERVAL_MS
         \\  NULLPANTRY_TRUST_ACTOR_HEADERS
@@ -1009,6 +1041,35 @@ test "worker principal can be narrowed explicitly" {
 
     try std.testing.expectEqualStrings("[\"project:nullpantry\"]", cfg.worker_scopes_json);
     try std.testing.expectEqualStrings("[\"read\",\"write\",\"verify\"]", cfg.worker_capabilities_json);
+}
+
+test "provider insecure http opt-in is explicit for embeddings fallbacks and llm" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const args = [_][:0]const u8{
+        "nullpantry",
+        "--embedding-base-url",
+        "http://provider.internal/v1",
+        "--embedding-model",
+        "embed-model",
+        "--embedding-allow-insecure-http",
+        "--embedding-fallbacks",
+        "[{\"provider\":\"ollama\",\"base_url\":\"http://ollama.internal:11434\",\"model\":\"nomic\",\"allow_insecure_http\":true}]",
+        "--llm-base-url",
+        "http://llm.internal/v1",
+        "--llm-model",
+        "chat-model",
+        "--llm-allow-insecure-http",
+    };
+    const cfg = try parseArgs(allocator, &args);
+    const embedding = embeddingConfigFromRuntime(cfg);
+    const completion = completionConfigFromRuntime(cfg);
+
+    try std.testing.expect(embedding.allow_insecure_http);
+    try std.testing.expectEqual(@as(usize, 1), embedding.fallbacks.len);
+    try std.testing.expect(embedding.fallbacks[0].allow_insecure_http);
+    try std.testing.expect(completion.allow_insecure_http);
 }
 
 test "agent memory redis backend can be configured from args" {

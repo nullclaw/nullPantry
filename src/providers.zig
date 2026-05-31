@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const ids = @import("ids.zig");
 const json = @import("json_util.zig");
+const net_security = @import("net_security.zig");
 const vector = @import("vector.zig");
 
 pub const max_provider_response_bytes: usize = 8 * 1024 * 1024;
@@ -60,6 +61,7 @@ pub const EmbeddingEndpointConfig = struct {
     model: ?[]const u8 = null,
     dimensions: usize = 64,
     timeout_secs: u32 = 30,
+    allow_insecure_http: bool = false,
 
     pub fn enabled(self: EmbeddingEndpointConfig) bool {
         return switch (self.provider) {
@@ -78,6 +80,7 @@ pub const EmbeddingConfig = struct {
     model: ?[]const u8 = null,
     dimensions: usize = 64,
     timeout_secs: u32 = 30,
+    allow_insecure_http: bool = false,
     fallbacks: []const EmbeddingEndpointConfig = &.{},
     runtime: ?*ProviderRuntime = null,
 
@@ -93,6 +96,7 @@ pub const EmbeddingConfig = struct {
             .model = self.model,
             .dimensions = self.dimensions,
             .timeout_secs = self.timeout_secs,
+            .allow_insecure_http = self.allow_insecure_http,
         };
     }
 };
@@ -102,6 +106,7 @@ pub const CompletionConfig = struct {
     api_key: ?[]const u8 = null,
     model: ?[]const u8 = null,
     timeout_secs: u32 = 45,
+    allow_insecure_http: bool = false,
     runtime: ?*ProviderRuntime = null,
 
     pub fn enabled(self: CompletionConfig) bool {
@@ -447,6 +452,7 @@ fn parseEmbeddingFallbacksJson(allocator: std.mem.Allocator, raw: []const u8, ba
                     .model = try dupOptional(allocator, json.nullableStringField(obj, "model")),
                     .dimensions = @intCast(@max(@as(i64, 1), json.intField(obj, "dimensions") orelse @as(i64, @intCast(base.dimensions)))),
                     .timeout_secs = @intCast(@max(@as(i64, 1), json.intField(obj, "timeout_secs") orelse @as(i64, @intCast(base.timeout_secs)))),
+                    .allow_insecure_http = json.boolField(obj, "allow_insecure_http") orelse json.boolField(obj, "insecure_http") orelse base.allow_insecure_http,
                 });
             },
             else => return error.InvalidEmbeddingFallbacks,
@@ -463,6 +469,7 @@ fn fallbackFromProvider(base: EmbeddingConfig, provider: EmbeddingProviderKind) 
         .model = base.model,
         .dimensions = base.dimensions,
         .timeout_secs = base.timeout_secs,
+        .allow_insecure_http = base.allow_insecure_http,
     };
 }
 
@@ -504,7 +511,7 @@ fn providerFailed(runtime: ?*ProviderRuntime, target: ProviderTarget) void {
 }
 
 fn callOpenAICompatibleEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfig, text: []const u8) ![]f32 {
-    const url = try providerUrl(allocator, cfg.base_url.?, "/embeddings");
+    const url = try providerUrl(allocator, cfg.base_url.?, "/embeddings", cfg.allow_insecure_http);
     defer allocator.free(url);
 
     var payload: std.ArrayListUnmanaged(u8) = .empty;
@@ -532,7 +539,7 @@ fn callGeminiEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfi
     const key = cfg.api_key orelse return error.ProviderUnavailable;
     const suffix = try std.fmt.allocPrint(allocator, "/v1beta/models/{s}:embedContent?key={s}", .{ model, key });
     defer allocator.free(suffix);
-    const url = try providerUrl(allocator, base_url, suffix);
+    const url = try providerUrl(allocator, base_url, suffix, cfg.allow_insecure_http);
     defer allocator.free(url);
 
     const body = try geminiEmbeddingPayload(allocator, model, text);
@@ -546,7 +553,7 @@ fn callVoyageEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfi
     if (text.len == 0) return allocator.alloc(f32, 0);
     const base_url = cfg.base_url orelse "https://api.voyageai.com";
     const model = cfg.model orelse "voyage-3-lite";
-    const url = try providerUrl(allocator, base_url, "/v1/embeddings");
+    const url = try providerUrl(allocator, base_url, "/v1/embeddings", cfg.allow_insecure_http);
     defer allocator.free(url);
 
     const body = try voyageEmbeddingPayload(allocator, model, text, "query");
@@ -560,7 +567,7 @@ fn callOllamaEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfi
     if (text.len == 0) return allocator.alloc(f32, 0);
     const base_url = cfg.base_url orelse "http://localhost:11434";
     const model = cfg.model orelse "nomic-embed-text";
-    const url = try providerUrl(allocator, base_url, "/api/embed");
+    const url = try providerUrl(allocator, base_url, "/api/embed", cfg.allow_insecure_http);
     defer allocator.free(url);
 
     const body = try ollamaEmbeddingPayload(allocator, model, text);
@@ -608,7 +615,7 @@ fn voyageEmbeddingPayload(allocator: std.mem.Allocator, model: []const u8, text:
 }
 
 fn callOpenAICompatibleChat(allocator: std.mem.Allocator, cfg: CompletionConfig, system_prompt: []const u8, prompt: []const u8) ![]const u8 {
-    const url = try providerUrl(allocator, cfg.base_url.?, "/chat/completions");
+    const url = try providerUrl(allocator, cfg.base_url.?, "/chat/completions", cfg.allow_insecure_http);
     defer allocator.free(url);
 
     var payload: std.ArrayListUnmanaged(u8) = .empty;
@@ -628,7 +635,8 @@ fn callOpenAICompatibleChat(allocator: std.mem.Allocator, cfg: CompletionConfig,
     return parseChatResponse(allocator, response);
 }
 
-fn providerUrl(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]u8 {
+fn providerUrl(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8, allow_insecure_http: bool) ![]u8 {
+    try net_security.validateHttpBaseUrl(base_url, allow_insecure_http);
     var end = base_url.len;
     while (end > 0 and base_url[end - 1] == '/') : (end -= 1) {}
     const trimmed = base_url[0..end];
@@ -849,17 +857,18 @@ test "embedding provider kind parsing and defaults" {
 }
 
 test "embedding fallback parsing supports csv and json endpoint specs" {
-    const base = EmbeddingConfig{ .base_url = "https://example.test/v1", .api_key = "key", .model = "model", .dimensions = 42, .timeout_secs = 7 };
+    const base = EmbeddingConfig{ .base_url = "https://example.test/v1", .api_key = "key", .model = "model", .dimensions = 42, .timeout_secs = 7, .allow_insecure_http = true };
     const csv = try parseEmbeddingFallbacks(std.testing.allocator, "voyage, ollama, local-deterministic", base);
     defer std.testing.allocator.free(csv);
     try std.testing.expectEqual(@as(usize, 3), csv.len);
     try std.testing.expectEqual(EmbeddingProviderKind.voyage, csv[0].provider);
     try std.testing.expectEqualStrings("key", csv[0].api_key.?);
+    try std.testing.expect(csv[0].allow_insecure_http);
     try std.testing.expectEqual(EmbeddingProviderKind.ollama, csv[1].provider);
     try std.testing.expectEqual(EmbeddingProviderKind.local_deterministic, csv[2].provider);
 
     const json_spec =
-        \\[{"provider":"gemini","api_key":"g","model":"text-embedding-004","dimensions":768},{"provider":"ollama","base_url":"http://localhost:11434","model":"nomic-embed-text"},{"provider":"local-deterministic"}]
+        \\[{"provider":"gemini","api_key":"g","model":"text-embedding-004","dimensions":768},{"provider":"ollama","base_url":"http://localhost:11434","model":"nomic-embed-text","allow_insecure_http":false},{"provider":"local-deterministic"}]
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -871,6 +880,7 @@ test "embedding fallback parsing supports csv and json endpoint specs" {
     try std.testing.expectEqual(EmbeddingProviderKind.ollama, parsed[1].provider);
     try std.testing.expectEqualStrings("http://localhost:11434", parsed[1].base_url.?);
     try std.testing.expectEqualStrings("nomic-embed-text", parsed[1].model.?);
+    try std.testing.expect(!parsed[1].allow_insecure_http);
     try std.testing.expectEqual(EmbeddingProviderKind.local_deterministic, parsed[2].provider);
 }
 
@@ -949,12 +959,19 @@ test "providers parse openai-compatible chat response" {
 }
 
 test "providers append endpoint suffixes safely" {
-    const a = try providerUrl(std.testing.allocator, "https://example.test/v1", "/embeddings");
+    const a = try providerUrl(std.testing.allocator, "https://example.test/v1", "/embeddings", false);
     defer std.testing.allocator.free(a);
     try std.testing.expectEqualStrings("https://example.test/v1/embeddings", a);
-    const b = try providerUrl(std.testing.allocator, "https://example.test/v1/embeddings", "/embeddings");
+    const b = try providerUrl(std.testing.allocator, "https://example.test/v1/embeddings", "/embeddings", false);
     defer std.testing.allocator.free(b);
     try std.testing.expectEqualStrings("https://example.test/v1/embeddings", b);
+    const local = try providerUrl(std.testing.allocator, "http://localhost:11434", "/api/embed", false);
+    defer std.testing.allocator.free(local);
+    try std.testing.expectEqualStrings("http://localhost:11434/api/embed", local);
+    try std.testing.expectError(error.InsecureRuntimeUrl, providerUrl(std.testing.allocator, "http://provider.internal/v1", "/embeddings", false));
+    const insecure = try providerUrl(std.testing.allocator, "http://provider.internal/v1", "/embeddings", true);
+    defer std.testing.allocator.free(insecure);
+    try std.testing.expectEqualStrings("http://provider.internal/v1/embeddings", insecure);
 }
 
 test "providers manifest includes concrete and compatible providers" {

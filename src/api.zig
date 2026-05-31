@@ -40,9 +40,11 @@ pub const Context = struct {
     embedding_provider: providers.EmbeddingProviderKind = .openai_compatible,
     embedding_fallbacks: []const providers.EmbeddingEndpointConfig = &.{},
     embedding_dimensions: usize = 64,
+    embedding_allow_insecure_http: bool = false,
     llm_base_url: ?[]const u8 = null,
     llm_api_key: ?[]const u8 = null,
     llm_model: ?[]const u8 = null,
+    llm_allow_insecure_http: bool = false,
     provider_timeout_secs: u32 = 30,
     provider_runtime: ?*providers.ProviderRuntime = null,
     trust_actor_headers: bool = false,
@@ -2307,6 +2309,7 @@ fn runExtraction(ctx: *Context, source: domain.Source, options: ExtractionOption
                     .api_key = ctx.llm_api_key,
                     .model = ctx.llm_model,
                     .timeout_secs = ctx.provider_timeout_secs,
+                    .allow_insecure_http = ctx.llm_allow_insecure_http,
                     .runtime = ctx.provider_runtime,
                 }, "Return only valid JSON for the requested NullPantry extraction schema. Do not include markdown fences unless the model cannot avoid them. Extract only source-grounded memory atoms and relations.", prompt) catch |err| {
                     if (options.strict_llm_extraction) return err;
@@ -2469,6 +2472,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
                 .model = ctx.embedding_model,
                 .dimensions = ctx.embedding_dimensions,
                 .timeout_secs = ctx.provider_timeout_secs,
+                .allow_insecure_http = ctx.embedding_allow_insecure_http,
                 .fallbacks = ctx.embedding_fallbacks,
                 .runtime = ctx.provider_runtime,
             }, chunk_text, ctx.embedding_dimensions) catch return count;
@@ -2567,9 +2571,11 @@ fn runJob(ctx: *Context, id: []const u8) HttpResponse {
         .embedding_provider = ctx.embedding_provider,
         .embedding_fallbacks = ctx.embedding_fallbacks,
         .embedding_dimensions = ctx.embedding_dimensions,
+        .embedding_allow_insecure_http = ctx.embedding_allow_insecure_http,
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
         .llm_model = ctx.llm_model,
+        .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
         .provider_timeout_secs = ctx.provider_timeout_secs,
     }) catch |err| switch (err) {
         error.JobNotQueued => return json.errorResponse(ctx.allocator, 409, "conflict", "Job is not queued"),
@@ -2789,7 +2795,7 @@ fn vectorEmbed(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    if (obj.get("base_url") != null or obj.get("api_key") != null or obj.get("model") != null or obj.get("provider") != null or obj.get("timeout_secs") != null) {
+    if (obj.get("base_url") != null or obj.get("api_key") != null or obj.get("model") != null or obj.get("provider") != null or obj.get("timeout_secs") != null or obj.get("embedding_allow_insecure_http") != null or obj.get("allow_insecure_http") != null) {
         return json.errorResponse(ctx.allocator, 400, "bad_request", "Provider overrides are not allowed; configure providers on the server");
     }
     const text = json.stringField(obj, "text") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing text");
@@ -2801,6 +2807,7 @@ fn vectorEmbed(ctx: *Context, body: []const u8) HttpResponse {
         .model = ctx.embedding_model,
         .dimensions = @min(dimensions, 4096),
         .timeout_secs = ctx.provider_timeout_secs,
+        .allow_insecure_http = ctx.embedding_allow_insecure_http,
         .fallbacks = ctx.embedding_fallbacks,
         .runtime = ctx.provider_runtime,
     };
@@ -2964,9 +2971,11 @@ fn vectorOutboxRun(ctx: *Context, body: []const u8) HttpResponse {
         .embedding_provider = ctx.embedding_provider,
         .embedding_fallbacks = ctx.embedding_fallbacks,
         .embedding_dimensions = ctx.embedding_dimensions,
+        .embedding_allow_insecure_http = ctx.embedding_allow_insecure_http,
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
         .llm_model = ctx.llm_model,
+        .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
         .provider_timeout_secs = ctx.provider_timeout_secs,
     }) catch return serverError(ctx);
     const pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
@@ -3108,9 +3117,11 @@ fn workersRun(ctx: *Context, body: []const u8) HttpResponse {
         .embedding_provider = ctx.embedding_provider,
         .embedding_fallbacks = ctx.embedding_fallbacks,
         .embedding_dimensions = ctx.embedding_dimensions,
+        .embedding_allow_insecure_http = ctx.embedding_allow_insecure_http,
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
         .llm_model = ctx.llm_model,
+        .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
         .provider_timeout_secs = ctx.provider_timeout_secs,
     }) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -4151,7 +4162,7 @@ fn lifecycleSummarize(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    if (obj.get("llm_base_url") != null or obj.get("llm_api_key") != null or obj.get("llm_model") != null or obj.get("timeout_secs") != null) {
+    if (obj.get("llm_base_url") != null or obj.get("llm_api_key") != null or obj.get("llm_model") != null or obj.get("timeout_secs") != null or obj.get("llm_allow_insecure_http") != null or obj.get("allow_insecure_http") != null) {
         return json.errorResponse(ctx.allocator, 400, "bad_request", "Provider overrides are not allowed; configure providers on the server");
     }
     const messages_value = obj.get("messages") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing messages");
@@ -4186,6 +4197,7 @@ fn lifecycleSummarize(ctx: *Context, body: []const u8) HttpResponse {
             .api_key = ctx.llm_api_key,
             .model = ctx.llm_model,
             .timeout_secs = ctx.provider_timeout_secs,
+            .allow_insecure_http = ctx.llm_allow_insecure_http,
             .runtime = ctx.provider_runtime,
         }, system, prompt)) |completion| {
             const trimmed = summarizer.trimUtf8WithSuffix(ctx.allocator, completion.content, max_chars) catch return serverError(ctx);
@@ -4281,7 +4293,7 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    if (obj.get("llm_base_url") != null or obj.get("llm_api_key") != null or obj.get("llm_model") != null or obj.get("timeout_secs") != null) {
+    if (obj.get("llm_base_url") != null or obj.get("llm_api_key") != null or obj.get("llm_model") != null or obj.get("timeout_secs") != null or obj.get("llm_allow_insecure_http") != null or obj.get("allow_insecure_http") != null) {
         return json.errorResponse(ctx.allocator, 400, "bad_request", "Provider overrides are not allowed; configure providers on the server");
     }
     const query = json.stringField(obj, "query") orelse json.stringField(obj, "question") orelse "";
@@ -4344,6 +4356,7 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
                 .api_key = ctx.llm_api_key,
                 .model = ctx.llm_model,
                 .timeout_secs = ctx.provider_timeout_secs,
+                .allow_insecure_http = ctx.llm_allow_insecure_http,
                 .runtime = ctx.provider_runtime,
             }, prompt)) |completion| {
                 if (answerCitationsValid(ctx, completion.content, results) catch false) {
@@ -4429,6 +4442,7 @@ fn maybeLlmRerankResults(ctx: *Context, query: []const u8, results: []domain.Sea
         .api_key = ctx.llm_api_key,
         .model = ctx.llm_model,
         .timeout_secs = ctx.provider_timeout_secs,
+        .allow_insecure_http = ctx.llm_allow_insecure_http,
         .runtime = ctx.provider_runtime,
     }, prompt) catch return results;
     return parseRerankOrder(ctx.allocator, completion.content, results) catch results;
@@ -5835,6 +5849,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
             .model = ctx.embedding_model,
             .dimensions = embedding_dimensions,
             .timeout_secs = ctx.provider_timeout_secs,
+            .allow_insecure_http = ctx.embedding_allow_insecure_http,
             .fallbacks = ctx.embedding_fallbacks,
             .runtime = ctx.provider_runtime,
         }, query, embedding_dimensions) catch |err| {
