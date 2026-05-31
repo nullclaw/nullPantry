@@ -2525,6 +2525,8 @@ pub const Store = struct {
                 try appendMissingAgentMemorySlice(allocator, &out, entries);
             }
         }
+        sortAgentMemoryResults(out.items);
+        trimAgentMemoryResults(allocator, &out, limit);
         return out.toOwnedSlice(allocator);
     }
 
@@ -2903,6 +2905,8 @@ pub const Store = struct {
         const native = try self.agentMemorySearchNative(allocator, query, limit, session_id, scopes_json, actor_id);
         defer allocator.free(native);
         try appendMissingAgentMemorySlice(allocator, &out, native);
+        sortAgentMemoryResults(out.items);
+        trimAgentMemoryResults(allocator, &out, limit);
         return out.toOwnedSlice(allocator);
     }
 
@@ -4290,6 +4294,26 @@ fn appendMissingAgentMemorySlice(allocator: std.mem.Allocator, out: *std.ArrayLi
         }
         try out.append(allocator, entry);
     }
+}
+
+fn sortAgentMemoryResults(items: []domain.AgentMemory) void {
+    std.mem.sort(domain.AgentMemory, items, {}, struct {
+        fn lessThan(_: void, a: domain.AgentMemory, b: domain.AgentMemory) bool {
+            const a_score = a.score orelse 0;
+            const b_score = b.score orelse 0;
+            if (a_score != b_score) return a_score > b_score;
+            const a_ts = std.fmt.parseInt(i64, a.timestamp, 10) catch 0;
+            const b_ts = std.fmt.parseInt(i64, b.timestamp, 10) catch 0;
+            if (a_ts != b_ts) return a_ts > b_ts;
+            return std.mem.order(u8, a.store, b.store) == .lt;
+        }
+    }.lessThan);
+}
+
+fn trimAgentMemoryResults(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), limit: usize) void {
+    if (limit == 0 or out.items.len <= limit) return;
+    for (out.items[limit..]) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+    out.shrinkRetainingCapacity(limit);
 }
 
 fn agentMemorySliceContains(entries: []const domain.AgentMemory, needle: domain.AgentMemory) bool {

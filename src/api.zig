@@ -8437,6 +8437,16 @@ test "api agent memory supports named stores and federated runtime reads" {
     try std.testing.expect(std.mem.indexOf(u8, subset_search.body, "Named Default Runtime Unique") == null);
     try std.testing.expect(std.mem.indexOf(u8, subset_search.body, "Named Native Unique") == null);
 
+    const low_rank_put = handleRequest(&ctx, "PUT", "/v1/agent-memory/rank.shared", "{\"content\":\"CrossStoreRank Alpha\",\"store\":\"scratch\"}", raw);
+    try std.testing.expectEqualStrings("200 OK", low_rank_put.status);
+    const high_rank_put = handleRequest(&ctx, "PUT", "/v1/agent-memory/rank.shared", "{\"content\":\"CrossStoreRank Alpha Beta\",\"store\":\"archive\"}", raw);
+    try std.testing.expectEqualStrings("200 OK", high_rank_put.status);
+    const ranked_subset_search = handleRequest(&ctx, "POST", "/v1/agent-memory/search", "{\"query\":\"CrossStoreRank Alpha Beta\",\"stores\":[\"scratch\",\"archive\"],\"limit\":1}", "POST /v1/agent-memory/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", ranked_subset_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, ranked_subset_search.body, "CrossStoreRank Alpha Beta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked_subset_search.body, "CrossStoreRank Alpha\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked_subset_search.body, "\"store\":\"archive\"") != null);
+
     const subset_query_list = handleRequest(&ctx, "GET", "/v1/agent-memory?stores=scratch,archive", "", "GET /v1/agent-memory?stores=scratch,archive HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", subset_query_list.status);
     try std.testing.expect(std.mem.indexOf(u8, subset_query_list.body, "Named Exact Subset Unique") != null);
