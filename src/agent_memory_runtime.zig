@@ -618,6 +618,7 @@ pub const MemoryAgentMemory = struct {
             }
             i += 1;
         }
+        _ = try self.deleteUsage(session_id, actor);
     }
 
     pub fn clearAutoSaved(self: *MemoryAgentMemory, session_id: ?[]const u8, actor_id: ?[]const u8) !void {
@@ -1169,16 +1170,26 @@ pub const RedisAgentMemory = struct {
 
     pub fn clearMessages(self: *RedisAgentMemory, session_id: []const u8, actor_id: ?[]const u8) !void {
         const actor = actor_id orelse return;
+        try self.clearMessagesInner(session_id, actor, true);
+    }
+
+    fn clearMessagesInner(self: *RedisAgentMemory, session_id: []const u8, actor: []const u8, delete_usage: bool) !void {
         const list_key = try self.sessionListKey(self.allocator, actor, session_id);
         defer self.allocator.free(list_key);
         const meta_key = try self.sessionMetaKey(self.allocator, actor, session_id);
         defer self.allocator.free(meta_key);
         const sessions_key = try self.sessionsIndexKey(self.allocator, actor);
         defer self.allocator.free(sessions_key);
+        const usage_key = if (delete_usage) try self.usageKey(self.allocator, actor, session_id) else null;
+        defer if (usage_key) |key| self.allocator.free(key);
         try self.beginTransaction();
         var committed = false;
         defer if (!committed) self.discardTransaction();
-        try self.queueCommand(&.{ "DEL", list_key, meta_key });
+        if (usage_key) |key| {
+            try self.queueCommand(&.{ "DEL", list_key, meta_key, key });
+        } else {
+            try self.queueCommand(&.{ "DEL", list_key, meta_key });
+        }
         try self.queueCommand(&.{ "SREM", sessions_key, session_id });
         var exec = try self.execTransaction();
         exec.deinit(self.allocator);
@@ -1217,7 +1228,7 @@ pub const RedisAgentMemory = struct {
             }
         }
         if (!saw_autosave) return;
-        try self.clearMessages(session_id, actor);
+        try self.clearMessagesInner(session_id, actor, false);
         for (loaded) |message| {
             if (domain.isAutosaveSessionRole(message.role)) continue;
             try self.saveMessageAt(session_id, message.role, message.content, message.created_at_ms, actor);
@@ -2900,6 +2911,29 @@ test "memory_lru clears all autosaves for one actor and preserves kept timestamp
     try std.testing.expectEqualStrings("other actor draft", other_actor_messages[0].content);
 }
 
+test "memory_lru clear messages deletes usage while autosave cleanup preserves it" {
+    var runtime = try Runtime.init(std.testing.allocator, .{ .backend = .memory_lru });
+    defer runtime.deinit();
+
+    try runtime.saveMessageAt("usage-session", "user", "kept", 401, "agent:a");
+    try runtime.saveMessageAt("usage-session", "autosave_user", "draft", 402, "agent:a");
+    try runtime.saveUsage("usage-session", 77, "agent:a");
+    try runtime.clearAutoSaved("usage-session", "agent:a");
+    try std.testing.expectEqual(@as(?u64, 77), try runtime.loadUsage("usage-session", "agent:a"));
+
+    try runtime.saveUsage("usage-session", 88, "agent:b");
+    try runtime.clearMessages("usage-session", "agent:a");
+    try std.testing.expectEqual(@as(?u64, null), try runtime.loadUsage("usage-session", "agent:a"));
+    try std.testing.expectEqual(@as(?u64, 88), try runtime.loadUsage("usage-session", "agent:b"));
+
+    const remaining = try runtime.loadMessages(std.testing.allocator, "usage-session", "agent:a");
+    defer {
+        for (remaining) |*message| freeMessage(std.testing.allocator, message);
+        std.testing.allocator.free(remaining);
+    }
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
 test "redis agent memory contract when configured" {
     const url = compat.process.getEnvVarOwned(std.testing.allocator, "NULLPANTRY_TEST_REDIS_URL") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => {
@@ -3065,9 +3099,18 @@ test "redis agent memory contract when configured" {
     try std.testing.expectEqualStrings("redis other actor draft", redis_other_messages[0].content);
 
     try runtime.saveUsage("sess", 128, "agent:a");
+    try runtime.saveUsage("sess", 256, "agent:b");
     try std.testing.expectEqual(@as(?u64, 128), try runtime.loadUsage("sess", "agent:a"));
-    try std.testing.expect(try runtime.deleteUsage("sess", "agent:a"));
+    try runtime.clearMessages("sess", "agent:a");
     try std.testing.expectEqual(@as(?u64, null), try runtime.loadUsage("sess", "agent:a"));
+    try std.testing.expectEqual(@as(?u64, 256), try runtime.loadUsage("sess", "agent:b"));
+    const b_messages_after_clear = try runtime.loadMessages(std.testing.allocator, "sess", "agent:b");
+    defer {
+        for (b_messages_after_clear) |*message| freeMessage(std.testing.allocator, message);
+        std.testing.allocator.free(b_messages_after_clear);
+    }
+    try std.testing.expectEqual(@as(usize, 1), b_messages_after_clear.len);
+    try std.testing.expectEqualStrings("hello from b", b_messages_after_clear[0].content);
     try std.testing.expect(try runtime.delete("pref.lang", null, "agent:a", "agent:a"));
     try std.testing.expect((try runtime.get(std.testing.allocator, "pref.lang", null, "agent:a")) == null);
     const still_b = (try runtime.get(std.testing.allocator, "pref.lang", null, "agent:b")).?;
