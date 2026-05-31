@@ -3224,6 +3224,7 @@ fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8) HttpResponse {
         if (std.mem.eql(u8, status, "pending")) {
             restorePendingCheckpointEvent(ctx, event_obj) catch |err| switch (err) {
                 error.Forbidden => return forbidden(ctx),
+                error.FeedDedupeMismatch => return feedDedupeConflict(ctx),
                 error.UnsupportedObjectType => return json.errorResponse(ctx.allocator, 400, "bad_request", "Unsupported feed object_type"),
                 error.InternalAgentMemory => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be restored through the feed"),
                 error.InternalAgentSessionMessage => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be restored through the feed"),
@@ -3274,6 +3275,15 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !void {
     } else if (isAgentSessionFeedObject(object_type)) {
         if (!canProposeAgentSessionEvent(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
     } else if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
+    const causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return error.InvalidPayload;
+
+    if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| {
+        if (try ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key)) |event| {
+            if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return error.Forbidden;
+            if (!feedDedupeMatches(event, event_type, operation, object_type, object_id, scope, permissions_json, event_actor_id, causality_json, payload_json)) return error.FeedDedupeMismatch;
+            return;
+        }
+    }
 
     _ = try ctx.store.appendFeedEvent(.{
         .event_type = event_type,
@@ -3284,7 +3294,7 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !void {
         .permissions_json = permissions_json,
         .actor_id = event_actor_id,
         .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
-        .causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch "{}",
+        .causality_json = causality_json,
         .payload_json = payload_json,
         .status = "pending",
     });
@@ -10090,6 +10100,16 @@ test "api memory checkpoint restore preserves actors and session deletes" {
 
     const retry = handleRequest(&admin_ctx, "POST", "/v1/memory/checkpoint", restore_body, "");
     try std.testing.expectEqualStrings("200 OK", retry.status);
+    const conflicting_pending_restore =
+        \\{"events":[
+        \\{"event_type":"agent_memory.put","operation":"put","object_type":"agent_memory","actor_id":"agent:restored","dedupe_key":"restore-agent-pending","object_id":"restored.pending.changed","status":"pending","payload":{"key":"restored.pending","content":"changed queued value"}}
+        \\]}
+    ;
+    const conflicting_pending = handleRequest(&admin_ctx, "POST", "/v1/memory/checkpoint", conflicting_pending_restore, "");
+    try std.testing.expectEqualStrings("409 Conflict", conflicting_pending.status);
+    const feed_after_conflict = handleRequest(&admin_ctx, "GET", "/v1/memory/events?limit=100", "", "");
+    try std.testing.expectEqualStrings("200 OK", feed_after_conflict.status);
+    try std.testing.expect(std.mem.indexOf(u8, feed_after_conflict.body, "changed queued value") == null);
     const events = try store.listFeedEvents(alloc, .{ .scopes_json = "[\"admin\"]", .limit = 100 });
     var dedupe_count: usize = 0;
     for (events) |event| {
