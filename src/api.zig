@@ -676,13 +676,21 @@ fn nullClawAgentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     const exact_owner = if (requested_scope) |scope| access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx) else null;
     defer if (exact_owner) |owner| ctx.allocator.free(owner);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-    const primary = if (exact_owner) |owner| ctx.store.agentMemoryListRouted(ctx.allocator, category, session_id, owner, storage_target) catch |err| switch (err) {
-        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
-        else => return serverError(ctx),
-    } else ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, session_id, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
-        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
-        else => return serverError(ctx),
-    };
+    const primary = if (exact_owner) |owner|
+        ctx.store.agentMemoryListRouted(ctx.allocator, category, session_id, owner, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        }
+    else if (session_id == null)
+        ctx.store.agentMemoryListAnyVisibleRouted(ctx.allocator, category, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        }
+    else
+        ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, session_id, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
     appendAgentMemoryEntries(ctx.allocator, &entries, primary) catch return serverError(ctx);
     if (include_global and session_id != null) {
         const global = if (exact_owner) |owner| ctx.store.agentMemoryListRouted(ctx.allocator, category, null, owner, storage_target) catch |err| switch (err) {
@@ -714,10 +722,16 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     const include_internal = json.boolField(obj, "include_internal") orelse false;
     const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-    const primary = ctx.store.agentMemorySearchRouted(ctx.allocator, query, limit, session_id, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
-        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
-        else => return serverError(ctx),
-    };
+    const primary = if (session_id == null)
+        ctx.store.agentMemorySearchAnyVisibleRouted(ctx.allocator, query, limit, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        }
+    else
+        ctx.store.agentMemorySearchRouted(ctx.allocator, query, limit, session_id, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
     appendAgentMemoryEntries(ctx.allocator, &entries, primary) catch return serverError(ctx);
     if (include_global and session_id != null) {
         const global = ctx.store.agentMemorySearchRouted(ctx.allocator, query, limit, null, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
@@ -7068,6 +7082,7 @@ fn agentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
     const include_global = queryBool(query, "include_global", false);
+    const include_sessions = queryBool(query, "include_sessions", false);
     const include_internal = queryBool(query, "include_internal", false);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const offset = parseLimit(json.queryParam(query, "offset"), 0);
@@ -7075,13 +7090,21 @@ fn agentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     const exact_owner = if (requested_scope) |scope| access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx) else null;
     defer if (exact_owner) |owner| ctx.allocator.free(owner);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-    const primary = if (exact_owner) |owner| ctx.store.agentMemoryListRouted(ctx.allocator, category, session_id, owner, storage_target) catch |err| switch (err) {
-        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
-        else => return serverError(ctx),
-    } else ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, session_id, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
-        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
-        else => return serverError(ctx),
-    };
+    const primary = if (exact_owner) |owner|
+        ctx.store.agentMemoryListRouted(ctx.allocator, category, session_id, owner, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        }
+    else if (session_id == null and include_sessions)
+        ctx.store.agentMemoryListAnyVisibleRouted(ctx.allocator, category, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        }
+    else
+        ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, session_id, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
     appendAgentMemoryEntries(ctx.allocator, &entries, primary) catch return serverError(ctx);
     if (include_global and session_id != null) {
         const global = if (exact_owner) |owner| ctx.store.agentMemoryListRouted(ctx.allocator, category, null, owner, storage_target) catch |err| switch (err) {
@@ -7110,13 +7133,20 @@ fn agentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     const scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx);
     const limit = positiveLimit(json.intField(obj, "limit"), 10);
     const include_global = json.boolField(obj, "include_global") orelse false;
+    const include_sessions = json.boolField(obj, "include_sessions") orelse false;
     const include_internal = json.boolField(obj, "include_internal") orelse false;
     const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-    const primary = ctx.store.agentMemorySearchRouted(ctx.allocator, query, limit, session_id, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
-        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
-        else => return serverError(ctx),
-    };
+    const primary = if (session_id == null and include_sessions)
+        ctx.store.agentMemorySearchAnyVisibleRouted(ctx.allocator, query, limit, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        }
+    else
+        ctx.store.agentMemorySearchRouted(ctx.allocator, query, limit, session_id, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
     appendAgentMemoryEntries(ctx.allocator, &entries, primary) catch return serverError(ctx);
     if (include_global and session_id != null) {
         const global = ctx.store.agentMemorySearchRouted(ctx.allocator, query, limit, null, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
@@ -9036,9 +9066,25 @@ test "api native agent memory is actor isolated" {
 
     const session_put = handleRequest(&ctx, "PUT", "/v1/agent-memory/session.pref", "{\"content\":\"Agent A session API value\",\"session_id\":\"sess_api\"}", raw_a);
     try std.testing.expectEqualStrings("200 OK", session_put.status);
+    const session_put_b = handleRequest(&ctx, "PUT", "/v1/agent-memory/session.pref", "{\"content\":\"Agent B session API value\",\"session_id\":\"sess_api\"}", raw_b);
+    try std.testing.expectEqualStrings("200 OK", session_put_b.status);
     const session_get = handleRequest(&ctx, "GET", "/v1/agent-memory/session.pref?session_id=sess_api", "", raw_a);
     try std.testing.expectEqualStrings("200 OK", session_get.status);
     try std.testing.expect(std.mem.indexOf(u8, session_get.body, "Agent A session API value") != null);
+    const list_without_sessions = handleRequest(&ctx, "GET", "/v1/agent-memory?category=core", "", "GET /v1/agent-memory?category=core HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", list_without_sessions.status);
+    try std.testing.expect(std.mem.indexOf(u8, list_without_sessions.body, "Agent A session API value") == null);
+    const list_with_sessions = handleRequest(&ctx, "GET", "/v1/agent-memory?category=core&include_sessions=true", "", "GET /v1/agent-memory?category=core&include_sessions=true HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", list_with_sessions.status);
+    try std.testing.expect(std.mem.indexOf(u8, list_with_sessions.body, "Agent A session API value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_with_sessions.body, "Agent B session API value") == null);
+    const search_without_sessions = handleRequest(&ctx, "POST", "/v1/agent-memory/search", "{\"query\":\"session API value\",\"limit\":10}", "POST /v1/agent-memory/search HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", search_without_sessions.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_without_sessions.body, "Agent A session API value") == null);
+    const search_with_sessions = handleRequest(&ctx, "POST", "/v1/agent-memory/search", "{\"query\":\"session API value\",\"limit\":10,\"include_sessions\":true}", "POST /v1/agent-memory/search HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", search_with_sessions.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_with_sessions.body, "Agent A session API value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_with_sessions.body, "Agent B session API value") == null);
 }
 
 test "api nullclaw agent adapter matches current nullclaw memory engine contract" {
@@ -9090,6 +9136,14 @@ test "api nullclaw agent adapter matches current nullclaw memory engine contract
     try std.testing.expectEqualStrings("200 OK", get_session_a_without_sid.status);
     try std.testing.expect(std.mem.indexOf(u8, get_session_a_without_sid.body, "Agent A session adapter value") != null);
     try std.testing.expect(std.mem.indexOf(u8, get_session_a_without_sid.body, "Agent B session adapter value") == null);
+    const list_session_a_without_sid = handleRequest(&ctx, "GET", "/v1/agent/memories?category=core", "", "GET /v1/agent/memories?category=core HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", list_session_a_without_sid.status);
+    try std.testing.expect(std.mem.indexOf(u8, list_session_a_without_sid.body, "Agent A session adapter value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_session_a_without_sid.body, "Agent B session adapter value") == null);
+    const search_session_a_without_sid = handleRequest(&ctx, "POST", "/v1/agent/memories/search", "{\"query\":\"session adapter value\",\"limit\":10}", "POST /v1/agent/memories/search HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", search_session_a_without_sid.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_session_a_without_sid.body, "Agent A session adapter value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_session_a_without_sid.body, "Agent B session adapter value") == null);
     const delete_session_a = handleRequest(&ctx, "DELETE", "/v1/agent/memories/pref.session", "", "DELETE /v1/agent/memories/pref.session HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", delete_session_a.status);
     const missing_session_a = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.session?session_id=sid-1", "", "GET /v1/agent/memories/pref.session?session_id=sid-1 HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
