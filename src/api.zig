@@ -6675,7 +6675,7 @@ fn lifecycleSnapshotImportStructured(ctx: *Context, items: []const std.json.Valu
     var first_id = true;
     var counts = SnapshotTypeCounts{};
 
-    const phases = [_][]const u8{ "source", "entity", "artifact", "memory_atom", "relation", "agent_memory", "context_pack" };
+    const phases = [_][]const u8{ "policy_scope", "space", "source", "entity", "artifact", "memory_atom", "relation", "agent_memory", "context_pack" };
     for (phases) |phase| {
         for (items) |item| {
             if (item != .object) {
@@ -6760,11 +6760,15 @@ fn snapshotPrimitiveSupported(value: []const u8) bool {
         std.mem.eql(u8, value, "memory_atom") or
         std.mem.eql(u8, value, "entity") or
         std.mem.eql(u8, value, "relation") or
+        std.mem.eql(u8, value, "space") or
+        std.mem.eql(u8, value, "policy_scope") or
         std.mem.eql(u8, value, "context_pack") or
         std.mem.eql(u8, value, "agent_memory");
 }
 
 const SnapshotTypeCounts = struct {
+    policy_scope: usize = 0,
+    space: usize = 0,
     source: usize = 0,
     artifact: usize = 0,
     memory_atom: usize = 0,
@@ -6774,11 +6778,11 @@ const SnapshotTypeCounts = struct {
     agent_memory: usize = 0,
 
     fn add(self: *SnapshotTypeCounts, object_type: []const u8) void {
-        if (std.mem.eql(u8, object_type, "source")) self.source += 1 else if (std.mem.eql(u8, object_type, "artifact")) self.artifact += 1 else if (std.mem.eql(u8, object_type, "memory_atom")) self.memory_atom += 1 else if (std.mem.eql(u8, object_type, "entity")) self.entity += 1 else if (std.mem.eql(u8, object_type, "relation")) self.relation += 1 else if (std.mem.eql(u8, object_type, "context_pack")) self.context_pack += 1 else if (std.mem.eql(u8, object_type, "agent_memory")) self.agent_memory += 1;
+        if (std.mem.eql(u8, object_type, "policy_scope")) self.policy_scope += 1 else if (std.mem.eql(u8, object_type, "space")) self.space += 1 else if (std.mem.eql(u8, object_type, "source")) self.source += 1 else if (std.mem.eql(u8, object_type, "artifact")) self.artifact += 1 else if (std.mem.eql(u8, object_type, "memory_atom")) self.memory_atom += 1 else if (std.mem.eql(u8, object_type, "entity")) self.entity += 1 else if (std.mem.eql(u8, object_type, "relation")) self.relation += 1 else if (std.mem.eql(u8, object_type, "context_pack")) self.context_pack += 1 else if (std.mem.eql(u8, object_type, "agent_memory")) self.agent_memory += 1;
     }
 
     fn toJson(self: SnapshotTypeCounts, allocator: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "{{\"source\":{d},\"artifact\":{d},\"memory_atom\":{d},\"entity\":{d},\"relation\":{d},\"context_pack\":{d},\"agent_memory\":{d}}}", .{ self.source, self.artifact, self.memory_atom, self.entity, self.relation, self.context_pack, self.agent_memory });
+        return std.fmt.allocPrint(allocator, "{{\"policy_scope\":{d},\"space\":{d},\"source\":{d},\"artifact\":{d},\"memory_atom\":{d},\"entity\":{d},\"relation\":{d},\"context_pack\":{d},\"agent_memory\":{d}}}", .{ self.policy_scope, self.space, self.source, self.artifact, self.memory_atom, self.entity, self.relation, self.context_pack, self.agent_memory });
     }
 };
 
@@ -6791,6 +6795,8 @@ fn appendSnapshotHydratedObjectJson(ctx: *Context, out: *std.ArrayListUnmanaged(
 }
 
 fn snapshotHydrateStructuredObject(ctx: *Context, object_type: []const u8, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    if (std.mem.eql(u8, object_type, "policy_scope")) return try snapshotHydratePolicyScope(ctx, obj, options);
+    if (std.mem.eql(u8, object_type, "space")) return try snapshotHydrateSpace(ctx, obj, options);
     if (std.mem.eql(u8, object_type, "source")) return try snapshotHydrateSource(ctx, obj, options);
     if (std.mem.eql(u8, object_type, "artifact")) return try snapshotHydrateArtifact(ctx, obj, options);
     if (std.mem.eql(u8, object_type, "entity")) return try snapshotHydrateEntity(ctx, obj, options);
@@ -6799,6 +6805,62 @@ fn snapshotHydrateStructuredObject(ctx: *Context, object_type: []const u8, obj: 
     if (std.mem.eql(u8, object_type, "agent_memory")) return try snapshotHydrateAgentMemory(ctx, obj, options);
     if (std.mem.eql(u8, object_type, "context_pack")) return try snapshotHydrateContextPack(ctx, obj, options);
     return error.Skipped;
+}
+
+fn snapshotHydratePolicyScope(ctx: *Context, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    const scope = json.stringField(obj, "scope") orelse json.stringField(obj, "id") orelse json.stringField(obj, "title") orelse return error.Skipped;
+    const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
+    if (!canWriteRecord(ctx, scope, permissions)) return error.Forbidden;
+    if (options.dry_run) return .{ .object_type = "policy_scope", .id = scope };
+    const existing = try ctx.store.getPolicyScope(ctx.allocator, scope);
+    if (existing) |policy| {
+        if (!recordVisibleToActor(ctx, policy.scope, policy.permissions_json)) return error.Forbidden;
+    }
+    const policy = try ctx.store.upsertPolicyScope(ctx.allocator, .{
+        .scope = scope,
+        .visibility = json.stringField(obj, "visibility") orelse "workspace",
+        .permissions_json = permissions,
+        .owner = json.nullableStringField(obj, "owner"),
+        .ttl_ms = json.intField(obj, "ttl_ms"),
+        .review_after_ms = json.intField(obj, "review_after_ms"),
+        .metadata_json = try rawField(ctx.allocator, obj, "metadata", try rawField(ctx.allocator, obj, "metadata_json", "{\"snapshot_import\":true}")),
+        .actor_id = ctx.actor_id,
+        .suppress_feed = true,
+    });
+    return .{ .object_type = "policy_scope", .id = policy.scope, .created = existing == null };
+}
+
+fn snapshotHydrateSpace(ctx: *Context, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    const name = json.stringField(obj, "name") orelse json.stringField(obj, "title") orelse json.stringField(obj, "id") orelse return error.Skipped;
+    const title = json.stringField(obj, "title") orelse name;
+    const scope = json.stringField(obj, "scope") orelse options.default_scope;
+    const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
+    if (!canWriteRecord(ctx, scope, permissions)) return error.Forbidden;
+    if (options.dry_run) return .{ .object_type = "space", .id = json.stringField(obj, "id") orelse name };
+    if (options.preserve_ids) {
+        if (json.stringField(obj, "id")) |id| {
+            if (try ctx.store.getSpace(ctx.allocator, id)) |existing| {
+                if (!recordVisibleToActor(ctx, existing.scope, existing.permissions_json)) return error.Forbidden;
+                return .{ .object_type = "space", .id = existing.id, .created = false };
+            }
+        }
+    }
+    if (try ctx.store.getSpace(ctx.allocator, name)) |existing| {
+        if (!recordVisibleToActor(ctx, existing.scope, existing.permissions_json)) return error.Forbidden;
+        return .{ .object_type = "space", .id = existing.id, .created = false };
+    }
+    const space = try ctx.store.createSpace(ctx.allocator, .{
+        .id = if (options.preserve_ids) json.nullableStringField(obj, "id") else null,
+        .name = name,
+        .title = title,
+        .description = json.nullableStringField(obj, "description") orelse json.nullableStringField(obj, "text"),
+        .scope = scope,
+        .permissions_json = permissions,
+        .metadata_json = try rawField(ctx.allocator, obj, "metadata", try rawField(ctx.allocator, obj, "metadata_json", "{\"snapshot_import\":true}")),
+        .actor_id = ctx.actor_id,
+        .suppress_feed = true,
+    });
+    return .{ .object_type = "space", .id = space.id };
 }
 
 fn snapshotHydrateSource(ctx: *Context, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
@@ -8482,6 +8544,18 @@ fn appendSnapshotFullRecord(ctx: *Context, out: *std.ArrayListUnmanaged(u8), res
         if (!recordVisibleToActor(ctx, relation.scope, relation.permissions_json)) return false;
         relation.source_ids_json = try sanitizeSourceIdsForActor(ctx, relation.source_ids_json);
         try relation.writeJson(ctx.allocator, out);
+        return true;
+    }
+    if (std.mem.eql(u8, result.result_type, "space")) {
+        const space = (try ctx.store.getSpace(ctx.allocator, result.id)) orelse return false;
+        if (!recordVisibleToActor(ctx, space.scope, space.permissions_json)) return false;
+        try space.writeJson(ctx.allocator, out);
+        return true;
+    }
+    if (std.mem.eql(u8, result.result_type, "policy_scope")) {
+        const policy = (try ctx.store.getPolicyScope(ctx.allocator, result.id)) orelse return false;
+        if (!recordVisibleToActor(ctx, policy.scope, policy.permissions_json)) return false;
+        try policy.writeJson(ctx.allocator, out);
         return true;
     }
     if (std.mem.eql(u8, result.result_type, "context_pack")) {
@@ -12156,10 +12230,12 @@ test "api lifecycle snapshot hydrate preserves typed primitives" {
 
     const body =
         \\{"objects":[
+        \\  {"object_type":"policy_scope","record":{"scope":"public","visibility":"workspace","permissions":[],"owner":"typed-snapshot-policy-owner","metadata":{"marker":"typed snapshot policy marker"}}},
+        \\  {"object_type":"space","record":{"id":"spc_snapshot_typed","name":"typed-snapshot-space","title":"Typed Snapshot Space","description":"typed snapshot shelf marker","scope":"public","permissions":[],"metadata":{"kind":"shelf"}}},
         \\  {"object_type":"source","record":{"id":"src_snapshot_typed","type":"transcript","title":"Typed Snapshot Transcript","content":"typed snapshot transcript evidence","scope":"public","permissions":[]}},
         \\  {"object_type":"entity","record":{"id":"ent_snapshot_from","type":"service","name":"SnapshotSourceService","description":"source entity","scope":"public","permissions":[]}},
         \\  {"object_type":"entity","record":{"id":"ent_snapshot_to","type":"service","name":"SnapshotTargetService","description":"target entity","scope":"public","permissions":[]}},
-        \\  {"object_type":"artifact","record":{"id":"art_snapshot_typed","artifact_type":"decision","title":"Typed Snapshot ADR","body":"Decision: typed snapshots preserve artifacts.","status":"accepted","scope":"public","permissions":[],"source_ids":["src_snapshot_typed"]}},
+        \\  {"object_type":"artifact","record":{"id":"art_snapshot_typed","artifact_type":"decision","title":"Typed Snapshot ADR","body":"Decision: typed snapshots preserve artifacts.","status":"accepted","space_id":"spc_snapshot_typed","scope":"public","permissions":[],"source_ids":["src_snapshot_typed"]}},
         \\  {"object_type":"memory_atom","record":{"id":"mem_snapshot_typed","predicate":"decision","object":"typed snapshots","text":"Typed snapshot memory atom survives as atom.","status":"verified","scope":"public","permissions":[],"source_ids":["src_snapshot_typed"]}},
         \\  {"object_type":"relation","record":{"id":"rel_snapshot_typed","from_entity_id":"ent_snapshot_from","relation_type":"depends_on","to_entity_id":"ent_snapshot_to","status":"verified","scope":"public","permissions":[],"source_ids":["src_snapshot_typed"]}},
         \\  {"object_type":"agent_memory","record":{"key":"typed_snapshot_pref","content":"typed agent memory survives hydrate","category":"preference","scope":"public","permissions":[]}},
@@ -12169,6 +12245,8 @@ test "api lifecycle snapshot hydrate preserves typed primitives" {
     const hydrated = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot/hydrate", body, "");
     try std.testing.expectEqualStrings("200 OK", hydrated.status);
     try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"atomic\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"policy_scope\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"space\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"source\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"artifact\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"memory_atom\":1") != null);
@@ -12180,8 +12258,12 @@ test "api lifecycle snapshot hydrate preserves typed primitives" {
     const hydrated_again = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot/hydrate", body, "");
     try std.testing.expectEqualStrings("200 OK", hydrated_again.status);
     try std.testing.expect(std.mem.indexOf(u8, hydrated_again.body, "\"imported\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hydrated_again.body, "\"hydrated\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated_again.body, "\"hydrated\":10") != null);
 
+    const typed_space = (try store.getSpace(alloc, "spc_snapshot_typed")).?;
+    try std.testing.expectEqualStrings("Typed Snapshot Space", typed_space.title);
+    const typed_policy = (try store.getPolicyScope(alloc, "public")).?;
+    try std.testing.expectEqualStrings("typed-snapshot-policy-owner", typed_policy.owner.?);
     try std.testing.expect((try store.getSource(alloc, "src_snapshot_typed")) != null);
     try std.testing.expect((try store.getArtifact(alloc, "art_snapshot_typed")) != null);
     try std.testing.expect((try store.getMemoryAtom(alloc, "mem_snapshot_typed")) != null);
@@ -12206,6 +12288,18 @@ test "api lifecycle snapshot hydrate preserves typed primitives" {
     try std.testing.expect(std.mem.indexOf(u8, pack_export.body, "\"object_type\":\"context_pack\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pack_export.body, "\"generated_summary\":\"Typed context pack exact summary survives hydrate\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pack_export.body, "\"included_sources\":[\"src_snapshot_typed\"]") != null);
+
+    const space_export = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot/export", "{\"query\":\"typed snapshot shelf marker\",\"scopes\":[\"public\"],\"include_deprecated\":true,\"limit\":10,\"persist\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", space_export.status);
+    try std.testing.expect(std.mem.indexOf(u8, space_export.body, "\"object_type\":\"space\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, space_export.body, "\"name\":\"typed-snapshot-space\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, space_export.body, "\"description\":\"typed snapshot shelf marker\"") != null);
+
+    const policy_export = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot/export", "{\"query\":\"typed snapshot policy marker\",\"scopes\":[\"public\"],\"include_deprecated\":true,\"limit\":10,\"persist\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", policy_export.status);
+    try std.testing.expect(std.mem.indexOf(u8, policy_export.body, "\"object_type\":\"policy_scope\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, policy_export.body, "\"owner\":\"typed-snapshot-policy-owner\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, policy_export.body, "typed snapshot policy marker") != null);
 
     const exported = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot/export", "{\"query\":\"typed snapshot transcript\",\"scopes\":[\"public\"],\"limit\":5,\"persist\":false}", "");
     try std.testing.expectEqualStrings("200 OK", exported.status);
@@ -14598,10 +14692,17 @@ test "api spaces and policy scopes are first-class permission-filtered records" 
     try std.testing.expect(std.mem.indexOf(u8, policy_resp.body, "\"policy_scope\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, policy_resp.body, "\"ttl_ms\":86400000") != null);
 
+    const policy_update = handleRequest(&project_ctx, "POST", "/v1/policy-scopes", "{\"scope\":\"project:nullpantry\",\"visibility\":\"team\",\"permissions\":[\"project:nullpantry\"],\"owner\":\"agent:nullpantry-updated\",\"ttl_ms\":43200000,\"review_after_ms\":302400000}", "");
+    try std.testing.expectEqualStrings("200 OK", policy_update.status);
+    try std.testing.expect(std.mem.indexOf(u8, policy_update.body, "\"owner\":\"agent:nullpantry-updated\"") != null);
+    const policy_update_retry = handleRequest(&project_ctx, "POST", "/v1/policy-scopes", "{\"scope\":\"project:nullpantry\",\"visibility\":\"team\",\"permissions\":[\"project:nullpantry\"],\"owner\":\"agent:nullpantry-updated\",\"ttl_ms\":43200000,\"review_after_ms\":302400000}", "");
+    try std.testing.expectEqualStrings("200 OK", policy_update_retry.status);
+
     const feed_resp = handleRequest(&project_ctx, "GET", "/v1/memory/events?limit=20", "", "");
     try std.testing.expectEqualStrings("200 OK", feed_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, feed_resp.body, "\"object_type\":\"space\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, feed_resp.body, "\"object_type\":\"policy_scope\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed_resp.body, "agent:nullpantry-updated") != null);
 
     const hidden_policy = handleRequest(&public_ctx, "GET", "/v1/policy-scopes", "", "");
     try std.testing.expectEqualStrings("200 OK", hidden_policy.status);

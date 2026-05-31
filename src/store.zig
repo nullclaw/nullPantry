@@ -260,6 +260,35 @@ fn domainPayloadJson(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
     return out.toOwnedSlice(allocator);
 }
 
+fn policyScopeFeedPayloadJson(allocator: std.mem.Allocator, policy: PolicyScope) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"scope\":");
+    try json.appendString(&out, allocator, policy.scope);
+    try out.appendSlice(allocator, ",\"visibility\":");
+    try json.appendString(&out, allocator, policy.visibility);
+    try out.appendSlice(allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(&out, allocator, policy.permissions_json, "[]");
+    try out.appendSlice(allocator, ",\"owner\":");
+    try json.appendNullableString(&out, allocator, policy.owner);
+    try out.appendSlice(allocator, ",\"ttl_ms\":");
+    if (policy.ttl_ms) |v| try out.print(allocator, "{d}", .{v}) else try out.appendSlice(allocator, "null");
+    try out.appendSlice(allocator, ",\"review_after_ms\":");
+    if (policy.review_after_ms) |v| try out.print(allocator, "{d}", .{v}) else try out.appendSlice(allocator, "null");
+    try out.appendSlice(allocator, ",\"metadata\":");
+    try json.appendRawJsonOr(&out, allocator, policy.metadata_json, "{}");
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+fn policyScopePutDedupeKey(allocator: std.mem.Allocator, scope: []const u8, payload_json: []const u8) ![]const u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(scope);
+    hasher.update("\n");
+    hasher.update(payload_json);
+    return std.fmt.allocPrint(allocator, "direct:policy_scope:{s}:{x}", .{ scope, hasher.final() });
+}
+
 pub fn payloadWithStorageRouteJson(allocator: std.mem.Allocator, payload_json: []const u8, route: AgentMemoryStorageRoute) ![]const u8 {
     if (route.target == .primary) return allocator.dupe(u8, payload_json);
     const trimmed = std.mem.trim(u8, payload_json, " \t\r\n");
@@ -2483,9 +2512,22 @@ pub const Store = struct {
     }
 
     fn appendPolicyScopePutFeedEvent(self: *Store, allocator: std.mem.Allocator, policy: PolicyScope, actor_id: ?[]const u8) !void {
-        const payload = try domainPayloadJson(allocator, policy);
+        const payload = try policyScopeFeedPayloadJson(allocator, policy);
         defer allocator.free(payload);
-        try self.appendAppliedPrimitiveFeedEvent(allocator, "policy_scope.put", "policy_scope", policy.scope, policy.scope, policy.permissions_json, actor_id, payload, .{});
+        const dedupe_key = try policyScopePutDedupeKey(allocator, policy.scope, payload);
+        defer allocator.free(dedupe_key);
+        _ = try self.appendFeedEvent(.{
+            .event_type = "policy_scope.put",
+            .operation = "put",
+            .object_type = "policy_scope",
+            .object_id = policy.scope,
+            .scope = policy.scope,
+            .permissions_json = policy.permissions_json,
+            .actor_id = actor_id,
+            .dedupe_key = dedupe_key,
+            .payload_json = payload,
+            .status = "applied",
+        });
     }
 
     fn appendAgentSessionMessagePutFeedEvent(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
