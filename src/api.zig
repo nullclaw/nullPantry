@@ -3753,13 +3753,28 @@ fn lifecycleMigrate(ctx: *Context, body: []const u8) HttpResponse {
     const delete_source = json.boolField(obj, "delete_source") orelse false;
     if (delete_source and !hasCapability(ctx, "delete")) return forbidden(ctx);
 
+    if (isAllMigrationKind(kind)) {
+        return lifecycleMigrateAll(ctx, obj, source_route, target_route, dry_run, delete_source);
+    }
     if (isAgentSessionMigrationKind(kind)) {
         return lifecycleMigrateAgentSessions(ctx, obj, kind, source_route, target_route, dry_run, delete_source);
     }
     if (!isAgentMemoryMigrationKind(kind)) {
-        return json.errorResponse(ctx.allocator, 400, "unsupported_migration_kind", "Supported migration kinds are agent_memory and agent_sessions");
+        return json.errorResponse(ctx.allocator, 400, "unsupported_migration_kind", "Supported migration kinds are agent_memory, agent_sessions, and all");
     }
 
+    return lifecycleMigrateAgentMemory(ctx, obj, kind, source_route, target_route, dry_run, delete_source);
+}
+
+fn lifecycleMigrateAgentMemory(
+    ctx: *Context,
+    obj: std.json.ObjectMap,
+    kind: []const u8,
+    source_route: store_mod.AgentMemoryStorageRoute,
+    target_route: store_mod.AgentMemoryStorageRoute,
+    dry_run: bool,
+    delete_source: bool,
+) HttpResponse {
     const session_id = json.nullableStringField(obj, "session_id");
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
@@ -3963,6 +3978,84 @@ fn isAgentMemoryMigrationKind(kind: []const u8) bool {
 
 fn isAgentSessionMigrationKind(kind: []const u8) bool {
     return std.mem.eql(u8, kind, "agent_session") or std.mem.eql(u8, kind, "agent_sessions") or std.mem.eql(u8, kind, "session") or std.mem.eql(u8, kind, "sessions");
+}
+
+fn isAllMigrationKind(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "all") or std.mem.eql(u8, kind, "agent_runtime") or std.mem.eql(u8, kind, "agent_state");
+}
+
+fn lifecycleMigrateAll(
+    ctx: *Context,
+    obj: std.json.ObjectMap,
+    source_route: store_mod.AgentMemoryStorageRoute,
+    target_route: store_mod.AgentMemoryStorageRoute,
+    dry_run: bool,
+    delete_source: bool,
+) HttpResponse {
+    const memory_preflight = lifecycleMigrateAgentMemory(ctx, obj, "agent_memory", source_route, target_route, true, delete_source);
+    if (!isOkResponse(memory_preflight)) return memory_preflight;
+    const session_preflight = lifecycleMigrateAgentSessions(ctx, obj, "agent_sessions", source_route, target_route, true, delete_source);
+    if (!isOkResponse(session_preflight)) return session_preflight;
+
+    if (dry_run) {
+        return lifecycleAllMigrationResponse(ctx, .{
+            .dry_run = true,
+            .delete_source = delete_source,
+            .preflight = true,
+            .source_route = source_route,
+            .target_route = target_route,
+            .agent_memory = memory_preflight.body,
+            .agent_sessions = session_preflight.body,
+        });
+    }
+
+    const memory_execute = lifecycleMigrateAgentMemory(ctx, obj, "agent_memory", source_route, target_route, false, delete_source);
+    if (!isOkResponse(memory_execute)) return memory_execute;
+    const session_execute = lifecycleMigrateAgentSessions(ctx, obj, "agent_sessions", source_route, target_route, false, delete_source);
+    if (!isOkResponse(session_execute)) return session_execute;
+    return lifecycleAllMigrationResponse(ctx, .{
+        .dry_run = false,
+        .delete_source = delete_source,
+        .preflight = true,
+        .source_route = source_route,
+        .target_route = target_route,
+        .agent_memory = memory_execute.body,
+        .agent_sessions = session_execute.body,
+    });
+}
+
+const LifecycleAllMigrationResponseInput = struct {
+    dry_run: bool,
+    delete_source: bool,
+    preflight: bool,
+    source_route: store_mod.AgentMemoryStorageRoute,
+    target_route: store_mod.AgentMemoryStorageRoute,
+    agent_memory: []const u8,
+    agent_sessions: []const u8,
+};
+
+fn lifecycleAllMigrationResponse(ctx: *Context, input: LifecycleAllMigrationResponseInput) HttpResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"ok\":true,\"migration\":{\"kind\":\"all\",\"dry_run\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (input.dry_run) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"delete_source\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (input.delete_source) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"preflight\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (input.preflight) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"source_route\":") catch return serverError(ctx);
+    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.source_route) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"target_route\":") catch return serverError(ctx);
+    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.target_route) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"results\":{\"agent_memory\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, input.agent_memory) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"agent_sessions\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, input.agent_sessions) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "}}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn isOkResponse(response: HttpResponse) bool {
+    return std.mem.eql(u8, response.status, "200 OK");
 }
 
 fn positiveBoundedInt(value: ?i64, default_value: usize, max_value: usize) usize {
@@ -8010,6 +8103,63 @@ test "api lifecycle migrate moves agent session state between storage planes" {
     try std.testing.expect(std.mem.indexOf(u8, scratch_history.body, "\"total\":0") != null);
     const scratch_usage = handleRequest(&ctx, "GET", "/v1/agent-sessions/migrate-session/usage?store=scratch", "", "GET /v1/agent-sessions/migrate-session/usage?store=scratch HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
     try std.testing.expectEqualStrings("404 Not Found", scratch_usage.status);
+}
+
+test "api lifecycle migrate all moves agent memory and sessions together" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory = .{ .backend = .memory_lru },
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "archive", .config = .{ .backend = .memory_lru } },
+        },
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const principals =
+        \\{"agent-route":{"actor_id":"agent:route","scopes":["public","write:public","delete:public","session:*","write:session:*"],"capabilities":["read","write","delete"]}}
+    ;
+    var ctx = Context{ .allocator = alloc, .store = &store, .token_principals_json = principals };
+
+    const memory_put = handleRequest(&ctx, "PUT", "/v1/agent-memory/all.key", "{\"content\":\"All migrate scratch memory\",\"scope\":\"public\",\"store\":\"scratch\"}", "PUT /v1/agent-memory/all.key HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", memory_put.status);
+    const message_put = handleRequest(&ctx, "POST", "/v1/agent-sessions/all-session/messages", "{\"role\":\"assistant\",\"content\":\"All migrate scratch session\",\"created_at_ms\":23456,\"store\":\"scratch\"}", "POST /v1/agent-sessions/all-session/messages HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", message_put.status);
+    const usage_put = handleRequest(&ctx, "PUT", "/v1/agent-sessions/all-session/usage", "{\"total_tokens\":654,\"store\":\"scratch\"}", "PUT /v1/agent-sessions/all-session/usage HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", usage_put.status);
+
+    const dry_run = handleRequest(&ctx, "POST", "/v1/lifecycle/migrate", "{\"kind\":\"all\",\"from\":\"scratch\",\"to\":\"archive\",\"scopes\":[\"public\"],\"dry_run\":true}", "POST /v1/lifecycle/migrate HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", dry_run.status);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"kind\":\"all\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"preflight\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"agent_memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"agent_sessions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"selected\":1") != null);
+
+    const execute = handleRequest(&ctx, "POST", "/v1/lifecycle/migrate", "{\"kind\":\"all\",\"from_store\":\"scratch\",\"to_store\":\"archive\",\"scopes\":[\"public\"],\"execute\":true,\"delete_source\":true}", "POST /v1/lifecycle/migrate HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", execute.status);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"kind\":\"all\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"dry_run\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"messages_copied\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"migrated\":1") != null);
+
+    const archive_memory = handleRequest(&ctx, "GET", "/v1/agent-memory/all.key?store=archive&scope=public", "", "GET /v1/agent-memory/all.key?store=archive&scope=public HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", archive_memory.status);
+    try std.testing.expect(std.mem.indexOf(u8, archive_memory.body, "All migrate scratch memory") != null);
+    const archive_history = handleRequest(&ctx, "GET", "/v1/agent-sessions/all-session?store=archive", "", "GET /v1/agent-sessions/all-session?store=archive HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", archive_history.status);
+    try std.testing.expect(std.mem.indexOf(u8, archive_history.body, "All migrate scratch session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, archive_history.body, "\"created_at\":\"23456\"") != null);
+    const archive_usage = handleRequest(&ctx, "GET", "/v1/agent-sessions/all-session/usage?store=archive", "", "GET /v1/agent-sessions/all-session/usage?store=archive HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", archive_usage.status);
+    try std.testing.expect(std.mem.indexOf(u8, archive_usage.body, "\"total_tokens\":654") != null);
+
+    const scratch_memory = handleRequest(&ctx, "GET", "/v1/agent-memory/all.key?store=scratch&scope=public", "", "GET /v1/agent-memory/all.key?store=scratch&scope=public HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("404 Not Found", scratch_memory.status);
+    const scratch_history = handleRequest(&ctx, "GET", "/v1/agent-sessions/all-session?store=scratch", "", "GET /v1/agent-sessions/all-session?store=scratch HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", scratch_history.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_history.body, "\"total\":0") != null);
 }
 
 test "api memory checkpoint restore preserves named runtime storage plane" {
