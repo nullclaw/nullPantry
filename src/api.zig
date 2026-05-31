@@ -9379,6 +9379,27 @@ test "api agent memory supports named stores and federated runtime reads" {
     const scratch_session_put = handleRequest(&ctx, "PUT", "/v1/agent-memory/named.session", "{\"content\":\"Named Scratch Session Unique\",\"store\":\"scratch\",\"session_id\":\"sess_route\"}", raw);
     try std.testing.expectEqualStrings("200 OK", scratch_session_put.status);
 
+    const runtime_session_hidden_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Named Scratch Session Unique\",\"store\":\"scratch\",\"scopes\":[\"session:sess_route\"],\"include_sessions\":false,\"use_vector\":false,\"use_temporal_decay\":false,\"use_mmr\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", runtime_session_hidden_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_session_hidden_search.body, "Named Scratch Session Unique") == null);
+    const runtime_session_visible_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Named Scratch Session Unique\",\"store\":\"scratch\",\"scopes\":[\"session:sess_route\"],\"include_sessions\":true,\"use_vector\":false,\"use_temporal_decay\":false,\"use_mmr\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", runtime_session_visible_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_session_visible_search.body, "Named Scratch Session Unique") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_session_visible_search.body, "\"store\":\"scratch\"") != null);
+    const runtime_session_retrieval = handleRequest(&ctx, "POST", "/v1/retrieval/search", "{\"query\":\"Named Scratch Session Unique\",\"store\":\"scratch\",\"scopes\":[\"session:sess_route\"],\"include_sessions\":true,\"use_vector\":false,\"use_temporal_decay\":false,\"use_mmr\":false,\"limit\":10}", "POST /v1/retrieval/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", runtime_session_retrieval.status);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_session_retrieval.body, "Named Scratch Session Unique") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_session_retrieval.body, "\"store\":\"scratch\"") != null);
+    const runtime_session_hidden_ask = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"Named Scratch Session Unique\",\"store\":\"scratch\",\"scopes\":[\"session:sess_route\"],\"include_sessions\":false,\"use_vector\":false,\"use_temporal_decay\":false,\"use_mmr\":false,\"use_cache\":false}", "POST /v1/ask HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", runtime_session_hidden_ask.status);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_session_hidden_ask.body, "Named Scratch Session Unique") == null);
+    const runtime_session_visible_ask = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"Named Scratch Session Unique\",\"store\":\"scratch\",\"scopes\":[\"session:sess_route\"],\"include_sessions\":true,\"use_vector\":false,\"use_temporal_decay\":false,\"use_mmr\":false,\"use_cache\":false}", "POST /v1/ask HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", runtime_session_visible_ask.status);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_session_visible_ask.body, "[store:scratch] Named Scratch Session Unique") != null);
+    const runtime_session_context = handleRequest(&ctx, "POST", "/v1/context-packs", "{\"task\":\"Named Scratch Session Unique\",\"store\":\"scratch\",\"scopes\":[\"session:sess_route\"],\"include_sessions\":true,\"use_vector\":false,\"use_temporal_decay\":false,\"use_mmr\":false,\"limit\":10,\"persist\":false}", "POST /v1/context-packs HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", runtime_session_context.status);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_session_context.body, "[store:scratch] Named Scratch Session Unique") != null);
+
     const scratch_count = handleRequest(&ctx, "GET", "/v1/agent-memory/count?store=scratch", "", "GET /v1/agent-memory/count?store=scratch HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", scratch_count.status);
     try std.testing.expect(std.mem.indexOf(u8, scratch_count.body, "\"count\":2") != null);

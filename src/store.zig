@@ -1368,14 +1368,11 @@ pub const Store = struct {
 
     fn appendRuntimeSearchResults(self: *Store, allocator: std.mem.Allocator, input: SearchInput, runtime: *agent_memory_runtime.Runtime, store_name: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const actor = input.actor_id orelse return;
-        const external = try runtime.search(
-            allocator,
-            input.query,
-            @max(input.limit, @as(usize, 20)),
-            input.session_id,
-            input.scopes_json,
-            actor,
-        );
+        const search_limit = @max(input.limit, @as(usize, 20));
+        const external = if (input.session_id == null and input.include_sessions)
+            try runtime.searchAnyVisible(allocator, input.query, search_limit, input.scopes_json, actor)
+        else
+            try runtime.search(allocator, input.query, search_limit, input.session_id, input.scopes_json, actor);
         defer {
             for (external) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
             allocator.free(external);
