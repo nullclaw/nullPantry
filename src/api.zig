@@ -198,26 +198,8 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return retrievalSearch(ctx, body);
     } else if (eql(seg1, "workers") and eql(seg2, "run") and is_post) {
         return workersRun(ctx, body);
-    } else if (eql(seg1, "memory") and (eql(seg2, "feed") or eql(seg2, "events")) and is_get) {
-        return memoryFeed(ctx, parsed.query);
-    } else if (eql(seg1, "memory") and (eql(seg2, "feed") or eql(seg2, "events")) and is_post) {
-        return appendMemoryFeed(ctx, body, parsed.query);
-    } else if (eql(seg1, "memory") and eql(seg2, "status") and is_get) {
-        return memoryFeedStatus(ctx, parsed.query);
-    } else if (eql(seg1, "memory") and eql(seg2, "stats") and is_get) {
-        return memoryStats(ctx);
-    } else if (eql(seg1, "memory") and eql(seg2, "reindex") and is_post) {
-        return memoryReindex(ctx, body);
-    } else if (eql(seg1, "memory") and eql(seg2, "drain-outbox") and is_post) {
-        return memoryDrainOutbox(ctx, body);
-    } else if (eql(seg1, "memory") and eql(seg2, "compact") and is_post) {
-        return memoryFeedCompact(ctx, body, parsed.query);
-    } else if (eql(seg1, "memory") and eql(seg2, "checkpoint") and is_get) {
-        return memoryFeedCheckpoint(ctx, parsed.query);
-    } else if (eql(seg1, "memory") and eql(seg2, "checkpoint") and is_post) {
-        return memoryFeedCheckpointRestore(ctx, body, parsed.query);
-    } else if (eql(seg1, "memory") and eql(seg2, "apply") and is_post) {
-        return applyMemoryEvent(ctx, body, parsed.query);
+    } else if (eql(seg1, "memory")) {
+        return handleMemorySurface(ctx, method, parsed.query, seg2, seg3, seg4, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "lucid") and eql(seg3, "status") and is_get) {
         return lifecycleLucidStatus(ctx);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "lucid") and eql(seg3, "rebuild") and is_post) {
@@ -326,6 +308,14 @@ fn handleAgentSessions(ctx: *Context, method: []const u8, query: []const u8, seg
         return writeHistoryShow(ctx, seg2.?, result, limit, offset);
     }
 
+    if (seg2 != null and seg3 == null and is_delete) {
+        return agentSessionTerminate(ctx, seg2.?, query, body);
+    }
+
+    if (seg2 != null and eql(seg3, "terminate") and is_post) {
+        return agentSessionTerminate(ctx, seg2.?, query, body);
+    }
+
     if (seg2 != null and eql(seg3, "messages")) {
         if ((is_post or is_delete) and !agentSessionWriteAllowed(ctx, seg2.?)) return forbidden(ctx);
         if (is_get and !agentSessionReadAllowed(ctx, seg2.?)) return forbidden(ctx);
@@ -357,6 +347,75 @@ fn handleAgentSessions(ctx: *Context, method: []const u8, query: []const u8, seg
     }
 
     return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
+}
+
+fn agentSessionTerminate(ctx: *Context, session_id: []const u8, query: []const u8, body: []const u8) HttpResponse {
+    if (!agentSessionWriteAllowed(ctx, session_id)) return forbidden(ctx);
+    const storage_target = if (std.mem.trim(u8, body, " \t\r\n").len == 0)
+        storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx)
+    else blk: {
+        var parsed = parseBody(ctx, body) catch return badJson(ctx);
+        defer parsed.deinit();
+        break :blk storage_routes.fromObjectOrQuery(ctx.allocator, parsed.value.object, query) catch return serverError(ctx);
+    };
+    const actor_filter = actorFilter(ctx);
+
+    const history = ctx.store.historyRouted(ctx.allocator, session_id, 500, 0, actor_filter, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    const usage = ctx.store.loadUsageRouted(session_id, actor_filter, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    const memory_entries = ctx.store.agentMemoryListVisibleRouted(ctx.allocator, null, session_id, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+
+    if (history.total == 0 and usage == null and memory_entries.len == 0) {
+        return json.errorResponse(ctx.allocator, 404, "session_not_found", "No session with that key");
+    }
+
+    var memory_deleted: usize = 0;
+    for (memory_entries) |entry| {
+        if (!agentMemoryEntryDeletable(ctx, entry)) return forbidden(ctx);
+        if (ctx.store.agentMemoryDeleteRouted(entry.key, entry.session_id, entry.actor_id, ctx.actor_id, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        }) {
+            memory_deleted += 1;
+        }
+    }
+
+    ctx.store.clearMessagesRouted(session_id, actor_filter, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    ctx.store.clearAutoSavedRouted(session_id, actor_filter, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    const usage_deleted_now = ctx.store.deleteUsageRouted(session_id, actor_filter, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    const usage_deleted = usage != null or usage_deleted_now;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"session_key\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, session_id) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"session_id\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, session_id) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"terminated\":true") catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"messages_deleted\":{d},\"memory_entries_deleted\":{d},\"usage_deleted\":{s},\"storage_route\":", .{
+        history.total,
+        memory_deleted,
+        if (usage_deleted) "true" else "false",
+    }) catch return serverError(ctx);
+    storage_routes.appendRouteJson(ctx.allocator, &out, storage_target) catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
 fn handleNullClawAgentAdapter(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[]u8, seg3: ?[]u8, seg4: ?[]u8, body: []const u8) HttpResponse {
@@ -392,6 +451,7 @@ fn handleNullClawAgentAdapter(ctx: *Context, method: []const u8, query: []const 
 
     if (eql(seg2, "sessions")) {
         if (eql(seg3, "auto-saved") and seg4 == null) return handleAgentSessions(ctx, method, query, seg3, null, body);
+        if (is_delete and seg3 != null and seg4 == null) return handleAgentSessions(ctx, method, query, seg3, null, body);
         if (is_delete and seg3 != null and eql(seg4, "messages")) return nullClawAgentClearMessages(ctx, seg3.?, query);
         if (seg3 != null and seg4 != null) return handleAgentSessions(ctx, method, query, seg3, seg4, body);
         if (seg3 == null and is_get) return handleAgentSessions(ctx, method, query, null, null, body);
@@ -401,6 +461,48 @@ fn handleNullClawAgentAdapter(ctx: *Context, method: []const u8, query: []const 
         if (is_get and seg3 == null) return handleAgentSessions(ctx, method, query, null, null, body);
         if (is_get and seg3 != null and seg4 == null) return handleAgentSessions(ctx, method, query, seg3, null, body);
     }
+
+    return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
+}
+
+fn handleMemorySurface(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[]u8, seg3: ?[]u8, seg4: ?[]u8, body: []const u8) HttpResponse {
+    const is_get = std.mem.eql(u8, method, "GET");
+    const is_post = std.mem.eql(u8, method, "POST");
+    const is_put = std.mem.eql(u8, method, "PUT");
+    const is_delete = std.mem.eql(u8, method, "DELETE");
+
+    if ((eql(seg2, "feed") or eql(seg2, "events")) and is_get and seg3 == null) return memoryFeed(ctx, query);
+    if ((eql(seg2, "feed") or eql(seg2, "events")) and is_post and seg3 == null) return appendMemoryFeed(ctx, body, query);
+    if (eql(seg2, "status") and is_get and seg3 == null) return memoryFeedStatus(ctx, query);
+    if (eql(seg2, "stats") and is_get and seg3 == null) return memoryStats(ctx);
+    if (eql(seg2, "reindex") and is_post and seg3 == null) return memoryReindex(ctx, body);
+    if (eql(seg2, "drain-outbox") and is_post and seg3 == null) return memoryDrainOutbox(ctx, body);
+    if (eql(seg2, "compact") and is_post and seg3 == null) return memoryFeedCompact(ctx, body, query);
+    if (eql(seg2, "checkpoint") and is_get and seg3 == null) return memoryFeedCheckpoint(ctx, query);
+    if (eql(seg2, "checkpoint") and is_post and seg3 == null) return memoryFeedCheckpointRestore(ctx, body, query);
+    if (eql(seg2, "apply") and is_post and seg3 == null) return applyMemoryEvent(ctx, body, query);
+
+    if (eql(seg2, "count") and is_get and seg3 == null) return agentMemoryCount(ctx, query);
+    if (eql(seg2, "list") and is_get and seg3 == null) return nullClawAgentMemoryList(ctx, query);
+    if (eql(seg2, "search") and is_post and seg3 == null) return nullClawAgentMemorySearch(ctx, body);
+    if (eql(seg2, "get") and is_get and seg3 != null and seg4 == null) return nullClawAgentMemoryGet(ctx, seg3.?, query);
+    if (eql(seg2, "store") and (is_post or is_put)) {
+        if (seg3 != null and seg4 == null) return memoryCommandStoreKey(ctx, seg3.?, body);
+        if (seg3 != null) return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
+        return memoryCommandStoreBody(ctx, body);
+    }
+    if (eql(seg2, "update") and (is_post or is_put)) {
+        if (seg3 != null and seg4 == null) return memoryCommandUpdateKey(ctx, seg3.?, body);
+        if (seg3 != null) return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
+        return memoryCommandUpdateBody(ctx, body);
+    }
+    if ((eql(seg2, "delete") or eql(seg2, "forget")) and (is_delete or is_post)) {
+        if (seg3 != null and seg4 == null) return memoryCommandDeleteKey(ctx, seg3.?, query);
+        if (seg3 != null) return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
+        if (is_post) return memoryCommandDeleteBody(ctx, body);
+    }
+    if (eql(seg2, "export-jsonl") and is_post and seg3 == null) return memoryCommandExportJsonl(ctx, body);
+    if (eql(seg2, "hygiene-report") and is_post and seg3 == null) return lifecycleHygieneReport(ctx, body);
 
     return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
 }
@@ -669,7 +771,7 @@ fn nullClawAgentMemoryStore(ctx: *Context, key: []const u8, body: []const u8) Ht
 
 fn nullClawAgentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
-    const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    const session_id = queryParamDecodedAlias(ctx, query, "session_id", "session") catch return serverError(ctx);
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
@@ -693,7 +795,7 @@ fn nullClawAgentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) Htt
 fn nullClawAgentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const category = json.queryParamDecoded(ctx.allocator, query, "category") catch return serverError(ctx);
-    const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    const session_id = queryParamDecodedAlias(ctx, query, "session_id", "session") catch return serverError(ctx);
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
@@ -741,7 +843,7 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    const session_id = json.nullableStringField(obj, "session_id");
+    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
@@ -783,7 +885,7 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
 
 fn nullClawAgentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "delete")) return forbidden(ctx);
-    const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    const session_id = queryParamDecodedAlias(ctx, query, "session_id", "session") catch return serverError(ctx);
     if (session_id != null) return agentMemoryDelete(ctx, key, query);
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
     if (requested_scope) |scope| {
@@ -801,6 +903,203 @@ fn nullClawAgentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) 
     };
     if (!deleted) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
     return ok(ctx, "{\"ok\":true}");
+}
+
+fn memoryCommandStoreBody(ctx: *Context, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const key = json.stringField(parsed.value.object, "key") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing key");
+    return memoryCommandMutationParsed(ctx, "store", key, parsed.value.object, false);
+}
+
+fn memoryCommandStoreKey(ctx: *Context, key: []const u8, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    return memoryCommandMutationParsed(ctx, "store", key, parsed.value.object, false);
+}
+
+fn memoryCommandUpdateBody(ctx: *Context, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const key = json.stringField(parsed.value.object, "key") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing key");
+    return memoryCommandMutationParsed(ctx, "update", key, parsed.value.object, true);
+}
+
+fn memoryCommandUpdateKey(ctx: *Context, key: []const u8, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    return memoryCommandMutationParsed(ctx, "update", key, parsed.value.object, true);
+}
+
+fn memoryCommandMutationParsed(ctx: *Context, action: []const u8, key: []const u8, obj: std.json.ObjectMap, require_existing: bool) HttpResponse {
+    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
+    const requested_scope = json.nullableStringField(obj, "scope");
+    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx);
+    if (require_existing) {
+        const existing = loadAgentMemoryForRequest(ctx, key, session_id, requested_scope, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        if (existing == null) return json.errorResponse(ctx.allocator, 404, "memory_not_found", "Memory entry not found");
+    }
+
+    const stored = agentMemoryStoreParsedWithDefaultCategory(ctx, key, obj, "conversation");
+    if (!std.mem.eql(u8, stored.status, "200 OK")) return stored;
+    const entry = loadAgentMemoryForRequest(ctx, key, session_id, requested_scope, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    if (entry == null) return json.errorResponse(ctx.allocator, 500, "memory_store_failed", "Stored entry could not be re-read");
+    return memoryCommandMutationResponse(ctx, action, entry.?);
+}
+
+fn memoryCommandMutationResponse(ctx: *Context, action: []const u8, entry: domain.AgentMemory) HttpResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"action\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, action) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"entry\":") catch return serverError(ctx);
+    appendNullClawAgentMemoryEntry(ctx, &out, entry) catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn memoryCommandDeleteKey(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
+    const session_id = queryParamDecodedAlias(ctx, query, "session_id", "session") catch return serverError(ctx);
+    const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return agentMemoryStorageUnavailable(ctx);
+    return memoryCommandDeleteParsed(ctx, key, session_id, requested_scope, storage_target);
+}
+
+fn memoryCommandDeleteBody(ctx: *Context, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const key = json.stringField(obj, "key") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing key");
+    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
+    const requested_scope = json.nullableStringField(obj, "scope");
+    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx);
+    return memoryCommandDeleteParsed(ctx, key, session_id, requested_scope, storage_target);
+}
+
+fn memoryCommandDeleteParsed(ctx: *Context, key: []const u8, session_id: ?[]const u8, requested_scope: ?[]const u8, storage_target: store_mod.AgentMemoryStorageRoute) HttpResponse {
+    if (!hasCapability(ctx, "delete")) return forbidden(ctx);
+    if (session_id) |sid| {
+        if (!agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+    }
+    const owner_actor_id = if (requested_scope) |scope|
+        access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx)
+    else
+        ctx.actor_id;
+    defer if (requested_scope != null) ctx.allocator.free(owner_actor_id);
+
+    if (session_id) |_| {
+        const entry = ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        if (entry == null or !agentMemoryEntryVisible(ctx, entry.?)) return memoryCommandDeleteResponse(ctx, key, session_id, false);
+        if (!agentMemoryEntryDeletable(ctx, entry.?)) return forbidden(ctx);
+        const deleted = ctx.store.agentMemoryDeleteRouted(key, session_id, owner_actor_id, ctx.actor_id, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        return memoryCommandDeleteResponse(ctx, key, session_id, deleted);
+    }
+
+    if (requested_scope) |scope| {
+        if (!domain.scopeDeletable(scope, ctx.actor_scopes_json)) return forbidden(ctx);
+    }
+    const deleted = ctx.store.agentMemoryDeleteAllRouted(key, owner_actor_id, ctx.actor_id, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    return memoryCommandDeleteResponse(ctx, key, null, deleted);
+}
+
+fn memoryCommandDeleteResponse(ctx: *Context, key: []const u8, session_id: ?[]const u8, deleted: bool) HttpResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"key\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, key) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"session_id\":") catch return serverError(ctx);
+    json.appendNullableString(&out, ctx.allocator, session_id) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"deleted\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (deleted) "true" else "false") catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn memoryCommandExportJsonl(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read") or !hasCapability(ctx, "export")) return forbidden(ctx);
+    var parsed = parseBody(ctx, optionalJsonObjectBody(body)) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const category = json.stringField(obj, "category");
+    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
+    if (session_id) |sid| {
+        if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
+    }
+    const include_internal = json.boolField(obj, "include_internal") orelse false;
+    const include_pii = json.boolField(obj, "include_pii") orelse false;
+    const limit = positiveLimit(json.intField(obj, "limit"), 1000);
+    const offset = positiveLimit(json.intField(obj, "offset"), 0);
+    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx);
+    const entries = if (session_id) |sid|
+        ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, sid, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        }
+    else
+        ctx.store.agentMemoryListAnyVisibleRouted(ctx.allocator, category, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var seen: usize = 0;
+    var written: usize = 0;
+    for (entries) |entry| {
+        if (!agentMemoryEntryVisible(ctx, entry)) continue;
+        if (!include_internal and domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+        if (seen < offset) {
+            seen += 1;
+            continue;
+        }
+        seen += 1;
+        if (written >= limit) break;
+        if (written > 0) out.append(ctx.allocator, '\n') catch return serverError(ctx);
+        appendMemoryCommandJsonlEntry(ctx, &out, entry, include_pii) catch return serverError(ctx);
+        written += 1;
+    }
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn appendMemoryCommandJsonlEntry(ctx: *Context, out: *std.ArrayListUnmanaged(u8), entry: domain.AgentMemory, include_pii: bool) !void {
+    const key = if (include_pii) entry.key else try redactExportText(ctx.allocator, entry.key);
+    const content = if (include_pii) entry.content else try redactExportText(ctx.allocator, entry.content);
+    try out.appendSlice(ctx.allocator, "{\"schema_version\":\"nullpantry.agent_memory_jsonl.v1\",\"key\":");
+    try json.appendString(out, ctx.allocator, key);
+    try out.appendSlice(ctx.allocator, ",\"category\":");
+    try json.appendString(out, ctx.allocator, entry.category);
+    try out.appendSlice(ctx.allocator, ",\"timestamp\":");
+    try json.appendString(out, ctx.allocator, entry.timestamp);
+    try out.appendSlice(ctx.allocator, ",\"content\":");
+    try json.appendString(out, ctx.allocator, content);
+    try out.appendSlice(ctx.allocator, ",\"session_id\":");
+    try json.appendNullableString(out, ctx.allocator, entry.session_id);
+    try out.appendSlice(ctx.allocator, ",\"scope\":");
+    try json.appendString(out, ctx.allocator, entry.scope);
+    try out.appendSlice(ctx.allocator, ",\"owner_id\":");
+    try json.appendString(out, ctx.allocator, entry.actor_id);
+    try out.appendSlice(ctx.allocator, ",\"created_by_actor_id\":");
+    try json.appendString(out, ctx.allocator, if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id);
+    if (entry.store.len > 0) {
+        try out.appendSlice(ctx.allocator, ",\"store\":");
+        try json.appendString(out, ctx.allocator, entry.store);
+        try out.appendSlice(ctx.allocator, ",\"storage\":");
+        try json.appendString(out, ctx.allocator, entry.store);
+    }
+    try out.appendSlice(ctx.allocator, ",\"pii_redacted\":");
+    try out.appendSlice(ctx.allocator, if (include_pii) "false" else "true");
+    try out.append(ctx.allocator, '}');
 }
 
 fn loadAgentMemoryForRequest(ctx: *Context, key: []const u8, session_id: ?[]const u8, requested_scope: ?[]const u8, storage_target: store_mod.AgentMemoryStorageRoute) !?domain.AgentMemory {
@@ -1960,7 +2259,8 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/agent-memory/search", .post = "searchAgentMemory" },
         .{ .path = "/agent-memory/count", .get = "countAgentMemory" },
         .{ .path = "/agent-sessions", .get = "listAgentSessions" },
-        .{ .path = "/agent-sessions/{id}", .get = "getAgentSessionHistory" },
+        .{ .path = "/agent-sessions/{id}", .get = "getAgentSessionHistory", .delete = "terminateAgentSession" },
+        .{ .path = "/agent-sessions/{id}/terminate", .post = "terminateAgentSession" },
         .{ .path = "/agent-sessions/{id}/messages", .get = "loadAgentSessionMessages", .post = "saveAgentSessionMessage", .delete = "clearAgentSessionMessages" },
         .{ .path = "/agent-sessions/{id}/usage", .get = "loadAgentSessionUsage", .put = "saveAgentSessionUsage", .delete = "deleteAgentSessionUsage" },
         .{ .path = "/agent-sessions/auto-saved", .delete = "clearAgentAutoSavedMessages" },
@@ -1994,6 +2294,20 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/memory/events", .get = "listFeedEvents", .post = "appendFeedEvent" },
         .{ .path = "/memory/status", .get = "feedStatus" },
         .{ .path = "/memory/stats", .get = "memoryStats" },
+        .{ .path = "/memory/count", .get = "memoryCount" },
+        .{ .path = "/memory/list", .get = "memoryList" },
+        .{ .path = "/memory/search", .post = "memorySearch" },
+        .{ .path = "/memory/get/{key}", .get = "memoryGet" },
+        .{ .path = "/memory/store", .post = "memoryStore" },
+        .{ .path = "/memory/store/{key}", .put = "memoryStore", .post = "memoryStore" },
+        .{ .path = "/memory/update", .post = "memoryUpdate" },
+        .{ .path = "/memory/update/{key}", .put = "memoryUpdate", .post = "memoryUpdate" },
+        .{ .path = "/memory/delete", .post = "memoryDelete" },
+        .{ .path = "/memory/delete/{key}", .delete = "memoryDelete", .post = "memoryDelete" },
+        .{ .path = "/memory/forget", .post = "memoryForget" },
+        .{ .path = "/memory/forget/{key}", .delete = "memoryForget", .post = "memoryForget" },
+        .{ .path = "/memory/export-jsonl", .post = "memoryExportJsonl" },
+        .{ .path = "/memory/hygiene-report", .post = "memoryHygieneReport" },
         .{ .path = "/memory/reindex", .post = "memoryReindex" },
         .{ .path = "/memory/drain-outbox", .post = "memoryDrainOutbox" },
         .{ .path = "/memory/compact", .post = "compactFeed" },
@@ -2072,7 +2386,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","nullclaw_api_memory_adapter","bootstrap_prompts","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_stats","memory_reindex","memory_drain_outbox","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","jsonl_export","hygiene_report","lifecycle_migrate","lifecycle_rollout","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","agent_session_terminate","nullclaw_api_memory_adapter","bootstrap_prompts","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_stats","memory_count","memory_list","memory_search","memory_get","memory_store","memory_update","memory_delete","memory_export_jsonl","memory_hygiene_report","memory_reindex","memory_drain_outbox","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","jsonl_export","hygiene_report","lifecycle_migrate","lifecycle_rollout","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -3002,7 +3316,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_memory_events":"GET /v1/agent/memory/events","nullclaw_api_memory_status":"GET /v1/agent/memory/status","nullclaw_api_memory_stats":"GET /v1/agent/memory/stats","nullclaw_api_memory_reindex":"POST /v1/agent/memory/reindex","nullclaw_api_memory_drain_outbox":"POST /v1/agent/memory/drain-outbox","nullclaw_api_memory_compact":"POST /v1/agent/memory/compact","nullclaw_api_memory_checkpoint":"GET|POST /v1/agent/memory/checkpoint","nullclaw_api_memory_apply":"POST /v1/agent/memory/apply","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","memory_stats":"GET /v1/lifecycle/stats|GET /v1/memory/stats|GET /v1/agent/memory/stats","memory_reindex":"POST /v1/memory/reindex|POST /v1/agent/memory/reindex","memory_drain_outbox":"POST /v1/memory/drain-outbox|POST /v1/agent/memory/drain-outbox","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","lifecycle_rollout":"POST /v1/lifecycle/rollout","jsonl_export":"POST /v1/lifecycle/export-jsonl","hygiene_report":"POST /v1/lifecycle/hygiene-report","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_memory_events":"GET /v1/agent/memory/events","nullclaw_api_memory_status":"GET /v1/agent/memory/status","nullclaw_api_memory_stats":"GET /v1/agent/memory/stats","nullclaw_api_memory_reindex":"POST /v1/agent/memory/reindex","nullclaw_api_memory_drain_outbox":"POST /v1/agent/memory/drain-outbox","nullclaw_api_memory_compact":"POST /v1/agent/memory/compact","nullclaw_api_memory_checkpoint":"GET|POST /v1/agent/memory/checkpoint","nullclaw_api_memory_apply":"POST /v1/agent/memory/apply","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_session_terminate":"DELETE /v1/agent/sessions/{id}|POST /v1/agent/sessions/{id}/terminate","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_terminate":"DELETE /v1/agent-sessions/{id}|POST /v1/agent-sessions/{id}/terminate","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","memory_stats":"GET /v1/lifecycle/stats|GET /v1/memory/stats|GET /v1/agent/memory/stats","memory_count":"GET /v1/memory/count","memory_list":"GET /v1/memory/list","memory_search":"POST /v1/memory/search","memory_get":"GET /v1/memory/get/{key}","memory_store":"POST|PUT /v1/memory/store/{key}|POST /v1/memory/store","memory_update":"POST|PUT /v1/memory/update/{key}|POST /v1/memory/update","memory_delete":"DELETE /v1/memory/delete/{key}|DELETE /v1/memory/forget/{key}|POST /v1/memory/delete|POST /v1/memory/forget","memory_export_jsonl":"POST /v1/memory/export-jsonl","memory_hygiene_report":"POST /v1/memory/hygiene-report","memory_reindex":"POST /v1/memory/reindex|POST /v1/agent/memory/reindex","memory_drain_outbox":"POST /v1/memory/drain-outbox|POST /v1/agent/memory/drain-outbox","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","lifecycle_rollout":"POST /v1/lifecycle/rollout","jsonl_export":"POST /v1/lifecycle/export-jsonl","hygiene_report":"POST /v1/lifecycle/hygiene-report","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -8244,6 +8558,10 @@ fn agentMemoryStoreKey(ctx: *Context, key: []const u8, body: []const u8) HttpRes
 }
 
 fn agentMemoryStoreParsed(ctx: *Context, key: []const u8, obj: std.json.ObjectMap) HttpResponse {
+    return agentMemoryStoreParsedWithDefaultCategory(ctx, key, obj, "core");
+}
+
+fn agentMemoryStoreParsedWithDefaultCategory(ctx: *Context, key: []const u8, obj: std.json.ObjectMap, default_category: []const u8) HttpResponse {
     if (!(hasCapability(ctx, "write") or hasCapability(ctx, "propose"))) return forbidden(ctx);
     const operation = domain.AgentMemoryOperation.parse(json.stringField(obj, "operation") orelse "put");
     const content = switch (operation) {
@@ -8251,7 +8569,7 @@ fn agentMemoryStoreParsed(ctx: *Context, key: []const u8, obj: std.json.ObjectMa
         .merge_string_set => agent_memory_reducer.stringSetPatchFromObject(ctx.allocator, obj) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid string-set merge payload"),
         .merge_object => agent_memory_reducer.objectPatchFromObject(ctx.allocator, obj) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid object merge payload"),
     };
-    const session_id = json.nullableStringField(obj, "session_id");
+    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
     if (session_id) |sid| {
         if (!agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
     }
@@ -8267,7 +8585,7 @@ fn agentMemoryStoreParsed(ctx: *Context, key: []const u8, obj: std.json.ObjectMa
     const entry = ctx.store.agentMemoryStoreRouted(ctx.allocator, .{
         .key = key,
         .content = content,
-        .category = json.stringField(obj, "category") orelse "core",
+        .category = json.stringField(obj, "category") orelse default_category,
         .session_id = session_id,
         .scope = scope,
         .permissions_json = permissions,
@@ -8285,7 +8603,7 @@ fn agentMemoryStoreParsed(ctx: *Context, key: []const u8, obj: std.json.ObjectMa
 
 fn agentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
-    const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    const session_id = queryParamDecodedAlias(ctx, query, "session_id", "session") catch return serverError(ctx);
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
@@ -8315,7 +8633,7 @@ fn agentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) HttpRespons
 fn agentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const category = json.queryParamDecoded(ctx.allocator, query, "category") catch return serverError(ctx);
-    const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    const session_id = queryParamDecodedAlias(ctx, query, "session_id", "session") catch return serverError(ctx);
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
@@ -8364,7 +8682,7 @@ fn agentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    const session_id = json.nullableStringField(obj, "session_id");
+    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
@@ -8407,7 +8725,7 @@ fn agentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
 
 fn agentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "delete")) return forbidden(ctx);
-    const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    const session_id = queryParamDecodedAlias(ctx, query, "session_id", "session") catch return serverError(ctx);
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
     if (session_id) |sid| {
         if (!agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
@@ -10322,6 +10640,11 @@ fn parseLimit(value: ?[]const u8, default_value: usize) usize {
     return @min(parsed, 500);
 }
 
+fn queryParamDecodedAlias(ctx: *Context, query: []const u8, primary: []const u8, alias: []const u8) !?[]const u8 {
+    if (try json.queryParamDecoded(ctx.allocator, query, primary)) |value| return value;
+    return try json.queryParamDecoded(ctx.allocator, query, alias);
+}
+
 fn queryBool(query: []const u8, name: []const u8, default_value: bool) bool {
     const raw = json.queryParam(query, name) orelse return default_value;
     return std.ascii.eqlIgnoreCase(raw, "true") or
@@ -11882,6 +12205,64 @@ test "api native agent memory supports session plus global recall and filters in
     try std.testing.expect(std.mem.indexOf(u8, list_internal.body, "autosave_user_1") != null);
 }
 
+test "api memory command surface covers nullclaw cli-shaped operations" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = Context{ .allocator = arena.allocator(), .store = &store };
+
+    const missing_update = handleRequest(&ctx, "POST", "/v1/memory/update/missing.pref", "{\"content\":\"must not create\",\"session\":\"cmd-session\"}", "");
+    try std.testing.expectEqualStrings("404 Not Found", missing_update.status);
+    try std.testing.expect(std.mem.indexOf(u8, missing_update.body, "memory_not_found") != null);
+
+    const stored = handleRequest(&ctx, "POST", "/v1/memory/store/cmd.pref", "{\"content\":\"Command Surface Value\",\"session\":\"cmd-session\"}", "");
+    try std.testing.expectEqualStrings("200 OK", stored.status);
+    try std.testing.expect(std.mem.indexOf(u8, stored.body, "\"action\":\"store\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored.body, "\"category\":\"conversation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored.body, "\"session_id\":\"cmd-session\"") != null);
+
+    const updated = handleRequest(&ctx, "POST", "/v1/memory/update/cmd.pref", "{\"content\":\"Command Surface Updated\",\"session\":\"cmd-session\"}", "");
+    try std.testing.expectEqualStrings("200 OK", updated.status);
+    try std.testing.expect(std.mem.indexOf(u8, updated.body, "\"action\":\"update\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.body, "Command Surface Updated") != null);
+
+    const count = handleRequest(&ctx, "GET", "/v1/memory/count", "", "");
+    try std.testing.expectEqualStrings("200 OK", count.status);
+    try std.testing.expect(std.mem.indexOf(u8, count.body, "\"count\":1") != null);
+
+    const got = handleRequest(&ctx, "GET", "/v1/memory/get/cmd.pref?session=cmd-session", "", "");
+    try std.testing.expectEqualStrings("200 OK", got.status);
+    try std.testing.expect(std.mem.indexOf(u8, got.body, "Command Surface Updated") != null);
+
+    const listed = handleRequest(&ctx, "GET", "/v1/memory/list?session=cmd-session&category=conversation", "", "");
+    try std.testing.expectEqualStrings("200 OK", listed.status);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "\"entries\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "cmd.pref") != null);
+
+    const searched = handleRequest(&ctx, "POST", "/v1/memory/search", "{\"query\":\"Surface Updated\",\"session\":\"cmd-session\",\"limit\":5}", "");
+    try std.testing.expectEqualStrings("200 OK", searched.status);
+    try std.testing.expect(std.mem.indexOf(u8, searched.body, "\"entries\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, searched.body, "Command Surface Updated") != null);
+
+    const exported = handleRequest(&ctx, "POST", "/v1/memory/export-jsonl", "{\"session\":\"cmd-session\",\"include_pii\":true}", "");
+    try std.testing.expectEqualStrings("200 OK", exported.status);
+    try std.testing.expect(std.mem.indexOf(u8, exported.body, "\"schema_version\":\"nullpantry.agent_memory_jsonl.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported.body, "\"key\":\"cmd.pref\"") != null);
+
+    const hygiene = handleRequest(&ctx, "POST", "/v1/memory/hygiene-report", "{\"session\":\"cmd-session\",\"include_memory_atoms\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", hygiene.status);
+    try std.testing.expect(std.mem.indexOf(u8, hygiene.body, "\"dry_run\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hygiene.body, "\"agent_memory_scanned\":1") != null);
+
+    const deleted = handleRequest(&ctx, "DELETE", "/v1/memory/delete/cmd.pref?session=cmd-session", "", "");
+    try std.testing.expectEqualStrings("200 OK", deleted.status);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.body, "\"deleted\":true") != null);
+    const deleted_again = handleRequest(&ctx, "DELETE", "/v1/memory/forget/cmd.pref?session=cmd-session", "", "");
+    try std.testing.expectEqualStrings("200 OK", deleted_again.status);
+    try std.testing.expect(std.mem.indexOf(u8, deleted_again.body, "\"deleted\":false") != null);
+}
+
 test "api native agent sessions are actor isolated and scope gated" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -11965,6 +12346,32 @@ test "api native agent sessions are actor isolated and scope gated" {
     const internal_search_a = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Internal runtime command secret\",\"scopes\":[\"session:shared\"],\"include_sessions\":true}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", internal_search_a.status);
     try std.testing.expect(std.mem.indexOf(u8, internal_search_a.body, "Internal runtime command secret") == null);
+
+    const session_memory = handleRequest(&ctx, "PUT", "/v1/agent-memory/terminate.pref", "{\"content\":\"Terminate session memory\",\"session_id\":\"shared\"}", raw_a);
+    try std.testing.expectEqualStrings("200 OK", session_memory.status);
+    const terminate_a = handleRequest(&ctx, "POST", "/v1/agent-sessions/shared/terminate", "{}", "POST /v1/agent-sessions/shared/terminate HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", terminate_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, terminate_a.body, "\"session_key\":\"shared\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminate_a.body, "\"terminated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminate_a.body, "\"messages_deleted\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminate_a.body, "\"memory_entries_deleted\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminate_a.body, "\"usage_deleted\":true") != null);
+    const get_a_after_terminate = handleRequest(&ctx, "GET", "/v1/agent-sessions/shared/messages", "", "GET /v1/agent-sessions/shared/messages HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", get_a_after_terminate.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_a_after_terminate.body, "\"messages\":[]") != null);
+    const usage_a_after_terminate = handleRequest(&ctx, "GET", "/v1/agent-sessions/shared/usage", "", "GET /v1/agent-sessions/shared/usage HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("404 Not Found", usage_a_after_terminate.status);
+    const session_memory_after_terminate = handleRequest(&ctx, "GET", "/v1/agent-memory/terminate.pref?session_id=shared", "", "GET /v1/agent-memory/terminate.pref?session_id=shared HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("404 Not Found", session_memory_after_terminate.status);
+    const get_b_after_terminate = handleRequest(&ctx, "GET", "/v1/agent-sessions/shared/messages", "", "GET /v1/agent-sessions/shared/messages HTTP/1.1\r\nAuthorization: Bearer agent-b\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", get_b_after_terminate.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_b_after_terminate.body, "Agent B session note") != null);
+
+    const adapter_msg = handleRequest(&ctx, "POST", "/v1/agent/sessions/adapter-term/messages", "{\"role\":\"user\",\"content\":\"adapter terminate message\"}", "POST /v1/agent/sessions/adapter-term/messages HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", adapter_msg.status);
+    const adapter_terminate = handleRequest(&ctx, "POST", "/v1/agent/sessions/adapter-term/terminate", "{}", "POST /v1/agent/sessions/adapter-term/terminate HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", adapter_terminate.status);
+    try std.testing.expect(std.mem.indexOf(u8, adapter_terminate.body, "\"terminated\":true") != null);
 }
 
 test "api single bearer token ignores actor header unless explicitly trusted" {
@@ -12179,10 +12586,14 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"rebuildVectorIndex\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"reconcileVectorIndex\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"putAgentMemoryByKey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"terminateAgentSession\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"migrateLifecycleStorage\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"exportJsonlDataset\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"createHygieneReport\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"memoryStats\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"memoryStore\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"memoryUpdate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"memoryExportJsonl\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"memoryReindex\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"memoryDrainOutbox\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "created_by_actor_id") != null);
@@ -12199,6 +12610,10 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"jsonl_export\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"hygiene_report\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"memory_stats\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"memory_store\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"memory_update\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"memory_export_jsonl\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"agent_session_terminate\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"memory_reindex\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"memory_drain_outbox\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"lifecycle_migrate\"") != null);
@@ -14924,12 +15339,17 @@ test "api manifest and connector endpoints describe headless service contracts" 
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "X-NullPantry-Actor-Scopes") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/remember") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "GET /v1/agent-sessions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "DELETE /v1/agent-sessions/{id}|POST /v1/agent-sessions/{id}/terminate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "nullclaw_api_session_terminate") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/vector/rebuild") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/vector/reconcile") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "nullclaw_api_memory_stats") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "nullclaw_api_memory_reindex") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "nullclaw_api_memory_drain_outbox") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "GET /v1/lifecycle/stats|GET /v1/memory/stats|GET /v1/agent/memory/stats") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "GET /v1/memory/count") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST|PUT /v1/memory/store/{key}|POST /v1/memory/store") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/memory/export-jsonl") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/memory/reindex|POST /v1/agent/memory/reindex") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/memory/drain-outbox|POST /v1/agent/memory/drain-outbox") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/lifecycle/migrate") != null);
