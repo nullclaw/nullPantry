@@ -3237,7 +3237,7 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !void {
     if (!canApplyAsActor(ctx, event_actor_id)) return error.Forbidden;
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return error.InvalidPayload;
     const scope = feedEventScope(ctx, obj, object_type, payload_json, event_actor_id) catch return error.InvalidPayload;
-    const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return error.InvalidPayload;
+    const permissions_json = feedEventPermissions(ctx, obj, payload_json) catch return error.InvalidPayload;
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         if (try feedAgentMemoryPayloadIsInternal(ctx, payload_json)) return error.InternalAgentMemory;
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
@@ -3269,7 +3269,7 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
     }
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
     const scope = feedEventScope(ctx, obj, object_type, payload_json, ctx.actor_id) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid feed payload");
-    const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    const permissions_json = feedEventPermissions(ctx, obj, payload_json) catch return serverError(ctx);
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         const internal_payload = feedAgentMemoryPayloadIsInternal(ctx, payload_json) catch return serverError(ctx);
         if (internal_payload) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be queued through the feed");
@@ -3312,7 +3312,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
         return applyFeedLifecycleMutation(ctx, obj, event_type, operation, object_type, event_actor_id, payload_json, causality_json);
     }
     const scope = feedEventScope(ctx, obj, object_type, payload_json, event_actor_id) catch return serverError(ctx);
-    const event_permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    const event_permissions_json = feedEventPermissions(ctx, obj, payload_json) catch return serverError(ctx);
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
     } else if (!canWriteRecord(ctx, scope, event_permissions_json)) return forbidden(ctx);
@@ -3600,6 +3600,22 @@ fn feedEventScope(ctx: *Context, obj: std.json.ObjectMap, object_type: []const u
     }
     if (!std.mem.eql(u8, object_type, "agent_memory")) return "workspace";
     return domain.defaultAgentMemoryScope(ctx.allocator, event_actor_id);
+}
+
+fn feedEventPermissions(ctx: *Context, obj: std.json.ObjectMap, payload_json: []const u8) ![]const u8 {
+    if (obj.get("permissions")) |value| {
+        if (value == .null) return "[]";
+        return try json.jsonFromValue(ctx.allocator, value);
+    }
+    const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
+    defer payload.deinit();
+    if (payload.value == .object) {
+        if (payload.value.object.get("permissions")) |value| {
+            if (value == .null) return "[]";
+            return try json.jsonFromValue(ctx.allocator, value);
+        }
+    }
+    return "[]";
 }
 
 fn canApplyAsActor(ctx: *Context, event_actor_id: []const u8) bool {
@@ -7926,19 +7942,26 @@ test "api feed events are permission filtered in feed and search" {
     var admin_ctx = Context{ .allocator = alloc, .store = &store };
     const append = handleRequest(&admin_ctx, "POST", "/v1/memory/feed", "{\"event_type\":\"memory.note\",\"object_type\":\"memory_atom\",\"object_id\":\"mem_secret\",\"scope\":\"public\",\"permissions\":[\"team:secret\"],\"payload\":{\"text\":\"feed-secret-payload\"}}", "");
     try std.testing.expectEqualStrings("200 OK", append.status);
+    const apply_payload_acl = handleRequest(&admin_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"operation\":\"put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"feed.payload.acl\",\"content\":\"payload-permission-secret\",\"scope\":\"public\",\"permissions\":[\"team:secret\"]}}", "");
+    try std.testing.expectEqualStrings("200 OK", apply_payload_acl.status);
 
     var public_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\"]" };
     const public_feed = handleRequest(&public_ctx, "GET", "/v1/memory/feed", "", "");
     try std.testing.expectEqualStrings("200 OK", public_feed.status);
     try std.testing.expect(std.mem.indexOf(u8, public_feed.body, "feed-secret-payload") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public_feed.body, "payload-permission-secret") == null);
     const public_search = handleRequest(&public_ctx, "POST", "/v1/search", "{\"query\":\"feed-secret-payload\",\"scopes\":[\"public\"]}", "");
     try std.testing.expectEqualStrings("200 OK", public_search.status);
     try std.testing.expect(std.mem.indexOf(u8, public_search.body, "feed-secret-payload") == null);
+    const public_agent_search = handleRequest(&public_ctx, "POST", "/v1/search", "{\"query\":\"payload-permission-secret\",\"scopes\":[\"public\"],\"include_agent_memory\":true,\"use_vector\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", public_agent_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, public_agent_search.body, "payload-permission-secret") == null);
 
     var secret_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\",\"team:secret\"]" };
     const secret_feed = handleRequest(&secret_ctx, "GET", "/v1/memory/feed", "", "");
     try std.testing.expectEqualStrings("200 OK", secret_feed.status);
     try std.testing.expect(std.mem.indexOf(u8, secret_feed.body, "feed-secret-payload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, secret_feed.body, "payload-permission-secret") != null);
 }
 
 test "api exposes engine registry retrieval plan vector and lifecycle endpoints" {
