@@ -175,6 +175,11 @@ fn agentMemoryRuntimeMetadataJson(allocator: std.mem.Allocator, store_name: []co
     return out.toOwnedSlice(allocator);
 }
 
+fn isAgentMemorySourceMetadata(metadata_json: []const u8) bool {
+    return std.mem.indexOf(u8, metadata_json, "\"native\":\"agent_memory\"") != null or
+        std.mem.indexOf(u8, metadata_json, "\"native\":\"agent_memory_runtime\"") != null;
+}
+
 fn agentMemoryFeedPayloadJson(allocator: std.mem.Allocator, store_name: []const u8, entry: domain.AgentMemory) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -5799,8 +5804,7 @@ pub const SQLiteStore = struct {
             const permissions = try columnText(allocator, stmt, 4);
             const imported_at_ms = c.sqlite3_column_int64(stmt, 5);
             const metadata = try columnText(allocator, stmt, 6);
-            if (std.mem.indexOf(u8, metadata, "\"native\":\"agent_memory\"") != null) continue;
-            if (std.mem.indexOf(u8, metadata, "\"native\":\"agent_memory_runtime\"") != null) continue;
+            if (isAgentMemorySourceMetadata(metadata)) continue;
             const status = try self.primitiveLifecycleStatus(allocator, "source", id_text);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
@@ -6355,7 +6359,7 @@ pub const SQLiteStore = struct {
         }
         if (std.mem.eql(u8, match.object_type, "source")) {
             const source = (try self.getSource(allocator, match.object_id)) orelse return null;
-            if (std.mem.indexOf(u8, source.metadata_json, "\"native\":\"agent_memory\"") != null) return null;
+            if (isAgentMemorySourceMetadata(source.metadata_json)) return null;
             const status = try self.primitiveLifecycleStatus(allocator, "source", source.id);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, source.scope, source.permissions_json, input.scopes_json, input.actor_id)) return null;
@@ -11397,7 +11401,7 @@ pub const PostgresStore = struct {
         for (parsed.value.array.items) |item| {
             if (item != .object) continue;
             const source = try readPgSource(allocator, item.object);
-            if (std.mem.indexOf(u8, source.metadata_json, "\"native\":\"agent_memory\"") != null) continue;
+            if (isAgentMemorySourceMetadata(source.metadata_json)) continue;
             const status = try self.primitiveLifecycleStatus(allocator, "source", source.id);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             if (!try self.recordVisibleWithPolicyForActor(allocator, source.scope, source.permissions_json, input.scopes_json, input.actor_id)) continue;
@@ -11841,7 +11845,7 @@ pub const PostgresStore = struct {
         }
         if (std.mem.eql(u8, match.object_type, "source")) {
             const source = (try self.getSource(allocator, match.object_id)) orelse return null;
-            if (std.mem.indexOf(u8, source.metadata_json, "\"native\":\"agent_memory\"") != null) return null;
+            if (isAgentMemorySourceMetadata(source.metadata_json)) return null;
             const status = try self.primitiveLifecycleStatus(allocator, "source", source.id);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, source.scope, source.permissions_json, input.scopes_json, input.actor_id)) return null;
@@ -13215,6 +13219,55 @@ test "sqlite vector search covers expanded NullPantry primitives" {
     try std.testing.expect(saw_relation);
     try std.testing.expect(saw_pack);
     try std.testing.expect(saw_agent_memory);
+}
+
+test "sqlite search hides runtime agent memory source mirrors" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = try store.createSource(alloc, .{
+        .source_type = "agent_observation",
+        .title = "Runtime mirror leak sentinel",
+        .content = "Runtime mirror source content must stay hidden as a normal source.",
+        .scope = "public",
+        .metadata_json = "{\"native\":\"agent_memory_runtime\",\"store\":\"redis\",\"key\":\"pref\"}",
+    });
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0, 0, 0 });
+    _ = try store.upsertVectorChunk(alloc, .{
+        .object_type = "source",
+        .object_id = source.id,
+        .text = source.content,
+        .scope = source.scope,
+        .permissions_json = source.permissions_json,
+        .embedding_json = embedding,
+        .dimensions = 4,
+    });
+
+    const keyword = try store.search(alloc, .{
+        .query = "Runtime mirror leak sentinel",
+        .scopes_json = "[\"public\"]",
+        .use_vector = false,
+        .limit = 10,
+    });
+    for (keyword) |result| {
+        try std.testing.expect(!std.mem.eql(u8, result.result_type, "source"));
+        try std.testing.expect(std.mem.indexOf(u8, result.text, "Runtime mirror source content") == null);
+    }
+
+    const vector = try store.search(alloc, .{
+        .query = "semantic runtime mirror sentinel",
+        .scopes_json = "[\"public\"]",
+        .query_embedding_json = embedding,
+        .use_vector = true,
+        .limit = 10,
+    });
+    for (vector) |result| {
+        try std.testing.expect(!std.mem.eql(u8, result.id, source.id));
+        try std.testing.expect(std.mem.indexOf(u8, result.text, "Runtime mirror source content") == null);
+    }
 }
 
 test "sqlite vector outbox reclaims expired running leases" {
