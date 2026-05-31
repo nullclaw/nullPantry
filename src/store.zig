@@ -4120,6 +4120,10 @@ pub const VectorChunkInput = struct {
     actor_id: ?[]const u8 = null,
 };
 
+pub fn makeVectorChunkId(allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_ordinal: i64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "vec:{d}:{s}:{s}:{d}", .{ object_type.len, object_type, object_id, chunk_ordinal });
+}
+
 pub const VectorChunk = struct {
     id: []const u8,
     object_type: []const u8,
@@ -7850,9 +7854,10 @@ pub const SQLiteStore = struct {
     }
 
     pub fn upsertVectorChunk(self: *Self, allocator: std.mem.Allocator, input: VectorChunkInput) !VectorChunk {
-        _ = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
+        const parsed_embedding = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
+        defer allocator.free(parsed_embedding);
         if (!try self.vectorBackingObjectExists(allocator, input.object_type, input.object_id)) return error.InvalidVectorTarget;
-        const id = try std.fmt.allocPrint(allocator, "vec_{s}_{d}", .{ input.object_id, input.chunk_ordinal });
+        const id = try makeVectorChunkId(allocator, input.object_type, input.object_id, input.chunk_ordinal);
         const now = ids.nowMs();
         const stmt = try self.prepare("INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,heading_path_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(id) DO UPDATE SET text=excluded.text, scope=excluded.scope, permissions_json=excluded.permissions_json, heading_path_json=excluded.heading_path_json, embedding_json=excluded.embedding_json, model=excluded.model, dimensions=excluded.dimensions, updated_at_ms=excluded.updated_at_ms");
         defer _ = c.sqlite3_finalize(stmt);
@@ -11317,7 +11322,7 @@ pub const PostgresStore = struct {
         const parsed_embedding = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
         defer allocator.free(parsed_embedding);
         if (!try self.vectorBackingObjectExists(allocator, input.object_type, input.object_id)) return error.InvalidVectorTarget;
-        const id = try std.fmt.allocPrint(allocator, "vec_{s}_{d}", .{ input.object_id, input.chunk_ordinal });
+        const id = try makeVectorChunkId(allocator, input.object_type, input.object_id, input.chunk_ordinal);
         const now = ids.nowMs();
         const chunk_ordinal = try std.fmt.allocPrint(allocator, "{d}", .{input.chunk_ordinal});
         defer allocator.free(chunk_ordinal);
@@ -15105,13 +15110,49 @@ test "sqlite vector layer stores chunks searches and enqueues outbox" {
     try std.testing.expectEqual(@as(usize, 2), try store.countVectorOutbox("pending"));
     const pending = try store.listVectorOutbox(alloc, .{ .action = "upsert", .status = "pending", .limit = 10 });
     try std.testing.expectEqual(@as(usize, 2), pending.len);
-    try std.testing.expect(std.mem.indexOf(u8, pending[0].payload_json, "\"vector_id\":\"vec_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending[0].payload_json, "\"vector_id\":\"vec:") != null);
     const results = try store.vectorSearch(alloc, .{ .embedding_json = a_json, .scopes_json = "[\"project:nullpantry\"]", .limit = 2 });
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    const expected_id = try std.fmt.allocPrint(alloc, "vec_{s}_0", .{atom_a.id});
+    const expected_id = try makeVectorChunkId(alloc, "memory_atom", atom_a.id, 0);
     try std.testing.expectEqualStrings(expected_id, results[0].id);
     const chunk = (try store.getVectorChunk(alloc, expected_id)).?;
     try std.testing.expectEqualStrings(atom_a.id, chunk.object_id);
+}
+
+test "sqlite vector chunk ids include object type to isolate primitives" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    const atom = try store.createMemoryAtom(alloc, .{ .id = "shared_vector_id", .text = "typed memory vector", .scope = "public", .created_by = "human" });
+    const policy = try store.upsertPolicyScope(alloc, .{ .scope = atom.id, .visibility = "public", .permissions_json = "[]" });
+    const memory_chunk = try store.upsertVectorChunk(alloc, .{
+        .object_type = "memory_atom",
+        .object_id = atom.id,
+        .text = atom.text,
+        .scope = atom.scope,
+        .embedding_json = embedding,
+        .dimensions = 2,
+    });
+    const policy_chunk = try store.upsertVectorChunk(alloc, .{
+        .object_type = "policy_scope",
+        .object_id = policy.scope,
+        .text = "typed policy vector",
+        .scope = policy.scope,
+        .permissions_json = policy.permissions_json,
+        .embedding_json = embedding,
+        .dimensions = 2,
+    });
+
+    try std.testing.expect(!std.mem.eql(u8, memory_chunk.id, policy_chunk.id));
+    try std.testing.expectEqualStrings("vec:11:memory_atom:shared_vector_id:0", memory_chunk.id);
+    try std.testing.expectEqualStrings("vec:12:policy_scope:shared_vector_id:0", policy_chunk.id);
+    try std.testing.expectEqual(@as(usize, 2), try store.countVectorChunks());
+    try std.testing.expectEqualStrings("memory_atom", (try store.getVectorChunk(alloc, memory_chunk.id)).?.object_type);
+    try std.testing.expectEqualStrings("policy_scope", (try store.getVectorChunk(alloc, policy_chunk.id)).?.object_type);
 }
 
 test "sqlite vector search covers expanded NullPantry primitives" {
@@ -15390,17 +15431,17 @@ test "lancedb external vector plane runs through canonical outbox and ACL hydrat
         \\payload="$(cat)"
         \\if [ "$1" = "upsert" ]; then
         \\  echo "$payload" | grep '"rows"' >/dev/null || exit 2
-        \\  echo "$payload" | grep '"vector_id":"vec_mem_lancedb_e2e_0"' >/dev/null || exit 3
+        \\  echo "$payload" | grep '"vector_id":"vec:11:memory_atom:mem_lancedb_e2e:0"' >/dev/null || exit 3
         \\  echo '{"status":"ok"}'
         \\  exit 0
         \\fi
         \\if [ "$1" = "search" ]; then
         \\  echo "$payload" | grep '\[1,0\]' >/dev/null || exit 4
-        \\  echo '{"matches":[{"id":"vec_mem_lancedb_e2e_0","score":0.99},{"id":"vec_missing","score":1.0}]}'
+        \\  echo '{"matches":[{"id":"vec:11:memory_atom:mem_lancedb_e2e:0","score":0.99},{"id":"vec_missing","score":1.0}]}'
         \\  exit 0
         \\fi
         \\if [ "$1" = "delete" ]; then
-        \\  echo "$payload" | grep '"vector_id":"vec_mem_lancedb_e2e_0"' >/dev/null || exit 5
+        \\  echo "$payload" | grep '"vector_id":"vec:11:memory_atom:mem_lancedb_e2e:0"' >/dev/null || exit 5
         \\  echo '{"status":"ok"}'
         \\  exit 0
         \\fi
@@ -15434,7 +15475,7 @@ test "lancedb external vector plane runs through canonical outbox and ACL hydrat
     const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
     const atom = try store.createMemoryAtom(alloc, .{ .id = "mem_lancedb_e2e", .text = "lancedb external memory", .scope = "public", .created_by = "human" });
     const chunk = try store.upsertVectorChunk(alloc, .{ .object_id = atom.id, .text = atom.text, .scope = atom.scope, .embedding_json = embedding, .dimensions = 2 });
-    try std.testing.expectEqualStrings("vec_mem_lancedb_e2e_0", chunk.id);
+    try std.testing.expectEqualStrings("vec:11:memory_atom:mem_lancedb_e2e:0", chunk.id);
     try std.testing.expectEqual(@as(usize, 1), try store.countVectorOutbox("pending"));
 
     const indexed = try store.runVectorOutbox(10);
@@ -15602,7 +15643,7 @@ test "sqlite vector search filters permissions" {
 
     const public_results = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .limit = 10 });
     try std.testing.expectEqual(@as(usize, 1), public_results.len);
-    const public_expected_id = try std.fmt.allocPrint(alloc, "vec_{s}_0", .{public_atom.id});
+    const public_expected_id = try makeVectorChunkId(alloc, "memory_atom", public_atom.id, 0);
     try std.testing.expectEqualStrings(public_expected_id, public_results[0].id);
 
     const admin_results = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"admin\"]", .limit = 10 });
@@ -15672,7 +15713,7 @@ test "sqlite vector search excludes deprecated artifacts by default" {
 
     const default_results = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .limit = 10 });
     try std.testing.expectEqual(@as(usize, 1), default_results.len);
-    const fresh_id = try std.fmt.allocPrint(alloc, "vec_{s}_0", .{fresh.id});
+    const fresh_id = try makeVectorChunkId(alloc, "artifact", fresh.id, 0);
     try std.testing.expectEqualStrings(fresh_id, default_results[0].id);
 
     const with_deprecated = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .limit = 10, .include_deprecated = true });

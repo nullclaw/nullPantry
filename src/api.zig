@@ -13082,7 +13082,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expectEqualStrings("404 Not Found", orphan_upsert.status);
     const vector_resp = handleRequest(&ctx, "POST", "/v1/vector/search", "{\"embedding\":[1,0],\"scopes\":[\"public\"],\"limit\":5}", "");
     try std.testing.expectEqualStrings("200 OK", vector_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, vector_resp.body, "vec_mem_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vector_resp.body, "vec:11:memory_atom:") != null);
     const outbox_resp = handleRequest(&ctx, "GET", "/v1/vector/outbox", "", "");
     try std.testing.expectEqualStrings("200 OK", outbox_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, outbox_resp.body, "\"pending\":2") != null);
