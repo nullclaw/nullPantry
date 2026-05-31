@@ -2577,6 +2577,7 @@ fn runJob(ctx: *Context, id: []const u8) HttpResponse {
         .llm_model = ctx.llm_model,
         .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
         .provider_timeout_secs = ctx.provider_timeout_secs,
+        .actor_id = ctx.actor_id,
     }) catch |err| switch (err) {
         error.JobNotQueued => return json.errorResponse(ctx.allocator, 409, "conflict", "Job is not queued"),
         else => return serverError(ctx),
@@ -2977,6 +2978,7 @@ fn vectorOutboxRun(ctx: *Context, body: []const u8) HttpResponse {
         .llm_model = ctx.llm_model,
         .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
         .provider_timeout_secs = ctx.provider_timeout_secs,
+        .actor_id = ctx.actor_id,
     }) catch return serverError(ctx);
     const pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
     const embedded = ctx.store.countVectorOutbox("embedded") catch return serverError(ctx);
@@ -3123,6 +3125,7 @@ fn workersRun(ctx: *Context, body: []const u8) HttpResponse {
         .llm_model = ctx.llm_model,
         .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
         .provider_timeout_secs = ctx.provider_timeout_secs,
+        .actor_id = ctx.actor_id,
     }) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.print(ctx.allocator, "{{\"worker_run\":{{\"jobs_checked\":{d},\"jobs_succeeded\":{d},\"jobs_failed\":{d},\"vector_outbox_processed\":{d},\"vector_outbox_failed\":{d},\"lucid_projection_processed\":{d},\"lucid_projection_failed\":{d}}}}}", .{ result.jobs_checked, result.jobs_succeeded, result.jobs_failed, result.vector_outbox_processed, result.vector_outbox_failed, result.lucid_projection_processed, result.lucid_projection_failed }) catch return serverError(ctx);
@@ -8923,7 +8926,7 @@ test "api ingest creates source artifact extracted memory entities vectors and j
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"project:nullpantry\"]" };
+    var ctx = Context{ .allocator = alloc, .store = &store, .actor_id = "agent:ingest-worker", .actor_scopes_json = "[\"project:nullpantry\"]" };
 
     const body =
         \\{"title":"Planning","type":"transcript","scope":"project:nullpantry","content":"Decision: NullPantry uses ingestion jobs\nConstraint: every atom has citations\nNullPantry depends on NullClaw\nRisk: stale memory"}
@@ -8937,6 +8940,17 @@ test "api ingest creates source artifact extracted memory entities vectors and j
     const worker_resp = handleRequest(&ctx, "POST", "/v1/workers/run", "{\"job_limit\":5,\"outbox_limit\":5}", "");
     try std.testing.expectEqualStrings("200 OK", worker_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, worker_resp.body, "\"jobs_succeeded\":1") != null);
+    const audit_events = try store.listAuditEvents(alloc, 0, 100);
+    var saw_worker_artifact_actor = false;
+    var saw_worker_atom_actor = false;
+    for (audit_events) |event| {
+        const actor = event.actor orelse continue;
+        if (!std.mem.eql(u8, actor, "agent:ingest-worker")) continue;
+        if (std.mem.eql(u8, event.event_type, "artifact.created")) saw_worker_artifact_actor = true;
+        if (std.mem.eql(u8, event.event_type, "memory_atom.created")) saw_worker_atom_actor = true;
+    }
+    try std.testing.expect(saw_worker_artifact_actor);
+    try std.testing.expect(saw_worker_atom_actor);
 
     const search_resp = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"ingestion jobs\",\"scopes\":[\"project:nullpantry\"]}", "");
     try std.testing.expectEqualStrings("200 OK", search_resp.status);
@@ -8974,6 +8988,42 @@ test "api run_now llm extraction falls back to heuristic unless strict" {
         \\{"title":"LLM strict","type":"transcript","scope":"public","content":"Decision: strict extraction must fail without a provider","run_now":true,"use_llm_extraction":true,"strict_llm_extraction":true}
     , "");
     try std.testing.expectEqualStrings("500 Internal Server Error", strict.status);
+}
+
+test "api direct job run preserves request actor for extracted knowledge" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Context{ .allocator = alloc, .store = &store, .actor_id = "agent:direct-job", .actor_scopes_json = "[\"public\"]" };
+
+    const source = try store.createSource(alloc, .{
+        .title = "Direct job source",
+        .content = "Decision: direct job run preserves the caller actor",
+        .scope = "public",
+        .actor_id = "agent:direct-job",
+    });
+    const create_body = try std.fmt.allocPrint(alloc, "{{\"type\":\"extract_memory\",\"scope\":\"public\",\"object_type\":\"source\",\"object_id\":\"{s}\",\"input\":{{\"create_artifact\":true,\"extract_memory\":true}}}}", .{source.id});
+    const created = handleRequest(&ctx, "POST", "/v1/jobs", create_body, "");
+    try std.testing.expectEqualStrings("200 OK", created.status);
+    const job_id = try extractJsonString(alloc, created.body, "\"id\":\"");
+    const run_path = try std.fmt.allocPrint(alloc, "/v1/jobs/{s}/run", .{job_id});
+    const finished = handleRequest(&ctx, "POST", run_path, "", "");
+    try std.testing.expectEqualStrings("200 OK", finished.status);
+    try std.testing.expect(std.mem.indexOf(u8, finished.body, "\"status\":\"succeeded\"") != null);
+
+    const audit_events = try store.listAuditEvents(alloc, 0, 100);
+    var saw_artifact_actor = false;
+    var saw_atom_actor = false;
+    for (audit_events) |event| {
+        const actor = event.actor orelse continue;
+        if (!std.mem.eql(u8, actor, "agent:direct-job")) continue;
+        if (std.mem.eql(u8, event.event_type, "artifact.created")) saw_artifact_actor = true;
+        if (std.mem.eql(u8, event.event_type, "memory_atom.created")) saw_atom_actor = true;
+    }
+    try std.testing.expect(saw_artifact_actor);
+    try std.testing.expect(saw_atom_actor);
 }
 
 test "api queued worker llm extraction preserves fallback and strict failure" {
