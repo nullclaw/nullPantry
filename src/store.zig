@@ -1319,9 +1319,13 @@ pub const Store = struct {
     }
 
     pub fn claimVectorOutbox(self: *Store, id: i64) !bool {
+        return self.claimVectorOutboxAs(id, default_vector_outbox_worker_id);
+    }
+
+    pub fn claimVectorOutboxAs(self: *Store, id: i64, worker_id: []const u8) !bool {
         return switch (self.backend) {
-            .sqlite => |*s| s.claimVectorOutbox(id),
-            .postgres => |*p| p.claimVectorOutbox(id),
+            .sqlite => |*s| s.claimVectorOutboxAs(id, worker_id),
+            .postgres => |*p| p.claimVectorOutboxAs(id, worker_id),
         };
     }
 
@@ -1392,14 +1396,18 @@ pub const Store = struct {
     }
 
     pub fn runVectorOutbox(self: *Store, limit: usize) !VectorOutboxRunResult {
-        if (self.vector_backend.externalEnabled()) return self.runExternalVectorOutbox(limit);
+        return self.runVectorOutboxAs(limit, default_vector_outbox_worker_id);
+    }
+
+    pub fn runVectorOutboxAs(self: *Store, limit: usize, worker_id: []const u8) !VectorOutboxRunResult {
+        if (self.vector_backend.externalEnabled()) return self.runExternalVectorOutbox(limit, worker_id);
         return switch (self.backend) {
             .sqlite => |*s| s.runVectorOutbox(limit),
             .postgres => |*p| p.runVectorOutbox(limit),
         };
     }
 
-    fn runExternalVectorOutbox(self: *Store, limit: usize) !VectorOutboxRunResult {
+    fn runExternalVectorOutbox(self: *Store, limit: usize, worker_id: []const u8) !VectorOutboxRunResult {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
@@ -1407,7 +1415,7 @@ pub const Store = struct {
         var result = VectorOutboxRunResult{};
         for (entries) |entry| {
             if (std.mem.eql(u8, entry.action, "embed")) continue;
-            if (!try self.claimVectorOutbox(entry.id)) continue;
+            if (!try self.claimVectorOutboxAs(entry.id, worker_id)) continue;
             const vector_id = vectorIdFromOutboxPayload(allocator, entry.payload_json) catch {
                 _ = try self.finishVectorOutbox(entry.id, "failed_external_index");
                 result.failed += 1;
@@ -2912,9 +2920,13 @@ pub const Store = struct {
     }
 
     pub fn claimJob(self: *Store, id: []const u8) !bool {
+        return self.claimJobAs(id, default_job_worker_id);
+    }
+
+    pub fn claimJobAs(self: *Store, id: []const u8, worker_id: []const u8) !bool {
         return switch (self.backend) {
-            .sqlite => |*s| s.claimJob(id),
-            .postgres => |*p| p.claimJob(id),
+            .sqlite => |*s| s.claimJobAs(id, worker_id),
+            .postgres => |*p| p.claimJobAs(id, worker_id),
         };
     }
 
@@ -3202,6 +3214,8 @@ pub const VectorOutboxEntry = struct {
     payload_json: []const u8,
     created_at_ms: i64,
     updated_at_ms: i64,
+    locked_until_ms: ?i64 = null,
+    worker_id: ?[]const u8 = null,
 };
 
 pub const VectorOutboxRunResult = struct {
@@ -3897,6 +3911,10 @@ const default_job_lease_ms: i64 = 5 * 60 * 1000;
 const default_job_worker_id = "system:worker";
 const default_vector_outbox_lease_ms: i64 = 5 * 60 * 1000;
 const default_vector_outbox_worker_id = "system:vector-worker";
+
+fn effectiveWorkerId(worker_id: []const u8, fallback: []const u8) []const u8 {
+    return if (worker_id.len > 0) worker_id else fallback;
+}
 
 fn jobListIncludesExpiredRunning(input: JobListInput) bool {
     const status = input.status orelse return false;
@@ -7065,13 +7083,13 @@ pub const SQLiteStore = struct {
         try self.reclaimExpiredVectorOutbox();
         const capped = @max(@as(usize, 1), @min(input.limit, 1000));
         const stmt = if (input.action != null and input.status != null)
-            try self.prepare("SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms FROM vector_outbox WHERE action = ?1 AND status = ?2 ORDER BY id LIMIT ?3")
+            try self.prepare("SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms,locked_until_ms,worker_id FROM vector_outbox WHERE action = ?1 AND status = ?2 ORDER BY id LIMIT ?3")
         else if (input.action != null)
-            try self.prepare("SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms FROM vector_outbox WHERE action = ?1 ORDER BY id LIMIT ?2")
+            try self.prepare("SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms,locked_until_ms,worker_id FROM vector_outbox WHERE action = ?1 ORDER BY id LIMIT ?2")
         else if (input.status != null)
-            try self.prepare("SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms FROM vector_outbox WHERE status = ?1 ORDER BY id LIMIT ?2")
+            try self.prepare("SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms,locked_until_ms,worker_id FROM vector_outbox WHERE status = ?1 ORDER BY id LIMIT ?2")
         else
-            try self.prepare("SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms FROM vector_outbox ORDER BY id LIMIT ?1");
+            try self.prepare("SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms,locked_until_ms,worker_id FROM vector_outbox ORDER BY id LIMIT ?1");
         defer _ = c.sqlite3_finalize(stmt);
         if (input.action != null and input.status != null) {
             bindText(stmt, 1, input.action.?);
@@ -7105,6 +7123,8 @@ pub const SQLiteStore = struct {
             .payload_json = try columnText(allocator, stmt, 6),
             .created_at_ms = c.sqlite3_column_int64(stmt, 7),
             .updated_at_ms = c.sqlite3_column_int64(stmt, 8),
+            .locked_until_ms = columnIntNullable(stmt, 9),
+            .worker_id = try columnTextNullable(allocator, stmt, 10),
         };
     }
 
@@ -7118,12 +7138,17 @@ pub const SQLiteStore = struct {
     }
 
     pub fn claimVectorOutbox(self: *Self, id: i64) !bool {
+        return self.claimVectorOutboxAs(id, default_vector_outbox_worker_id);
+    }
+
+    pub fn claimVectorOutboxAs(self: *Self, id: i64, worker_id: []const u8) !bool {
         const now = ids.nowMs();
         const locked_until = now + default_vector_outbox_lease_ms;
+        const claim_worker_id = effectiveWorkerId(worker_id, default_vector_outbox_worker_id);
         const stmt = try self.prepare("UPDATE vector_outbox SET status = 'running', attempts = attempts + 1, locked_until_ms = ?1, worker_id = ?2, updated_at_ms = ?3 WHERE id = ?4 AND (status = 'pending' OR (status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= ?5))");
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, locked_until);
-        bindText(stmt, 2, default_vector_outbox_worker_id);
+        bindText(stmt, 2, claim_worker_id);
         _ = c.sqlite3_bind_int64(stmt, 3, now);
         _ = c.sqlite3_bind_int64(stmt, 4, id);
         _ = c.sqlite3_bind_int64(stmt, 5, now);
@@ -8315,11 +8340,16 @@ pub const SQLiteStore = struct {
     }
 
     pub fn claimJob(self: *Self, id: []const u8) !bool {
+        return self.claimJobAs(id, default_job_worker_id);
+    }
+
+    pub fn claimJobAs(self: *Self, id: []const u8, worker_id: []const u8) !bool {
         const now = ids.nowMs();
+        const claim_worker_id = effectiveWorkerId(worker_id, default_job_worker_id);
         const stmt = try self.prepare("UPDATE jobs SET status = 'running', locked_until_ms = ?1, worker_id = ?2, updated_at_ms = ?3 WHERE id = ?4 AND (status = 'queued' OR (status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= ?5))");
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, now + default_job_lease_ms);
-        bindText(stmt, 2, default_job_worker_id);
+        bindText(stmt, 2, claim_worker_id);
         _ = c.sqlite3_bind_int64(stmt, 3, now);
         bindText(stmt, 4, id);
         _ = c.sqlite3_bind_int64(stmt, 5, now);
@@ -10133,7 +10163,7 @@ pub const PostgresStore = struct {
         defer allocator.free(limit_text);
         const parsed = try self.queryArrayParamsJson(
             allocator,
-            "SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms FROM vector_outbox " ++
+            "SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms,locked_until_ms,worker_id FROM vector_outbox " ++
                 "WHERE ($1::text IS NULL OR action = $1) AND ($2::text IS NULL OR status = $2) ORDER BY id LIMIT $3::bigint",
             &.{ input.action, input.status, limit_text },
         );
@@ -10160,6 +10190,10 @@ pub const PostgresStore = struct {
     }
 
     pub fn claimVectorOutbox(self: *PostgresStore, id: i64) !bool {
+        return self.claimVectorOutboxAs(id, default_vector_outbox_worker_id);
+    }
+
+    pub fn claimVectorOutboxAs(self: *PostgresStore, id: i64, worker_id: []const u8) !bool {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
@@ -10167,10 +10201,11 @@ pub const PostgresStore = struct {
         const locked_until = try std.fmt.allocPrint(allocator, "{d}", .{now + default_vector_outbox_lease_ms});
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
         const id_text = try std.fmt.allocPrint(allocator, "{d}", .{id});
+        const claim_worker_id = effectiveWorkerId(worker_id, default_vector_outbox_worker_id);
         const text = try self.queryParamsText(
             allocator,
             "WITH updated AS (UPDATE vector_outbox SET status = 'running', attempts = attempts + 1, locked_until_ms = $1::bigint, worker_id = $2, updated_at_ms = $3::bigint WHERE id = $4::bigint AND (status = 'pending' OR (status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= $5::bigint)) RETURNING 1) SELECT count(*)::text FROM updated",
-            &.{ locked_until, default_vector_outbox_worker_id, now_text, id_text, now_text },
+            &.{ locked_until, claim_worker_id, now_text, id_text, now_text },
         );
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
@@ -11144,16 +11179,21 @@ pub const PostgresStore = struct {
     }
 
     pub fn claimJob(self: *PostgresStore, id: []const u8) !bool {
+        return self.claimJobAs(id, default_job_worker_id);
+    }
+
+    pub fn claimJobAs(self: *PostgresStore, id: []const u8, worker_id: []const u8) !bool {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
         const now = ids.nowMs();
         const locked_until = try std.fmt.allocPrint(allocator, "{d}", .{now + default_job_lease_ms});
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        const claim_worker_id = effectiveWorkerId(worker_id, default_job_worker_id);
         const text = try self.queryParamsText(
             allocator,
             "WITH updated AS (UPDATE jobs SET status = 'running', locked_until_ms = $1::bigint, worker_id = $2, updated_at_ms = $3::bigint WHERE id = $4 AND (status = 'queued' OR (status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= $5::bigint)) RETURNING 1) SELECT count(*)::text FROM updated",
-            &.{ locked_until, default_job_worker_id, now_text, id, now_text },
+            &.{ locked_until, claim_worker_id, now_text, id, now_text },
         );
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
@@ -12282,6 +12322,8 @@ fn readPgVectorOutboxEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap
         .payload_json = try rawJsonField(allocator, obj, "payload_json", "{}"),
         .created_at_ms = json.intField(obj, "created_at_ms") orelse 0,
         .updated_at_ms = json.intField(obj, "updated_at_ms") orelse 0,
+        .locked_until_ms = optionalIntField(obj, "locked_until_ms"),
+        .worker_id = try dupNullableStringField(allocator, obj, "worker_id"),
     };
 }
 
@@ -13137,9 +13179,13 @@ test "sqlite vector outbox reclaims expired running leases" {
     const alloc = arena.allocator();
 
     const outbox_id = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = "memory_atom", .object_id = "mem_test", .payload_json = "{}" });
-    try std.testing.expect(try store.claimVectorOutbox(outbox_id));
+    try std.testing.expect(try store.claimVectorOutboxAs(outbox_id, "worker:embed-a"));
     try std.testing.expect(!try store.claimVectorOutbox(outbox_id));
     try std.testing.expectEqual(@as(usize, 1), try store.countVectorOutbox("running"));
+    const running = try store.listVectorOutbox(alloc, .{ .action = "embed", .status = "running", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), running.len);
+    try std.testing.expect(running[0].locked_until_ms != null);
+    try std.testing.expectEqualStrings("worker:embed-a", running[0].worker_id.?);
 
     const expire_sql = try std.fmt.allocPrint(alloc, "UPDATE vector_outbox SET locked_until_ms = 1 WHERE id = {d}", .{outbox_id});
     try testingSqliteExec(&store, try alloc.dupeZ(u8, expire_sql));
@@ -14500,12 +14546,12 @@ test "sqlite jobs persist status transitions with scoped listing" {
 
     const job = try store.createJob(alloc, .{ .job_type = "ingest", .scope = "project:nullpantry", .input_json = "{\"title\":\"x\"}" });
     try std.testing.expectEqualStrings("queued", job.status);
-    try std.testing.expect(try store.claimJob(job.id));
+    try std.testing.expect(try store.claimJobAs(job.id, "worker:ingest-a"));
     try std.testing.expect(!(try store.claimJob(job.id)));
     const claimed = (try store.getJob(alloc, job.id)).?;
     try std.testing.expectEqualStrings("running", claimed.status);
     try std.testing.expect(claimed.locked_until_ms != null);
-    try std.testing.expectEqualStrings(default_job_worker_id, claimed.worker_id.?);
+    try std.testing.expectEqualStrings("worker:ingest-a", claimed.worker_id.?);
     try std.testing.expect(try store.finishJob(job.id, "succeeded", "{\"ok\":true}", null));
     const loaded = (try store.getJob(alloc, job.id)).?;
     try std.testing.expectEqualStrings("succeeded", loaded.status);

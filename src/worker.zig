@@ -54,7 +54,7 @@ pub fn runOnce(allocator: std.mem.Allocator, store: *store_mod.Store, options: R
     });
     result.jobs_checked = jobs.len;
     for (jobs) |job| {
-        if (!(try store.claimJob(job.id))) continue;
+        if (!(try store.claimJobAs(job.id, options.actor_id))) continue;
         if (runClaimedJob(allocator, store, job, options)) |summary_json| {
             _ = try store.finishJob(job.id, "succeeded", summary_json, null);
             result.jobs_succeeded += 1;
@@ -71,7 +71,7 @@ pub fn runOnce(allocator: std.mem.Allocator, store: *store_mod.Store, options: R
 
 pub fn runJobById(allocator: std.mem.Allocator, store: *store_mod.Store, id: []const u8, options: RunOptions) !store_mod.Job {
     const job = (try store.getJob(allocator, id)) orelse return error.JobNotFound;
-    if (!try store.claimJob(job.id)) return error.JobNotQueued;
+    if (!try store.claimJobAs(job.id, options.actor_id)) return error.JobNotQueued;
     if (runClaimedJob(allocator, store, job, options)) |summary_json| {
         _ = try store.finishJob(job.id, "succeeded", summary_json, null);
     } else |err| {
@@ -123,7 +123,7 @@ pub fn runVectorOutboxOnce(allocator: std.mem.Allocator, store: *store_mod.Store
     const embedded = try runEmbeddingOutbox(allocator, store, options);
     result.processed += embedded.processed;
     result.failed += embedded.failed;
-    const indexed = try store.runVectorOutbox(options.outbox_limit);
+    const indexed = try store.runVectorOutboxAs(options.outbox_limit, options.actor_id);
     result.processed += indexed.processed;
     result.failed += indexed.failed;
     return result;
@@ -445,7 +445,7 @@ fn runEmbeddingOutbox(allocator: std.mem.Allocator, store: *store_mod.Store, opt
     const entries = try store.listVectorOutbox(allocator, .{ .action = "embed", .status = "pending", .limit = options.outbox_limit });
     var result = store_mod.VectorOutboxRunResult{};
     for (entries) |entry| {
-        if (!try store.claimVectorOutbox(entry.id)) continue;
+        if (!try store.claimVectorOutboxAs(entry.id, options.actor_id)) continue;
         processEmbeddingOutboxEntry(allocator, store, options, entry) catch {
             _ = try store.finishVectorOutbox(entry.id, "failed_embedding");
             result.failed += 1;
