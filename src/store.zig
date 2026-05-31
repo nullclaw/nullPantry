@@ -10561,6 +10561,41 @@ pub const PostgresStore = struct {
         return changed;
     }
 
+    fn insertContextPackRecord(
+        self: *PostgresStore,
+        allocator: std.mem.Allocator,
+        id: []const u8,
+        purpose: []const u8,
+        target: []const u8,
+        query: []const u8,
+        included_sources_json: []const u8,
+        included_artifacts_json: []const u8,
+        included_memory_atoms_json: []const u8,
+        included_result_refs_json: []const u8,
+        required_scopes_json: []const u8,
+        actor_id: ?[]const u8,
+        actor_isolated: bool,
+        generated_summary: []const u8,
+        token_budget: i64,
+        created_at_ms: i64,
+        audit_actor_id: ?[]const u8,
+    ) !void {
+        const token_budget_text = try std.fmt.allocPrint(allocator, "{d}", .{token_budget});
+        defer allocator.free(token_budget_text);
+        const created_at_text = try std.fmt.allocPrint(allocator, "{d}", .{created_at_ms});
+        defer allocator.free(created_at_text);
+        try self.runParams(
+            allocator,
+            "WITH inserted AS (" ++
+                "INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated,generated_summary,token_budget,created_at_ms) " ++
+                "VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11::boolean,$12,$13::bigint,$14::bigint) RETURNING id" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'context_pack.created',$15,'context_pack',id,'{}'::jsonb,$14::bigint FROM inserted RETURNING 1" ++
+                ") SELECT count(*)::text FROM inserted",
+            &.{ id, purpose, target, query, included_sources_json, included_artifacts_json, included_memory_atoms_json, included_result_refs_json, required_scopes_json, actor_id, if (actor_isolated) "true" else "false", generated_summary, token_budget_text, created_at_text, audit_actor_id },
+        );
+    }
+
     pub fn createContextPack(self: *PostgresStore, allocator: std.mem.Allocator, input: ContextPackInput) !ContextPackResult {
         const search_results = input.preselected_results orelse try self.search(allocator, .{
             .query = input.query,
@@ -10595,15 +10630,24 @@ pub const PostgresStore = struct {
         const result_refs = try context_pack.resultRefsJson(allocator, budgeted_results);
         const actor_isolated = context_pack.requiresActorIsolation(budgeted_results);
         if (input.persist) {
-            const sql = try std.fmt.allocPrint(
+            try self.insertContextPackRecord(
                 allocator,
-                "BEGIN; " ++
-                    "INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated,generated_summary,token_budget,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{d}); " ++
-                    "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('context_pack.created',{s},'context_pack',{s},'{{}}'::jsonb,{d}); " ++
-                    "COMMIT;",
-                .{ try sqlString(allocator, id), try sqlString(allocator, input.purpose), try sqlString(allocator, input.target), try sqlString(allocator, input.query), try sqlJsonb(allocator, sources), try sqlJsonb(allocator, artifacts), try sqlJsonb(allocator, atoms), try sqlJsonb(allocator, result_refs), try sqlJsonb(allocator, required_scopes), try sqlNullableString(allocator, input.actor_id), if (actor_isolated) "true" else "false", try sqlString(allocator, summary), input.token_budget, now, try sqlNullableString(allocator, input.actor_id), try sqlString(allocator, id), now },
+                id,
+                input.purpose,
+                input.target,
+                input.query,
+                sources,
+                artifacts,
+                atoms,
+                result_refs,
+                required_scopes,
+                input.actor_id,
+                actor_isolated,
+                summary,
+                input.token_budget,
+                now,
+                input.actor_id,
             );
-            try self.runSql(sql);
         }
         return .{ .id = id, .purpose = input.purpose, .target = input.target, .query = input.query, .generated_summary = summary, .sections_json = sections, .citations_json = sources, .forbidden_assumptions_json = context_pack.forbidden_assumptions_json, .suggested_next_steps_json = context_pack.suggested_next_steps_json, .included_sources_json = sources, .included_artifacts_json = artifacts, .included_memory_atoms_json = atoms, .included_result_refs_json = result_refs, .required_scopes_json = required_scopes, .actor_id = input.actor_id, .actor_isolated = actor_isolated, .token_budget = input.token_budget, .created_at_ms = now, .persisted = input.persist };
     }
@@ -10611,33 +10655,24 @@ pub const PostgresStore = struct {
     pub fn importContextPackSnapshot(self: *PostgresStore, allocator: std.mem.Allocator, input: ContextPackSnapshotInput) !ContextPackResult {
         const id = try idOrMake(allocator, input.id, "ctx_");
         const now = ids.nowMs();
-        const sql = try std.fmt.allocPrint(
+        try self.insertContextPackRecord(
             allocator,
-            "BEGIN; " ++
-                "INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated,generated_summary,token_budget,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{d}); " ++
-                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('context_pack.created',{s},'context_pack',{s},'{{}}'::jsonb,{d}); " ++
-                "COMMIT;",
-            .{
-                try sqlString(allocator, id),
-                try sqlString(allocator, input.purpose),
-                try sqlString(allocator, input.target),
-                try sqlString(allocator, input.query),
-                try sqlJsonb(allocator, input.included_sources_json),
-                try sqlJsonb(allocator, input.included_artifacts_json),
-                try sqlJsonb(allocator, input.included_memory_atoms_json),
-                try sqlJsonb(allocator, input.included_result_refs_json),
-                try sqlJsonb(allocator, input.required_scopes_json),
-                try sqlNullableString(allocator, input.actor_id),
-                if (input.actor_isolated) "true" else "false",
-                try sqlString(allocator, input.generated_summary),
-                input.token_budget,
-                now,
-                try sqlNullableString(allocator, input.actor_id_for_audit orelse input.actor_id),
-                try sqlString(allocator, id),
-                now,
-            },
+            id,
+            input.purpose,
+            input.target,
+            input.query,
+            input.included_sources_json,
+            input.included_artifacts_json,
+            input.included_memory_atoms_json,
+            input.included_result_refs_json,
+            input.required_scopes_json,
+            input.actor_id,
+            input.actor_isolated,
+            input.generated_summary,
+            input.token_budget,
+            now,
+            input.actor_id_for_audit orelse input.actor_id,
         );
-        try self.runSql(sql);
         return .{
             .id = id,
             .purpose = input.purpose,
