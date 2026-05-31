@@ -215,6 +215,10 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return lifecycleSnapshotExport(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and eql(seg3, "import") and is_post) {
         return lifecycleSnapshotImport(ctx, body);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and eql(seg3, "hydrate") and is_post) {
+        return lifecycleSnapshotImport(ctx, body);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "hydrate") and is_post) {
+        return lifecycleSnapshotImport(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and is_post) {
         return lifecycleSnapshot(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "cache") and eql(seg3, "put") and is_post) {
@@ -1154,6 +1158,8 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/lifecycle/snapshot", .post = "createSnapshot" },
         .{ .path = "/lifecycle/snapshot/export", .post = "exportSnapshot" },
         .{ .path = "/lifecycle/snapshot/import", .post = "importSnapshot" },
+        .{ .path = "/lifecycle/snapshot/hydrate", .post = "hydrateSnapshot" },
+        .{ .path = "/lifecycle/hydrate", .post = "hydrateSnapshot" },
         .{ .path = "/lifecycle/lucid/status", .get = "lucidProjectionStatus" },
         .{ .path = "/lifecycle/lucid/rebuild", .post = "rebuildLucidProjection" },
         .{ .path = "/lifecycle/analytics/status", .get = "analyticsStatus" },
@@ -1204,7 +1210,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -2149,7 +2155,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -3836,7 +3842,7 @@ fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    const objects_value = obj.get("objects") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing objects");
+    const objects_value = snapshotObjectsValue(obj) orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing objects");
     const objects = switch (objects_value) {
         .array => |a| a,
         else => return badJson(ctx),
@@ -3844,18 +3850,29 @@ fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
     const default_scope = json.stringField(obj, "default_scope") orelse "workspace";
     const default_permissions = rawField(ctx.allocator, obj, "default_permissions", "[]") catch return serverError(ctx);
     const created_by = json.stringField(obj, "created_by") orelse "agent";
+    const dry_run = (json.boolField(obj, "dry_run") orelse false) or
+        (json.boolField(obj, "preflight") orelse false) or
+        (json.boolField(obj, "preflight_only") orelse false);
 
     var prepared: std.ArrayListUnmanaged(store_mod.PreparedMemoryImport) = .empty;
     errdefer prepared.deinit(ctx.allocator);
+    var skipped: usize = 0;
     for (objects.items) |item| {
-        if (item != .object) continue;
+        if (item != .object) {
+            skipped += 1;
+            continue;
+        }
         const source_obj = item.object;
-        const text = json.stringField(source_obj, "text") orelse continue;
+        const text = json.stringField(source_obj, "text") orelse {
+            skipped += 1;
+            continue;
+        };
         const title = json.stringField(source_obj, "title") orelse json.stringField(source_obj, "id") orelse "snapshot object";
         const result_type = json.stringField(source_obj, "type") orelse json.stringField(source_obj, "result_type") orelse "snapshot";
         const scope = json.stringField(source_obj, "scope") orelse default_scope;
         const permissions_json = rawField(ctx.allocator, source_obj, "permissions", default_permissions) catch return serverError(ctx);
-        var source_ids_json = rawField(ctx.allocator, source_obj, "citations", "[]") catch return serverError(ctx);
+        const exported_source_ids_json = rawField(ctx.allocator, source_obj, "source_ids", "[]") catch return serverError(ctx);
+        var source_ids_json = rawField(ctx.allocator, source_obj, "citations", exported_source_ids_json) catch return serverError(ctx);
         const has_valid_sources = jsonArrayHasStringItems(ctx.allocator, source_ids_json) and sourceIdsCanBackRecord(ctx, source_ids_json, scope, permissions_json);
         if (!has_valid_sources) source_ids_json = "[]";
         const status = normalizedImportedMemoryStatus(json.stringField(source_obj, "status"));
@@ -3892,6 +3909,9 @@ fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
         if (!canCreateMemoryAtom(ctx, input)) return forbidden(ctx);
         prepared.append(ctx.allocator, .{ .atom = input, .generated_source = generated_source }) catch return serverError(ctx);
     }
+    if (dry_run) {
+        return snapshotHydrateResponse(ctx, 0, prepared.items.len, skipped, true, "[]");
+    }
     const atoms = ctx.store.importMemoryAtomsAtomic(ctx.allocator, prepared.items) catch return serverError(ctx);
     var imported_ids: std.ArrayListUnmanaged(u8) = .empty;
     imported_ids.append(ctx.allocator, '[') catch return serverError(ctx);
@@ -3900,9 +3920,21 @@ fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
         json.appendString(&imported_ids, ctx.allocator, atom.id) catch return serverError(ctx);
     }
     imported_ids.append(ctx.allocator, ']') catch return serverError(ctx);
+    return snapshotHydrateResponse(ctx, atoms.len, prepared.items.len, skipped, false, imported_ids.items);
+}
+
+fn snapshotObjectsValue(obj: std.json.ObjectMap) ?std.json.Value {
+    if (obj.get("objects")) |objects| return objects;
+    if (obj.get("snapshot")) |snapshot_value| {
+        if (snapshot_value == .object) return snapshot_value.object.get("objects");
+    }
+    return null;
+}
+
+fn snapshotHydrateResponse(ctx: *Context, imported: usize, validated: usize, skipped: usize, dry_run: bool, memory_atom_ids_json: []const u8) HttpResponse {
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    out.print(ctx.allocator, "{{\"imported\":{d},\"atomic\":true,\"memory_atom_ids\":", .{atoms.len}) catch return serverError(ctx);
-    out.appendSlice(ctx.allocator, imported_ids.items) catch return serverError(ctx);
+    out.print(ctx.allocator, "{{\"imported\":{d},\"hydrated\":{d},\"validated\":{d},\"skipped\":{d},\"dry_run\":{s},\"atomic\":true,\"memory_atom_ids\":", .{ imported, imported, validated, skipped, if (dry_run) "true" else "false" }) catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, memory_atom_ids_json, "[]") catch return serverError(ctx);
     out.append(ctx.allocator, '}') catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
@@ -7278,11 +7310,30 @@ test "api lifecycle snapshot export and import are permission aware" {
     const import_resp = handleRequest(&writer_ctx, "POST", "/v1/lifecycle/snapshot/import", "{\"objects\":[{\"type\":\"memory_atom\",\"title\":\"Imported\",\"text\":\"imported snapshot memory\",\"scope\":\"public\",\"status\":\"verified\"}]}", "");
     try std.testing.expectEqualStrings("200 OK", import_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, import_resp.body, "\"imported\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, import_resp.body, "\"hydrated\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, import_resp.body, "\"atomic\":true") != null);
 
     const search_resp = handleRequest(&writer_ctx, "POST", "/v1/search", "{\"query\":\"imported snapshot memory\",\"scopes\":[\"public\"]}", "");
     try std.testing.expectEqualStrings("200 OK", search_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "imported snapshot memory") != null);
+
+    const dry_run_body = "{\"dry_run\":true,\"snapshot\":{\"objects\":[{\"type\":\"memory_atom\",\"title\":\"Dry Run\",\"text\":\"dry run snapshot hydrate memory\",\"scope\":\"public\",\"status\":\"verified\"},{\"type\":\"bad\"}]}}";
+    const dry_run = handleRequest(&writer_ctx, "POST", "/v1/lifecycle/snapshot/hydrate", dry_run_body, "");
+    try std.testing.expectEqualStrings("200 OK", dry_run.status);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"dry_run\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"validated\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"skipped\":1") != null);
+    const dry_search = handleRequest(&writer_ctx, "POST", "/v1/search", "{\"query\":\"dry run snapshot hydrate memory\",\"scopes\":[\"public\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", dry_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, dry_search.body, "dry run snapshot hydrate memory") == null);
+
+    const hydrate_resp = handleRequest(&writer_ctx, "POST", "/v1/lifecycle/hydrate", "{\"snapshot\":{\"objects\":[{\"type\":\"memory_atom\",\"title\":\"Hydrated\",\"text\":\"hydrated snapshot memory\",\"scope\":\"public\",\"status\":\"verified\"}]}}", "");
+    try std.testing.expectEqualStrings("200 OK", hydrate_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, hydrate_resp.body, "\"hydrated\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrate_resp.body, "\"dry_run\":false") != null);
+    const hydrate_search = handleRequest(&writer_ctx, "POST", "/v1/search", "{\"query\":\"hydrated snapshot memory\",\"scopes\":[\"public\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", hydrate_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, hydrate_search.body, "hydrated snapshot memory") != null);
 }
 
 test "api retrieval search fuses keyword and vector results" {
