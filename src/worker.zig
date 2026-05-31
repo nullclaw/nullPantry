@@ -56,12 +56,12 @@ pub fn runOnce(allocator: std.mem.Allocator, store: *store_mod.Store, options: R
     for (jobs) |job| {
         if (!(try store.claimJobAs(job.id, options.actor_id))) continue;
         if (runClaimedJob(allocator, store, job, options)) |summary_json| {
-            _ = try store.finishJob(job.id, "succeeded", summary_json, null);
+            _ = try store.finishJobAs(job.id, "succeeded", summary_json, null, options.actor_id);
             result.jobs_succeeded += 1;
             if (std.mem.eql(u8, job.job_type, "lucid_projection")) result.lucid_projection_processed += 1;
         } else |err| {
             const error_text = @errorName(err);
-            _ = try store.finishJob(job.id, "failed", "{}", error_text);
+            _ = try store.finishJobAs(job.id, "failed", "{}", error_text, options.actor_id);
             result.jobs_failed += 1;
             if (std.mem.eql(u8, job.job_type, "lucid_projection")) result.lucid_projection_failed += 1;
         }
@@ -73,9 +73,9 @@ pub fn runJobById(allocator: std.mem.Allocator, store: *store_mod.Store, id: []c
     const job = (try store.getJob(allocator, id)) orelse return error.JobNotFound;
     if (!try store.claimJobAs(job.id, options.actor_id)) return error.JobNotQueued;
     if (runClaimedJob(allocator, store, job, options)) |summary_json| {
-        _ = try store.finishJob(job.id, "succeeded", summary_json, null);
+        _ = try store.finishJobAs(job.id, "succeeded", summary_json, null, options.actor_id);
     } else |err| {
-        _ = try store.finishJob(job.id, "failed", "{}", @errorName(err));
+        _ = try store.finishJobAs(job.id, "failed", "{}", @errorName(err), options.actor_id);
     }
     return (try store.getJob(allocator, id)) orelse job;
 }
@@ -447,11 +447,11 @@ fn runEmbeddingOutbox(allocator: std.mem.Allocator, store: *store_mod.Store, opt
     for (entries) |entry| {
         if (!try store.claimVectorOutboxAs(entry.id, options.actor_id)) continue;
         processEmbeddingOutboxEntry(allocator, store, options, entry) catch {
-            _ = try store.finishVectorOutbox(entry.id, "failed_embedding");
+            _ = try store.finishVectorOutboxAs(entry.id, "failed_embedding", options.actor_id);
             result.failed += 1;
             continue;
         };
-        _ = try store.finishVectorOutbox(entry.id, "embedded");
+        _ = try store.finishVectorOutboxAs(entry.id, "embedded", options.actor_id);
         result.processed += 1;
     }
     return result;

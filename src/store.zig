@@ -1330,9 +1330,13 @@ pub const Store = struct {
     }
 
     pub fn finishVectorOutbox(self: *Store, id: i64, status: []const u8) !bool {
+        return self.finishVectorOutboxAs(id, status, null);
+    }
+
+    pub fn finishVectorOutboxAs(self: *Store, id: i64, status: []const u8, worker_id: ?[]const u8) !bool {
         return switch (self.backend) {
-            .sqlite => |*s| s.finishVectorOutbox(id, status),
-            .postgres => |*p| p.finishVectorOutbox(id, status),
+            .sqlite => |*s| s.finishVectorOutboxAs(id, status, worker_id),
+            .postgres => |*p| p.finishVectorOutboxAs(id, status, worker_id),
         };
     }
 
@@ -1417,31 +1421,31 @@ pub const Store = struct {
             if (std.mem.eql(u8, entry.action, "embed")) continue;
             if (!try self.claimVectorOutboxAs(entry.id, worker_id)) continue;
             const vector_id = vectorIdFromOutboxPayload(allocator, entry.payload_json) catch {
-                _ = try self.finishVectorOutbox(entry.id, "failed_external_index");
+                _ = try self.finishVectorOutboxAs(entry.id, "failed_external_index", worker_id);
                 result.failed += 1;
                 continue;
             };
             if (std.mem.eql(u8, entry.action, "delete")) {
                 vector_runtime.delete(allocator, self.vector_backend, vector_id) catch {
-                    _ = try self.finishVectorOutbox(entry.id, "failed_external_delete");
+                    _ = try self.finishVectorOutboxAs(entry.id, "failed_external_delete", worker_id);
                     result.failed += 1;
                     continue;
                 };
-                _ = try self.finishVectorOutbox(entry.id, "deleted_external");
+                _ = try self.finishVectorOutboxAs(entry.id, "deleted_external", worker_id);
                 result.processed += 1;
                 continue;
             }
             const chunk = (try self.getVectorChunk(allocator, vector_id)) orelse {
-                _ = try self.finishVectorOutbox(entry.id, "failed_external_index");
+                _ = try self.finishVectorOutboxAs(entry.id, "failed_external_index", worker_id);
                 result.failed += 1;
                 continue;
             };
             vector_runtime.upsert(allocator, self.vector_backend, vectorChunkUpsertInput(chunk)) catch {
-                _ = try self.finishVectorOutbox(entry.id, "failed_external_index");
+                _ = try self.finishVectorOutboxAs(entry.id, "failed_external_index", worker_id);
                 result.failed += 1;
                 continue;
             };
-            _ = try self.finishVectorOutbox(entry.id, "indexed_external");
+            _ = try self.finishVectorOutboxAs(entry.id, "indexed_external", worker_id);
             result.processed += 1;
         }
         return result;
@@ -2931,9 +2935,13 @@ pub const Store = struct {
     }
 
     pub fn finishJob(self: *Store, id: []const u8, status: []const u8, result_json: []const u8, error_text: ?[]const u8) !bool {
+        return self.finishJobAs(id, status, result_json, error_text, null);
+    }
+
+    pub fn finishJobAs(self: *Store, id: []const u8, status: []const u8, result_json: []const u8, error_text: ?[]const u8, worker_id: ?[]const u8) !bool {
         return switch (self.backend) {
-            .sqlite => |*s| s.finishJob(id, status, result_json, error_text),
-            .postgres => |*p| p.finishJob(id, status, result_json, error_text),
+            .sqlite => |*s| s.finishJobAs(id, status, result_json, error_text, worker_id),
+            .postgres => |*p| p.finishJobAs(id, status, result_json, error_text, worker_id),
         };
     }
 
@@ -7157,11 +7165,19 @@ pub const SQLiteStore = struct {
     }
 
     pub fn finishVectorOutbox(self: *Self, id: i64, status: []const u8) !bool {
-        const stmt = try self.prepare("UPDATE vector_outbox SET status = ?1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?2 WHERE id = ?3");
+        return self.finishVectorOutboxAs(id, status, null);
+    }
+
+    pub fn finishVectorOutboxAs(self: *Self, id: i64, status: []const u8, worker_id: ?[]const u8) !bool {
+        const stmt = if (worker_id != null)
+            try self.prepare("UPDATE vector_outbox SET status = ?1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?2 WHERE id = ?3 AND status = 'running' AND worker_id = ?4")
+        else
+            try self.prepare("UPDATE vector_outbox SET status = ?1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?2 WHERE id = ?3");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, status);
         _ = c.sqlite3_bind_int64(stmt, 2, ids.nowMs());
         _ = c.sqlite3_bind_int64(stmt, 3, id);
+        if (worker_id) |worker| bindText(stmt, 4, worker);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
         return c.sqlite3_changes(self.db) > 0;
     }
@@ -8360,13 +8376,21 @@ pub const SQLiteStore = struct {
     }
 
     pub fn finishJob(self: *Self, id: []const u8, status: []const u8, result_json: []const u8, error_text: ?[]const u8) !bool {
-        const stmt = try self.prepare("UPDATE jobs SET status = ?1, result_json = ?2, error_text = ?3, attempts = attempts + 1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?4 WHERE id = ?5");
+        return self.finishJobAs(id, status, result_json, error_text, null);
+    }
+
+    pub fn finishJobAs(self: *Self, id: []const u8, status: []const u8, result_json: []const u8, error_text: ?[]const u8, worker_id: ?[]const u8) !bool {
+        const stmt = if (worker_id != null)
+            try self.prepare("UPDATE jobs SET status = ?1, result_json = ?2, error_text = ?3, attempts = attempts + 1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?4 WHERE id = ?5 AND status = 'running' AND worker_id = ?6")
+        else
+            try self.prepare("UPDATE jobs SET status = ?1, result_json = ?2, error_text = ?3, attempts = attempts + 1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?4 WHERE id = ?5");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, status);
         bindText(stmt, 2, result_json);
         bindNullableText(stmt, 3, error_text);
         _ = c.sqlite3_bind_int64(stmt, 4, ids.nowMs());
         bindText(stmt, 5, id);
+        if (worker_id) |worker| bindText(stmt, 6, worker);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
         const changed = c.sqlite3_changes(self.db) > 0;
         if (changed) try self.insertAudit("job.finished", "job", id);
@@ -10211,16 +10235,27 @@ pub const PostgresStore = struct {
     }
 
     pub fn finishVectorOutbox(self: *PostgresStore, id: i64, status: []const u8) !bool {
+        return self.finishVectorOutboxAs(id, status, null);
+    }
+
+    pub fn finishVectorOutboxAs(self: *PostgresStore, id: i64, status: []const u8, worker_id: ?[]const u8) !bool {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
         const id_text = try std.fmt.allocPrint(allocator, "{d}", .{id});
-        const text = try self.queryParamsText(
-            allocator,
-            "WITH updated AS (UPDATE vector_outbox SET status = $1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $2::bigint WHERE id = $3::bigint RETURNING 1) SELECT count(*)::text FROM updated",
-            &.{ status, now_text, id_text },
-        );
+        const text = if (worker_id) |worker|
+            try self.queryParamsText(
+                allocator,
+                "WITH updated AS (UPDATE vector_outbox SET status = $1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $2::bigint WHERE id = $3::bigint AND status = 'running' AND worker_id = $4 RETURNING 1) SELECT count(*)::text FROM updated",
+                &.{ status, now_text, id_text, worker },
+            )
+        else
+            try self.queryParamsText(
+                allocator,
+                "WITH updated AS (UPDATE vector_outbox SET status = $1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $2::bigint WHERE id = $3::bigint RETURNING 1) SELECT count(*)::text FROM updated",
+                &.{ status, now_text, id_text },
+            );
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
@@ -11199,15 +11234,26 @@ pub const PostgresStore = struct {
     }
 
     pub fn finishJob(self: *PostgresStore, id: []const u8, status: []const u8, result_json: []const u8, error_text: ?[]const u8) !bool {
+        return self.finishJobAs(id, status, result_json, error_text, null);
+    }
+
+    pub fn finishJobAs(self: *PostgresStore, id: []const u8, status: []const u8, result_json: []const u8, error_text: ?[]const u8, worker_id: ?[]const u8) !bool {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
-        const text = try self.queryParamsText(
-            allocator,
-            "WITH updated AS (UPDATE jobs SET status = $1, result_json = $2::jsonb, error_text = $3, attempts = attempts + 1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $4::bigint WHERE id = $5 RETURNING 1) SELECT count(*)::text FROM updated",
-            &.{ status, result_json, error_text, now_text, id },
-        );
+        const text = if (worker_id) |worker|
+            try self.queryParamsText(
+                allocator,
+                "WITH updated AS (UPDATE jobs SET status = $1, result_json = $2::jsonb, error_text = $3, attempts = attempts + 1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $4::bigint WHERE id = $5 AND status = 'running' AND worker_id = $6 RETURNING 1) SELECT count(*)::text FROM updated",
+                &.{ status, result_json, error_text, now_text, id, worker },
+            )
+        else
+            try self.queryParamsText(
+                allocator,
+                "WITH updated AS (UPDATE jobs SET status = $1, result_json = $2::jsonb, error_text = $3, attempts = attempts + 1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $4::bigint WHERE id = $5 RETURNING 1) SELECT count(*)::text FROM updated",
+                &.{ status, result_json, error_text, now_text, id },
+            );
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
@@ -13186,14 +13232,16 @@ test "sqlite vector outbox reclaims expired running leases" {
     try std.testing.expectEqual(@as(usize, 1), running.len);
     try std.testing.expect(running[0].locked_until_ms != null);
     try std.testing.expectEqualStrings("worker:embed-a", running[0].worker_id.?);
+    try std.testing.expect(!try store.finishVectorOutboxAs(outbox_id, "embedded", "worker:embed-other"));
 
     const expire_sql = try std.fmt.allocPrint(alloc, "UPDATE vector_outbox SET locked_until_ms = 1 WHERE id = {d}", .{outbox_id});
     try testingSqliteExec(&store, try alloc.dupeZ(u8, expire_sql));
     const pending = try store.listVectorOutbox(alloc, .{ .action = "embed", .status = "pending", .limit = 10 });
     try std.testing.expectEqual(@as(usize, 1), pending.len);
     try std.testing.expectEqual(outbox_id, pending[0].id);
-    try std.testing.expect(try store.claimVectorOutbox(outbox_id));
-    try std.testing.expect(try store.finishVectorOutbox(outbox_id, "embedded"));
+    try std.testing.expect(try store.claimVectorOutboxAs(outbox_id, "worker:embed-b"));
+    try std.testing.expect(!try store.finishVectorOutboxAs(outbox_id, "embedded", "worker:embed-a"));
+    try std.testing.expect(try store.finishVectorOutboxAs(outbox_id, "embedded", "worker:embed-b"));
     try std.testing.expectEqual(@as(usize, 0), try store.countVectorOutbox("running"));
     try std.testing.expectEqual(@as(usize, 1), try store.countVectorOutbox("embedded"));
 }
@@ -14552,7 +14600,8 @@ test "sqlite jobs persist status transitions with scoped listing" {
     try std.testing.expectEqualStrings("running", claimed.status);
     try std.testing.expect(claimed.locked_until_ms != null);
     try std.testing.expectEqualStrings("worker:ingest-a", claimed.worker_id.?);
-    try std.testing.expect(try store.finishJob(job.id, "succeeded", "{\"ok\":true}", null));
+    try std.testing.expect(!try store.finishJobAs(job.id, "succeeded", "{\"ok\":false}", null, "worker:ingest-other"));
+    try std.testing.expect(try store.finishJobAs(job.id, "succeeded", "{\"ok\":true}", null, "worker:ingest-a"));
     const loaded = (try store.getJob(alloc, job.id)).?;
     try std.testing.expectEqualStrings("succeeded", loaded.status);
     try std.testing.expectEqual(@as(i64, 1), loaded.attempts);
@@ -14560,7 +14609,7 @@ test "sqlite jobs persist status transitions with scoped listing" {
     try std.testing.expect(loaded.worker_id == null);
 
     const expired = try store.createJob(alloc, .{ .job_type = "ingest", .scope = "project:nullpantry", .input_json = "{\"title\":\"expired\"}" });
-    try std.testing.expect(try store.claimJob(expired.id));
+    try std.testing.expect(try store.claimJobAs(expired.id, "worker:expired-a"));
     const expire_sql_text = try std.fmt.allocPrint(alloc, "UPDATE jobs SET locked_until_ms = 1 WHERE id = '{s}'", .{expired.id});
     const expire_sql = try alloc.dupeZ(u8, expire_sql_text);
     try testingSqliteExec(&store, expire_sql);
@@ -14572,10 +14621,12 @@ test "sqlite jobs persist status transitions with scoped listing" {
     try std.testing.expectEqualStrings(expired.id, runnable[0].id);
     try std.testing.expectEqualStrings("running", runnable[0].status);
 
-    try std.testing.expect(try store.claimJob(expired.id));
+    try std.testing.expect(try store.claimJobAs(expired.id, "worker:expired-b"));
+    try std.testing.expect(!try store.finishJobAs(expired.id, "succeeded", "{\"stale\":true}", null, "worker:expired-a"));
+    try std.testing.expect(try store.finishJobAs(expired.id, "succeeded", "{\"fresh\":true}", null, "worker:expired-b"));
 
     const visible = try store.listJobs(alloc, .{ .scopes_json = "[\"project:nullpantry\"]", .status = "succeeded" });
-    try std.testing.expectEqual(@as(usize, 1), visible.len);
+    try std.testing.expectEqual(@as(usize, 2), visible.len);
     const hidden = try store.listJobs(alloc, .{ .scopes_json = "[\"public\"]", .status = "succeeded" });
     try std.testing.expectEqual(@as(usize, 0), hidden.len);
 }
