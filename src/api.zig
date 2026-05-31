@@ -3211,6 +3211,7 @@ fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8) HttpResponse {
                 error.Forbidden => return forbidden(ctx),
                 error.UnsupportedObjectType => return json.errorResponse(ctx.allocator, 400, "bad_request", "Unsupported feed object_type"),
                 error.InternalAgentMemory => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be restored through the feed"),
+                error.InternalAgentSessionMessage => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be restored through the feed"),
                 error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid checkpoint event"),
                 else => return serverError(ctx),
             };
@@ -3252,6 +3253,9 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !void {
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         if (try feedAgentMemoryPayloadIsInternal(ctx, payload_json)) return error.InternalAgentMemory;
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
+    } else if (std.mem.eql(u8, object_type, "agent_session_message")) {
+        if (try feedAgentSessionMessagePayloadIsInternal(ctx, payload_json)) return error.InternalAgentSessionMessage;
+        if (!canProposeAgentSessionEvent(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
     } else if (isAgentSessionFeedObject(object_type)) {
         if (!canProposeAgentSessionEvent(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
     } else if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
@@ -3287,6 +3291,10 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
         const internal_payload = feedAgentMemoryPayloadIsInternal(ctx, payload_json) catch return serverError(ctx);
         if (internal_payload) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be queued through the feed");
         if (!canProposeRecord(ctx, scope, permissions_json) and !canApplyAgentMemoryScope(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
+    } else if (std.mem.eql(u8, object_type, "agent_session_message")) {
+        const internal_payload = feedAgentSessionMessagePayloadIsInternal(ctx, payload_json) catch return serverError(ctx);
+        if (internal_payload) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be queued through the feed");
+        if (!canProposeAgentSessionEvent(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
     } else if (isAgentSessionFeedObject(object_type)) {
         if (!canProposeAgentSessionEvent(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
     } else if (!canProposeRecord(ctx, scope, permissions_json)) return forbidden(ctx);
@@ -3330,6 +3338,9 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     const event_permissions_json = feedEventPermissions(ctx, obj, object_type, payload_json, event_actor_id) catch return serverError(ctx);
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
+    } else if (std.mem.eql(u8, object_type, "agent_session_message")) {
+        if (feedAgentSessionMessagePayloadIsInternal(ctx, payload_json) catch return serverError(ctx)) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be applied through the feed");
+        if (!canApplyAgentSessionEvent(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
     } else if (isAgentSessionFeedObject(object_type)) {
         if (!canApplyAgentSessionEvent(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
     } else if (!canWriteRecord(ctx, scope, event_permissions_json)) return forbidden(ctx);
@@ -3366,6 +3377,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     if (std.mem.eql(u8, object_type, "agent_session_message")) {
         session_message_input = buildAppliedAgentSessionMessageInput(ctx, operation, payload_json, event_actor_id) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
+            error.InternalAgentSessionMessage => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be applied through the feed"),
             error.MissingRequiredField, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Session message feed payload must include session_id, role and content"),
             else => return serverError(ctx),
         };
@@ -3843,6 +3855,7 @@ fn buildAppliedAgentSessionMessageInput(ctx: *Context, operation: []const u8, pa
         return .{ .session_id = session_id, .actor_id = payload_actor, .delete_all = true, .route = route };
     }
     const role = json.stringField(obj, "role") orelse return error.MissingRequiredField;
+    if (domain.isRuntimeCommandRole(role)) return error.InternalAgentSessionMessage;
     const content = json.stringField(obj, "content") orelse return error.MissingRequiredField;
     return .{
         .session_id = session_id,
@@ -6910,6 +6923,17 @@ fn feedAgentMemoryPayloadIsInternal(ctx: *Context, payload_json: []const u8) !bo
         json.stringField(parsed.value.object, "text") orelse
         json.stringField(parsed.value.object, "value") orelse "";
     return domain.isInternalMemoryEntryKeyOrContent(key, content);
+}
+
+fn feedAgentSessionMessagePayloadIsInternal(ctx: *Context, payload_json: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const role = json.stringField(parsed.value.object, "role") orelse return false;
+    return domain.isRuntimeCommandRole(role);
 }
 
 fn feedEventObjectVisibleToActor(ctx: *Context, event: store_mod.FeedEvent) bool {
@@ -10015,6 +10039,42 @@ test "api memory checkpoint restore replays isolated agent session messages and 
     const restored_b_usage = handleRequest(&target_b, "GET", "/v1/agent-sessions/sync/usage", "", "");
     try std.testing.expectEqualStrings("200 OK", restored_b_usage.status);
     try std.testing.expect(std.mem.indexOf(u8, restored_b_usage.body, "\"total_tokens\":29") != null);
+}
+
+test "api memory feed excludes internal runtime command session payloads" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var actor_ctx = Context{ .allocator = alloc, .store = &store, .actor_id = "agent:runtime", .actor_scopes_json = "[\"session:internal\",\"write:session:internal\"]" };
+    const internal_save_body = "{\"role\":\"__runtime_command__\",\"content\":\"runtime command must stay local\",\"created_at_ms\":303}";
+    const saved = handleRequest(&actor_ctx, "POST", "/v1/agent-sessions/internal/messages", internal_save_body, "");
+    try std.testing.expectEqualStrings("200 OK", saved.status);
+
+    const feed = handleRequest(&actor_ctx, "GET", "/v1/memory/events?limit=50", "", "");
+    try std.testing.expectEqualStrings("200 OK", feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "runtime command must stay local") == null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "__runtime_command__") == null);
+
+    const queued = handleRequest(&actor_ctx, "POST", "/v1/memory/feed", "{\"event_type\":\"agent_session_message.put\",\"object_type\":\"agent_session_message\",\"payload\":{\"session_id\":\"internal\",\"role\":\"__runtime_command__\",\"content\":\"queued leak\"}}", "");
+    try std.testing.expectEqualStrings("400 Bad Request", queued.status);
+
+    const applied = handleRequest(&actor_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_session_message.put\",\"object_type\":\"agent_session_message\",\"payload\":{\"session_id\":\"internal\",\"role\":\"__runtime_command__\",\"content\":\"applied leak\"}}", "");
+    try std.testing.expectEqualStrings("400 Bad Request", applied.status);
+
+    var admin_ctx = Context{ .allocator = alloc, .store = &store };
+    const checkpoint =
+        \\{"events":[
+        \\{"event_type":"agent_session_message.put","operation":"put","object_type":"agent_session_message","actor_id":"agent:runtime","scope":"session:internal","permissions":["actor:agent:runtime"],"payload":{"session_id":"internal","role":"__runtime_command__","content":"checkpoint leak"}}
+        \\]}
+    ;
+    const restore = handleRequest(&admin_ctx, "POST", "/v1/memory/checkpoint", checkpoint, "");
+    try std.testing.expectEqualStrings("400 Bad Request", restore.status);
+    const messages = handleRequest(&actor_ctx, "GET", "/v1/agent-sessions/internal/messages", "", "");
+    try std.testing.expectEqualStrings("200 OK", messages.status);
+    try std.testing.expect(std.mem.indexOf(u8, messages.body, "checkpoint leak") == null);
 }
 
 test "api memory checkpoint restore preserves primitive ids and links" {

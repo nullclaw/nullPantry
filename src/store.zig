@@ -2278,6 +2278,7 @@ pub const Store = struct {
     }
 
     fn appendAgentSessionMessagePutFeedEvent(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        if (domain.isRuntimeCommandRole(role)) return;
         const object_id = try agentSessionMessageObjectId(allocator, session_id, role, content, created_at_ms, actor_id);
         defer allocator.free(object_id);
         const scope = try agentSessionScope(allocator, session_id);
