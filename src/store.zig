@@ -104,6 +104,7 @@ fn feedReferenceObjectType(value: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, value, "ent_")) return "entity";
     if (std.mem.startsWith(u8, value, "rel_")) return "relation";
     if (std.mem.startsWith(u8, value, "ctx_")) return "context_pack";
+    if (std.mem.startsWith(u8, value, "spc_")) return "space";
     return null;
 }
 
@@ -603,7 +604,9 @@ const PrimitiveMirrorKind = enum {
 fn primitiveLifecycleUsesOverlay(object_type: []const u8) bool {
     return std.mem.eql(u8, object_type, "source") or
         std.mem.eql(u8, object_type, "entity") or
-        std.mem.eql(u8, object_type, "context_pack");
+        std.mem.eql(u8, object_type, "context_pack") or
+        std.mem.eql(u8, object_type, "space") or
+        std.mem.eql(u8, object_type, "policy_scope");
 }
 
 fn lucidProjectionKey(allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8) ![]u8 {
@@ -1022,10 +1025,12 @@ pub const Store = struct {
     }
 
     pub fn createSpace(self: *Store, allocator: std.mem.Allocator, input: SpaceInput) !Space {
-        return switch (self.backend) {
+        const space = try switch (self.backend) {
             .sqlite => |*s| s.createSpace(allocator, input),
             .postgres => |*p| p.createSpace(allocator, input),
         };
+        if (!input.suppress_feed) try self.appendSpacePutFeedEvent(allocator, space, input.actor_id);
+        return space;
     }
 
     pub fn getSpace(self: *Store, allocator: std.mem.Allocator, id: []const u8) !?Space {
@@ -1043,10 +1048,12 @@ pub const Store = struct {
     }
 
     pub fn upsertPolicyScope(self: *Store, allocator: std.mem.Allocator, input: PolicyScopeInput) !PolicyScope {
-        return switch (self.backend) {
+        const policy = try switch (self.backend) {
             .sqlite => |*s| s.upsertPolicyScope(allocator, input),
             .postgres => |*p| p.upsertPolicyScope(allocator, input),
         };
+        if (!input.suppress_feed) try self.appendPolicyScopePutFeedEvent(allocator, policy, input.actor_id);
+        return policy;
     }
 
     pub fn getPolicyScope(self: *Store, allocator: std.mem.Allocator, scope: []const u8) !?PolicyScope {
@@ -2467,6 +2474,18 @@ pub const Store = struct {
         const payload = try contextPackFeedPayloadJson(allocator, pack);
         defer allocator.free(payload);
         try self.appendAppliedPrimitiveFeedEvent(allocator, "context_pack.put", "context_pack", pack.id, scope, permissions_json, actor_id, payload, route);
+    }
+
+    fn appendSpacePutFeedEvent(self: *Store, allocator: std.mem.Allocator, space: Space, actor_id: ?[]const u8) !void {
+        const payload = try domainPayloadJson(allocator, space);
+        defer allocator.free(payload);
+        try self.appendAppliedPrimitiveFeedEvent(allocator, "space.put", "space", space.id, space.scope, space.permissions_json, actor_id, payload, .{});
+    }
+
+    fn appendPolicyScopePutFeedEvent(self: *Store, allocator: std.mem.Allocator, policy: PolicyScope, actor_id: ?[]const u8) !void {
+        const payload = try domainPayloadJson(allocator, policy);
+        defer allocator.free(payload);
+        try self.appendAppliedPrimitiveFeedEvent(allocator, "policy_scope.put", "policy_scope", policy.scope, policy.scope, policy.permissions_json, actor_id, payload, .{});
     }
 
     fn appendAgentSessionMessagePutFeedEvent(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
@@ -3965,6 +3984,7 @@ pub const SourceInput = struct {
 };
 
 pub const SpaceInput = struct {
+    id: ?[]const u8 = null,
     name: []const u8,
     title: []const u8,
     description: ?[]const u8 = null,
@@ -3972,6 +3992,7 @@ pub const SpaceInput = struct {
     permissions_json: []const u8 = "[]",
     metadata_json: []const u8 = "{}",
     actor_id: ?[]const u8 = null,
+    suppress_feed: bool = false,
 };
 
 pub const Space = struct {
@@ -4013,6 +4034,7 @@ pub const PolicyScopeInput = struct {
     review_after_ms: ?i64 = null,
     metadata_json: []const u8 = "{}",
     actor_id: ?[]const u8 = null,
+    suppress_feed: bool = false,
 };
 
 pub const PolicyScope = struct {
@@ -5752,7 +5774,7 @@ pub const SQLiteStore = struct {
     }
 
     pub fn createSpace(self: *Self, allocator: std.mem.Allocator, input: SpaceInput) !Space {
-        const id = try ids.make(allocator, "spc_");
+        const id = try idOrMake(allocator, input.id, "spc_");
         const now = ids.nowMs();
         const stmt = try self.prepare("INSERT INTO spaces (id,name,title,description,scope,permissions_json,metadata_json,created_at_ms,updated_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)");
         defer _ = c.sqlite3_finalize(stmt);
@@ -5788,6 +5810,8 @@ pub const SQLiteStore = struct {
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const space = try readSqliteSpace(allocator, stmt);
             if (!try self.recordVisibleWithPolicy(allocator, space.scope, space.permissions_json, scopes_json)) continue;
+            const status = try self.primitiveLifecycleStatus(allocator, "space", space.id);
+            if (!domain.isDefaultVisibleStatus(status)) continue;
             try out.append(allocator, space);
         }
         return out.toOwnedSlice(allocator);
@@ -5843,6 +5867,8 @@ pub const SQLiteStore = struct {
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const policy = try readSqlitePolicyScope(allocator, stmt);
             if (!try self.recordVisibleWithPolicy(allocator, policy.scope, policy.permissions_json, scopes_json)) continue;
+            const status = try self.primitiveLifecycleStatus(allocator, "policy_scope", policy.scope);
+            if (!domain.isDefaultVisibleStatus(status)) continue;
             try out.append(allocator, policy);
         }
         return out.toOwnedSlice(allocator);
@@ -6700,6 +6726,8 @@ pub const SQLiteStore = struct {
         if (std.mem.eql(u8, object_type, "source")) return (try self.getSource(allocator, object_id)) != null;
         if (std.mem.eql(u8, object_type, "entity")) return (try self.getEntity(allocator, object_id)) != null;
         if (std.mem.eql(u8, object_type, "context_pack")) return try self.contextPackExists(object_id);
+        if (std.mem.eql(u8, object_type, "space")) return (try self.getSpace(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "policy_scope")) return (try self.getPolicyScope(allocator, object_id)) != null;
         return false;
     }
 
@@ -6898,10 +6926,12 @@ pub const SQLiteStore = struct {
             const metadata = try columnText(allocator, stmt, 6);
             const updated_at_ms = c.sqlite3_column_int64(stmt, 7);
             if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
+            const status = try self.primitiveLifecycleStatus(allocator, "space", id_text);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             const text = if (description) |d| try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ name, title, d, metadata }) else try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ name, title, metadata });
             const relevance = if (use_fts) @max(0.0, 6.0 - c.sqlite3_column_double(stmt, 8)) else scoreText(input.query, text);
             if (!use_fts and input.query.len > 0 and relevance <= 0) continue;
-            try results.append(allocator, .{ .id = id_text, .result_type = "space", .title = title, .text = text, .scope = scope, .status = "active", .score = relevance + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "space", scope, permissions, input.actor_id), .created_at_ms = updated_at_ms, .confidence = 0.7 });
+            try results.append(allocator, .{ .id = id_text, .result_type = "space", .title = title, .text = text, .scope = scope, .status = status, .score = relevance + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "space", scope, permissions, input.actor_id), .created_at_ms = updated_at_ms, .confidence = 0.7 });
         }
     }
 
@@ -6920,10 +6950,12 @@ pub const SQLiteStore = struct {
             const metadata = try columnText(allocator, stmt, 4);
             const updated_at_ms = c.sqlite3_column_int64(stmt, 5);
             if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
+            const status = try self.primitiveLifecycleStatus(allocator, "policy_scope", scope);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             const text = if (owner) |o| try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ scope, visibility, o, metadata }) else try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ scope, visibility, metadata });
             const relevance = if (use_fts) @max(0.0, 6.0 - c.sqlite3_column_double(stmt, 6)) else scoreText(input.query, text);
             if (!use_fts and input.query.len > 0 and relevance <= 0) continue;
-            try results.append(allocator, .{ .id = scope, .result_type = "policy_scope", .title = scope, .text = text, .scope = scope, .status = visibility, .score = relevance + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", scope, permissions, input.actor_id), .created_at_ms = updated_at_ms, .confidence = 0.7 });
+            try results.append(allocator, .{ .id = scope, .result_type = "policy_scope", .title = scope, .text = text, .scope = scope, .status = status, .score = relevance + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", scope, permissions, input.actor_id), .created_at_ms = updated_at_ms, .confidence = 0.7 });
         }
     }
 
@@ -7613,6 +7645,8 @@ pub const SQLiteStore = struct {
         }
         if (std.mem.eql(u8, match.object_type, "space")) {
             const space = (try self.getSpace(allocator, match.object_id)) orelse return null;
+            const status = try self.primitiveLifecycleStatus(allocator, "space", space.id);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, space.scope, space.permissions_json, input.scopes_json, input.actor_id)) return null;
             const text = if (space.description) |description|
                 try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ space.name, space.title, description, space.metadata_json })
@@ -7624,7 +7658,7 @@ pub const SQLiteStore = struct {
                 .title = space.title,
                 .text = try vectorMatchedTextOwned(allocator, match, text),
                 .scope = space.scope,
-                .status = "active",
+                .status = status,
                 .score = match.score + 0.2,
                 .source_ids_json = "[]",
                 .heading_path_json = try vectorHeadingPathJsonOwned(allocator, match),
@@ -7636,6 +7670,8 @@ pub const SQLiteStore = struct {
         }
         if (std.mem.eql(u8, match.object_type, "policy_scope")) {
             const policy = (try self.getPolicyScope(allocator, match.object_id)) orelse return null;
+            const status = try self.primitiveLifecycleStatus(allocator, "policy_scope", policy.scope);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, policy.scope, policy.permissions_json, input.scopes_json, input.actor_id)) return null;
             const text = if (policy.owner) |owner|
                 try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ policy.scope, policy.visibility, owner, policy.metadata_json })
@@ -7647,7 +7683,7 @@ pub const SQLiteStore = struct {
                 .title = policy.scope,
                 .text = try vectorMatchedTextOwned(allocator, match, text),
                 .scope = policy.scope,
-                .status = policy.visibility,
+                .status = status,
                 .score = match.score + 0.2,
                 .source_ids_json = "[]",
                 .heading_path_json = try vectorHeadingPathJsonOwned(allocator, match),
@@ -8088,10 +8124,14 @@ pub const SQLiteStore = struct {
         }
         if (std.mem.eql(u8, object_type, "space")) {
             const space = (try self.getSpace(allocator, object_id)) orelse return false;
+            const status = try self.primitiveLifecycleStatus(allocator, "space", space.id);
+            if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
             return try self.recordVisibleWithPolicyForActor(allocator, space.scope, space.permissions_json, scopes_json, actor_id);
         }
         if (std.mem.eql(u8, object_type, "policy_scope")) {
             const policy = (try self.getPolicyScope(allocator, object_id)) orelse return false;
+            const status = try self.primitiveLifecycleStatus(allocator, "policy_scope", policy.scope);
+            if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
             return try self.recordVisibleWithPolicyForActor(allocator, policy.scope, policy.permissions_json, scopes_json, actor_id);
         }
         return false;
@@ -10464,7 +10504,7 @@ pub const PostgresStore = struct {
     }
 
     pub fn createSpace(self: *PostgresStore, allocator: std.mem.Allocator, input: SpaceInput) !Space {
-        const id = try ids.make(allocator, "spc_");
+        const id = try idOrMake(allocator, input.id, "spc_");
         const now = ids.nowMs();
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
         defer allocator.free(now_text);
@@ -10505,6 +10545,8 @@ pub const PostgresStore = struct {
             if (item != .object) continue;
             const space = try readPgSpace(allocator, item.object);
             if (!try self.recordVisibleWithPolicy(allocator, space.scope, space.permissions_json, scopes_json)) continue;
+            const status = try self.primitiveLifecycleStatus(allocator, "space", space.id);
+            if (!domain.isDefaultVisibleStatus(status)) continue;
             try out.append(allocator, space);
         };
         return out.toOwnedSlice(allocator);
@@ -10556,6 +10598,8 @@ pub const PostgresStore = struct {
             if (item != .object) continue;
             const policy = try readPgPolicyScope(allocator, item.object);
             if (!try self.recordVisibleWithPolicy(allocator, policy.scope, policy.permissions_json, scopes_json)) continue;
+            const status = try self.primitiveLifecycleStatus(allocator, "policy_scope", policy.scope);
+            if (!domain.isDefaultVisibleStatus(status)) continue;
             try out.append(allocator, policy);
         };
         return out.toOwnedSlice(allocator);
@@ -11055,6 +11099,8 @@ pub const PostgresStore = struct {
         if (std.mem.eql(u8, object_type, "source")) return (try self.getSource(allocator, object_id)) != null;
         if (std.mem.eql(u8, object_type, "entity")) return (try self.getEntity(allocator, object_id)) != null;
         if (std.mem.eql(u8, object_type, "context_pack")) return try self.contextPackExists(allocator, object_id);
+        if (std.mem.eql(u8, object_type, "space")) return (try self.getSpace(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "policy_scope")) return (try self.getPolicyScope(allocator, object_id)) != null;
         return false;
     }
 
@@ -11461,10 +11507,14 @@ pub const PostgresStore = struct {
         }
         if (std.mem.eql(u8, object_type, "space")) {
             const space = (try self.getSpace(allocator, object_id)) orelse return false;
+            const status = try self.primitiveLifecycleStatus(allocator, "space", space.id);
+            if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
             return try self.recordVisibleWithPolicyForActor(allocator, space.scope, space.permissions_json, scopes_json, actor_id);
         }
         if (std.mem.eql(u8, object_type, "policy_scope")) {
             const policy = (try self.getPolicyScope(allocator, object_id)) orelse return false;
+            const status = try self.primitiveLifecycleStatus(allocator, "policy_scope", policy.scope);
+            if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
             return try self.recordVisibleWithPolicyForActor(allocator, policy.scope, policy.permissions_json, scopes_json, actor_id);
         }
         return false;
@@ -13043,10 +13093,12 @@ pub const PostgresStore = struct {
             if (item != .object) continue;
             const space = try readPgSpace(allocator, item.object);
             if (!try self.recordVisibleWithPolicyForActor(allocator, space.scope, space.permissions_json, input.scopes_json, input.actor_id)) continue;
+            const status = try self.primitiveLifecycleStatus(allocator, "space", space.id);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             const text = if (space.description) |d| try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ space.name, space.title, d }) else try std.fmt.allocPrint(allocator, "{s} {s}", .{ space.name, space.title });
             const relevance = pgScoreText(input.query, text);
             if (relevance <= 0 and input.query.len > 0) continue;
-            try results.append(allocator, .{ .id = space.id, .result_type = "space", .title = space.title, .text = text, .scope = space.scope, .status = "active", .score = relevance + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, space.scope, space.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "space", space.scope, space.permissions_json, input.actor_id), .created_at_ms = space.updated_at_ms, .confidence = 0.7 });
+            try results.append(allocator, .{ .id = space.id, .result_type = "space", .title = space.title, .text = text, .scope = space.scope, .status = status, .score = relevance + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, space.scope, space.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "space", space.scope, space.permissions_json, input.actor_id), .created_at_ms = space.updated_at_ms, .confidence = 0.7 });
         }
     }
 
@@ -13067,10 +13119,12 @@ pub const PostgresStore = struct {
             if (item != .object) continue;
             const policy = try readPgPolicyScope(allocator, item.object);
             if (!try self.recordVisibleWithPolicyForActor(allocator, policy.scope, policy.permissions_json, input.scopes_json, input.actor_id)) continue;
+            const status = try self.primitiveLifecycleStatus(allocator, "policy_scope", policy.scope);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             const text = if (policy.owner) |o| try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ policy.scope, policy.visibility, o, policy.metadata_json }) else try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ policy.scope, policy.visibility, policy.metadata_json });
             const relevance = pgScoreText(input.query, text);
             if (relevance <= 0 and input.query.len > 0) continue;
-            try results.append(allocator, .{ .id = policy.scope, .result_type = "policy_scope", .title = policy.scope, .text = text, .scope = policy.scope, .status = policy.visibility, .score = relevance + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, policy.scope, policy.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", policy.scope, policy.permissions_json, input.actor_id), .created_at_ms = policy.updated_at_ms, .confidence = 0.7 });
+            try results.append(allocator, .{ .id = policy.scope, .result_type = "policy_scope", .title = policy.scope, .text = text, .scope = policy.scope, .status = status, .score = relevance + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, policy.scope, policy.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", policy.scope, policy.permissions_json, input.actor_id), .created_at_ms = policy.updated_at_ms, .confidence = 0.7 });
         }
     }
 
@@ -13594,21 +13648,25 @@ pub const PostgresStore = struct {
         }
         if (std.mem.eql(u8, match.object_type, "space")) {
             const space = (try self.getSpace(allocator, match.object_id)) orelse return null;
+            const status = try self.primitiveLifecycleStatus(allocator, "space", space.id);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, space.scope, space.permissions_json, input.scopes_json, input.actor_id)) return null;
             const text = if (space.description) |description|
                 try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ space.name, space.title, description, space.metadata_json })
             else
                 try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ space.name, space.title, space.metadata_json });
-            return .{ .id = space.id, .result_type = "space", .title = space.title, .text = try vectorMatchedTextOwned(allocator, match, text), .scope = space.scope, .status = "active", .score = match.score + 0.2, .source_ids_json = "[]", .heading_path_json = try vectorHeadingPathJsonOwned(allocator, match), .required_scopes_json = try requiredAccessJsonGlobal(allocator, space.scope, space.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "space", space.scope, space.permissions_json, input.actor_id), .created_at_ms = space.updated_at_ms, .confidence = 0.7 };
+            return .{ .id = space.id, .result_type = "space", .title = space.title, .text = try vectorMatchedTextOwned(allocator, match, text), .scope = space.scope, .status = status, .score = match.score + 0.2, .source_ids_json = "[]", .heading_path_json = try vectorHeadingPathJsonOwned(allocator, match), .required_scopes_json = try requiredAccessJsonGlobal(allocator, space.scope, space.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "space", space.scope, space.permissions_json, input.actor_id), .created_at_ms = space.updated_at_ms, .confidence = 0.7 };
         }
         if (std.mem.eql(u8, match.object_type, "policy_scope")) {
             const policy = (try self.getPolicyScope(allocator, match.object_id)) orelse return null;
+            const status = try self.primitiveLifecycleStatus(allocator, "policy_scope", policy.scope);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, policy.scope, policy.permissions_json, input.scopes_json, input.actor_id)) return null;
             const text = if (policy.owner) |owner|
                 try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ policy.scope, policy.visibility, owner, policy.metadata_json })
             else
                 try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ policy.scope, policy.visibility, policy.metadata_json });
-            return .{ .id = policy.scope, .result_type = "policy_scope", .title = policy.scope, .text = try vectorMatchedTextOwned(allocator, match, text), .scope = policy.scope, .status = policy.visibility, .score = match.score + 0.2, .source_ids_json = "[]", .heading_path_json = try vectorHeadingPathJsonOwned(allocator, match), .required_scopes_json = try requiredAccessJsonGlobal(allocator, policy.scope, policy.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", policy.scope, policy.permissions_json, input.actor_id), .created_at_ms = policy.updated_at_ms, .confidence = 0.7 };
+            return .{ .id = policy.scope, .result_type = "policy_scope", .title = policy.scope, .text = try vectorMatchedTextOwned(allocator, match, text), .scope = policy.scope, .status = status, .score = match.score + 0.2, .source_ids_json = "[]", .heading_path_json = try vectorHeadingPathJsonOwned(allocator, match), .required_scopes_json = try requiredAccessJsonGlobal(allocator, policy.scope, policy.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", policy.scope, policy.permissions_json, input.actor_id), .created_at_ms = policy.updated_at_ms, .confidence = 0.7 };
         }
         return null;
     }

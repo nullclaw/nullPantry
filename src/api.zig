@@ -5353,6 +5353,9 @@ fn feedEventScope(ctx: *Context, obj: std.json.ObjectMap, object_type: []const u
     // The returned scope may borrow from this request-arena parse tree.
     if (payload.value == .object) {
         if (json.stringField(payload.value.object, "scope")) |scope| return scope;
+        if (std.mem.eql(u8, object_type, "policy_scope")) {
+            if (json.stringField(obj, "object_id")) |scope| return scope;
+        }
         if (isAgentSessionFeedObject(object_type)) {
             const session_id = json.stringField(payload.value.object, "session_id") orelse {
                 if (json.boolField(payload.value.object, "delete_autosaved") orelse json.boolField(payload.value.object, "autosave_only") orelse false) return "session:*";
@@ -8956,6 +8959,14 @@ fn feedEventObjectVisibleToActor(ctx: *Context, event: store_mod.FeedEvent) bool
         _ = (ctx.store.contextPackLifecycleTarget(ctx.allocator, event.object_id, ctx.actor_id, ctx.actor_scopes_json) catch return false) orelse return true;
         return true;
     }
+    if (std.mem.eql(u8, event.object_type, "space")) {
+        const space = (ctx.store.getSpace(ctx.allocator, event.object_id) catch return false) orelse return true;
+        return recordVisibleToActor(ctx, space.scope, space.permissions_json);
+    }
+    if (std.mem.eql(u8, event.object_type, "policy_scope")) {
+        const policy = (ctx.store.getPolicyScope(ctx.allocator, event.object_id) catch return false) orelse return true;
+        return recordVisibleToActor(ctx, policy.scope, policy.permissions_json);
+    }
     if (std.mem.eql(u8, event.object_type, "agent_memory")) {
         return feedRecordVisibleToActor(ctx, event.scope, event.permissions_json);
     }
@@ -9015,6 +9026,10 @@ fn feedReferenceStringVisible(ctx: *Context, value: []const u8) bool {
     if (std.mem.startsWith(u8, value, "ctx_")) {
         _ = (ctx.store.contextPackLifecycleTarget(ctx.allocator, value, ctx.actor_id, ctx.actor_scopes_json) catch return false) orelse return false;
         return true;
+    }
+    if (std.mem.startsWith(u8, value, "spc_")) {
+        const space = (ctx.store.getSpace(ctx.allocator, value) catch return false) orelse return false;
+        return recordVisibleToActor(ctx, space.scope, space.permissions_json);
     }
     return true;
 }
@@ -9080,7 +9095,9 @@ fn feedObjectTypeSupported(object_type: []const u8) bool {
         std.mem.eql(u8, object_type, "agent_memory") or
         std.mem.eql(u8, object_type, "agent_session_message") or
         std.mem.eql(u8, object_type, "agent_session_usage") or
-        std.mem.eql(u8, object_type, "context_pack");
+        std.mem.eql(u8, object_type, "context_pack") or
+        std.mem.eql(u8, object_type, "space") or
+        std.mem.eql(u8, object_type, "policy_scope");
 }
 
 fn isAgentSessionFeedObject(object_type: []const u8) bool {
@@ -9091,7 +9108,9 @@ fn isAgentSessionFeedObject(object_type: []const u8) bool {
 fn feedLifecycleUsesOverlay(object_type: []const u8) bool {
     return std.mem.eql(u8, object_type, "source") or
         std.mem.eql(u8, object_type, "entity") or
-        std.mem.eql(u8, object_type, "context_pack");
+        std.mem.eql(u8, object_type, "context_pack") or
+        std.mem.eql(u8, object_type, "space") or
+        std.mem.eql(u8, object_type, "policy_scope");
 }
 
 fn isLifecycleFeedOperation(operation: []const u8) bool {
@@ -9181,6 +9200,16 @@ fn resolveFeedMutationTarget(ctx: *Context, obj: std.json.ObjectMap, payload_obj
         const target = (try ctx.store.contextPackLifecycleTarget(ctx.allocator, object_id, ctx.actor_id, ctx.actor_scopes_json)) orelse return error.NotFound;
         return .{ .object_id = target.object_id, .scope = target.scope, .permissions_json = target.permissions_json };
     }
+    if (std.mem.eql(u8, object_type, "space")) {
+        const space = (try ctx.store.getSpace(ctx.allocator, object_id)) orelse return error.NotFound;
+        if (!recordVisibleToActor(ctx, space.scope, space.permissions_json)) return error.NotFound;
+        return .{ .object_id = space.id, .scope = space.scope, .permissions_json = space.permissions_json };
+    }
+    if (std.mem.eql(u8, object_type, "policy_scope")) {
+        const policy = (try ctx.store.getPolicyScope(ctx.allocator, object_id)) orelse return error.NotFound;
+        if (!recordVisibleToActor(ctx, policy.scope, policy.permissions_json)) return error.NotFound;
+        return .{ .object_id = policy.scope, .scope = policy.scope, .permissions_json = policy.permissions_json };
+    }
     const scope = json.stringField(obj, "scope") orelse json.stringField(payload_obj, "scope") orelse "workspace";
     const permissions_json = rawField(ctx.allocator, obj, "permissions", rawField(ctx.allocator, payload_obj, "permissions", "[]") catch "[]") catch "[]";
     return .{ .object_id = object_id, .scope = scope, .permissions_json = permissions_json };
@@ -9269,6 +9298,16 @@ fn applyFeedObjectPut(ctx: *Context, object_type: []const u8, payload_json: []co
         const input = try buildAppliedContextPackInput(ctx, obj, event_actor_id, event_object_id);
         const context = try ctx.store.createContextPack(ctx.allocator, input);
         return context.id;
+    }
+    if (std.mem.eql(u8, object_type, "space")) {
+        const input = try buildAppliedSpaceInput(ctx, obj, fallback_scope, fallback_permissions_json, event_actor_id, event_object_id);
+        const space = try ctx.store.createSpace(ctx.allocator, input);
+        return space.id;
+    }
+    if (std.mem.eql(u8, object_type, "policy_scope")) {
+        const input = try buildAppliedPolicyScopeInput(ctx, obj, fallback_scope, fallback_permissions_json, event_actor_id, event_object_id);
+        const policy = try ctx.store.upsertPolicyScope(ctx.allocator, input);
+        return policy.scope;
     }
     return error.InvalidPayload;
 }
@@ -9404,6 +9443,41 @@ fn buildAppliedContextPackInput(ctx: *Context, obj: std.json.ObjectMap, event_ac
         .min_relevance = minRelevanceFromObject(obj),
         .actor_id = event_actor_id,
         .agent_memory_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        .suppress_feed = true,
+    };
+}
+
+fn buildAppliedSpaceInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8) !store_mod.SpaceInput {
+    const scope = payloadScope(obj, fallback_scope);
+    const permissions_json = try payloadPermissions(ctx, obj, fallback_permissions_json);
+    if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
+    const name = json.stringField(obj, "name") orelse return error.MissingRequiredField;
+    return .{
+        .id = try feedIdOverride(obj, event_object_id, "spc_"),
+        .name = name,
+        .title = json.stringField(obj, "title") orelse name,
+        .description = json.nullableStringField(obj, "description"),
+        .scope = scope,
+        .permissions_json = permissions_json,
+        .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch "{}",
+        .actor_id = event_actor_id,
+        .suppress_feed = true,
+    };
+}
+
+fn buildAppliedPolicyScopeInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8) !store_mod.PolicyScopeInput {
+    const scope = json.stringField(obj, "scope") orelse event_object_id orelse fallback_scope;
+    const permissions_json = try payloadPermissions(ctx, obj, fallback_permissions_json);
+    if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
+    return .{
+        .scope = scope,
+        .visibility = json.stringField(obj, "visibility") orelse "workspace",
+        .permissions_json = permissions_json,
+        .owner = json.nullableStringField(obj, "owner"),
+        .ttl_ms = json.intField(obj, "ttl_ms"),
+        .review_after_ms = json.intField(obj, "review_after_ms"),
+        .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch "{}",
+        .actor_id = event_actor_id,
         .suppress_feed = true,
     };
 }
@@ -13046,6 +13120,8 @@ test "api memory checkpoint restore preserves primitive ids and links" {
     const restore_body =
         \\{"events":[
         \\{"event_type":"source.put","operation":"put","object_type":"source","object_id":"src_restore_fixed","scope":"public","permissions":["public"],"payload":{"id":"src_restore_fixed","type":"transcript","title":"Fixed Restore Source","content":"restore stable source content","scope":"public","permissions":["public"]}},
+        \\{"event_type":"space.put","operation":"put","object_type":"space","object_id":"spc_restore_fixed","scope":"public","permissions":["public"],"payload":{"id":"spc_restore_fixed","name":"restore-space","title":"Restore Space","description":"restore stable shelf","scope":"public","permissions":["public"],"metadata":{"topic":"restore"}}},
+        \\{"event_type":"policy_scope.put","operation":"put","object_type":"policy_scope","object_id":"project:restore","scope":"project:restore","permissions":["project:restore"],"payload":{"scope":"project:restore","visibility":"project","permissions":["project:restore"],"owner":"agent:restore","ttl_ms":1000,"review_after_ms":2000,"metadata":{"topic":"restore policy"}}},
         \\{"event_type":"artifact.put","operation":"put","object_type":"artifact","object_id":"art_restore_fixed","scope":"public","permissions":["public"],"payload":{"id":"art_restore_fixed","type":"decision","title":"Fixed Restore Decision","body":"restore stable decision body","status":"proposed","scope":"public","permissions":["public"],"source_ids":["src_restore_fixed"],"fields":{"context":"restore context","decision":"restore stable decision","alternatives":"none","consequences":"stable ids","owner":"NullPantry","review_date":"2026-06-30"}}},
         \\{"event_type":"entity.put","operation":"put","object_type":"entity","object_id":"ent_restore_a","scope":"public","permissions":["public"],"payload":{"id":"ent_restore_a","type":"project","name":"Restore Project","scope":"public","permissions":["public"]}},
         \\{"event_type":"entity.put","operation":"put","object_type":"entity","object_id":"ent_restore_b","scope":"public","permissions":["public"],"payload":{"id":"ent_restore_b","type":"service","name":"Restore Service","scope":"public","permissions":["public"]}},
@@ -13056,10 +13132,14 @@ test "api memory checkpoint restore preserves primitive ids and links" {
     ;
     const restore = handleRequest(&admin_ctx, "POST", "/v1/memory/checkpoint", restore_body, "");
     try std.testing.expectEqualStrings("200 OK", restore.status);
-    try std.testing.expect(std.mem.indexOf(u8, restore.body, "\"applied_events\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restore.body, "\"applied_events\":9") != null);
 
     const source = (try store.getSource(alloc, "src_restore_fixed")).?;
     try std.testing.expectEqualStrings("Fixed Restore Source", source.title);
+    const space = (try store.getSpace(alloc, "spc_restore_fixed")).?;
+    try std.testing.expectEqualStrings("Restore Space", space.title);
+    const policy = (try store.getPolicyScope(alloc, "project:restore")).?;
+    try std.testing.expectEqualStrings("agent:restore", policy.owner.?);
     const artifact = (try store.getArtifact(alloc, "art_restore_fixed")).?;
     try std.testing.expect(std.mem.indexOf(u8, artifact.source_ids_json, "src_restore_fixed") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact.fields_json, "\"decision\":\"restore stable decision\"") != null);
@@ -13082,6 +13162,13 @@ test "api memory checkpoint restore preserves primitive ids and links" {
         if (std.mem.eql(u8, result.id, "ctx_restore_fixed")) saw_context_pack = true;
     }
     try std.testing.expect(saw_context_pack);
+
+    const space_results = try store.search(alloc, .{ .query = "restore stable shelf", .scopes_json = "[\"public\"]", .limit = 20, .use_vector = false });
+    var saw_space = false;
+    for (space_results) |result| {
+        if (std.mem.eql(u8, result.id, "spc_restore_fixed")) saw_space = true;
+    }
+    try std.testing.expect(saw_space);
 }
 
 test "api memory apply covers pantry primitives and lifecycle reducers" {
@@ -13132,6 +13219,16 @@ test "api memory apply covers pantry primitives and lifecycle reducers" {
     const context_apply = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"context_pack.put\",\"object_type\":\"context_pack\",\"scope\":\"public\",\"payload\":{\"query\":\"Primitive decision\",\"scopes\":[\"public\"],\"use_vector\":false}}", "");
     try std.testing.expectEqualStrings("200 OK", context_apply.status);
     try std.testing.expect(std.mem.indexOf(u8, context_apply.body, "\"object_type\":\"context_pack\"") != null);
+
+    const space_apply = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"space.put\",\"object_type\":\"space\",\"scope\":\"public\",\"dedupe_key\":\"primitive-space-1\",\"payload\":{\"id\":\"spc_primitive_space\",\"name\":\"primitive-space\",\"title\":\"Primitive Space\",\"description\":\"Primitive shelf\",\"permissions\":[\"public\"]}}", "");
+    try std.testing.expectEqualStrings("200 OK", space_apply.status);
+    const applied_space = (try store.getSpace(alloc, "spc_primitive_space")).?;
+    try std.testing.expectEqualStrings("Primitive Space", applied_space.title);
+
+    const policy_apply = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"policy_scope.put\",\"object_type\":\"policy_scope\",\"object_id\":\"public\",\"scope\":\"public\",\"dedupe_key\":\"primitive-policy-1\",\"payload\":{\"scope\":\"public\",\"visibility\":\"workspace\",\"permissions\":[\"public\"],\"owner\":\"agent:primitive\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", policy_apply.status);
+    const applied_policy = (try store.getPolicyScope(alloc, "public")).?;
+    try std.testing.expectEqualStrings("agent:primitive", applied_policy.owner.?);
 
     const verify_body = try std.fmt.allocPrint(alloc, "{{\"event_type\":\"artifact.verify\",\"operation\":\"verify\",\"object_type\":\"artifact\",\"object_id\":\"{s}\",\"payload\":{{\"status\":\"accepted\"}}}}", .{artifact_id});
     const verify = handleRequest(&ctx, "POST", "/v1/memory/apply", verify_body, "");
@@ -13205,6 +13302,28 @@ test "api lifecycle overlay hides source entity and context pack by default" {
     try std.testing.expect(std.mem.indexOf(u8, context_after.body, "\"context_packs\":[]") != null);
     const context_with_deprecated = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Overlay Context Unique\",\"use_vector\":false,\"include_deprecated\":true}", "");
     try std.testing.expect(std.mem.indexOf(u8, context_with_deprecated.body, "\"status\":\"superseded\"") != null);
+
+    const space_apply = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"space.put\",\"object_type\":\"space\",\"scope\":\"public\",\"payload\":{\"id\":\"spc_overlay_space\",\"name\":\"overlay-space\",\"title\":\"Overlay Space Unique\",\"description\":\"overlay shelf body\",\"permissions\":[\"public\"]}}", "");
+    try std.testing.expectEqualStrings("200 OK", space_apply.status);
+    const space_before = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"overlay shelf body\",\"use_vector\":false}", "");
+    try std.testing.expect(std.mem.indexOf(u8, space_before.body, "Overlay Space Unique") != null);
+    const space_supersede = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"space.supersede\",\"operation\":\"supersede\",\"object_type\":\"space\",\"object_id\":\"spc_overlay_space\",\"payload\":{\"reason\":\"test\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", space_supersede.status);
+    const space_after = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"overlay shelf body\",\"use_vector\":false}", "");
+    try std.testing.expect(std.mem.indexOf(u8, space_after.body, "\"spaces\":[]") != null);
+    const space_with_deprecated = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"overlay shelf body\",\"use_vector\":false,\"include_deprecated\":true}", "");
+    try std.testing.expect(std.mem.indexOf(u8, space_with_deprecated.body, "\"status\":\"superseded\"") != null);
+
+    const policy_apply = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"policy_scope.put\",\"object_type\":\"policy_scope\",\"object_id\":\"public\",\"scope\":\"public\",\"payload\":{\"scope\":\"public\",\"visibility\":\"workspace\",\"permissions\":[\"public\"],\"owner\":\"overlay-policy-owner\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", policy_apply.status);
+    const policy_before = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"overlay-policy-owner\",\"use_vector\":false}", "");
+    try std.testing.expect(std.mem.indexOf(u8, policy_before.body, "\"type\":\"policy_scope\"") != null);
+    const policy_supersede = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"policy_scope.supersede\",\"operation\":\"supersede\",\"object_type\":\"policy_scope\",\"object_id\":\"public\",\"payload\":{\"reason\":\"test\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", policy_supersede.status);
+    const policy_after = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"overlay-policy-owner\",\"use_vector\":false}", "");
+    try std.testing.expect(std.mem.indexOf(u8, policy_after.body, "\"policy_scopes\":[]") != null);
+    const policy_with_deprecated = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"overlay-policy-owner\",\"use_vector\":false,\"include_deprecated\":true}", "");
+    try std.testing.expect(std.mem.indexOf(u8, policy_with_deprecated.body, "\"status\":\"superseded\"") != null);
 }
 
 test "api memory feed redacts payload references hidden from actor" {
@@ -14423,6 +14542,11 @@ test "api spaces and policy scopes are first-class permission-filtered records" 
     try std.testing.expectEqualStrings("200 OK", policy_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, policy_resp.body, "\"policy_scope\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, policy_resp.body, "\"ttl_ms\":86400000") != null);
+
+    const feed_resp = handleRequest(&project_ctx, "GET", "/v1/memory/events?limit=20", "", "");
+    try std.testing.expectEqualStrings("200 OK", feed_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, feed_resp.body, "\"object_type\":\"space\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed_resp.body, "\"object_type\":\"policy_scope\"") != null);
 
     const hidden_policy = handleRequest(&public_ctx, "GET", "/v1/policy-scopes", "", "");
     try std.testing.expectEqualStrings("200 OK", hidden_policy.status);
