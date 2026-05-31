@@ -292,6 +292,26 @@ fn payloadWithStorageRouteJson(allocator: std.mem.Allocator, payload_json: []con
     return out.toOwnedSlice(allocator);
 }
 
+fn storageRouteDedupePart(allocator: std.mem.Allocator, route: AgentMemoryStorageRoute) ![]const u8 {
+    return switch (route.target) {
+        .primary => allocator.dupe(u8, "primary"),
+        .native => allocator.dupe(u8, "native"),
+        .runtime => allocator.dupe(u8, "runtime"),
+        .named => std.fmt.allocPrint(allocator, "named:{s}", .{route.name orelse "runtime"}),
+        .all => allocator.dupe(u8, "all"),
+        .subset => blk: {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer out.deinit(allocator);
+            try out.appendSlice(allocator, "subset:");
+            for (route.stores, 0..) |store_name, i| {
+                if (i > 0) try out.append(allocator, ',');
+                try out.appendSlice(allocator, store_name);
+            }
+            break :blk try out.toOwnedSlice(allocator);
+        },
+    };
+}
+
 fn contextPackFeedScope(allocator: std.mem.Allocator, pack: ContextPackResult) ![]const u8 {
     if (pack.actor_isolated) {
         if (pack.actor_id) |actor| return domain.defaultAgentMemoryScope(allocator, actor);
@@ -2249,7 +2269,9 @@ pub const Store = struct {
         payload_json: []const u8,
         route: AgentMemoryStorageRoute,
     ) !void {
-        const dedupe_key = try std.fmt.allocPrint(allocator, "direct:{s}:{s}", .{ object_type, object_id });
+        const route_part = try storageRouteDedupePart(allocator, route);
+        defer allocator.free(route_part);
+        const dedupe_key = try std.fmt.allocPrint(allocator, "direct:{s}:{s}:{s}", .{ object_type, route_part, object_id });
         defer allocator.free(dedupe_key);
         const routed_payload = try payloadWithStorageRouteJson(allocator, payload_json, route);
         defer allocator.free(routed_payload);
@@ -2313,7 +2335,9 @@ pub const Store = struct {
         defer allocator.free(permissions_json);
         const payload = try agentSessionMessageFeedPayloadJson(allocator, route, session_id, role, content, created_at_ms, actor_id, scope, permissions_json);
         defer allocator.free(payload);
-        const dedupe_key = try std.fmt.allocPrint(allocator, "direct:agent_session_message:{s}", .{object_id});
+        const route_part = try storageRouteDedupePart(allocator, route);
+        defer allocator.free(route_part);
+        const dedupe_key = try std.fmt.allocPrint(allocator, "direct:agent_session_message:{s}:{s}", .{ route_part, object_id });
         defer allocator.free(dedupe_key);
         _ = try self.appendFeedEvent(.{
             .event_type = "agent_session_message.put",
@@ -7655,6 +7679,10 @@ pub const SQLiteStore = struct {
     }
 
     pub fn appendFeedEvent(self: *Self, input: FeedEventInput) !i64 {
+        if (input.dedupe_key) |key| {
+            if (try self.feedEventIdByDedupeInput(input)) |existing_id| return existing_id;
+            if (try self.feedEventIdByDedupeKey(key)) |_| return error.FeedDedupeMismatch;
+        }
         const now = ids.nowMs();
         const applied = if (std.mem.eql(u8, input.status, "applied")) now else null;
         const stmt = try self.prepare("INSERT OR IGNORE INTO memory_feed_events (event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)");
@@ -7675,7 +7703,8 @@ pub const SQLiteStore = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
         if (c.sqlite3_changes(self.db) == 0) {
             if (input.dedupe_key) |key| {
-                if (try self.feedEventIdByDedupeKey(key)) |existing_id| return existing_id;
+                if (try self.feedEventIdByDedupeInput(input)) |existing_id| return existing_id;
+                if (try self.feedEventIdByDedupeKey(key)) |_| return error.FeedDedupeMismatch;
             }
             return error.InsertFailed;
         }
@@ -7742,6 +7771,27 @@ pub const SQLiteStore = struct {
         const stmt = try self.prepare("SELECT id FROM memory_feed_events WHERE dedupe_key = ?1 LIMIT 1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, dedupe_key);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return c.sqlite3_column_int64(stmt, 0);
+    }
+
+    fn feedEventIdByDedupeInput(self: *Self, input: FeedEventInput) !?i64 {
+        const key = input.dedupe_key orelse return null;
+        const stmt = try self.prepare(
+            "SELECT id FROM memory_feed_events WHERE dedupe_key = ?1 AND event_type = ?2 AND operation = ?3 AND object_type = ?4 AND object_id = ?5 AND scope = ?6 AND permissions_json = ?7 AND ((actor_id IS NULL AND ?8 IS NULL) OR actor_id = ?8) AND causality_json = ?9 AND payload_json = ?10 AND status = ?11 LIMIT 1",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key);
+        bindText(stmt, 2, input.event_type);
+        bindText(stmt, 3, input.operation);
+        bindText(stmt, 4, input.object_type);
+        bindText(stmt, 5, input.object_id);
+        bindText(stmt, 6, input.scope);
+        bindText(stmt, 7, input.permissions_json);
+        bindNullableText(stmt, 8, input.actor_id);
+        bindText(stmt, 9, input.causality_json);
+        bindText(stmt, 10, input.payload_json);
+        bindText(stmt, 11, input.status);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         return c.sqlite3_column_int64(stmt, 0);
     }
@@ -10770,7 +10820,8 @@ pub const PostgresStore = struct {
 
     pub fn appendFeedEvent(self: *PostgresStore, input: FeedEventInput) !i64 {
         if (input.dedupe_key) |key| {
-            if (try self.feedEventIdByDedupeKey(key)) |id| return id;
+            if (try self.feedEventIdByDedupeInput(self.allocator, input)) |id| return id;
+            if (try self.feedEventIdByDedupeKey(key)) |_| return error.FeedDedupeMismatch;
         }
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -10780,12 +10831,22 @@ pub const PostgresStore = struct {
         const applied_text: ?[]const u8 = if (std.mem.eql(u8, input.status, "applied")) now_text else null;
         const text = try self.queryParamsText(
             allocator,
-            "INSERT INTO memory_feed_events (event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms) " ++
+            "WITH inserted AS (" ++
+                "INSERT INTO memory_feed_events (event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms) " ++
                 "VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9::jsonb,$10::jsonb,$11,$12::bigint,$13::bigint) " ++
-                "ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO UPDATE SET dedupe_key = excluded.dedupe_key RETURNING id::text",
+                "ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING RETURNING id" ++
+                "), existing_match AS (" ++
+                "SELECT id FROM memory_feed_events WHERE dedupe_key = $8 AND event_type = $1 AND operation = $2 AND object_type = $3 AND object_id = $4 AND scope = $5 AND permissions_json = $6::jsonb AND (($7::text IS NULL AND actor_id IS NULL) OR actor_id = $7) AND causality_json = $9::jsonb AND payload_json = $10::jsonb AND status = $11 LIMIT 1" ++
+                ") SELECT coalesce((SELECT id::text FROM inserted), (SELECT id::text FROM existing_match), '')",
             &.{ input.event_type, input.operation, input.object_type, input.object_id, input.scope, input.permissions_json, input.actor_id, input.dedupe_key, input.causality_json, input.payload_json, input.status, now_text, applied_text },
         );
-        const id = std.fmt.parseInt(i64, text, 10) catch 0;
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        const id = std.fmt.parseInt(i64, trimmed, 10) catch 0;
+        if (id == 0) {
+            if (input.dedupe_key) |key| {
+                if (try self.feedEventIdByDedupeKey(key)) |_| return error.FeedDedupeMismatch;
+            }
+        }
         if (id > 0) try self.insertAudit(self.allocator, "memory_feed.appended", input.actor_id, "memory_feed_event", input.object_id);
         return id;
     }
@@ -10820,8 +10881,21 @@ pub const PostgresStore = struct {
         defer arena.deinit();
         const allocator = arena.allocator();
         const text = try self.queryParamsText(allocator, "SELECT coalesce((SELECT id::text FROM memory_feed_events WHERE dedupe_key = $1 LIMIT 1), '')", &.{key});
-        if (text.len == 0) return null;
-        return std.fmt.parseInt(i64, text, 10) catch null;
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return std.fmt.parseInt(i64, trimmed, 10) catch null;
+    }
+
+    fn feedEventIdByDedupeInput(self: *PostgresStore, allocator: std.mem.Allocator, input: FeedEventInput) !?i64 {
+        const key = input.dedupe_key orelse return null;
+        const text = try self.queryParamsText(
+            allocator,
+            "SELECT coalesce((SELECT id::text FROM memory_feed_events WHERE dedupe_key = $1 AND event_type = $2 AND operation = $3 AND object_type = $4 AND object_id = $5 AND scope = $6 AND permissions_json = $7::jsonb AND (($8::text IS NULL AND actor_id IS NULL) OR actor_id = $8) AND causality_json = $9::jsonb AND payload_json = $10::jsonb AND status = $11 LIMIT 1), '')",
+            &.{ key, input.event_type, input.operation, input.object_type, input.object_id, input.scope, input.permissions_json, input.actor_id, input.causality_json, input.payload_json, input.status },
+        );
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return std.fmt.parseInt(i64, trimmed, 10) catch null;
     }
 
     pub fn listFeedEvents(self: *PostgresStore, allocator: std.mem.Allocator, input: FeedListInput) ![]FeedEvent {
@@ -14857,13 +14931,14 @@ test "sqlite direct primitive writes append applied feed events" {
     try std.testing.expect(!saw_hidden);
 }
 
-test "sqlite memory feed dedupe key is idempotent" {
+test "sqlite memory feed dedupe key is idempotent and rejects conflicting events" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
 
     const first = try store.appendFeedEvent(.{ .event_type = "memory_atom.upsert", .object_type = "memory_atom", .object_id = "mem_a", .scope = "public", .dedupe_key = "evt-1", .payload_json = "{\"text\":\"one\"}" });
-    const second = try store.appendFeedEvent(.{ .event_type = "memory_atom.upsert", .object_type = "memory_atom", .object_id = "mem_b", .scope = "public", .dedupe_key = "evt-1", .payload_json = "{\"text\":\"two\"}" });
+    const second = try store.appendFeedEvent(.{ .event_type = "memory_atom.upsert", .object_type = "memory_atom", .object_id = "mem_a", .scope = "public", .dedupe_key = "evt-1", .payload_json = "{\"text\":\"one\"}" });
     try std.testing.expectEqual(first, second);
+    try std.testing.expectError(error.FeedDedupeMismatch, store.appendFeedEvent(.{ .event_type = "memory_atom.upsert", .object_type = "memory_atom", .object_id = "mem_b", .scope = "public", .dedupe_key = "evt-1", .payload_json = "{\"text\":\"two\"}" }));
     try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM memory_feed_events"));
 }
 
@@ -15985,6 +16060,18 @@ test "postgres storage contract covers primitives when configured" {
         .status = "applied",
     });
     try std.testing.expectEqual(feed_id, try store.appendFeedEvent(.{
+        .event_type = "contract.memory.put",
+        .operation = "put",
+        .object_type = "memory_atom",
+        .object_id = atom.id,
+        .scope = "team:pg",
+        .permissions_json = "[\"team:pg\"]",
+        .actor_id = "agent:pg-a",
+        .dedupe_key = feed_key,
+        .payload_json = "{\"text\":\"postgres feed contract\"}",
+        .status = "applied",
+    }));
+    try std.testing.expectError(error.FeedDedupeMismatch, store.appendFeedEvent(.{
         .event_type = "contract.memory.put",
         .operation = "put",
         .object_type = "memory_atom",

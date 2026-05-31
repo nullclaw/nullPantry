@@ -3346,7 +3346,10 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
         .causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx),
         .payload_json = payload_json,
         .status = "pending",
-    }) catch return serverError(ctx);
+    }) catch |err| switch (err) {
+        error.FeedDedupeMismatch => return feedDedupeConflict(ctx),
+        else => return serverError(ctx),
+    };
     const response = std.fmt.allocPrint(ctx.allocator, "{{\"event_id\":{d},\"queued\":true}}", .{id}) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
 }
