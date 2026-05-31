@@ -2139,6 +2139,65 @@ pub const Store = struct {
         };
     }
 
+    fn patchRuntimeAgentMemoryMirrorsStatus(self: *Store, allocator: std.mem.Allocator, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
+        return switch (self.backend) {
+            .sqlite => |*s| s.patchRuntimeAgentMemoryMirrorsStatus(store_name, key, session_id, owner_actor_id, status, writer_actor_id),
+            .postgres => |*p| p.patchRuntimeAgentMemoryMirrorsStatus(allocator, store_name, key, session_id, owner_actor_id, status, writer_actor_id),
+        };
+    }
+
+    fn patchAgentMemoryStatusNative(self: *Store, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
+        return switch (self.backend) {
+            .sqlite => |*s| s.patchAgentMemoryStatus(key, session_id, owner_actor_id, status, writer_actor_id),
+            .postgres => |*p| p.patchAgentMemoryStatus(key, session_id, owner_actor_id, status, writer_actor_id),
+        };
+    }
+
+    fn patchAgentMemoryRuntimeStatus(self: *Store, allocator: std.mem.Allocator, runtime: *agent_memory_runtime.Runtime, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
+        var changed = try self.patchRuntimeAgentMemoryMirrorsStatus(allocator, store_name, key, session_id, owner_actor_id, status, writer_actor_id);
+        if (!domain.isDefaultVisibleStatus(status)) {
+            changed = (try runtime.delete(key, session_id, owner_actor_id, writer_actor_id)) or changed;
+        } else if (!changed) {
+            var existing = try runtime.get(allocator, key, session_id, owner_actor_id);
+            defer if (existing) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+            changed = existing != null;
+        }
+        return changed;
+    }
+
+    pub fn patchAgentMemoryStatusRouted(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, status: []const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
+        return switch (route.target) {
+            .primary => if (self.agent_memory.isExternal())
+                self.patchAgentMemoryRuntimeStatus(allocator, &self.agent_memory, "runtime", key, session_id, owner_actor_id, status, writer_actor_id)
+            else
+                self.patchAgentMemoryStatusNative(key, session_id, owner_actor_id, status, writer_actor_id),
+            .native => self.patchAgentMemoryStatusNative(key, session_id, owner_actor_id, status, writer_actor_id),
+            .runtime => if (self.agent_memory.isExternal())
+                self.patchAgentMemoryRuntimeStatus(allocator, &self.agent_memory, "runtime", key, session_id, owner_actor_id, status, writer_actor_id)
+            else
+                error.AgentMemoryStorageUnavailable,
+            .named => self.patchAgentMemoryRuntimeStatus(allocator, try self.namedAgentMemoryRuntime(route), route.name orelse "named", key, session_id, owner_actor_id, status, writer_actor_id),
+            .subset => blk: {
+                const stores = try requireSubsetStores(route);
+                var changed = false;
+                for (stores) |store_name| {
+                    changed = (try self.patchAgentMemoryStatusRouted(allocator, key, session_id, owner_actor_id, status, writer_actor_id, routeForSubsetStoreName(store_name))) or changed;
+                }
+                break :blk changed;
+            },
+            .all => blk: {
+                var changed = try self.patchAgentMemoryStatusNative(key, session_id, owner_actor_id, status, writer_actor_id);
+                if (self.agent_memory.isExternal()) {
+                    changed = (try self.patchAgentMemoryRuntimeStatus(allocator, &self.agent_memory, "runtime", key, session_id, owner_actor_id, status, writer_actor_id)) or changed;
+                }
+                for (self.agent_memory_stores.stores.items) |*named| {
+                    changed = (try self.patchAgentMemoryRuntimeStatus(allocator, &named.runtime, named.name, key, session_id, owner_actor_id, status, writer_actor_id)) or changed;
+                }
+                break :blk changed;
+            },
+        };
+    }
+
     fn deprecateRuntimeAgentMemoryMirrorsForDelete(self: *Store, key: []const u8, session_id: ?[]const u8, owner_actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
         const owner = owner_actor_id orelse return;
         switch (route.target) {
@@ -7965,6 +8024,9 @@ pub const SQLiteStore = struct {
             return try self.vectorContextPackVisible(allocator, object_id, scopes_json, actor_id, include_deprecated);
         }
         if (std.mem.eql(u8, object_type, "agent_memory")) {
+            const status = (try self.agentMemoryStatusById(allocator, object_id)) orelse return false;
+            defer allocator.free(status);
+            if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
             const entry = (try self.agentMemoryById(allocator, object_id)) orelse return false;
             return try self.agentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, scopes_json, actor_id);
         }
@@ -8092,6 +8154,16 @@ pub const SQLiteStore = struct {
         bindText(stmt, 1, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         return try readAgentMemory(allocator, stmt);
+    }
+
+    fn agentMemoryStatusById(self: *Self, allocator: std.mem.Allocator, id: []const u8) !?[]u8 {
+        const stmt = try self.prepare(
+            "SELECT ma.status FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.id = ?1 LIMIT 1",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try columnText(allocator, stmt, 0);
     }
 
     pub fn enqueueVectorOutbox(self: *Self, input: VectorOutboxInput) !i64 {
@@ -9011,7 +9083,7 @@ pub const SQLiteStore = struct {
     }
 
     fn agentMemoryContentInTx(self: *Self, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, owner_actor_id: ?[]const u8) !?[]u8 {
-        const stmt = try self.prepare("SELECT ma.text FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.key = ?1 AND " ++ sqlite_agent_session_actor_where_ami ++ " ORDER BY ami.timestamp_ms DESC LIMIT 1");
+        const stmt = try self.prepare("SELECT ma.text FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.key = ?1 AND ma.status NOT IN ('rejected','deprecated','superseded') AND " ++ sqlite_agent_session_actor_where_ami ++ " ORDER BY ami.timestamp_ms DESC LIMIT 1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, key);
         bindNullableText(stmt, 2, session_id);
@@ -9099,6 +9171,34 @@ pub const SQLiteStore = struct {
         }
     }
 
+    fn patchRuntimeAgentMemoryMirrorsStatus(self: *Self, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
+        const stmt = try self.prepare(
+            "UPDATE memory_atoms SET status = ?5, last_verified_at_ms = CASE WHEN ?6 THEN ?7 ELSE last_verified_at_ms END " ++
+                "WHERE predicate = 'agent.memory' AND object = ?1 " ++
+                "AND EXISTS (" ++
+                "SELECT 1 FROM json_each(memory_atoms.source_ids_json) sid " ++
+                "JOIN sources s ON s.id = sid.value " ++
+                "WHERE json_extract(s.metadata_json, '$.native') = 'agent_memory_runtime' " ++
+                "AND json_extract(s.metadata_json, '$.store') = ?2 " ++
+                "AND json_extract(s.metadata_json, '$.key') = ?1 " ++
+                "AND ((?3 IS NULL AND (json_type(s.metadata_json, '$.session_id') IS NULL OR json_type(s.metadata_json, '$.session_id') = 'null')) OR json_extract(s.metadata_json, '$.session_id') = ?3) " ++
+                "AND json_extract(s.metadata_json, '$.owner_id') = ?4" ++
+                ")",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key);
+        bindText(stmt, 2, store_name);
+        bindNullableText(stmt, 3, session_id);
+        bindText(stmt, 4, owner_actor_id);
+        bindText(stmt, 5, status);
+        _ = c.sqlite3_bind_int(stmt, 6, if (std.mem.eql(u8, status, "verified")) 1 else 0);
+        _ = c.sqlite3_bind_int64(stmt, 7, ids.nowMs());
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+        const changed = c.sqlite3_changes(self.db) > 0;
+        if (changed) try self.insertAuditActor("agent_memory.runtime_mirrors_status", writer_actor_id, "agent_memory", key);
+        return changed;
+    }
+
     pub fn agentMemoryGet(self: *Self, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
         const stmt = try self.prepare(agentMemorySelectSql("AND ami.key = ?1", "ORDER BY ami.timestamp_ms DESC LIMIT 1"));
         defer _ = c.sqlite3_finalize(stmt);
@@ -9127,7 +9227,7 @@ pub const SQLiteStore = struct {
         const stmt = try self.prepare(
             "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
-                "WHERE ami.key = ?1 " ++
+                "WHERE ami.key = ?1 AND ma.status NOT IN ('rejected','deprecated','superseded') " ++
                 "ORDER BY CASE WHEN ami.actor_id = ?2 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC",
         );
         defer _ = c.sqlite3_finalize(stmt);
@@ -9180,11 +9280,12 @@ pub const SQLiteStore = struct {
         const sql = if (category != null)
             "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
-                "WHERE ami.category = ?1 " ++
+                "WHERE ma.status NOT IN ('rejected','deprecated','superseded') AND ami.category = ?1 " ++
                 "ORDER BY CASE WHEN ami.actor_id = ?2 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC"
         else
             "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
+                "WHERE ma.status NOT IN ('rejected','deprecated','superseded') " ++
                 "ORDER BY CASE WHEN ami.actor_id = ?1 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC";
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -9331,8 +9432,36 @@ pub const SQLiteStore = struct {
         return changed;
     }
 
+    pub fn patchAgentMemoryStatus(self: *Self, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
+        const owner_actor = actor_id orelse return false;
+        self.tx_mutex.lockUncancelable(compat.io());
+        defer self.tx_mutex.unlock(compat.io());
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        const audit_actor = writer_actor_id orelse owner_actor;
+        const stmt = try self.prepare(
+            "UPDATE memory_atoms SET status = ?1, last_verified_at_ms = CASE WHEN ?2 THEN ?3 ELSE last_verified_at_ms END " ++
+                "WHERE id IN (" ++
+                "SELECT memory_atom_id FROM agent_memory_items WHERE key = ?4 AND " ++
+                "((?5 IS NULL AND session_id IS NULL AND actor_id = ?6) OR (?5 IS NOT NULL AND session_id = ?5 AND actor_id = ?6))" ++
+                ")",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, status);
+        _ = c.sqlite3_bind_int(stmt, 2, if (std.mem.eql(u8, status, "verified")) 1 else 0);
+        _ = c.sqlite3_bind_int64(stmt, 3, ids.nowMs());
+        bindText(stmt, 4, key);
+        bindNullableText(stmt, 5, session_id);
+        bindText(stmt, 6, owner_actor);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+        const changed = c.sqlite3_changes(self.db) > 0;
+        if (changed) try self.insertAuditActor("agent_memory.status", audit_actor, "agent_memory", key);
+        try self.exec("COMMIT");
+        return changed;
+    }
+
     pub fn agentMemoryCount(self: *Self, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
-        const stmt = try self.prepare("SELECT session_id,actor_id,scope,permissions_json FROM agent_memory_items");
+        const stmt = try self.prepare("SELECT ami.session_id,ami.actor_id,ami.scope,ami.permissions_json FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ma.status NOT IN ('rejected','deprecated','superseded')");
         defer _ = c.sqlite3_finalize(stmt);
         var count: usize = 0;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
@@ -9354,13 +9483,13 @@ pub const SQLiteStore = struct {
     fn agentMemorySelectSql(comptime extra_where: []const u8, comptime tail: []const u8) [*:0]const u8 {
         return "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
-            "WHERE " ++ sqlite_agent_session_actor_where_ami ++ " " ++ extra_where ++ " " ++ tail;
+            "WHERE ma.status NOT IN ('rejected','deprecated','superseded') AND " ++ sqlite_agent_session_actor_where_ami ++ " " ++ extra_where ++ " " ++ tail;
     }
 
     fn agentMemoryVisibleSelectSql(comptime extra_where: []const u8, comptime tail: []const u8) [*:0]const u8 {
         return "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
-            "WHERE " ++ sqlite_agent_session_where_ami ++ " " ++ extra_where ++ " " ++ tail;
+            "WHERE ma.status NOT IN ('rejected','deprecated','superseded') AND " ++ sqlite_agent_session_where_ami ++ " " ++ extra_where ++ " " ++ tail;
     }
 
     fn agentMemoryStmtVisible(self: *Self, allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, scopes_json: []const u8, actor_id: []const u8) !bool {
@@ -11399,6 +11528,9 @@ pub const PostgresStore = struct {
             return try self.vectorContextPackVisible(allocator, object_id, scopes_json, actor_id, include_deprecated);
         }
         if (std.mem.eql(u8, object_type, "agent_memory")) {
+            const status = (try self.agentMemoryStatusById(allocator, object_id)) orelse return false;
+            defer allocator.free(status);
+            if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
             const entry = (try self.agentMemoryById(allocator, object_id)) orelse return false;
             return try self.agentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, scopes_json, actor_id);
         }
@@ -11535,6 +11667,19 @@ pub const PostgresStore = struct {
         defer parsed.deinit();
         if (parsed.value == .null) return null;
         return try readPgAgentMemory(allocator, parsed.value.object);
+    }
+
+    fn agentMemoryStatusById(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?[]u8 {
+        const text = try self.queryParamsText(
+            allocator,
+            "SELECT coalesce((SELECT ma.status FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.id = $1 LIMIT 1), '')",
+            &.{id},
+        );
+        if (text.len == 0) {
+            allocator.free(text);
+            return null;
+        }
+        return text;
     }
 
     pub fn enqueueVectorOutbox(self: *PostgresStore, input: VectorOutboxInput) !i64 {
@@ -12408,7 +12553,7 @@ pub const PostgresStore = struct {
             allocator,
             "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
-                "WHERE ami.key = $1 " ++
+                "WHERE ami.key = $1 AND ma.status NOT IN ('rejected','deprecated','superseded') " ++
                 "ORDER BY CASE WHEN ami.actor_id = $2 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC",
             &.{ key, actor_id },
         );
@@ -12438,7 +12583,7 @@ pub const PostgresStore = struct {
             allocator,
             "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
-                "WHERE ($1::text IS NULL OR ami.category = $1) " ++
+                "WHERE ma.status NOT IN ('rejected','deprecated','superseded') AND ($1::text IS NULL OR ami.category = $1) " ++
                 "ORDER BY CASE WHEN ami.actor_id = $2 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC",
             &.{ category, actor_id },
         );
@@ -12466,6 +12611,7 @@ pub const PostgresStore = struct {
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
             "WHERE ($1::text IS NULL OR ami.key = $1) " ++
             "AND ($2::text IS NULL OR ami.category = $2) " ++
+            "AND ma.status NOT IN ('rejected','deprecated','superseded') " ++
             "AND (($3::text IS NULL AND ami.session_id IS NULL AND $4::text IS NOT NULL AND ami.actor_id = $4) OR ($3::text IS NOT NULL AND ami.session_id = $3 AND $4::text IS NOT NULL AND ami.actor_id = $4)) " ++
             "ORDER BY ami.timestamp_ms DESC LIMIT $5::bigint";
         const sql_all =
@@ -12473,6 +12619,7 @@ pub const PostgresStore = struct {
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
             "WHERE ($1::text IS NULL OR ami.key = $1) " ++
             "AND ($2::text IS NULL OR ami.category = $2) " ++
+            "AND ma.status NOT IN ('rejected','deprecated','superseded') " ++
             "AND (($3::text IS NULL AND ami.session_id IS NULL AND $4::text IS NOT NULL AND ami.actor_id = $4) OR ($3::text IS NOT NULL AND ami.session_id = $3 AND $4::text IS NOT NULL AND ami.actor_id = $4)) " ++
             "ORDER BY ami.timestamp_ms DESC";
         const parsed = if (limit) |max_rows| blk: {
@@ -12495,6 +12642,7 @@ pub const PostgresStore = struct {
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
             "WHERE ($1::text IS NULL OR ami.key = $1) " ++
             "AND ($2::text IS NULL OR ami.category = $2) " ++
+            "AND ma.status NOT IN ('rejected','deprecated','superseded') " ++
             "AND (($3::text IS NULL AND ami.session_id IS NULL) OR ($3::text IS NOT NULL AND ami.session_id = $3)) " ++
             "ORDER BY CASE WHEN ami.actor_id = $4 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC LIMIT $5::bigint";
         const sql_all =
@@ -12502,6 +12650,7 @@ pub const PostgresStore = struct {
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
             "WHERE ($1::text IS NULL OR ami.key = $1) " ++
             "AND ($2::text IS NULL OR ami.category = $2) " ++
+            "AND ma.status NOT IN ('rejected','deprecated','superseded') " ++
             "AND (($3::text IS NULL AND ami.session_id IS NULL) OR ($3::text IS NOT NULL AND ami.session_id = $3)) " ++
             "ORDER BY CASE WHEN ami.actor_id = $4 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC";
         const parsed = if (limit) |max_rows| blk: {
@@ -12586,6 +12735,29 @@ pub const PostgresStore = struct {
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
+    pub fn patchAgentMemoryStatus(self: *PostgresStore, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
+        const owner_actor = actor_id orelse return false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const verified_text = if (std.mem.eql(u8, status, "verified")) "true" else "false";
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH updated AS (" ++
+                "UPDATE memory_atoms SET status = $1, last_verified_at_ms = CASE WHEN $2::boolean THEN $3::bigint ELSE last_verified_at_ms END " ++
+                "WHERE id IN (" ++
+                "SELECT memory_atom_id FROM agent_memory_items WHERE key = $4 " ++
+                "AND (($5::text IS NULL AND session_id IS NULL AND actor_id = $6) OR ($5::text IS NOT NULL AND session_id = $5 AND actor_id = $6))" ++
+                ") RETURNING id" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'agent_memory.status',$7,'agent_memory',$4,'{}'::jsonb,(extract(epoch from clock_timestamp()) * 1000)::bigint WHERE EXISTS (SELECT 1 FROM updated) RETURNING 1" ++
+                ") SELECT count(*)::text FROM updated",
+            &.{ status, verified_text, now_text, key, session_id, owner_actor, writer_actor_id orelse owner_actor },
+        );
+        return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
+    }
+
     fn deprecateRuntimeAgentMemoryMirrors(self: *PostgresStore, allocator: std.mem.Allocator, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, writer_actor_id: ?[]const u8) !void {
         const text = try self.queryParamsText(
             allocator,
@@ -12631,11 +12803,42 @@ pub const PostgresStore = struct {
         allocator.free(text);
     }
 
+    fn patchRuntimeAgentMemoryMirrorsStatus(self: *PostgresStore, allocator: std.mem.Allocator, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
+        const verified_text = if (std.mem.eql(u8, status, "verified")) "true" else "false";
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
+        defer allocator.free(now_text);
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH updated AS (" ++
+                "UPDATE memory_atoms ma SET status = $5, last_verified_at_ms = CASE WHEN $6::boolean THEN $7::bigint ELSE last_verified_at_ms END " ++
+                "WHERE ma.predicate = 'agent.memory' AND ma.object = $1 " ++
+                "AND EXISTS (" ++
+                "SELECT 1 FROM jsonb_array_elements_text(ma.source_ids_json) sid(id) " ++
+                "JOIN sources s ON s.id = sid.id " ++
+                "WHERE s.metadata_json->>'native' = 'agent_memory_runtime' " ++
+                "AND s.metadata_json->>'store' = $2 " ++
+                "AND s.metadata_json->>'key' = $1 " ++
+                "AND (($3::text IS NULL AND s.metadata_json->>'session_id' IS NULL) OR s.metadata_json->>'session_id' = $3) " ++
+                "AND s.metadata_json->>'owner_id' = $4" ++
+                ") RETURNING ma.id" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'agent_memory.runtime_mirrors_status',$8,'agent_memory',$1,'{}'::jsonb,(extract(epoch from clock_timestamp()) * 1000)::bigint WHERE EXISTS (SELECT 1 FROM updated) RETURNING 1" ++
+                ") SELECT count(*)::text FROM updated",
+            &.{ key, store_name, session_id, owner_actor_id, status, verified_text, now_text, writer_actor_id },
+        );
+        defer allocator.free(text);
+        return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
+    }
+
     pub fn agentMemoryCount(self: *PostgresStore, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const parsed = try self.queryArrayParamsJson(allocator, "SELECT session_id,actor_id,scope,permissions_json FROM agent_memory_items", &.{});
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT ami.session_id,ami.actor_id,ami.scope,ami.permissions_json FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ma.status NOT IN ('rejected','deprecated','superseded')",
+            &.{},
+        );
         defer parsed.deinit();
         var count: usize = 0;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {

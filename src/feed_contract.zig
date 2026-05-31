@@ -234,6 +234,10 @@ pub fn operationFromEventType(event_type: []const u8) []const u8 {
     if (std.mem.endsWith(u8, event_type, ".delete_all") or std.mem.endsWith(u8, event_type, "_delete_all")) return "delete_all";
     if (std.mem.endsWith(u8, event_type, ".delete_scoped") or std.mem.endsWith(u8, event_type, "_delete_scoped")) return "delete_scoped";
     if (std.mem.endsWith(u8, event_type, ".delete") or std.mem.endsWith(u8, event_type, ".forget")) return "delete";
+    if (std.mem.endsWith(u8, event_type, ".verify") or std.mem.endsWith(u8, event_type, "_verify")) return "verify";
+    if (std.mem.endsWith(u8, event_type, ".mark_stale") or std.mem.endsWith(u8, event_type, "_mark_stale")) return "mark_stale";
+    if (std.mem.endsWith(u8, event_type, ".stale") or std.mem.endsWith(u8, event_type, "_stale")) return "stale";
+    if (std.mem.endsWith(u8, event_type, ".supersede") or std.mem.endsWith(u8, event_type, "_supersede")) return "supersede";
     if (std.mem.endsWith(u8, event_type, ".delete_autosaved") or std.mem.endsWith(u8, event_type, ".clear_autosaved")) return "delete_autosaved";
     if (std.mem.endsWith(u8, event_type, ".merge_object") or std.mem.endsWith(u8, event_type, "_merge_object")) return "merge_object";
     if (std.mem.endsWith(u8, event_type, ".merge_string_set") or std.mem.endsWith(u8, event_type, "_merge_string_set")) return "merge_string_set";

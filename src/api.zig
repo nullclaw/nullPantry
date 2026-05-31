@@ -5358,6 +5358,9 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     defer ctx.allocator.free(event_payload_json);
     const causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx);
     const event_dedupe_key = feed_contract.dedupeKeyFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    if (std.mem.eql(u8, object_type, "agent_memory") and isAgentMemoryStatusLifecycleOperation(operation)) {
+        return applyAgentMemoryLifecycleMutation(ctx, obj, event_type, operation, event_actor_id, event_payload_json, event_payload_route, causality_json);
+    }
     if (feed_contract.isLifecycleOperation(operation) and !feed_contract.objectTypeUsesAgentMemoryStorageRoute(object_type)) {
         return applyFeedLifecycleMutation(ctx, obj, event_type, operation, object_type, event_actor_id, event_payload_json, causality_json);
     }
@@ -5764,6 +5767,16 @@ const AgentMemoryApplyInput = struct {
     route: store_mod.AgentMemoryStorageRoute = .{},
 };
 
+const AgentMemoryLifecycleApplyInput = struct {
+    key: []const u8,
+    session_id: ?[]const u8,
+    owner_actor_id: []const u8,
+    scope: []const u8,
+    permissions_json: []const u8,
+    status: []const u8,
+    route: store_mod.AgentMemoryStorageRoute = .{},
+};
+
 const AgentSessionMessageApplyInput = struct {
     session_id: ?[]const u8,
     role: []const u8 = "",
@@ -5792,6 +5805,33 @@ fn canApplyAgentMemoryScope(ctx: *Context, event_actor_id: []const u8, scope: []
     if (!domain.isActorOwnedAgentMemoryScope(scope, event_actor_id)) return false;
     return (hasCapability(ctx, "write") or hasCapability(ctx, "propose")) and
         access.permissionsVisibleForActor(ctx.allocator, permissions_json, ctx.actor_scopes_json, event_actor_id);
+}
+
+fn isAgentMemoryStatusLifecycleOperation(operation: []const u8) bool {
+    return std.mem.eql(u8, operation, "verify") or
+        std.mem.eql(u8, operation, "mark_stale") or
+        std.mem.eql(u8, operation, "stale") or
+        std.mem.eql(u8, operation, "supersede");
+}
+
+fn applyAgentMemoryLifecycleMutation(ctx: *Context, obj: std.json.ObjectMap, event_type: []const u8, operation: []const u8, event_actor_id: []const u8, payload_json: []const u8, fallback_route: store_mod.AgentMemoryStorageRoute, causality_json: []const u8) HttpResponse {
+    const input = buildAppliedAgentMemoryLifecycleInput(ctx, operation, payload_json, json.nullableStringField(obj, "object_id"), event_actor_id, fallback_route) catch |err| switch (err) {
+        error.Forbidden => return forbidden(ctx),
+        error.NotFound => return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory target not found"),
+        error.InternalAgentMemory => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be applied through the feed"),
+        error.MissingKey, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Agent memory lifecycle payload must include key/object_id"),
+        else => return serverError(ctx),
+    };
+    if (!(ctx.store.patchAgentMemoryStatusRouted(ctx.allocator, input.key, input.session_id, input.owner_actor_id, input.status, event_actor_id, input.route) catch return serverError(ctx))) {
+        return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory target not found");
+    }
+    const event_id = applyOrAppendFeedEventRecord(ctx, obj, event_type, operation, "agent_memory", input.key, input.scope, input.permissions_json, event_actor_id, causality_json, payload_json) catch |err| switch (err) {
+        error.FeedConflict => return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying"),
+        error.FeedDedupeMismatch => return feedDedupeConflict(ctx),
+        error.Forbidden => return forbidden(ctx),
+        else => return serverError(ctx),
+    };
+    return appliedFeedObjectResponse(ctx, event_id, "agent_memory", input.key, null);
 }
 
 fn canApplyAgentSessionEvent(ctx: *Context, event_actor_id: []const u8, scope: []const u8, permissions_json: []const u8) bool {
@@ -5858,6 +5898,49 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
         .writer_actor_id = event_actor_id,
         .operation = memory_operation,
     }, .route = route };
+}
+
+fn buildAppliedAgentMemoryLifecycleInput(ctx: *Context, operation: []const u8, payload_json: []const u8, object_id: ?[]const u8, event_actor_id: []const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !AgentMemoryLifecycleApplyInput {
+    const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
+    // Returned input fields borrow slices from this request-arena parse tree.
+    if (payload.value != .object) return error.InvalidPayload;
+    const obj = payload.value.object;
+    const key = json.stringField(obj, "key") orelse object_id orelse return error.MissingKey;
+    if (domain.isInternalMemoryKey(key)) return error.InternalAgentMemory;
+    const session_id = nullableStringFieldAlias(obj, "session_id", "session");
+    if (session_id) |sid| {
+        if (!agentSessionWriteAllowed(ctx, sid)) return error.Forbidden;
+    }
+    const route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route);
+    const scope = json.nullableStringField(obj, "scope");
+    const computed_owner_id = try access.agentMemoryOwner(ctx.allocator, event_actor_id, scope);
+    const owner_actor_id = json.stringField(obj, "owner_id") orelse computed_owner_id;
+    if (!std.mem.eql(u8, owner_actor_id, computed_owner_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
+
+    var existing = (try ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, route)) orelse return error.NotFound;
+    defer agent_memory_runtime.freeAgentMemory(ctx.allocator, &existing);
+    const visible = access.agentMemoryVisible(ctx.allocator, .{
+        .owner_actor_id = existing.actor_id,
+        .scope = existing.scope,
+        .permissions_json = existing.permissions_json,
+        .session_id = existing.session_id,
+        .request_actor_id = event_actor_id,
+        .request_scopes_json = ctx.actor_scopes_json,
+        .record_visible = recordVisibleToActor(ctx, existing.scope, existing.permissions_json),
+        .session_visible = if (existing.session_id) |sid| access.sessionVisibleForScopes(ctx.allocator, sid, ctx.actor_scopes_json) else true,
+    });
+    if (!visible) return error.Forbidden;
+    if (!feedLifecycleMutationAllowed(ctx, operation, existing.scope, existing.permissions_json)) return error.Forbidden;
+    const payload_status = feed_contract.statusFromLifecycleOperation(operation, obj);
+    return .{
+        .key = try ctx.allocator.dupe(u8, key),
+        .session_id = if (session_id) |sid| try ctx.allocator.dupe(u8, sid) else null,
+        .owner_actor_id = try ctx.allocator.dupe(u8, owner_actor_id),
+        .scope = try ctx.allocator.dupe(u8, existing.scope),
+        .permissions_json = try ctx.allocator.dupe(u8, existing.permissions_json),
+        .status = try ctx.allocator.dupe(u8, payload_status),
+        .route = route,
+    };
 }
 
 fn buildAppliedAgentSessionMessageInput(ctx: *Context, operation: []const u8, payload_json: []const u8, event_actor_id: []const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !AgentSessionMessageApplyInput {
@@ -14377,6 +14460,56 @@ test "api memory apply covers pantry primitives and lifecycle reducers" {
         if (event.dedupe_key != null and std.mem.eql(u8, event.dedupe_key.?, "primitive-source-1")) source_dedupe_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), source_dedupe_count);
+}
+
+test "api memory apply supports agent memory lifecycle reducers" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory_stores = &.{.{ .name = "scratch", .config = .{ .backend = .memory_lru } }},
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_id = "agent:lifecycle",
+        .actor_scopes_json = "[\"admin\"]",
+    };
+
+    const native_put = handleRequest(&ctx, "POST", "/v1/memory/apply?storage=native", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"native.lifecycle.pref\",\"content\":\"Native lifecycle agent memory\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", native_put.status);
+
+    const native_stale = handleRequest(&ctx, "POST", "/v1/memory/apply?storage=native", "{\"event_type\":\"agent_memory.mark_stale\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"native.lifecycle.pref\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", native_stale.status);
+    const stale_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Native lifecycle agent memory\",\"use_vector\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", stale_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, stale_search.body, "\"status\":\"stale\"") != null);
+
+    const native_verify = handleRequest(&ctx, "POST", "/v1/memory/apply?storage=native", "{\"event_type\":\"agent_memory.verify\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"native.lifecycle.pref\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", native_verify.status);
+    const verified_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Native lifecycle agent memory\",\"use_vector\":false}", "");
+    try std.testing.expect(std.mem.indexOf(u8, verified_search.body, "\"status\":\"verified\"") != null);
+
+    const native_supersede = handleRequest(&ctx, "POST", "/v1/memory/apply?storage=native", "{\"event_type\":\"agent_memory.supersede\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"native.lifecycle.pref\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", native_supersede.status);
+    try std.testing.expect((try store.agentMemoryGetRouted(alloc, "native.lifecycle.pref", null, "shared:public", .{ .target = .native })) == null);
+    const hidden_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Native lifecycle agent memory\",\"use_vector\":false}", "");
+    try std.testing.expect(std.mem.indexOf(u8, hidden_search.body, "Native lifecycle agent memory") == null);
+    const deprecated_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Native lifecycle agent memory\",\"use_vector\":false,\"include_deprecated\":true}", "");
+    try std.testing.expect(std.mem.indexOf(u8, deprecated_search.body, "\"status\":\"superseded\"") != null);
+
+    const scratch_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"scratch.lifecycle.pref\",\"content\":\"Scratch lifecycle agent memory\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_put.status);
+    const scratch_before = handleRequest(&ctx, "GET", "/v1/agent-memory/scratch.lifecycle.pref?store=scratch&scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_before.status);
+
+    const scratch_supersede = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.supersede\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"scratch.lifecycle.pref\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_supersede.status);
+    const scratch_after = handleRequest(&ctx, "GET", "/v1/agent-memory/scratch.lifecycle.pref?store=scratch&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", scratch_after.status);
+    const scratch_deprecated_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Scratch lifecycle agent memory\",\"use_vector\":false,\"include_deprecated\":true}", "");
+    try std.testing.expect(std.mem.indexOf(u8, scratch_deprecated_search.body, "\"status\":\"superseded\"") != null);
 }
 
 test "api lifecycle overlay hides source entity and context pack by default" {
