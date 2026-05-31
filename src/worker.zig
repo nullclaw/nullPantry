@@ -1,5 +1,6 @@
 const std = @import("std");
 const store_mod = @import("store.zig");
+const storage_routes = @import("storage_route.zig");
 const domain = @import("domain.zig");
 const extraction = @import("extraction.zig");
 const providers = @import("providers.zig");
@@ -105,13 +106,14 @@ pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job:
     if (std.mem.eql(u8, job.job_type, "extract_memory") or std.mem.eql(u8, job.job_type, "ingest_source") or std.mem.eql(u8, job.job_type, "ingest")) {
         if (job.object_id.len == 0 or !std.mem.eql(u8, job.object_type, "source")) return error.UnsupportedJob;
         const source = (try store.getSource(allocator, job.object_id)) orelse return error.SourceNotFound;
-        const job_options = ExtractionJobOptions{
+        var job_options = ExtractionJobOptions{
             .create_artifact = jobBoolOption(allocator, job.input_json, "create_artifact", true),
             .extract_memory = if (std.mem.eql(u8, job.job_type, "extract_memory")) true else jobBoolOption(allocator, job.input_json, "extract_memory", true),
             .use_llm_extraction = jobBoolOption(allocator, job.input_json, "use_llm_extraction", false) or jobBoolOption(allocator, job.input_json, "structured_extraction", false),
             .strict_llm_extraction = jobBoolOption(allocator, job.input_json, "strict_llm_extraction", false),
             .storage_route = try jobStorageRouteOption(allocator, job.input_json),
         };
+        defer job_options.storage_route.deinit(allocator);
         const extracted = try extractSource(allocator, store, source, options, job_options);
         return try std.fmt.allocPrint(allocator, "{{\"source_id\":\"{s}\",\"artifact_count\":{d},\"memory_atom_count\":{d},\"entity_count\":{d},\"relation_count\":{d},\"vector_chunk_count\":{d},\"extraction_provider\":\"{s}\",\"extraction_fallback\":{s}}}", .{ source.id, extracted.artifact_count, extracted.memory_atom_count, extracted.entity_count, extracted.relation_count, extracted.vector_chunk_count, extracted.extraction_provider, if (extracted.extraction_fallback) "true" else "false" });
     }
@@ -191,24 +193,32 @@ fn jobStorageRouteOption(allocator: std.mem.Allocator, input_json: []const u8) !
     defer parsed.deinit();
     if (parsed.value != .object) return .{};
     const obj = parsed.value.object;
-    if (json.stringField(obj, "storage")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
-    if (json.stringField(obj, "store")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
-    if (json.stringField(obj, "target_store")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
+    if (json.stringField(obj, "storage")) |value| return routeFromOwnedSelector(allocator, value);
+    if (json.stringField(obj, "store")) |value| return routeFromOwnedSelector(allocator, value);
+    if (json.stringField(obj, "target_store")) |value| return routeFromOwnedSelector(allocator, value);
     const value = obj.get("stores") orelse return .{};
     return switch (value) {
-        .string => |s| store_mod.AgentMemoryStorageRoute.parse(s),
-        .array => |items| blk: {
-            var stores = try allocator.alloc([]const u8, items.items.len);
+        .string => |s| routeFromOwnedSelector(allocator, s),
+        .array => |items| {
+            var csv: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer csv.deinit(allocator);
             var count: usize = 0;
             for (items.items) |item| {
                 if (item != .string) continue;
-                stores[count] = item.string;
+                if (count > 0) try csv.append(allocator, ',');
+                try csv.appendSlice(allocator, item.string);
                 count += 1;
             }
-            break :blk store_mod.AgentMemoryStorageRoute.fromStores(stores[0..count]);
+            if (count == 0) return .{};
+            const owned_csv = try csv.toOwnedSlice(allocator);
+            return try storage_routes.fromOwnedCsv(allocator, owned_csv);
         },
         else => .{},
     };
+}
+
+fn routeFromOwnedSelector(allocator: std.mem.Allocator, value: []const u8) !store_mod.AgentMemoryStorageRoute {
+    return storage_routes.fromOwnedSelector(allocator, try allocator.dupe(u8, value));
 }
 
 fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: domain.Source, options: RunOptions, job_options: ExtractionJobOptions) !ExtractionCounts {
@@ -604,6 +614,29 @@ test "worker job execution scopes are unique" {
     const scopes = try jobExecutionScopesJson(std.testing.allocator, job);
     defer std.testing.allocator.free(scopes);
     try std.testing.expectEqualStrings("[\"project:nullpantry\",\"team:memory\"]", scopes);
+}
+
+test "worker job storage route owns parsed selectors" {
+    const allocator = std.testing.allocator;
+
+    const named = try jobStorageRouteOption(allocator, "{\"store\":\"scratch\"}");
+    defer named.deinit(allocator);
+    try std.testing.expectEqual(store_mod.AgentMemoryStorageTarget.named, named.target);
+    try std.testing.expectEqualStrings("scratch", named.name.?);
+    try std.testing.expect(named.owned_backing != null);
+
+    const subset = try jobStorageRouteOption(allocator, "{\"stores\":[\"scratch\",\"archive\"]}");
+    defer subset.deinit(allocator);
+    try std.testing.expectEqual(store_mod.AgentMemoryStorageTarget.subset, subset.target);
+    try std.testing.expectEqual(@as(usize, 2), subset.stores.len);
+    try std.testing.expectEqualStrings("scratch", subset.stores[0]);
+    try std.testing.expectEqualStrings("archive", subset.stores[1]);
+    try std.testing.expect(subset.owned_backing != null);
+
+    const alias = try jobStorageRouteOption(allocator, "{\"storage\":\"postgres\"}");
+    defer alias.deinit(allocator);
+    try std.testing.expectEqual(store_mod.AgentMemoryStorageTarget.native, alias.target);
+    try std.testing.expect(alias.owned_backing == null);
 }
 
 test "worker persists embed outbox before provider call and replays locally" {

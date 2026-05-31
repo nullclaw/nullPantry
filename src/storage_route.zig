@@ -70,14 +70,35 @@ pub fn fromObjectOrQuery(allocator: std.mem.Allocator, obj: std.json.ObjectMap, 
 }
 
 pub fn fromQuery(allocator: std.mem.Allocator, query: []const u8) !Route {
-    if (try json.queryParamDecoded(allocator, query, "storage")) |value| return routeFromOwnedSelector(allocator, value);
-    if (try json.queryParamDecoded(allocator, query, "store")) |value| return routeFromOwnedSelector(allocator, value);
-    if (try json.queryParamDecoded(allocator, query, "target_store")) |value| return routeFromOwnedSelector(allocator, value);
-    if (try json.queryParamDecoded(allocator, query, "stores")) |value| return fromOwnedCsv(allocator, value);
+    if (try queryParamRoute(allocator, query, "storage")) |route| return route;
+    if (try queryParamRoute(allocator, query, "store")) |route| return route;
+    if (try queryParamRoute(allocator, query, "target_store")) |route| return route;
+    if (try queryParamCsvRoute(allocator, query, "stores")) |route| return route;
     return .{};
 }
 
-fn routeFromOwnedSelector(allocator: std.mem.Allocator, value: []const u8) Route {
+fn queryParamRoute(allocator: std.mem.Allocator, query: []const u8, name: []const u8) !?Route {
+    const raw = json.queryParam(query, name) orelse return null;
+    if (!needsPercentDecode(raw)) return Route.parse(raw);
+    const decoded = try json.percentDecode(allocator, raw);
+    return fromOwnedSelector(allocator, decoded);
+}
+
+fn queryParamCsvRoute(allocator: std.mem.Allocator, query: []const u8, name: []const u8) !?Route {
+    const raw = json.queryParam(query, name) orelse return null;
+    if (!needsPercentDecode(raw)) return try fromCsv(allocator, raw);
+    const decoded = try json.percentDecode(allocator, raw);
+    return try fromOwnedCsv(allocator, decoded);
+}
+
+fn needsPercentDecode(raw: []const u8) bool {
+    for (raw) |ch| {
+        if (ch == '%' or ch == '+') return true;
+    }
+    return false;
+}
+
+pub fn fromOwnedSelector(allocator: std.mem.Allocator, value: []const u8) Route {
     var route = Route.parse(value);
     if (route.target == .named) {
         route.owned_backing = value;
@@ -87,7 +108,7 @@ fn routeFromOwnedSelector(allocator: std.mem.Allocator, value: []const u8) Route
     return route;
 }
 
-fn fromOwnedCsv(allocator: std.mem.Allocator, value: []const u8) !Route {
+pub fn fromOwnedCsv(allocator: std.mem.Allocator, value: []const u8) !Route {
     errdefer allocator.free(value);
     var route = try fromCsv(allocator, value);
     if (route.target == .named or route.target == .subset) {
@@ -264,6 +285,7 @@ test "storage route parses object and query selectors consistently" {
     const query_route = try fromQuery(allocator, "stores=scratch,archive");
     defer query_route.deinit(allocator);
     try std.testing.expectEqual(Target.subset, query_route.target);
+    try std.testing.expect(query_route.owned_backing == null);
 }
 
 test "storage route compacts sparse store selectors before ownership transfer" {
@@ -312,12 +334,14 @@ test "storage route decodes query selectors before routing" {
     defer named.deinit(allocator);
     try std.testing.expectEqual(Target.named, named.target);
     try std.testing.expectEqualStrings("team:alpha", named.name.?);
+    try std.testing.expect(named.owned_backing != null);
 
     const subset = try fromQuery(allocator, "stores=team%3Aalpha,archive%2Dold");
     defer subset.deinit(allocator);
     try std.testing.expectEqual(Target.subset, subset.target);
     try std.testing.expectEqualStrings("team:alpha", subset.stores[0]);
     try std.testing.expectEqualStrings("archive-old", subset.stores[1]);
+    try std.testing.expect(subset.owned_backing != null);
 
     const alias = try fromQuery(allocator, "storage=postgres");
     defer alias.deinit(allocator);
