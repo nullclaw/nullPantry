@@ -76,6 +76,7 @@ pub const RetrievalPlan = struct {
 
 const search_token_delimiters = " \t\r\n.,;:/\\-_*\"'()[]{}<>!?|&+=#@$%^`~";
 const max_backend_search_terms = 64;
+const max_lexical_score_token_bytes = 256;
 
 pub fn reciprocalRankFusion(allocator: std.mem.Allocator, lists: []const []const RankedItem, k: f64, limit: usize) ![]RankedItem {
     var fused: std.ArrayListUnmanaged(RankedItem) = .empty;
@@ -233,7 +234,7 @@ pub fn buildPlanWithAdaptive(allocator: std.mem.Allocator, query: []const u8, ha
         .use_keyword = use_keyword,
         .use_vector = use_vector,
         .use_graph = has_backend_terms and queryHasEntityHint(query),
-        .use_reranker = allow_reranker,
+        .use_reranker = allow_reranker and has_backend_terms,
         .adaptive_enabled = adaptive.enabled,
         .strategy = analysis.recommended_strategy,
         .token_count = analysis.token_count,
@@ -551,6 +552,59 @@ fn buildWebsearchQuery(allocator: std.mem.Allocator, query: []const u8, terms: [
 
 pub fn buildExactWebsearchQuery(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
     return buildWebsearchQuery(allocator, query, &.{});
+}
+
+pub fn lexicalScore(query: []const u8, text: []const u8) f64 {
+    if (query.len == 0 or text.len == 0) return 0.0;
+    var seen_terms: [max_backend_search_terms][max_lexical_score_token_bytes]u8 = undefined;
+    var seen_lens: [max_backend_search_terms]usize = undefined;
+    var seen_count: usize = 0;
+    var score: f64 = 0.0;
+
+    var it = std.mem.tokenizeAny(u8, query, search_token_delimiters);
+    while (it.next()) |raw| {
+        if (seen_count >= max_backend_search_terms) break;
+        var token_buf: [max_lexical_score_token_bytes]u8 = undefined;
+        const token = normalizeLexicalScoreToken(raw, &token_buf) orelse continue;
+        if (isFtsStopword(token)) continue;
+        if (containsSeenLexicalTerm(&seen_terms, &seen_lens, seen_count, token)) continue;
+        @memcpy(seen_terms[seen_count][0..token.len], token);
+        seen_lens[seen_count] = token.len;
+        seen_count += 1;
+        if (std.ascii.indexOfIgnoreCase(text, token) != null) score += 1.0;
+    }
+
+    return score;
+}
+
+fn normalizeLexicalScoreToken(raw: []const u8, buf: *[max_lexical_score_token_bytes]u8) ?[]const u8 {
+    var len: usize = 0;
+    for (raw) |ch| {
+        if (ch < 0x80) {
+            if (!std.ascii.isAlphanumeric(ch)) continue;
+            if (len >= buf.len) return null;
+            buf[len] = std.ascii.toLower(ch);
+            len += 1;
+        } else {
+            if (len >= buf.len) return null;
+            buf[len] = ch;
+            len += 1;
+        }
+    }
+    if (len == 0) return null;
+    return buf[0..len];
+}
+
+fn containsSeenLexicalTerm(
+    seen_terms: *const [max_backend_search_terms][max_lexical_score_token_bytes]u8,
+    seen_lens: *const [max_backend_search_terms]usize,
+    seen_count: usize,
+    token: []const u8,
+) bool {
+    for (0..seen_count) |i| {
+        if (seen_lens[i] == token.len and std.mem.eql(u8, seen_terms[i][0..seen_lens[i]], token)) return true;
+    }
+    return false;
 }
 
 fn collectSearchTerms(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
@@ -884,6 +938,12 @@ test "retrieval websearch query builder sanitizes operators and expansion terms"
     try std.testing.expect(std.mem.indexOf(u8, web, "decision OR decision") == null);
 }
 
+test "retrieval lexical scoring uses backend search terms" {
+    try std.testing.expectEqual(@as(f64, 0.0), lexicalScore("??? OR AND the", "the and or"));
+    try std.testing.expectEqual(@as(f64, 1.0), lexicalScore("decision decision OR what", "ADR decision rationale"));
+    try std.testing.expectEqual(@as(f64, 2.0), lexicalScore("scope:project/NullPantry", "project nullpantry docs"));
+}
+
 test "retrieval plan disables backend retrieval for empty sanitized queries" {
     var plan = try buildPlan(std.testing.allocator, "??? OR AND the", true, true);
     defer plan.deinit(std.testing.allocator);
@@ -891,6 +951,7 @@ test "retrieval plan disables backend retrieval for empty sanitized queries" {
     try std.testing.expect(!plan.use_keyword);
     try std.testing.expect(!plan.use_vector);
     try std.testing.expect(!plan.use_graph);
+    try std.testing.expect(!plan.use_reranker);
     try std.testing.expectEqualStrings("", plan.websearch_query);
 }
 

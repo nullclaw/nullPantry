@@ -7285,14 +7285,7 @@ pub const SQLiteStore = struct {
     }
 
     fn scoreText(query: []const u8, text: []const u8) f64 {
-        if (query.len == 0) return 1.0;
-        var score: f64 = 0.0;
-        var it = std.mem.tokenizeAny(u8, query, " \t\r\n.,;:/\\-_*\"'()[]{}<>!?");
-        while (it.next()) |token| {
-            if (token.len == 0) continue;
-            if (std.ascii.indexOfIgnoreCase(text, token) != null) score += 1.0;
-        }
-        return score;
+        return retrieval_mod.lexicalScore(query, text);
     }
 
     pub fn upsertVectorChunk(self: *Self, allocator: std.mem.Allocator, input: VectorChunkInput) !VectorChunk {
@@ -13040,15 +13033,7 @@ fn readPgVectorOutboxEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap
 }
 
 fn pgScoreText(query: []const u8, text: []const u8) f64 {
-    if (query.len == 0) return 1.0;
-    var score: f64 = 0.0;
-    var it = std.mem.tokenizeAny(u8, query, " \t\r\n.,;:/\\-_*\"'");
-    while (it.next()) |token| {
-        if (token.len == 0) continue;
-        if (std.ascii.eqlIgnoreCase(token, "OR") or std.ascii.eqlIgnoreCase(token, "AND") or std.ascii.eqlIgnoreCase(token, "NOT")) continue;
-        if (std.ascii.indexOfIgnoreCase(text, token) != null) score += 1.0;
-    }
-    return score;
+    return retrieval_mod.lexicalScore(query, text);
 }
 
 fn contextPackHasEvidence(pack: ContextPackResult) bool {
