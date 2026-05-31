@@ -26,6 +26,7 @@ const graph_mod = @import("graph.zig");
 const agent_memory_reducer = @import("agent_memory_reducer.zig");
 const agent_memory_runtime = @import("agent_memory_runtime.zig");
 const bootstrap_prompts = @import("bootstrap_prompts.zig");
+const feed_contract = @import("feed_contract.zig");
 
 const nullclaw_agent_memory_projection = "agent_memory";
 
@@ -4811,9 +4812,9 @@ fn responseEventId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
 
 fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap, fallback_route: store_mod.AgentMemoryStorageRoute) !i64 {
     const event_type = json.stringField(obj, "event_type") orelse return error.InvalidPayload;
-    const operation = json.stringField(obj, "operation") orelse operationFromEventType(event_type);
+    const operation = json.stringField(obj, "operation") orelse feed_contract.operationFromEventType(event_type);
     const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
-    if (!feedObjectTypeSupported(object_type)) return error.UnsupportedObjectType;
+    if (!feed_contract.objectTypeSupported(object_type)) return error.UnsupportedObjectType;
     const object_id = json.stringField(obj, "object_id") orelse return error.InvalidPayload;
     const event_actor_id = json.stringField(obj, "actor_id") orelse ctx.actor_id;
     if (!canApplyAsActor(ctx, event_actor_id)) return error.Forbidden;
@@ -4822,16 +4823,16 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap, fallbac
     const payload_route = feedObjectPayloadRoute(ctx, object_type, explicit_or_fallback_route);
     const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, payload_route) catch return error.InvalidPayload;
     defer ctx.allocator.free(event_payload_json);
-    const scope = feedEventScope(ctx, obj, object_type, event_payload_json, event_actor_id) catch return error.InvalidPayload;
-    const permissions_json = feedEventPermissions(ctx, obj, object_type, event_payload_json, event_actor_id) catch return error.InvalidPayload;
-    const dedupe_key = feedEventDedupeKey(ctx, obj) catch return error.InvalidPayload;
+    const scope = feed_contract.eventScope(ctx.allocator, obj, object_type, event_payload_json, event_actor_id) catch return error.InvalidPayload;
+    const permissions_json = feed_contract.eventPermissions(ctx.allocator, obj, object_type, event_payload_json, event_actor_id) catch return error.InvalidPayload;
+    const dedupe_key = feed_contract.dedupeKeyFromObject(ctx.allocator, obj) catch return error.InvalidPayload;
     if (std.mem.eql(u8, object_type, "agent_memory")) {
-        if (try feedAgentMemoryPayloadIsInternal(ctx, event_payload_json)) return error.InternalAgentMemory;
+        if (try feed_contract.agentMemoryPayloadIsInternal(ctx.allocator, event_payload_json)) return error.InternalAgentMemory;
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
     } else if (std.mem.eql(u8, object_type, "agent_session_message")) {
-        if (try feedAgentSessionMessagePayloadIsInternal(ctx, event_payload_json)) return error.InternalAgentSessionMessage;
+        if (try feed_contract.agentSessionMessagePayloadIsInternal(ctx.allocator, event_payload_json)) return error.InternalAgentSessionMessage;
         if (!canProposeAgentSessionEvent(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
-    } else if (isAgentSessionFeedObject(object_type)) {
+    } else if (feed_contract.isAgentSessionObject(object_type)) {
         if (!canProposeAgentSessionEvent(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
     } else if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
     const causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return error.InvalidPayload;
@@ -4839,7 +4840,7 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap, fallbac
     if (dedupe_key) |key| {
         if (try ctx.store.getFeedEventByDedupeKey(ctx.allocator, key)) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return error.Forbidden;
-            if (!feedDedupeMatches(event, event_type, operation, object_type, object_id, scope, permissions_json, event_actor_id, causality_json, event_payload_json)) return error.FeedDedupeMismatch;
+            if (!feed_contract.dedupeMatches(event, .{ .event_type = event_type, .operation = operation, .object_type = object_type, .object_id = object_id, .scope = scope, .permissions_json = permissions_json, .actor_id = event_actor_id, .causality_json = causality_json, .payload_json = event_payload_json })) return error.FeedDedupeMismatch;
             return event.id;
         }
     }
@@ -4865,7 +4866,7 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     const obj = parsed.value.object;
     const event_type = json.stringField(obj, "event_type") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing event_type");
     const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
-    if (!feedObjectTypeSupported(object_type)) {
+    if (!feed_contract.objectTypeSupported(object_type)) {
         return json.errorResponse(ctx.allocator, 400, "bad_request", "Unsupported feed object_type");
     }
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
@@ -4873,25 +4874,25 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     const payload_route = feedObjectPayloadRoute(ctx, object_type, storage_route);
     const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, payload_route) catch return serverError(ctx);
     defer ctx.allocator.free(event_payload_json);
-    const scope = feedEventScope(ctx, obj, object_type, event_payload_json, ctx.actor_id) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid feed payload");
-    const permissions_json = feedEventPermissions(ctx, obj, object_type, event_payload_json, ctx.actor_id) catch return serverError(ctx);
-    const dedupe_key = feedEventDedupeKey(ctx, obj) catch return serverError(ctx);
+    const scope = feed_contract.eventScope(ctx.allocator, obj, object_type, event_payload_json, ctx.actor_id) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid feed payload");
+    const permissions_json = feed_contract.eventPermissions(ctx.allocator, obj, object_type, event_payload_json, ctx.actor_id) catch return serverError(ctx);
+    const dedupe_key = feed_contract.dedupeKeyFromObject(ctx.allocator, obj) catch return serverError(ctx);
     if (std.mem.eql(u8, object_type, "agent_memory")) {
-        const internal_payload = feedAgentMemoryPayloadIsInternal(ctx, event_payload_json) catch return serverError(ctx);
+        const internal_payload = feed_contract.agentMemoryPayloadIsInternal(ctx.allocator, event_payload_json) catch return serverError(ctx);
         if (internal_payload) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be queued through the feed");
         if (!canProposeRecord(ctx, scope, permissions_json) and !canApplyAgentMemoryScope(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
     } else if (std.mem.eql(u8, object_type, "agent_session_message")) {
-        const internal_payload = feedAgentSessionMessagePayloadIsInternal(ctx, event_payload_json) catch return serverError(ctx);
+        const internal_payload = feed_contract.agentSessionMessagePayloadIsInternal(ctx.allocator, event_payload_json) catch return serverError(ctx);
         if (internal_payload) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be queued through the feed");
         if (!canProposeAgentSessionEvent(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
-    } else if (isAgentSessionFeedObject(object_type)) {
+    } else if (feed_contract.isAgentSessionObject(object_type)) {
         if (!canProposeAgentSessionEvent(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
     } else if (!canProposeRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     const event_object_id = json.stringField(obj, "object_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing object_id");
     if (dedupe_key) |key| {
         if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, key) catch return serverError(ctx)) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return forbidden(ctx);
-            if (!feedDedupeMatches(event, event_type, json.stringField(obj, "operation") orelse "put", object_type, event_object_id, scope, permissions_json, ctx.actor_id, rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx), event_payload_json)) {
+            if (!feed_contract.dedupeMatches(event, .{ .event_type = event_type, .operation = json.stringField(obj, "operation") orelse "put", .object_type = object_type, .object_id = event_object_id, .scope = scope, .permissions_json = permissions_json, .actor_id = ctx.actor_id, .causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx), .payload_json = event_payload_json })) {
                 return feedDedupeConflict(ctx);
             }
             const response = std.fmt.allocPrint(ctx.allocator, "{{\"event_id\":{d},\"queued\":true}}", .{event.id}) catch return serverError(ctx);
@@ -4928,10 +4929,10 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
         return runtimeMemoryFeedApply(ctx, runtime, body);
     }
     const event_type = json.stringField(obj, "event_type") orelse "memory_atom.upsert";
-    const operation = json.stringField(obj, "operation") orelse operationFromEventType(event_type);
+    const operation = json.stringField(obj, "operation") orelse feed_contract.operationFromEventType(event_type);
     const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
     const event_object_id = json.nullableStringField(obj, "object_id");
-    if (!feedObjectTypeSupported(object_type)) {
+    if (!feed_contract.objectTypeSupported(object_type)) {
         return json.errorResponse(ctx.allocator, 400, "bad_request", "Unsupported feed object_type");
     }
     const event_actor_id = json.stringField(obj, "actor_id") orelse ctx.actor_id;
@@ -4941,18 +4942,18 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, event_payload_route) catch return serverError(ctx);
     defer ctx.allocator.free(event_payload_json);
     const causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx);
-    const event_dedupe_key = feedEventDedupeKey(ctx, obj) catch return serverError(ctx);
-    if (isLifecycleFeedOperation(operation) and !std.mem.eql(u8, object_type, "agent_memory") and !isAgentSessionFeedObject(object_type)) {
+    const event_dedupe_key = feed_contract.dedupeKeyFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    if (feed_contract.isLifecycleOperation(operation) and !feed_contract.objectTypeUsesAgentMemoryStorageRoute(object_type)) {
         return applyFeedLifecycleMutation(ctx, obj, event_type, operation, object_type, event_actor_id, event_payload_json, causality_json);
     }
-    const scope = feedEventScope(ctx, obj, object_type, event_payload_json, event_actor_id) catch return serverError(ctx);
-    const event_permissions_json = feedEventPermissions(ctx, obj, object_type, event_payload_json, event_actor_id) catch return serverError(ctx);
+    const scope = feed_contract.eventScope(ctx.allocator, obj, object_type, event_payload_json, event_actor_id) catch return serverError(ctx);
+    const event_permissions_json = feed_contract.eventPermissions(ctx.allocator, obj, object_type, event_payload_json, event_actor_id) catch return serverError(ctx);
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
     } else if (std.mem.eql(u8, object_type, "agent_session_message")) {
-        if (feedAgentSessionMessagePayloadIsInternal(ctx, event_payload_json) catch return serverError(ctx)) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be applied through the feed");
+        if (feed_contract.agentSessionMessagePayloadIsInternal(ctx.allocator, event_payload_json) catch return serverError(ctx)) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be applied through the feed");
         if (!canApplyAgentSessionEvent(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
-    } else if (isAgentSessionFeedObject(object_type)) {
+    } else if (feed_contract.isAgentSessionObject(object_type)) {
         if (!canApplyAgentSessionEvent(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
     } else if (!canWriteRecord(ctx, scope, event_permissions_json)) return forbidden(ctx);
     var memory_input: ?store_mod.MemoryAtomInput = null;
@@ -5015,7 +5016,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
                     return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying");
                 }
             } else {
-                if (!feedDedupeMatches(event, event_type, operation, object_type, event_object_id, scope, event_permissions_json, event_actor_id, causality_json, event_payload_json)) return feedDedupeConflict(ctx);
+                if (!feed_contract.dedupeMatches(event, .{ .event_type = event_type, .operation = operation, .object_type = object_type, .object_id = event_object_id, .scope = scope, .permissions_json = event_permissions_json, .actor_id = event_actor_id, .causality_json = causality_json, .payload_json = event_payload_json })) return feedDedupeConflict(ctx);
                 return appliedFeedObjectResponse(ctx, event.id, event.object_type, event.object_id, if (std.mem.eql(u8, event.object_type, "memory_atom")) event.object_id else null);
             }
         }
@@ -5036,7 +5037,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
         const reservation = (ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key) catch return serverError(ctx)) orelse return serverError(ctx);
         if (reservation.id != reserved_event_id.? or !std.mem.eql(u8, reservation.status, "applying") or !std.mem.eql(u8, reservation.object_id, reservation_id)) {
             if (std.mem.eql(u8, reservation.status, "applied")) {
-                if (!feedDedupeMatches(reservation, event_type, operation, object_type, event_object_id, scope, event_permissions_json, event_actor_id, causality_json, event_payload_json)) return feedDedupeConflict(ctx);
+                if (!feed_contract.dedupeMatches(reservation, .{ .event_type = event_type, .operation = operation, .object_type = object_type, .object_id = event_object_id, .scope = scope, .permissions_json = event_permissions_json, .actor_id = event_actor_id, .causality_json = causality_json, .payload_json = event_payload_json })) return feedDedupeConflict(ctx);
                 return appliedFeedObjectResponse(ctx, reservation.id, reservation.object_type, reservation.object_id, if (std.mem.eql(u8, reservation.object_type, "memory_atom")) reservation.object_id else null);
             }
             return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying");
@@ -5366,54 +5367,6 @@ const AgentSessionUsageApplyInput = struct {
     delete_usage: bool = false,
     route: store_mod.AgentMemoryStorageRoute = .{},
 };
-
-fn operationFromEventType(event_type: []const u8) []const u8 {
-    if (std.mem.endsWith(u8, event_type, ".delete_all") or std.mem.endsWith(u8, event_type, "_delete_all")) return "delete_all";
-    if (std.mem.endsWith(u8, event_type, ".delete_scoped") or std.mem.endsWith(u8, event_type, "_delete_scoped")) return "delete_scoped";
-    if (std.mem.endsWith(u8, event_type, ".delete") or std.mem.endsWith(u8, event_type, ".forget")) return "delete";
-    if (std.mem.endsWith(u8, event_type, ".delete_autosaved") or std.mem.endsWith(u8, event_type, ".clear_autosaved")) return "delete_autosaved";
-    if (std.mem.endsWith(u8, event_type, ".merge_object") or std.mem.endsWith(u8, event_type, "_merge_object")) return "merge_object";
-    if (std.mem.endsWith(u8, event_type, ".merge_string_set") or std.mem.endsWith(u8, event_type, "_merge_string_set")) return "merge_string_set";
-    return "put";
-}
-
-fn feedEventScope(ctx: *Context, obj: std.json.ObjectMap, object_type: []const u8, payload_json: []const u8, event_actor_id: []const u8) ![]const u8 {
-    if (json.stringField(obj, "scope")) |scope| return scope;
-    const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
-    // The returned scope may borrow from this request-arena parse tree.
-    if (payload.value == .object) {
-        if (json.stringField(payload.value.object, "scope")) |scope| return scope;
-        if (std.mem.eql(u8, object_type, "policy_scope")) {
-            if (json.stringField(obj, "object_id")) |scope| return scope;
-        }
-        if (isAgentSessionFeedObject(object_type)) {
-            const session_id = json.stringField(payload.value.object, "session_id") orelse {
-                if (json.boolField(payload.value.object, "delete_autosaved") orelse json.boolField(payload.value.object, "autosave_only") orelse false) return "session:*";
-                return error.InvalidPayload;
-            };
-            return std.fmt.allocPrint(ctx.allocator, "session:{s}", .{session_id});
-        }
-    }
-    if (!std.mem.eql(u8, object_type, "agent_memory")) return "workspace";
-    return domain.defaultAgentMemoryScope(ctx.allocator, event_actor_id);
-}
-
-fn feedEventPermissions(ctx: *Context, obj: std.json.ObjectMap, object_type: []const u8, payload_json: []const u8, event_actor_id: []const u8) ![]const u8 {
-    if (obj.get("permissions")) |value| {
-        if (value == .null) return "[]";
-        return try json.jsonFromValue(ctx.allocator, value);
-    }
-    const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
-    defer payload.deinit();
-    if (payload.value == .object) {
-        if (payload.value.object.get("permissions")) |value| {
-            if (value == .null) return "[]";
-            return try json.jsonFromValue(ctx.allocator, value);
-        }
-    }
-    if (isAgentSessionFeedObject(object_type)) return domain.actorGrantJson(ctx.allocator, event_actor_id);
-    return "[]";
-}
 
 fn canApplyAsActor(ctx: *Context, event_actor_id: []const u8) bool {
     return std.mem.eql(u8, event_actor_id, ctx.actor_id) or domain.hasActorScope(ctx.actor_scopes_json, "admin");
@@ -8888,7 +8841,7 @@ fn feedEventRenderableInMode(ctx: *Context, event: store_mod.FeedEvent, mode: Fe
     if (mode != .nullclaw_agent_memory) return true;
     if (!std.mem.eql(u8, event.object_type, "agent_memory")) return false;
     const payload_json = try feedPayloadForActor(ctx, event);
-    if (feedPayloadIsRedacted(payload_json)) return false;
+    if (try feed_contract.payloadIsRedacted(ctx.allocator, payload_json)) return false;
     var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{}) catch return false;
     defer parsed.deinit();
     return parsed.value == .object;
@@ -8900,15 +8853,17 @@ fn appendFeedEventForActor(ctx: *Context, out: *std.ArrayListUnmanaged(u8), even
 
 fn appendFeedEventForActorMode(ctx: *Context, out: *std.ArrayListUnmanaged(u8), event: store_mod.FeedEvent, mode: FeedWireMode) !void {
     const payload_json = try feedPayloadForActor(ctx, event);
-    const origin = feedOriginIdentity(ctx, event);
+    const origin = feed_contract.originIdentity(event.dedupe_key, ctx.feed_instance_id, event.id);
+    const timestamp_ms = try feed_contract.timestampMsFromCausality(ctx.allocator, event.causality_json, event.created_at_ms);
+    const wire_operation = feed_contract.wireOperation(event.object_type, event.operation, mode == .nullclaw_agent_memory);
     try out.print(ctx.allocator, "{{\"id\":{d},\"event_type\":", .{event.id});
     try json.appendString(out, ctx.allocator, event.event_type);
     try out.print(ctx.allocator, ",\"sequence\":{d},\"origin_instance_id\":", .{event.id});
     try json.appendString(out, ctx.allocator, origin.instance_id);
     try out.print(ctx.allocator, ",\"origin_sequence\":{d}", .{origin.sequence});
-    try out.print(ctx.allocator, ",\"schema_version\":1,\"timestamp_ms\":{d}", .{feedEventTimestampMs(ctx, event)});
+    try out.print(ctx.allocator, ",\"schema_version\":1,\"timestamp_ms\":{d}", .{timestamp_ms});
     try out.appendSlice(ctx.allocator, ",\"operation\":");
-    try json.appendString(out, ctx.allocator, feedWireOperation(event, mode));
+    try json.appendString(out, ctx.allocator, wire_operation);
     try out.appendSlice(ctx.allocator, ",\"object_type\":");
     try json.appendString(out, ctx.allocator, event.object_type);
     try out.appendSlice(ctx.allocator, ",\"object_id\":");
@@ -8925,7 +8880,7 @@ fn appendFeedEventForActorMode(ctx: *Context, out: *std.ArrayListUnmanaged(u8), 
     try json.appendRawJsonOr(out, ctx.allocator, event.causality_json, "{}");
     try out.appendSlice(ctx.allocator, ",\"payload\":");
     try json.appendRawJsonOr(out, ctx.allocator, payload_json, "{}");
-    try appendAgentMemoryFeedCompatFields(ctx, out, event, payload_json, mode);
+    try feed_contract.appendAgentMemoryCompatFields(ctx.allocator, out, event.object_type, event.object_id, payload_json, wire_operation);
     try out.appendSlice(ctx.allocator, ",\"status\":");
     try json.appendString(out, ctx.allocator, event.status);
     try out.print(ctx.allocator, ",\"created_at_ms\":{d},\"applied_at_ms\":", .{event.created_at_ms});
@@ -8935,141 +8890,11 @@ fn appendFeedEventForActorMode(ctx: *Context, out: *std.ArrayListUnmanaged(u8), 
     try out.append(ctx.allocator, '}');
 }
 
-const FeedOriginIdentity = struct {
-    instance_id: []const u8,
-    sequence: i64,
-};
-
-fn feedOriginIdentity(ctx: *Context, event: store_mod.FeedEvent) FeedOriginIdentity {
-    if (event.dedupe_key) |dedupe_key| {
-        if (parseOriginDedupeKey(dedupe_key)) |origin| return origin;
-    }
-    return .{ .instance_id = ctx.feed_instance_id, .sequence = event.id };
-}
-
-fn parseOriginDedupeKey(dedupe_key: []const u8) ?FeedOriginIdentity {
-    const prefix = "origin:";
-    if (!std.mem.startsWith(u8, dedupe_key, prefix)) return null;
-    const value = dedupe_key[prefix.len..];
-    const split = std.mem.lastIndexOfScalar(u8, value, ':') orelse return null;
-    if (split == 0 or split + 1 >= value.len) return null;
-    const sequence = std.fmt.parseInt(i64, value[split + 1 ..], 10) catch return null;
-    if (sequence < 0) return null;
-    return .{ .instance_id = value[0..split], .sequence = sequence };
-}
-
-fn feedEventTimestampMs(ctx: *Context, event: store_mod.FeedEvent) i64 {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, event.causality_json, .{}) catch return event.created_at_ms;
-    defer parsed.deinit();
-    if (parsed.value != .object) return event.created_at_ms;
-    return json.intField(parsed.value.object, "origin_timestamp_ms") orelse
-        json.intField(parsed.value.object, "timestamp_ms") orelse
-        event.created_at_ms;
-}
-
-fn feedWireOperation(event: store_mod.FeedEvent, mode: FeedWireMode) []const u8 {
-    if (mode == .nullclaw_agent_memory and std.mem.eql(u8, event.object_type, "agent_memory")) {
-        if (std.mem.eql(u8, event.operation, "delete") or std.mem.eql(u8, event.operation, "forget")) return "delete_scoped";
-    }
-    return event.operation;
-}
-
-fn appendAgentMemoryFeedCompatFields(ctx: *Context, out: *std.ArrayListUnmanaged(u8), event: store_mod.FeedEvent, payload_json: []const u8, mode: FeedWireMode) !void {
-    if (!std.mem.eql(u8, event.object_type, "agent_memory")) return;
-    if (feedPayloadIsRedacted(payload_json)) {
-        try out.appendSlice(ctx.allocator, ",\"key\":null,\"session_id\":null,\"category\":null,\"value_kind\":null,\"content\":null");
-        return;
-    }
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{}) catch {
-        try out.appendSlice(ctx.allocator, ",\"key\":null,\"session_id\":null,\"category\":null,\"value_kind\":null,\"content\":null");
-        return;
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) {
-        try out.appendSlice(ctx.allocator, ",\"key\":null,\"session_id\":null,\"category\":null,\"value_kind\":null,\"content\":null");
-        return;
-    }
-    const payload_obj = parsed.value.object;
-    try out.appendSlice(ctx.allocator, ",\"key\":");
-    if (json.stringField(payload_obj, "key")) |key| {
-        try json.appendString(out, ctx.allocator, key);
-    } else {
-        try json.appendString(out, ctx.allocator, event.object_id);
-    }
-    try out.appendSlice(ctx.allocator, ",\"session_id\":");
-    try json.appendNullableString(out, ctx.allocator, json.nullableStringField(payload_obj, "session_id"));
-    try out.appendSlice(ctx.allocator, ",\"category\":");
-    try json.appendNullableString(out, ctx.allocator, json.nullableStringField(payload_obj, "category"));
-    try out.appendSlice(ctx.allocator, ",\"value_kind\":");
-    try json.appendNullableString(out, ctx.allocator, agentMemoryFeedValueKind(payload_obj, feedWireOperation(event, mode)));
-    try out.appendSlice(ctx.allocator, ",\"content\":");
-    if (try agentMemoryFeedCompatContent(ctx, payload_obj, feedWireOperation(event, mode))) |content| {
-        try json.appendString(out, ctx.allocator, content);
-    } else {
-        try out.appendSlice(ctx.allocator, "null");
-    }
-}
-
-fn agentMemoryFeedValueKind(payload_obj: std.json.ObjectMap, operation: []const u8) ?[]const u8 {
-    if (json.stringField(payload_obj, "value_kind")) |value_kind| return value_kind;
-    if (std.mem.eql(u8, operation, "merge_string_set")) return "string_set";
-    if (std.mem.eql(u8, operation, "merge_object")) return "json_object";
-    return null;
-}
-
-fn agentMemoryFeedCompatContent(ctx: *Context, payload_obj: std.json.ObjectMap, operation: []const u8) !?[]const u8 {
-    if (std.mem.eql(u8, operation, "merge_string_set")) {
-        if (payload_obj.get("values")) |values| return try json.jsonFromValue(ctx.allocator, values);
-        if (payload_obj.get("value")) |value| return try json.jsonFromValue(ctx.allocator, value);
-    } else if (std.mem.eql(u8, operation, "merge_object")) {
-        if (payload_obj.get("object")) |object| return try json.jsonFromValue(ctx.allocator, object);
-        if (payload_obj.get("value")) |value| return try json.jsonFromValue(ctx.allocator, value);
-    } else {
-        if (json.stringField(payload_obj, "content")) |content| return content;
-        if (json.stringField(payload_obj, "text")) |text| return text;
-        if (payload_obj.get("value")) |value| return try json.jsonFromValue(ctx.allocator, value);
-    }
-    return null;
-}
-
-fn feedPayloadIsRedacted(payload_json: []const u8) bool {
-    return std.mem.indexOf(u8, payload_json, "\"redacted\":true") != null;
-}
-
 fn feedPayloadForActor(ctx: *Context, event: store_mod.FeedEvent) ![]const u8 {
-    if (!feedEventObjectVisibleToActor(ctx, event)) return redactedFeedPayload();
-    if (!try feedReferencedObjectsVisible(ctx, event.payload_json)) return redactedFeedPayload();
-    if (std.mem.eql(u8, event.object_type, "agent_memory") and try feedAgentMemoryPayloadIsInternal(ctx, event.payload_json)) return redactedFeedPayload();
+    if (!feedEventObjectVisibleToActor(ctx, event)) return feed_contract.redactedPayload();
+    if (!try feedReferencedObjectsVisible(ctx, event.payload_json)) return feed_contract.redactedPayload();
+    if (std.mem.eql(u8, event.object_type, "agent_memory") and try feed_contract.agentMemoryPayloadIsInternal(ctx.allocator, event.payload_json)) return feed_contract.redactedPayload();
     return event.payload_json;
-}
-
-fn redactedFeedPayload() []const u8 {
-    return "{\"redacted\":true,\"reason\":\"inaccessible_payload_reference\"}";
-}
-
-fn feedAgentMemoryPayloadIsInternal(ctx: *Context, payload_json: []const u8) !bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const key = json.stringField(parsed.value.object, "key") orelse "";
-    const content = json.stringField(parsed.value.object, "content") orelse
-        json.stringField(parsed.value.object, "text") orelse
-        json.stringField(parsed.value.object, "value") orelse "";
-    return domain.isInternalMemoryEntryKeyOrContent(key, content);
-}
-
-fn feedAgentSessionMessagePayloadIsInternal(ctx: *Context, payload_json: []const u8) !bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const role = json.stringField(parsed.value.object, "role") orelse return false;
-    return domain.isRuntimeCommandRole(role);
 }
 
 fn feedEventObjectVisibleToActor(ctx: *Context, event: store_mod.FeedEvent) bool {
@@ -9109,64 +8934,47 @@ fn feedEventObjectVisibleToActor(ctx: *Context, event: store_mod.FeedEvent) bool
     if (std.mem.eql(u8, event.object_type, "agent_memory")) {
         return feedRecordVisibleToActor(ctx, event.scope, event.permissions_json);
     }
-    if (isAgentSessionFeedObject(event.object_type)) {
+    if (feed_contract.isAgentSessionObject(event.object_type)) {
         return feedRecordVisibleToActor(ctx, event.scope, event.permissions_json);
     }
     return true;
 }
 
 fn feedReferencedObjectsVisible(ctx: *Context, payload_json: []const u8) !bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{}) catch return true;
-    defer parsed.deinit();
-    return feedValueReferencesVisible(ctx, parsed.value);
+    return try feed_contract.payloadReferencesVisible(ctx.allocator, payload_json, ApiFeedReferenceVisibility{ .ctx = ctx }, apiFeedReferenceVisibleForActor);
 }
 
-fn feedValueReferencesVisible(ctx: *Context, value: std.json.Value) bool {
-    return switch (value) {
-        .string => |s| feedReferenceStringVisible(ctx, s),
-        .array => |arr| {
-            for (arr.items) |item| {
-                if (!feedValueReferencesVisible(ctx, item)) return false;
-            }
-            return true;
-        },
-        .object => |obj| {
-            var iterator = obj.iterator();
-            while (iterator.next()) |entry| {
-                if (!feedValueReferencesVisible(ctx, entry.value_ptr.*)) return false;
-            }
-            return true;
-        },
-        else => true,
-    };
-}
+const ApiFeedReferenceVisibility = struct {
+    ctx: *Context,
+};
 
-fn feedReferenceStringVisible(ctx: *Context, value: []const u8) bool {
-    if (std.mem.startsWith(u8, value, "src_")) {
+fn apiFeedReferenceVisibleForActor(input: ApiFeedReferenceVisibility, object_type: []const u8, value: []const u8) !bool {
+    const ctx = input.ctx;
+    if (std.mem.eql(u8, object_type, "source")) {
         const source = (ctx.store.getSource(ctx.allocator, value) catch return false) orelse return false;
         return recordVisibleToActor(ctx, source.scope, source.permissions_json);
     }
-    if (std.mem.startsWith(u8, value, "art_")) {
+    if (std.mem.eql(u8, object_type, "artifact")) {
         const artifact = (ctx.store.getArtifact(ctx.allocator, value) catch return false) orelse return false;
         return recordVisibleToActor(ctx, artifact.scope, artifact.permissions_json);
     }
-    if (std.mem.startsWith(u8, value, "mem_")) {
+    if (std.mem.eql(u8, object_type, "memory_atom")) {
         const atom = (ctx.store.getMemoryAtom(ctx.allocator, value) catch return false) orelse return false;
         return recordVisibleToActor(ctx, atom.scope, atom.permissions_json);
     }
-    if (std.mem.startsWith(u8, value, "ent_")) {
+    if (std.mem.eql(u8, object_type, "entity")) {
         const entity = (ctx.store.getEntity(ctx.allocator, value) catch return false) orelse return false;
         return recordVisibleToActor(ctx, entity.scope, entity.permissions_json);
     }
-    if (std.mem.startsWith(u8, value, "rel_")) {
+    if (std.mem.eql(u8, object_type, "relation")) {
         const relation = (ctx.store.getRelation(ctx.allocator, value) catch return false) orelse return false;
         return recordVisibleToActor(ctx, relation.scope, relation.permissions_json);
     }
-    if (std.mem.startsWith(u8, value, "ctx_")) {
+    if (std.mem.eql(u8, object_type, "context_pack")) {
         _ = (ctx.store.contextPackLifecycleTarget(ctx.allocator, value, ctx.actor_id, ctx.actor_scopes_json) catch return false) orelse return false;
         return true;
     }
-    if (std.mem.startsWith(u8, value, "spc_")) {
+    if (std.mem.eql(u8, object_type, "space")) {
         const space = (ctx.store.getSpace(ctx.allocator, value) catch return false) orelse return false;
         return recordVisibleToActor(ctx, space.scope, space.permissions_json);
     }
@@ -9193,100 +9001,14 @@ fn feedDedupeConflict(ctx: *Context) HttpResponse {
     return json.errorResponse(ctx.allocator, 409, "conflict", "Feed dedupe key already belongs to a different event payload");
 }
 
-fn feedEventDedupeKey(ctx: *Context, obj: std.json.ObjectMap) !?[]const u8 {
-    if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| return dedupe_key;
-    const origin_instance_id = json.stringField(obj, "origin_instance_id") orelse
-        json.stringField(obj, "source_instance_id") orelse
-        json.stringField(obj, "instance_id") orelse
-        return null;
-    const origin_sequence = json.intField(obj, "origin_sequence") orelse
-        json.intField(obj, "sequence") orelse
-        json.intField(obj, "id") orelse
-        return null;
-    const key: []const u8 = try std.fmt.allocPrint(ctx.allocator, "origin:{s}:{d}", .{ origin_instance_id, origin_sequence });
-    return key;
-}
-
-fn feedDedupeMatches(event: store_mod.FeedEvent, event_type: []const u8, operation: []const u8, object_type: []const u8, object_id: ?[]const u8, scope: []const u8, permissions_json: []const u8, actor_id: []const u8, causality_json: []const u8, payload_json: []const u8) bool {
-    if (!std.mem.eql(u8, event.event_type, event_type)) return false;
-    if (!std.mem.eql(u8, event.operation, operation)) return false;
-    if (!std.mem.eql(u8, event.object_type, object_type)) return false;
-    const origin_replay = if (event.dedupe_key) |key| std.mem.startsWith(u8, key, "origin:") else false;
-    if (!origin_replay) {
-        if (object_id) |expected_object_id| {
-            if (!std.mem.eql(u8, event.object_id, expected_object_id)) return false;
-        }
-    }
-    if (!std.mem.eql(u8, event.scope, scope)) return false;
-    if (!std.mem.eql(u8, event.permissions_json, permissions_json)) return false;
-    if (event.actor_id == null or !std.mem.eql(u8, event.actor_id.?, actor_id)) return false;
-    if (!std.mem.eql(u8, event.causality_json, causality_json)) return false;
-    if (!std.mem.eql(u8, event.payload_json, payload_json)) return false;
-    return true;
-}
-
-fn feedObjectTypeSupported(object_type: []const u8) bool {
-    return std.mem.eql(u8, object_type, "memory_atom") or
-        std.mem.eql(u8, object_type, "source") or
-        std.mem.eql(u8, object_type, "artifact") or
-        std.mem.eql(u8, object_type, "entity") or
-        std.mem.eql(u8, object_type, "relation") or
-        std.mem.eql(u8, object_type, "agent_memory") or
-        std.mem.eql(u8, object_type, "agent_session_message") or
-        std.mem.eql(u8, object_type, "agent_session_usage") or
-        std.mem.eql(u8, object_type, "context_pack") or
-        std.mem.eql(u8, object_type, "space") or
-        std.mem.eql(u8, object_type, "policy_scope");
-}
-
 fn feedObjectPayloadRoute(ctx: *Context, object_type: []const u8, fallback: store_mod.AgentMemoryStorageRoute) store_mod.AgentMemoryStorageRoute {
-    if (std.mem.eql(u8, object_type, "agent_memory") or
-        std.mem.eql(u8, object_type, "agent_session_message") or
-        std.mem.eql(u8, object_type, "agent_session_usage"))
-    {
+    if (feed_contract.objectTypeUsesAgentMemoryStorageRoute(object_type)) {
         return ctx.store.effectiveAgentMemoryEventRoute(fallback);
     }
-    if (std.mem.eql(u8, object_type, "memory_atom") or
-        std.mem.eql(u8, object_type, "source") or
-        std.mem.eql(u8, object_type, "artifact") or
-        std.mem.eql(u8, object_type, "entity") or
-        std.mem.eql(u8, object_type, "relation") or
-        std.mem.eql(u8, object_type, "context_pack"))
-    {
+    if (feed_contract.objectTypeUsesKnowledgeStorageRoute(object_type)) {
         return fallback;
     }
     return .{};
-}
-
-fn isAgentSessionFeedObject(object_type: []const u8) bool {
-    return std.mem.eql(u8, object_type, "agent_session_message") or
-        std.mem.eql(u8, object_type, "agent_session_usage");
-}
-
-fn feedLifecycleUsesOverlay(object_type: []const u8) bool {
-    return std.mem.eql(u8, object_type, "source") or
-        std.mem.eql(u8, object_type, "entity") or
-        std.mem.eql(u8, object_type, "context_pack") or
-        std.mem.eql(u8, object_type, "space") or
-        std.mem.eql(u8, object_type, "policy_scope");
-}
-
-fn isLifecycleFeedOperation(operation: []const u8) bool {
-    return std.mem.eql(u8, operation, "delete") or
-        std.mem.eql(u8, operation, "forget") or
-        std.mem.eql(u8, operation, "verify") or
-        std.mem.eql(u8, operation, "mark_stale") or
-        std.mem.eql(u8, operation, "stale") or
-        std.mem.eql(u8, operation, "supersede");
-}
-
-fn statusFromLifecycleOperation(operation: []const u8, payload_obj: std.json.ObjectMap) []const u8 {
-    if (json.stringField(payload_obj, "status")) |status| return status;
-    if (std.mem.eql(u8, operation, "verify")) return "verified";
-    if (std.mem.eql(u8, operation, "mark_stale") or std.mem.eql(u8, operation, "stale")) return "stale";
-    if (std.mem.eql(u8, operation, "supersede")) return "superseded";
-    if (std.mem.eql(u8, operation, "delete") or std.mem.eql(u8, operation, "forget")) return "deprecated";
-    return "proposed";
 }
 
 const FeedMutationTarget = struct {
@@ -9307,14 +9029,14 @@ fn applyFeedLifecycleMutation(ctx: *Context, obj: std.json.ObjectMap, event_type
     };
     if (!feedLifecycleMutationAllowed(ctx, operation, target.scope, target.permissions_json)) return forbidden(ctx);
 
-    const status = statusFromLifecycleOperation(operation, payload_obj);
+    const status = feed_contract.statusFromLifecycleOperation(operation, payload_obj);
     if (std.mem.eql(u8, object_type, "memory_atom")) {
         if (!(ctx.store.patchMemoryAtomStatusActor(target.object_id, status, std.mem.eql(u8, status, "verified"), event_actor_id) catch return serverError(ctx))) return json.errorResponse(ctx.allocator, 404, "not_found", "Memory atom not found");
     } else if (std.mem.eql(u8, object_type, "artifact")) {
         if (!(ctx.store.patchArtifactStatusActor(target.object_id, status, event_actor_id) catch return serverError(ctx))) return json.errorResponse(ctx.allocator, 404, "not_found", "Artifact not found");
     } else if (std.mem.eql(u8, object_type, "relation")) {
         if (!(ctx.store.patchRelationStatusActor(target.object_id, status, event_actor_id) catch return serverError(ctx))) return json.errorResponse(ctx.allocator, 404, "not_found", "Relation not found");
-    } else if (feedLifecycleUsesOverlay(object_type)) {
+    } else if (feed_contract.lifecycleUsesOverlay(object_type)) {
         if (!(ctx.store.patchPrimitiveLifecycleActor(ctx.allocator, object_type, target.object_id, status, event_actor_id, payload_json) catch return serverError(ctx))) return json.errorResponse(ctx.allocator, 404, "not_found", "Feed target not found");
     }
 
@@ -9385,12 +9107,12 @@ fn feedLifecycleMutationAllowed(ctx: *Context, operation: []const u8, scope: []c
 }
 
 fn applyOrAppendFeedEventRecord(ctx: *Context, obj: std.json.ObjectMap, event_type: []const u8, operation: []const u8, object_type: []const u8, object_id: []const u8, scope: []const u8, permissions_json: []const u8, event_actor_id: []const u8, causality_json: []const u8, payload_json: []const u8) !i64 {
-    const dedupe_key = try feedEventDedupeKey(ctx, obj);
+    const dedupe_key = try feed_contract.dedupeKeyFromObject(ctx.allocator, obj);
     if (dedupe_key) |key| {
         if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, key) catch return error.StoreFailure) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return error.Forbidden;
             if (std.mem.eql(u8, event.status, "applied")) {
-                if (!feedDedupeMatches(event, event_type, operation, object_type, object_id, scope, permissions_json, event_actor_id, causality_json, payload_json)) return error.FeedDedupeMismatch;
+                if (!feed_contract.dedupeMatches(event, .{ .event_type = event_type, .operation = operation, .object_type = object_type, .object_id = object_id, .scope = scope, .permissions_json = permissions_json, .actor_id = event_actor_id, .causality_json = causality_json, .payload_json = payload_json })) return error.FeedDedupeMismatch;
                 return event.id;
             }
             return error.FeedConflict;

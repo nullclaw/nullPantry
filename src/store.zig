@@ -17,7 +17,7 @@ const vector_runtime = @import("vector_runtime.zig");
 const analytics_runtime = @import("analytics_runtime.zig");
 const lucid_runtime = @import("lucid_runtime.zig");
 const graph_mod = @import("graph.zig");
-const feed_payload = @import("feed_payload.zig");
+const feed_contract = @import("feed_contract.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -39,22 +39,48 @@ const agentMemoryPermissions = access.agentMemoryPermissions;
 const isSharedAgentMemoryOwner = access.isSharedAgentMemoryOwner;
 const permissionsVisibleForActor = access.permissionsVisibleForActor;
 const combinedPermissionsJson = access.combinedPermissionsJson;
-const agentMemoryWriteFeedEventType = feed_payload.agentMemoryWriteEventType;
-const agentMemoryDeleteFeedEventType = feed_payload.agentMemoryDeleteEventType;
-const agentMemoryDeleteAllFeedEventType = feed_payload.agentMemoryDeleteAllEventType;
-const agentMemoryFeedPayloadJson = feed_payload.agentMemoryWrite;
-const agentMemoryDeleteFeedPayloadJson = feed_payload.agentMemoryDelete;
-const domainPayloadJson = feed_payload.domainObject;
-const policyScopeFeedPayloadJson = feed_payload.policyScope;
-const policyScopePutDedupeKey = feed_payload.policyScopeDedupeKey;
-pub const payloadWithStorageRouteJson = feed_payload.withStorageRoute;
-const storageRouteDedupePart = feed_payload.storageRouteDedupePart;
-const contextPackFeedPayloadJson = feed_payload.contextPack;
-const agentSessionMessageFeedPayloadJson = feed_payload.agentSessionMessagePut;
-const agentSessionMessageDeleteFeedPayloadJson = feed_payload.agentSessionMessageDelete;
-const agentSessionAutosaveDeleteFeedPayloadJson = feed_payload.agentSessionAutosaveDelete;
-const agentSessionUsageFeedPayloadJson = feed_payload.agentSessionUsagePut;
-const agentSessionUsageDeleteFeedPayloadJson = feed_payload.agentSessionUsageDelete;
+const agentMemoryWriteFeedEventType = feed_contract.agentMemoryWriteEventType;
+const agentMemoryDeleteFeedEventType = feed_contract.agentMemoryDeleteEventType;
+const agentMemoryDeleteAllFeedEventType = feed_contract.agentMemoryDeleteAllEventType;
+const agentMemoryFeedPayloadJson = feed_contract.agentMemoryWrite;
+const agentMemoryDeleteFeedPayloadJson = feed_contract.agentMemoryDelete;
+const domainPayloadJson = feed_contract.domainObject;
+const policyScopeFeedPayloadJson = feed_contract.policyScope;
+const policyScopePutDedupeKey = feed_contract.policyScopeDedupeKey;
+pub const payloadWithStorageRouteJson = feed_contract.withStorageRoute;
+const storageRouteDedupePart = feed_contract.storageRouteDedupePart;
+const contextPackFeedPayloadJson = feed_contract.contextPack;
+const agentSessionMessageFeedPayloadJson = feed_contract.agentSessionMessagePut;
+const agentSessionMessageDeleteFeedPayloadJson = feed_contract.agentSessionMessageDelete;
+const agentSessionAutosaveDeleteFeedPayloadJson = feed_contract.agentSessionAutosaveDelete;
+const agentSessionUsageFeedPayloadJson = feed_contract.agentSessionUsagePut;
+const agentSessionUsageDeleteFeedPayloadJson = feed_contract.agentSessionUsageDelete;
+const feedObjectTypeHasVisibleBackingRecord = feed_contract.objectTypeHasVisibleBackingRecord;
+const feedAgentMemoryPayloadIsInternal = feed_contract.agentMemoryPayloadIsInternal;
+
+const SQLiteFeedReferenceVisibility = struct {
+    store: *SQLiteStore,
+    allocator: std.mem.Allocator,
+    scopes_json: []const u8,
+    actor_id: ?[]const u8,
+    include_deprecated: bool,
+};
+
+fn sqliteFeedReferenceVisibleForActor(input: SQLiteFeedReferenceVisibility, object_type: []const u8, object_id: []const u8) !bool {
+    return try input.store.vectorChunkObjectVisible(input.allocator, object_type, object_id, "", "[]", input.scopes_json, input.actor_id, input.include_deprecated);
+}
+
+const PostgresFeedReferenceVisibility = struct {
+    store: *PostgresStore,
+    allocator: std.mem.Allocator,
+    scopes_json: []const u8,
+    actor_id: ?[]const u8,
+    include_deprecated: bool,
+};
+
+fn postgresFeedReferenceVisibleForActor(input: PostgresFeedReferenceVisibility, object_type: []const u8, object_id: []const u8) !bool {
+    return try input.store.vectorChunkObjectVisible(input.allocator, object_type, object_id, "", "[]", input.scopes_json, input.actor_id, input.include_deprecated);
+}
 
 const sqlite_agent_actor_where =
     "(?3 IS NOT NULL AND actor_id = ?3)";
@@ -102,39 +128,6 @@ fn primitiveTypeFromAgentCategory(category: []const u8) ?[]const u8 {
         return value;
     }
     return null;
-}
-
-fn feedObjectTypeHasVisibleBackingRecord(object_type: []const u8) bool {
-    return std.mem.eql(u8, object_type, "source") or
-        std.mem.eql(u8, object_type, "artifact") or
-        std.mem.eql(u8, object_type, "memory_atom") or
-        std.mem.eql(u8, object_type, "entity") or
-        std.mem.eql(u8, object_type, "relation") or
-        std.mem.eql(u8, object_type, "context_pack") or
-        std.mem.eql(u8, object_type, "agent_memory");
-}
-
-fn feedReferenceObjectType(value: []const u8) ?[]const u8 {
-    if (std.mem.startsWith(u8, value, "src_")) return "source";
-    if (std.mem.startsWith(u8, value, "art_")) return "artifact";
-    if (std.mem.startsWith(u8, value, "mem_")) return "memory_atom";
-    if (std.mem.startsWith(u8, value, "ent_")) return "entity";
-    if (std.mem.startsWith(u8, value, "rel_")) return "relation";
-    if (std.mem.startsWith(u8, value, "ctx_")) return "context_pack";
-    if (std.mem.startsWith(u8, value, "spc_")) return "space";
-    return null;
-}
-
-fn feedAgentMemoryPayloadIsInternal(allocator: std.mem.Allocator, payload_json: []const u8) !bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const key = json.stringField(parsed.value.object, "key") orelse "";
-    const content = json.stringField(parsed.value.object, "content") orelse "";
-    return domain.isInternalMemoryEntryKeyOrContent(key, content);
 }
 
 fn isLucidProjectableObjectType(object_type: []const u8) bool {
@@ -7221,39 +7214,13 @@ pub const SQLiteStore = struct {
     }
 
     fn feedPayloadReferencesVisibleForActor(self: *Self, allocator: std.mem.Allocator, payload_json: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return true,
-        };
-        defer parsed.deinit();
-        return try self.feedValueReferencesVisibleForActor(allocator, parsed.value, scopes_json, actor_id, include_deprecated);
-    }
-
-    fn feedValueReferencesVisibleForActor(self: *Self, allocator: std.mem.Allocator, value: std.json.Value, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
-        return switch (value) {
-            .string => |s| try self.feedReferenceStringVisibleForActor(allocator, s, scopes_json, actor_id, include_deprecated),
-            .array => |arr| {
-                for (arr.items) |item| {
-                    if (!try self.feedValueReferencesVisibleForActor(allocator, item, scopes_json, actor_id, include_deprecated)) return false;
-                }
-                return true;
-            },
-            .object => |obj| {
-                var iterator = obj.iterator();
-                while (iterator.next()) |entry| {
-                    if (!try self.feedValueReferencesVisibleForActor(allocator, entry.value_ptr.*, scopes_json, actor_id, include_deprecated)) return false;
-                }
-                return true;
-            },
-            else => true,
-        };
-    }
-
-    fn feedReferenceStringVisibleForActor(self: *Self, allocator: std.mem.Allocator, value: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
-        if (feedReferenceObjectType(value)) |object_type| {
-            return try self.vectorChunkObjectVisible(allocator, object_type, value, "", "[]", scopes_json, actor_id, include_deprecated);
-        }
-        return true;
+        return try feed_contract.payloadReferencesVisible(allocator, payload_json, SQLiteFeedReferenceVisibility{
+            .store = self,
+            .allocator = allocator,
+            .scopes_json = scopes_json,
+            .actor_id = actor_id,
+            .include_deprecated = include_deprecated,
+        }, sqliteFeedReferenceVisibleForActor);
     }
 
     fn searchAgentMemories(self: *Self, allocator: std.mem.Allocator, input: SearchInput, fts_query: []const u8, use_fts: bool, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
@@ -13304,39 +13271,13 @@ pub const PostgresStore = struct {
     }
 
     fn feedPayloadReferencesVisibleForActor(self: *PostgresStore, allocator: std.mem.Allocator, payload_json: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return true,
-        };
-        defer parsed.deinit();
-        return try self.feedValueReferencesVisibleForActor(allocator, parsed.value, scopes_json, actor_id, include_deprecated);
-    }
-
-    fn feedValueReferencesVisibleForActor(self: *PostgresStore, allocator: std.mem.Allocator, value: std.json.Value, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
-        return switch (value) {
-            .string => |s| try self.feedReferenceStringVisibleForActor(allocator, s, scopes_json, actor_id, include_deprecated),
-            .array => |arr| {
-                for (arr.items) |item| {
-                    if (!try self.feedValueReferencesVisibleForActor(allocator, item, scopes_json, actor_id, include_deprecated)) return false;
-                }
-                return true;
-            },
-            .object => |obj| {
-                var iterator = obj.iterator();
-                while (iterator.next()) |entry| {
-                    if (!try self.feedValueReferencesVisibleForActor(allocator, entry.value_ptr.*, scopes_json, actor_id, include_deprecated)) return false;
-                }
-                return true;
-            },
-            else => true,
-        };
-    }
-
-    fn feedReferenceStringVisibleForActor(self: *PostgresStore, allocator: std.mem.Allocator, value: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
-        if (feedReferenceObjectType(value)) |object_type| {
-            return try self.vectorChunkObjectVisible(allocator, object_type, value, "", "[]", scopes_json, actor_id, include_deprecated);
-        }
-        return true;
+        return try feed_contract.payloadReferencesVisible(allocator, payload_json, PostgresFeedReferenceVisibility{
+            .store = self,
+            .allocator = allocator,
+            .scopes_json = scopes_json,
+            .actor_id = actor_id,
+            .include_deprecated = include_deprecated,
+        }, postgresFeedReferenceVisibleForActor);
     }
 
     fn searchPgAgentMemories(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
