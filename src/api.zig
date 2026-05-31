@@ -4529,7 +4529,7 @@ fn nullClawEventToNativeFeedEvent(ctx: *Context, obj: std.json.ObjectMap) ![]con
     try appendOptionalRawField(ctx.allocator, &out, obj, "scope");
     try appendOptionalRawField(ctx.allocator, &out, obj, "permissions");
     try appendOptionalRawField(ctx.allocator, &out, obj, "dedupe_key");
-    try appendOptionalRawField(ctx.allocator, &out, obj, "causality");
+    try appendNullClawCausalityField(ctx.allocator, &out, obj);
     try out.appendSlice(ctx.allocator, ",\"payload\":{");
     try appendNullClawEventPayload(ctx, &out, obj, operation, key);
     try out.append(ctx.allocator, '}');
@@ -4616,6 +4616,20 @@ fn appendOptionalRawField(allocator: std.mem.Allocator, out: *std.ArrayListUnman
     try json.appendString(out, allocator, name);
     try out.append(allocator, ':');
     try appendRawJsonValue(allocator, out, value);
+}
+
+fn appendNullClawCausalityField(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), obj: std.json.ObjectMap) !void {
+    if (obj.get("causality")) |value| {
+        try out.append(allocator, ',');
+        try json.appendString(out, allocator, "causality");
+        try out.append(allocator, ':');
+        try appendRawJsonValue(allocator, out, value);
+        return;
+    }
+    const timestamp_value = obj.get("timestamp_ms") orelse return;
+    try out.appendSlice(allocator, ",\"causality\":{\"origin_timestamp_ms\":");
+    try appendRawJsonValue(allocator, out, timestamp_value);
+    try out.append(allocator, '}');
 }
 
 fn appendRawJsonValue(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value) !void {
@@ -8609,12 +8623,13 @@ fn appendFeedEventForActor(ctx: *Context, out: *std.ArrayListUnmanaged(u8), even
 
 fn appendFeedEventForActorMode(ctx: *Context, out: *std.ArrayListUnmanaged(u8), event: store_mod.FeedEvent, mode: FeedWireMode) !void {
     const payload_json = try feedPayloadForActor(ctx, event);
+    const origin = feedOriginIdentity(ctx, event);
     try out.print(ctx.allocator, "{{\"id\":{d},\"event_type\":", .{event.id});
     try json.appendString(out, ctx.allocator, event.event_type);
     try out.print(ctx.allocator, ",\"sequence\":{d},\"origin_instance_id\":", .{event.id});
-    try json.appendString(out, ctx.allocator, ctx.feed_instance_id);
-    try out.print(ctx.allocator, ",\"origin_sequence\":{d}", .{event.id});
-    try out.print(ctx.allocator, ",\"schema_version\":1,\"timestamp_ms\":{d}", .{event.created_at_ms});
+    try json.appendString(out, ctx.allocator, origin.instance_id);
+    try out.print(ctx.allocator, ",\"origin_sequence\":{d}", .{origin.sequence});
+    try out.print(ctx.allocator, ",\"schema_version\":1,\"timestamp_ms\":{d}", .{feedEventTimestampMs(ctx, event)});
     try out.appendSlice(ctx.allocator, ",\"operation\":");
     try json.appendString(out, ctx.allocator, feedWireOperation(event, mode));
     try out.appendSlice(ctx.allocator, ",\"object_type\":");
@@ -8641,6 +8656,38 @@ fn appendFeedEventForActorMode(ctx: *Context, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(ctx.allocator, ",\"compacted_at_ms\":");
     if (event.compacted_at_ms) |v| try out.print(ctx.allocator, "{d}", .{v}) else try out.appendSlice(ctx.allocator, "null");
     try out.append(ctx.allocator, '}');
+}
+
+const FeedOriginIdentity = struct {
+    instance_id: []const u8,
+    sequence: i64,
+};
+
+fn feedOriginIdentity(ctx: *Context, event: store_mod.FeedEvent) FeedOriginIdentity {
+    if (event.dedupe_key) |dedupe_key| {
+        if (parseOriginDedupeKey(dedupe_key)) |origin| return origin;
+    }
+    return .{ .instance_id = ctx.feed_instance_id, .sequence = event.id };
+}
+
+fn parseOriginDedupeKey(dedupe_key: []const u8) ?FeedOriginIdentity {
+    const prefix = "origin:";
+    if (!std.mem.startsWith(u8, dedupe_key, prefix)) return null;
+    const value = dedupe_key[prefix.len..];
+    const split = std.mem.lastIndexOfScalar(u8, value, ':') orelse return null;
+    if (split == 0 or split + 1 >= value.len) return null;
+    const sequence = std.fmt.parseInt(i64, value[split + 1 ..], 10) catch return null;
+    if (sequence < 0) return null;
+    return .{ .instance_id = value[0..split], .sequence = sequence };
+}
+
+fn feedEventTimestampMs(ctx: *Context, event: store_mod.FeedEvent) i64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, event.causality_json, .{}) catch return event.created_at_ms;
+    defer parsed.deinit();
+    if (parsed.value != .object) return event.created_at_ms;
+    return json.intField(parsed.value.object, "origin_timestamp_ms") orelse
+        json.intField(parsed.value.object, "timestamp_ms") orelse
+        event.created_at_ms;
 }
 
 fn feedWireOperation(event: store_mod.FeedEvent, mode: FeedWireMode) []const u8 {
@@ -10787,7 +10834,9 @@ test "api nullclaw memory adapter exposes replayable api-memory feed contract" {
     const feed = handleRequest(&source_ctx, "GET", "/v1/agent/memory/events?after=0&limit=10", "", "");
     try std.testing.expectEqualStrings("200 OK", feed.status);
     try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"schema_version\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"timestamp_ms\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"origin_instance_id\":\"nullclaw-a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"origin_sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"timestamp_ms\":123") != null);
     try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"key\":\"api.tags\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"value_kind\":\"string_set\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"content\":\"[\\\"zig\\\"]\"") != null);
@@ -10800,6 +10849,9 @@ test "api nullclaw memory adapter exposes replayable api-memory feed contract" {
 
     const checkpoint = handleRequest(&source_ctx, "GET", "/v1/agent/memory/checkpoint?after=0&limit=10", "", "");
     try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"origin_instance_id\":\"nullclaw-a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"origin_sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"timestamp_ms\":123") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"key\":\"api.tags\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"object_type\":\"agent_memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "not nullclaw feed") == null);
@@ -10809,6 +10861,11 @@ test "api nullclaw memory adapter exposes replayable api-memory feed contract" {
     const restored = handleRequest(&target_ctx, "GET", "/v1/agent-memory/api.tags", "", "");
     try std.testing.expectEqualStrings("200 OK", restored.status);
     try std.testing.expect(std.mem.indexOf(u8, restored.body, "[\\\"zig\\\"]") != null);
+    const restored_feed = handleRequest(&target_ctx, "GET", "/v1/agent/memory/events?after=0&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", restored_feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, restored_feed.body, "\"origin_instance_id\":\"nullclaw-a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored_feed.body, "\"origin_sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored_feed.body, "\"timestamp_ms\":123") != null);
 }
 
 test "api memory feed endpoints honor named runtime route selection" {
