@@ -262,6 +262,7 @@ pub const SearchResult = struct {
     created_at_ms: i64 = 0,
     confidence: f64 = 0.5,
     store: []const u8 = "",
+    session_id: ?[]const u8 = null,
 
     pub fn writeJson(self: SearchResult, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
         try out.appendSlice(allocator, "{\"id\":");
@@ -281,6 +282,10 @@ pub const SearchResult = struct {
             try json.appendString(out, allocator, self.store);
             try out.appendSlice(allocator, ",\"storage\":");
             try json.appendString(out, allocator, self.store);
+        }
+        if (self.session_id) |session_id| {
+            try out.appendSlice(allocator, ",\"session_id\":");
+            try json.appendString(out, allocator, session_id);
         }
         try out.print(allocator, ",\"score\":{d},\"created_at_ms\":{d},\"confidence\":{d},\"actor_isolated\":{s},\"required_scopes\":", .{ self.score, self.created_at_ms, self.confidence, if (self.actor_isolated) "true" else "false" });
         try json.appendRawJsonOr(out, allocator, self.required_scopes_json, "[]");

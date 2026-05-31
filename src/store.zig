@@ -1204,6 +1204,10 @@ pub const Store = struct {
             const text = try allocator.dupe(u8, entry.content);
             const scope = try allocator.dupe(u8, entry.scope);
             const required_scopes = try requiredAccessJsonGlobal(allocator, entry.scope, entry.permissions_json, actor);
+            const result_session_id = if (primitive_type == null)
+                if (entry.session_id) |sid| try allocator.dupe(u8, sid) else null
+            else
+                null;
             try results.append(allocator, .{
                 .id = id,
                 .result_type = primitive_type orelse "agent_memory",
@@ -1218,6 +1222,7 @@ pub const Store = struct {
                 .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0,
                 .confidence = 0.8,
                 .store = if (primitive_type == null) result_store else "",
+                .session_id = result_session_id,
             });
         }
     }
@@ -7414,6 +7419,7 @@ pub const SQLiteStore = struct {
                 .created_at_ms = timestamp_ms,
                 .confidence = confidence,
                 .store = "native",
+                .session_id = session_id,
             });
         }
     }
@@ -7469,6 +7475,7 @@ pub const SQLiteStore = struct {
                 .actor_isolated = true,
                 .created_at_ms = created_at_ms,
                 .confidence = 0.45,
+                .session_id = session_id,
             });
         }
     }
@@ -7632,6 +7639,7 @@ pub const SQLiteStore = struct {
                 .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0,
                 .confidence = entry.score orelse 0.7,
                 .store = "native",
+                .session_id = entry.session_id,
             };
         }
         if (std.mem.eql(u8, match.object_type, "space")) {
@@ -13686,6 +13694,7 @@ pub const PostgresStore = struct {
                 .created_at_ms = json.intField(obj, "timestamp_ms") orelse 0,
                 .confidence = confidence,
                 .store = "native",
+                .session_id = try dupNullableStringField(allocator, obj, "session_id"),
             });
         }
     }
@@ -13734,7 +13743,7 @@ pub const PostgresStore = struct {
             const relevance = pgScoreText(input.query, text) + pgScoreText(input.query, session_id) + pgScoreText(input.query, role);
             if (relevance <= 0 and input.query.len > 0) continue;
             const scope = try std.fmt.allocPrint(allocator, "session:{s}", .{session_id});
-            try results.append(allocator, .{ .id = try std.fmt.allocPrint(allocator, "session_msg_{d}", .{json.intField(item.object, "id") orelse 0}), .result_type = "session_message", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ session_id, role }), .text = text, .scope = scope, .status = "active", .score = relevance + 0.1, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, "[]", input.actor_id), .actor_isolated = true, .created_at_ms = json.intField(item.object, "created_at_ms") orelse 0, .confidence = 0.45 });
+            try results.append(allocator, .{ .id = try std.fmt.allocPrint(allocator, "session_msg_{d}", .{json.intField(item.object, "id") orelse 0}), .result_type = "session_message", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ session_id, role }), .text = text, .scope = scope, .status = "active", .score = relevance + 0.1, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, "[]", input.actor_id), .actor_isolated = true, .created_at_ms = json.intField(item.object, "created_at_ms") orelse 0, .confidence = 0.45, .session_id = try allocator.dupe(u8, session_id) });
         }
     }
 
@@ -13826,6 +13835,7 @@ pub const PostgresStore = struct {
                 .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0,
                 .confidence = entry.score orelse 0.7,
                 .store = "native",
+                .session_id = entry.session_id,
             };
         }
         if (std.mem.eql(u8, match.object_type, "space")) {
@@ -14571,8 +14581,13 @@ fn agentMemorySessionAllowedForSearch(search_session_id: ?[]const u8, include_se
     return include_sessions or entry_session_id == null;
 }
 
-fn searchResultAllowedForSession(_: SearchInput, _: domain.SearchResult) bool {
-    return true;
+fn searchResultAllowedForSession(input: SearchInput, candidate: domain.SearchResult) bool {
+    if (!searchResultCarriesSessionIdentity(candidate.result_type)) return true;
+    return agentMemorySessionAllowedForSearch(input.session_id, input.include_sessions, candidate.session_id);
+}
+
+fn searchResultCarriesSessionIdentity(result_type: []const u8) bool {
+    return std.mem.eql(u8, result_type, "agent_memory") or std.mem.eql(u8, result_type, "session_message");
 }
 
 fn findSearchResultIndex(results: []const domain.SearchResult, candidate: domain.SearchResult) ?usize {
@@ -15293,6 +15308,78 @@ test "retrieval ranking preserves runtime store identity when ids collide" {
     }
     try std.testing.expect(saw_scratch);
     try std.testing.expect(saw_archive);
+}
+
+test "retrieval finalization enforces carried session identity" {
+    const alloc = std.testing.allocator;
+    const global = domain.SearchResult{
+        .id = "global-agent-memory",
+        .result_type = "agent_memory",
+        .title = "global memory",
+        .text = "global memory",
+        .scope = "agent:agent:a",
+        .status = "active",
+        .score = 0.9,
+        .source_ids_json = "[]",
+    };
+    const session_memory = domain.SearchResult{
+        .id = "session-agent-memory",
+        .result_type = "agent_memory",
+        .title = "session memory",
+        .text = "session memory",
+        .scope = "session:sess-a",
+        .status = "active",
+        .score = 0.8,
+        .source_ids_json = "[]",
+        .session_id = "sess-a",
+    };
+    const session_message = domain.SearchResult{
+        .id = "session-message",
+        .result_type = "session_message",
+        .title = "session message",
+        .text = "session message",
+        .scope = "session:sess-b",
+        .status = "active",
+        .score = 0.7,
+        .source_ids_json = "[]",
+        .session_id = "sess-b",
+    };
+    const candidates = [_]domain.SearchResult{ global, session_memory, session_message };
+
+    const no_sessions = try finalizeSearchResults(alloc, .{
+        .query = "session",
+        .scopes_json = "[\"session:sess-a\",\"session:sess-b\"]",
+        .limit = 10,
+        .include_sessions = false,
+        .use_temporal_decay = false,
+        .use_mmr = false,
+    }, &candidates, 10);
+    defer alloc.free(no_sessions);
+    try std.testing.expectEqual(@as(usize, 1), no_sessions.len);
+    try std.testing.expectEqualStrings("global-agent-memory", no_sessions[0].id);
+
+    const exact_session = try finalizeSearchResults(alloc, .{
+        .query = "session",
+        .scopes_json = "[\"session:sess-a\",\"session:sess-b\"]",
+        .limit = 10,
+        .session_id = "sess-a",
+        .use_temporal_decay = false,
+        .use_mmr = false,
+    }, &candidates, 10);
+    defer alloc.free(exact_session);
+    try std.testing.expectEqual(@as(usize, 1), exact_session.len);
+    try std.testing.expectEqualStrings("session-agent-memory", exact_session[0].id);
+
+    const all_sessions = try finalizeSearchResults(alloc, .{
+        .query = "session",
+        .scopes_json = "[\"session:sess-a\",\"session:sess-b\"]",
+        .limit = 10,
+        .include_sessions = true,
+        .use_temporal_decay = false,
+        .use_mmr = false,
+    }, &candidates, 10);
+    defer alloc.free(all_sessions);
+    try std.testing.expectEqual(@as(usize, 3), all_sessions.len);
 }
 
 test "sqlite vector layer stores chunks searches and enqueues outbox" {
