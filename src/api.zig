@@ -4081,7 +4081,11 @@ fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
     const since_id = feedCursorFromQuery(query);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
-    const events = listCentralFeedEventsForRoute(ctx, since_id, limit, feed_scopes, false, storage_route) catch |err| switch (err) {
+    const projection_floor = routeProjectionCursorFloor(ctx, storage_route) catch return serverError(ctx);
+    if (projection_floor) |floor| {
+        if (since_id < floor) return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted storage-route cursor floor; request a checkpoint");
+    }
+    const events = listCentralFeedEventsForRoute(ctx, since_id, limit, feed_scopes, projection_floor != null, storage_route) catch |err| switch (err) {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor; request a checkpoint"),
         else => return serverError(ctx),
     };
@@ -4095,7 +4099,10 @@ fn memoryFeedStatus(ctx: *Context, query: []const u8) HttpResponse {
         return runtimeMemoryFeedStatus(ctx, runtime);
     }
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
-    const status = centralFeedStatusForRoute(ctx, feed_scopes, storage_route) catch return serverError(ctx);
+    const status = if (routeProjectionCursorFloor(ctx, storage_route) catch return serverError(ctx)) |floor|
+        centralFeedStatusForRouteFromFloor(ctx, feed_scopes, storage_route, floor) catch return serverError(ctx)
+    else
+        centralFeedStatusForRoute(ctx, feed_scopes, storage_route) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     status.writeJsonWithInstance(ctx.allocator, &out, ctx.feed_instance_id) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
@@ -4111,6 +4118,17 @@ fn memoryFeedCompact(ctx: *Context, body: []const u8, query: []const u8) HttpRes
         return runtimeMemoryFeedCompact(ctx, runtime, requested_before_id);
     }
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    if (feedRouteProjectionName(ctx, storage_route) catch return serverError(ctx)) |projection_name| {
+        const projection_floor = ctx.store.feedProjectionCursorFloor(ctx.allocator, projection_name) catch return serverError(ctx);
+        const status = centralFeedStatusForRouteFromFloor(ctx, feed_scopes, storage_route, projection_floor) catch return serverError(ctx);
+        const before_id = requested_before_id orelse status.max_event_id;
+        const result = ctx.store.compactFeedCursorProjection(projection_name, before_id, ctx.actor_id) catch return serverError(ctx);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        out.print(ctx.allocator, "{{\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"oldest_available_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"compacted_events\":{d},\"projection\":\"storage_route\",\"route\":", .{ result.cursor_floor, result.cursor_floor, result.cursor_floor + 1, result.max_event_id, result.max_event_id, result.compacted_events }) catch return serverError(ctx);
+        appendAgentMemoryStorageRouteJson(ctx.allocator, &out, storage_route) catch return serverError(ctx);
+        out.append(ctx.allocator, '}') catch return serverError(ctx);
+        return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+    }
     const status = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
     const before_id = requested_before_id orelse status.max_event_id;
     const result = ctx.store.compactFeed(before_id, ctx.actor_id) catch return serverError(ctx);
@@ -4133,7 +4151,10 @@ fn memoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
         return runtimeMemoryFeedCheckpoint(ctx, runtime, query);
     }
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
-    const status = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
+    const status = if (routeProjectionCursorFloor(ctx, storage_route) catch return serverError(ctx)) |floor|
+        centralFeedStatusForRouteFromFloor(ctx, feed_scopes, storage_route, floor) catch return serverError(ctx)
+    else
+        ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
     const since_id = feedCursorFromQuery(query);
     const limit = parseLimit(json.queryParam(query, "limit"), 500);
     const events = listCentralFeedEventsForRoute(ctx, since_id, limit, feed_scopes, true, storage_route) catch |err| switch (err) {
@@ -4177,6 +4198,44 @@ fn centralFeedRouteNeedsFilter(route: store_mod.AgentMemoryStorageRoute) bool {
     };
 }
 
+fn routeProjectionCursorFloor(ctx: *Context, route: store_mod.AgentMemoryStorageRoute) !?i64 {
+    const projection_name = (try feedRouteProjectionName(ctx, route)) orelse return null;
+    return try ctx.store.feedProjectionCursorFloor(ctx.allocator, projection_name);
+}
+
+fn feedRouteProjectionName(ctx: *Context, route: store_mod.AgentMemoryStorageRoute) !?[]const u8 {
+    if (!centralFeedRouteNeedsFilter(route)) return null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    try out.appendSlice(ctx.allocator, "memory_feed_route:actor:");
+    try out.appendSlice(ctx.allocator, ctx.actor_id);
+    try out.append(ctx.allocator, ':');
+    switch (route.target) {
+        .primary, .all => unreachable,
+        .native => try out.appendSlice(ctx.allocator, "native"),
+        .runtime => try out.appendSlice(ctx.allocator, "runtime"),
+        .named => {
+            try out.appendSlice(ctx.allocator, "named:");
+            try out.appendSlice(ctx.allocator, route.name orelse "runtime");
+        },
+        .subset => {
+            try out.appendSlice(ctx.allocator, "subset:");
+            const stores = try ctx.allocator.dupe([]const u8, route.stores);
+            std.mem.sort([]const u8, stores, {}, struct {
+                fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lessThan);
+            for (stores, 0..) |store_name, i| {
+                if (i > 0) try out.append(ctx.allocator, ',');
+                try out.appendSlice(ctx.allocator, store_name);
+            }
+        },
+    }
+    const projection_name = try out.toOwnedSlice(ctx.allocator);
+    return projection_name;
+}
+
 fn listCentralFeedEventsForRoute(ctx: *Context, since_id: i64, limit: usize, scopes_json: []const u8, ignore_cursor_floor: bool, route: store_mod.AgentMemoryStorageRoute) ![]store_mod.FeedEvent {
     if (!centralFeedRouteNeedsFilter(route)) {
         return ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = scopes_json, .ignore_cursor_floor = ignore_cursor_floor, .actor_id = ctx.actor_id });
@@ -4209,20 +4268,26 @@ fn centralFeedStatusForRoute(ctx: *Context, scopes_json: []const u8, route: stor
     const base = try ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = scopes_json, .actor_id = ctx.actor_id });
     if (!centralFeedRouteNeedsFilter(route)) return base;
 
+    return centralFeedStatusForRouteFromFloor(ctx, scopes_json, route, base.cursor_floor);
+}
+
+fn centralFeedStatusForRouteFromFloor(ctx: *Context, scopes_json: []const u8, route: store_mod.AgentMemoryStorageRoute, cursor_floor: i64) !store_mod.FeedStatus {
+    const base = try ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = scopes_json, .actor_id = ctx.actor_id });
     var filtered = store_mod.FeedStatus{
-        .cursor_floor = base.cursor_floor,
+        .cursor_floor = cursor_floor,
         .max_event_id = base.max_event_id,
         .visible_events = 0,
         .pending_events = 0,
         .applying_events = 0,
         .applied_events = 0,
     };
-    var cursor = base.cursor_floor;
+    var cursor = cursor_floor;
     while (true) {
         const batch = try ctx.store.listFeedEvents(ctx.allocator, .{
             .since_id = cursor,
             .limit = 500,
             .scopes_json = scopes_json,
+            .ignore_cursor_floor = true,
             .actor_id = ctx.actor_id,
         });
         if (batch.len == 0) break;
@@ -4421,7 +4486,7 @@ fn runtimeMemoryFeedApply(ctx: *Context, runtime: *agent_memory_runtime.Runtime,
 
 const FeedProjectionCompaction = struct {
     name: []const u8,
-    object_type: []const u8,
+    object_type: ?[]const u8 = null,
 };
 
 fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8, query: []const u8) HttpResponse {
@@ -4436,15 +4501,22 @@ fn memoryFeedCheckpointRestoreInternal(ctx: *Context, body: []const u8, query: [
             return runtimeMemoryFeedCheckpointRestore(ctx, runtime, body);
         }
     }
+    const effective_projection = projection_compaction orelse blk: {
+        const projection_name = (feedRouteProjectionName(ctx, storage_route) catch return serverError(ctx)) orelse break :blk null;
+        break :blk FeedProjectionCompaction{ .name = projection_name };
+    };
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const events_value = checkpointEventsValue(parsed.value.object) orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Checkpoint restore requires an events array");
     if (events_value != .array) return json.errorResponse(ctx.allocator, 400, "bad_request", "Checkpoint restore requires an events array");
     const checkpoint_compacted_through = checkpointCompactedThrough(parsed.value.object);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
-    const status_before_restore = if (projection_compaction) |projection| blk: {
+    const status_before_restore = if (effective_projection) |projection| blk: {
         const projection_floor = ctx.store.feedProjectionCursorFloor(ctx.allocator, projection.name) catch return serverError(ctx);
-        break :blk centralFeedStatusByObjectTypeFromFloor(ctx, feed_scopes, projection.object_type, projection_floor) catch return serverError(ctx);
+        break :blk if (projection.object_type) |object_type|
+            centralFeedStatusByObjectTypeFromFloor(ctx, feed_scopes, object_type, projection_floor) catch return serverError(ctx)
+        else
+            centralFeedStatusForRouteFromFloor(ctx, feed_scopes, storage_route, projection_floor) catch return serverError(ctx);
     } else ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
 
     var restored: usize = 0;
@@ -4470,7 +4542,7 @@ fn memoryFeedCheckpointRestoreInternal(ctx: *Context, body: []const u8, query: [
             queued += 1;
         } else if (std.mem.eql(u8, status, "applied") or std.mem.eql(u8, status, "applying")) {
             const event_body = json.jsonFromValue(ctx.allocator, event_value) catch return serverError(ctx);
-            const response = applyMemoryEvent(ctx, event_body, "");
+            const response = applyMemoryEvent(ctx, event_body, query);
             if (!std.mem.eql(u8, response.status, "200 OK")) return response;
             local_event_id = responseEventId(ctx.allocator, response.body);
             applied += 1;
@@ -4491,15 +4563,17 @@ fn memoryFeedCheckpointRestoreInternal(ctx: *Context, body: []const u8, query: [
     var cursor_floor_restored = false;
     var cursor_floor_restore_skipped = false;
     if (checkpoint_compacted_through > 0 and local_compact_floor > 0) {
-        const can_restore_floor = if (projection_compaction != null)
+        const can_restore_floor = if (effective_projection != null)
             (status_before_restore.visible_events == 0 or status_before_restore.cursor_floor >= local_compact_floor)
         else
             (status_before_restore.max_event_id == 0 or status_before_restore.cursor_floor >= local_compact_floor);
         if (can_restore_floor) {
-            const compacted = if (projection_compaction) |projection|
-                ctx.store.compactFeedProjection(projection.name, projection.object_type, local_compact_floor, ctx.actor_id) catch return serverError(ctx)
-            else
-                ctx.store.compactFeed(local_compact_floor, ctx.actor_id) catch return serverError(ctx);
+            const compacted = if (effective_projection) |projection| blk: {
+                break :blk if (projection.object_type) |object_type|
+                    ctx.store.compactFeedProjection(projection.name, object_type, local_compact_floor, ctx.actor_id) catch return serverError(ctx)
+                else
+                    ctx.store.compactFeedCursorProjection(projection.name, local_compact_floor, ctx.actor_id) catch return serverError(ctx);
+            } else ctx.store.compactFeed(local_compact_floor, ctx.actor_id) catch return serverError(ctx);
             restored_cursor_floor = compacted.cursor_floor;
             cursor_floor_restored = true;
         } else {
@@ -11053,8 +11127,12 @@ test "api memory feed endpoints honor named runtime route selection" {
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed session feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "\"total_tokens\":123") != null);
 
+    const native_apply = handleRequest(&ctx, "POST", "/v1/memory/events", "{\"event_type\":\"memory_atom.put\",\"object_type\":\"memory_atom\",\"object_id\":\"route_native_memory\",\"scope\":\"public\",\"payload\":{\"text\":\"Native feed survives route compact\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", native_apply.status);
+
     const native_feed = handleRequest(&ctx, "GET", "/v1/memory/events?storage=native", "", "");
     try std.testing.expectEqualStrings("200 OK", native_feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Native feed survives route compact") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch routed feed apply") == null);
     try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch routed session feed") == null);
 
@@ -11068,9 +11146,29 @@ test "api memory feed endpoints honor named runtime route selection" {
     const named_compact = handleRequest(&ctx, "POST", "/v1/memory/compact?store=scratch", "{}", "");
     try std.testing.expectEqualStrings("200 OK", named_compact.status);
     try std.testing.expect(std.mem.indexOf(u8, named_compact.body, "\"cursor_floor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_compact.body, "\"projection\":\"storage_route\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_compact.body, "\"name\":\"scratch\"") != null);
+
+    const expired_named_feed = handleRequest(&ctx, "GET", "/v1/memory/events?store=scratch&after=0", "", "");
+    try std.testing.expectEqualStrings("410 Gone", expired_named_feed.status);
+    const native_feed_after_route_compact = handleRequest(&ctx, "GET", "/v1/memory/events?storage=native&after=0", "", "");
+    try std.testing.expectEqualStrings("200 OK", native_feed_after_route_compact.status);
+    try std.testing.expect(std.mem.indexOf(u8, native_feed_after_route_compact.body, "Native feed survives route compact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_feed_after_route_compact.body, "Scratch routed feed apply") == null);
+    const global_feed_after_route_compact = handleRequest(&ctx, "GET", "/v1/memory/events?after=0", "", "");
+    try std.testing.expectEqualStrings("200 OK", global_feed_after_route_compact.status);
+    try std.testing.expect(std.mem.indexOf(u8, global_feed_after_route_compact.body, "Native feed survives route compact") != null);
 
     const named_restore = handleRequest(&ctx, "POST", "/v1/memory/checkpoint?store=scratch", "{\"events\":[]}", "");
     try std.testing.expectEqualStrings("200 OK", named_restore.status);
+
+    const query_routed_restore = handleRequest(&ctx, "POST", "/v1/memory/checkpoint?store=scratch", "{\"events\":[{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"scope\":\"public\",\"payload\":{\"key\":\"restored.routed\",\"content\":\"Restored via query route\",\"scope\":\"public\"}}]}", "");
+    try std.testing.expectEqualStrings("200 OK", query_routed_restore.status);
+    const query_routed_get = handleRequest(&ctx, "GET", "/v1/agent-memory/restored.routed?store=scratch&scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", query_routed_get.status);
+    try std.testing.expect(std.mem.indexOf(u8, query_routed_get.body, "Restored via query route") != null);
+    const query_routed_native_get = handleRequest(&ctx, "GET", "/v1/agent-memory/restored.routed?storage=native&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", query_routed_native_get.status);
 }
 
 test "api memory checkpoint restore preserves primitive named runtime mirrors" {

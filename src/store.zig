@@ -1745,6 +1745,13 @@ pub const Store = struct {
         };
     }
 
+    pub fn compactFeedCursorProjection(self: *Store, name: []const u8, before_id: i64, actor_id: ?[]const u8) !FeedCompactResult {
+        return switch (self.backend) {
+            .sqlite => |*s| s.compactFeedCursorProjection(name, before_id, actor_id),
+            .postgres => |*p| p.compactFeedCursorProjection(name, before_id, actor_id),
+        };
+    }
+
     pub fn compactFeed(self: *Store, before_id: i64, actor_id: ?[]const u8) !FeedCompactResult {
         return switch (self.backend) {
             .sqlite => |*s| s.compactFeed(before_id, actor_id),
@@ -8568,6 +8575,26 @@ pub const SQLiteStore = struct {
         return .{ .cursor_floor = try self.feedProjectionCursorFloor(name), .max_event_id = max_id, .compacted_events = changed };
     }
 
+    pub fn compactFeedCursorProjection(self: *Self, name: []const u8, before_id: i64, actor_id: ?[]const u8) !FeedCompactResult {
+        const max_id: i64 = @intCast(try self.countSql("SELECT coalesce(max(id), 0) FROM memory_feed_events"));
+        const old_floor = try self.feedProjectionCursorFloor(name);
+        const floor = @max(@as(i64, 0), @min(before_id, max_id));
+        const count_stmt = try self.prepare("SELECT count(*) FROM memory_feed_events WHERE id > ?1 AND id <= ?2");
+        defer _ = c.sqlite3_finalize(count_stmt);
+        _ = c.sqlite3_bind_int64(count_stmt, 1, old_floor);
+        _ = c.sqlite3_bind_int64(count_stmt, 2, floor);
+        const changed: usize = if (c.sqlite3_step(count_stmt) == c.SQLITE_ROW) @intCast(c.sqlite3_column_int64(count_stmt, 0)) else 0;
+        const now = ids.nowMs();
+        const state = try self.prepare("INSERT INTO memory_feed_cursors (name, cursor_floor, updated_at_ms) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET cursor_floor = CASE WHEN cursor_floor < excluded.cursor_floor THEN excluded.cursor_floor ELSE cursor_floor END, updated_at_ms = excluded.updated_at_ms");
+        defer _ = c.sqlite3_finalize(state);
+        bindText(state, 1, name);
+        _ = c.sqlite3_bind_int64(state, 2, floor);
+        _ = c.sqlite3_bind_int64(state, 3, now);
+        if (c.sqlite3_step(state) != c.SQLITE_DONE) return error.UpdateFailed;
+        try self.insertAuditActor("memory_feed_projection.compacted", actor_id, "memory_feed_projection", name);
+        return .{ .cursor_floor = try self.feedProjectionCursorFloor(name), .max_event_id = max_id, .compacted_events = changed };
+    }
+
     fn readFeedEvent(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !FeedEvent {
         const scope = try columnText(allocator, stmt, 5);
         return readFeedEventWithScope(allocator, stmt, scope);
@@ -11902,6 +11929,41 @@ pub const PostgresStore = struct {
             allocator,
             "SELECT count(*)::text FROM memory_feed_events WHERE id > $1::bigint AND id <= $2::bigint AND object_type = $3",
             &.{ old_floor_text, floor_text, object_type },
+        );
+        const compacted = std.fmt.parseInt(usize, compacted_text, 10) catch 0;
+        var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+        try payload_buf.appendSlice(allocator, "{\"projection\":");
+        try json.appendString(&payload_buf, allocator, name);
+        try payload_buf.print(allocator, ",\"compacted_events\":{d}}}", .{compacted});
+        const payload = try payload_buf.toOwnedSlice(allocator);
+        _ = try self.queryParamsText(
+            allocator,
+            "WITH updated_state AS (" ++
+                "INSERT INTO memory_feed_cursors (name,cursor_floor,updated_at_ms) VALUES ($1,$2::bigint,$3::bigint) " ++
+                "ON CONFLICT(name) DO UPDATE SET cursor_floor = greatest(memory_feed_cursors.cursor_floor, excluded.cursor_floor), updated_at_ms = excluded.updated_at_ms RETURNING cursor_floor" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_feed_projection.compacted',$4,'memory_feed_projection',$1,$5::jsonb,$3::bigint) RETURNING 1" ++
+                ") SELECT coalesce((SELECT cursor_floor::text FROM updated_state), '0')",
+            &.{ name, floor_text, now_text, actor_id, payload },
+        );
+        return .{ .cursor_floor = try self.feedProjectionCursorFloor(allocator, name), .max_event_id = max_id, .compacted_events = compacted };
+    }
+
+    pub fn compactFeedCursorProjection(self: *PostgresStore, name: []const u8, before_id: i64, actor_id: ?[]const u8) !FeedCompactResult {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const max_text = try self.queryText(allocator, "SELECT coalesce(max(id), 0)::text FROM memory_feed_events");
+        const max_id = std.fmt.parseInt(i64, max_text, 10) catch 0;
+        const old_floor = try self.feedProjectionCursorFloor(allocator, name);
+        const floor = @max(@as(i64, 0), @min(before_id, max_id));
+        const old_floor_text = try std.fmt.allocPrint(allocator, "{d}", .{old_floor});
+        const floor_text = try std.fmt.allocPrint(allocator, "{d}", .{floor});
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
+        const compacted_text = try self.queryParamsText(
+            allocator,
+            "SELECT count(*)::text FROM memory_feed_events WHERE id > $1::bigint AND id <= $2::bigint",
+            &.{ old_floor_text, floor_text },
         );
         const compacted = std.fmt.parseInt(usize, compacted_text, 10) catch 0;
         var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
