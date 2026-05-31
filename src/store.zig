@@ -1770,6 +1770,13 @@ pub const Store = struct {
         };
     }
 
+    pub fn listMemoryAtomsVisible(self: *Store, allocator: std.mem.Allocator, input: MemoryAtomListInput) ![]domain.MemoryAtom {
+        return switch (self.backend) {
+            .sqlite => |*s| s.listMemoryAtomsVisible(allocator, input),
+            .postgres => |*p| p.listMemoryAtomsVisible(allocator, input),
+        };
+    }
+
     pub fn createContextPack(self: *Store, allocator: std.mem.Allocator, input: ContextPackInput) !ContextPackResult {
         try self.ensureKnowledgePrimitiveMirrorRoute(input.agent_memory_route);
         var owns_search_results = false;
@@ -4521,6 +4528,13 @@ pub const HygieneRunResult = struct {
     archived: usize = 0,
     purged: usize = 0,
     expired_cache_entries: usize = 0,
+};
+
+pub const MemoryAtomListInput = struct {
+    limit: usize = 1000,
+    scopes_json: []const u8 = "[\"admin\"]",
+    actor_id: ?[]const u8 = null,
+    include_deprecated: bool = false,
 };
 
 pub const ContextPackInput = struct {
@@ -8686,6 +8700,36 @@ pub const SQLiteStore = struct {
         return result;
     }
 
+    pub fn listMemoryAtomsVisible(self: *Self, allocator: std.mem.Allocator, input: MemoryAtomListInput) ![]domain.MemoryAtom {
+        const limit = @max(@as(usize, 1), @min(input.limit, 5000));
+        const scan_limit = @max(limit, @min(limit * 5, @as(usize, 5000)));
+        const stmt = try self.prepare(
+            "SELECT id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json " ++
+                "FROM memory_atoms WHERE predicate <> 'agent.memory' ORDER BY created_at_ms DESC LIMIT ?1",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(scan_limit));
+        var list: std.ArrayListUnmanaged(domain.MemoryAtom) = .empty;
+        errdefer {
+            for (list.items) |*atom| deinitMemoryAtom(allocator, atom);
+            list.deinit(allocator);
+        }
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            var atom = try readMemoryAtom(allocator, stmt);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(atom.status)) {
+                deinitMemoryAtom(allocator, &atom);
+                continue;
+            }
+            if (!try self.recordVisibleWithPolicyForActor(allocator, atom.scope, atom.permissions_json, input.scopes_json, input.actor_id)) {
+                deinitMemoryAtom(allocator, &atom);
+                continue;
+            }
+            try list.append(allocator, atom);
+            if (list.items.len >= limit) break;
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
     fn hardDeleteMemoryAtom(self: *Self, id_text: []const u8) !bool {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -12029,6 +12073,40 @@ pub const PostgresStore = struct {
         };
         try self.insertAudit(self.allocator, "lifecycle.hygiene", null, "memory_atom", "bulk");
         return result;
+    }
+
+    pub fn listMemoryAtomsVisible(self: *PostgresStore, allocator: std.mem.Allocator, input: MemoryAtomListInput) ![]domain.MemoryAtom {
+        const limit = @max(@as(usize, 1), @min(input.limit, 5000));
+        const scan_limit = @max(limit, @min(limit * 5, @as(usize, 5000)));
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{scan_limit});
+        defer allocator.free(limit_text);
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json " ++
+                "FROM memory_atoms WHERE predicate <> 'agent.memory' ORDER BY created_at_ms DESC LIMIT $1::bigint",
+            &.{limit_text},
+        );
+        defer parsed.deinit();
+        var out: std.ArrayListUnmanaged(domain.MemoryAtom) = .empty;
+        errdefer {
+            for (out.items) |*atom| deinitMemoryAtom(allocator, atom);
+            out.deinit(allocator);
+        }
+        if (parsed.value == .array) for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            var atom = try readPgMemoryAtom(allocator, item.object);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(atom.status)) {
+                deinitMemoryAtom(allocator, &atom);
+                continue;
+            }
+            if (!try self.recordVisibleWithPolicyForActor(allocator, atom.scope, atom.permissions_json, input.scopes_json, input.actor_id)) {
+                deinitMemoryAtom(allocator, &atom);
+                continue;
+            }
+            try out.append(allocator, atom);
+            if (out.items.len >= limit) break;
+        };
+        return out.toOwnedSlice(allocator);
     }
 
     fn hardDeleteMemoryAtom(self: *PostgresStore, id_text: []const u8) !bool {
