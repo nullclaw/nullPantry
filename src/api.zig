@@ -1192,6 +1192,7 @@ fn agentSessionReadAllowed(ctx: *Context, session_id: []const u8) bool {
     if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
     if (!hasCapability(ctx, "read")) return false;
     const scope = std.fmt.allocPrint(ctx.allocator, "session:{s}", .{session_id}) catch return false;
+    defer ctx.allocator.free(scope);
     return domain.scopeVisible(scope, ctx.actor_scopes_json);
 }
 
@@ -1199,6 +1200,7 @@ fn agentSessionWriteAllowed(ctx: *Context, session_id: []const u8) bool {
     if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
     if (!hasCapability(ctx, "write")) return false;
     const scope = std.fmt.allocPrint(ctx.allocator, "session:{s}", .{session_id}) catch return false;
+    defer ctx.allocator.free(scope);
     return domain.scopeWritable(scope, ctx.actor_scopes_json);
 }
 
@@ -1212,6 +1214,23 @@ fn allAgentSessionsWriteAllowed(ctx: *Context) bool {
     if (domain.hasActorScope(ctx.actor_scopes_json, "admin")) return true;
     if (!hasCapability(ctx, "write")) return false;
     return domain.scopeWritable("session:", ctx.actor_scopes_json);
+}
+
+test "agent session ACL helpers release derived session scopes" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+
+    var ctx = Context{
+        .allocator = std.testing.allocator,
+        .store = &store,
+        .actor_scopes_json = "[\"session:alpha\",\"write:session:alpha\"]",
+        .actor_capabilities_json = "[\"read\",\"write\"]",
+    };
+
+    try std.testing.expect(agentSessionReadAllowed(&ctx, "alpha"));
+    try std.testing.expect(agentSessionWriteAllowed(&ctx, "alpha"));
+    try std.testing.expect(!agentSessionReadAllowed(&ctx, "beta"));
+    try std.testing.expect(!agentSessionWriteAllowed(&ctx, "beta"));
 }
 
 fn authorized(ctx: *Context, raw_request: []const u8) bool {
@@ -5462,13 +5481,18 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     var agent_memory_delete_actor_id: ?[]const u8 = null;
     var agent_memory_delete_all = false;
     var agent_memory_route: store_mod.AgentMemoryStorageRoute = .{};
+    var agent_memory_prepared: ?AgentMemoryApplyInput = null;
+    defer {
+        if (agent_memory_prepared) |*prepared| prepared.deinit(ctx.allocator);
+    }
     if (std.mem.eql(u8, object_type, "agent_memory")) {
-        const prepared = buildAppliedAgentMemoryInput(ctx, operation, event_payload_json, event_object_id, event_actor_id, event_payload_route) catch |err| switch (err) {
+        agent_memory_prepared = buildAppliedAgentMemoryInput(ctx, operation, event_payload_json, event_object_id, event_actor_id, event_payload_route) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.InternalAgentMemory => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be applied through the feed"),
             error.MissingKey, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Agent memory apply payload must include key/object_id and valid merge content"),
             else => return serverError(ctx),
         };
+        const prepared = agent_memory_prepared.?;
         agent_memory_route = prepared.route;
         if (prepared.delete_key) |key| {
             agent_memory_delete_key = key;
@@ -5839,7 +5863,74 @@ const AgentMemoryApplyInput = struct {
     delete_actor_id: ?[]const u8 = null,
     delete_all: bool = false,
     route: store_mod.AgentMemoryStorageRoute = .{},
+    owned_owner_actor_id: ?[]const u8 = null,
+
+    fn deinit(self: *AgentMemoryApplyInput, allocator: std.mem.Allocator) void {
+        if (self.owned_owner_actor_id) |owner| allocator.free(owner);
+        self.owned_owner_actor_id = null;
+    }
 };
+
+const AgentMemoryOwnerLease = struct {
+    value: []const u8,
+    owned: ?[]const u8 = null,
+
+    fn deinit(self: *AgentMemoryOwnerLease, allocator: std.mem.Allocator) void {
+        if (self.owned) |owner| allocator.free(owner);
+        self.owned = null;
+    }
+
+    fn transfer(self: *AgentMemoryOwnerLease) ?[]const u8 {
+        const owned = self.owned;
+        self.owned = null;
+        return owned;
+    }
+};
+
+fn agentMemoryOwnerLease(ctx: *Context, event_actor_id: []const u8, scope: ?[]const u8, obj: std.json.ObjectMap) !AgentMemoryOwnerLease {
+    const computed_owner_id = try access.agentMemoryOwner(ctx.allocator, event_actor_id, scope);
+    errdefer ctx.allocator.free(computed_owner_id);
+    if (json.stringField(obj, "owner_id")) |explicit_owner_id| {
+        if (!std.mem.eql(u8, explicit_owner_id, computed_owner_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
+        ctx.allocator.free(computed_owner_id);
+        return .{ .value = explicit_owner_id };
+    }
+    return .{ .value = computed_owner_id, .owned = computed_owner_id };
+}
+
+test "agent memory owner lease owns computed shared owner and rejects spoofed owner" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+
+    var ctx = Context{
+        .allocator = std.testing.allocator,
+        .store = &store,
+        .actor_id = "agent:a",
+        .actor_scopes_json = "[\"team:alpha\",\"write:team:alpha\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"feed_apply\"]",
+    };
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"scope\":\"team:alpha\"}", .{});
+    defer parsed.deinit();
+
+    var lease = try agentMemoryOwnerLease(&ctx, "agent:a", "team:alpha", parsed.value.object);
+    defer lease.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("shared:team:alpha", lease.value);
+    try std.testing.expect(lease.owned != null);
+
+    var explicit = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"owner_id\":\"shared:team:alpha\"}", .{});
+    defer explicit.deinit();
+
+    var explicit_lease = try agentMemoryOwnerLease(&ctx, "agent:a", "team:alpha", explicit.value.object);
+    defer explicit_lease.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("shared:team:alpha", explicit_lease.value);
+    try std.testing.expect(explicit_lease.owned == null);
+
+    var spoofed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"owner_id\":\"shared:team:beta\"}", .{});
+    defer spoofed.deinit();
+
+    try std.testing.expectError(error.Forbidden, agentMemoryOwnerLease(&ctx, "agent:a", "team:alpha", spoofed.value.object));
+}
 
 const AgentMemoryLifecycleApplyInput = struct {
     key: []const u8,
@@ -5936,14 +6027,17 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
     }
     const route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route);
     const scope = json.nullableStringField(obj, "scope");
-    const computed_owner_id = try access.agentMemoryOwner(ctx.allocator, event_actor_id, scope);
-    const owner_actor_id = json.stringField(obj, "owner_id") orelse computed_owner_id;
-    if (!std.mem.eql(u8, owner_actor_id, computed_owner_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
+    var owner = try agentMemoryOwnerLease(ctx, event_actor_id, scope, obj);
+    defer owner.deinit(ctx.allocator);
     if (std.mem.eql(u8, operation, "delete_all")) {
-        return .{ .delete_key = key, .delete_session_id = null, .delete_actor_id = owner_actor_id, .delete_all = true, .route = route };
+        const owner_value = owner.value;
+        const owned_owner_actor_id = owner.transfer();
+        return .{ .delete_key = key, .delete_session_id = null, .delete_actor_id = owner_value, .delete_all = true, .route = route, .owned_owner_actor_id = owned_owner_actor_id };
     }
     if (std.mem.eql(u8, operation, "delete") or std.mem.eql(u8, operation, "forget") or std.mem.eql(u8, operation, "delete_scoped")) {
-        return .{ .delete_key = key, .delete_session_id = session_id, .delete_actor_id = owner_actor_id, .route = route };
+        const owner_value = owner.value;
+        const owned_owner_actor_id = owner.transfer();
+        return .{ .delete_key = key, .delete_session_id = session_id, .delete_actor_id = owner_value, .route = route, .owned_owner_actor_id = owned_owner_actor_id };
     }
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return error.InvalidPayload;
     if (scope) |requested_scope| {
@@ -5961,6 +6055,8 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
     };
     if (domain.isInternalMemoryEntryKeyOrContent(key, content)) return error.InternalAgentMemory;
 
+    const owner_value = owner.value;
+    const owned_owner_actor_id = owner.transfer();
     return .{ .input = .{
         .key = key,
         .content = content,
@@ -5969,10 +6065,10 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
         .scope = scope,
         .permissions_json = permissions_json,
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch "{}",
-        .actor_id = owner_actor_id,
+        .actor_id = owner_value,
         .writer_actor_id = event_actor_id,
         .operation = memory_operation,
-    }, .route = route };
+    }, .route = route, .owned_owner_actor_id = owned_owner_actor_id };
 }
 
 fn buildAppliedAgentMemoryLifecycleInput(ctx: *Context, operation: []const u8, payload_json: []const u8, object_id: ?[]const u8, event_actor_id: []const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !AgentMemoryLifecycleApplyInput {
@@ -5988,11 +6084,10 @@ fn buildAppliedAgentMemoryLifecycleInput(ctx: *Context, operation: []const u8, p
     }
     const route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route);
     const scope = json.nullableStringField(obj, "scope");
-    const computed_owner_id = try access.agentMemoryOwner(ctx.allocator, event_actor_id, scope);
-    const owner_actor_id = json.stringField(obj, "owner_id") orelse computed_owner_id;
-    if (!std.mem.eql(u8, owner_actor_id, computed_owner_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
+    var owner = try agentMemoryOwnerLease(ctx, event_actor_id, scope, obj);
+    defer owner.deinit(ctx.allocator);
 
-    var existing = (try ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, route)) orelse return error.NotFound;
+    var existing = (try ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner.value, route)) orelse return error.NotFound;
     defer agent_memory_runtime.freeAgentMemory(ctx.allocator, &existing);
     const visible = access.agentMemoryVisible(ctx.allocator, .{
         .owner_actor_id = existing.actor_id,
@@ -6010,7 +6105,7 @@ fn buildAppliedAgentMemoryLifecycleInput(ctx: *Context, operation: []const u8, p
     return .{
         .key = try ctx.allocator.dupe(u8, key),
         .session_id = if (session_id) |sid| try ctx.allocator.dupe(u8, sid) else null,
-        .owner_actor_id = try ctx.allocator.dupe(u8, owner_actor_id),
+        .owner_actor_id = try ctx.allocator.dupe(u8, owner.value),
         .scope = try ctx.allocator.dupe(u8, existing.scope),
         .permissions_json = try ctx.allocator.dupe(u8, existing.permissions_json),
         .status = try ctx.allocator.dupe(u8, payload_status),
@@ -7694,7 +7789,10 @@ fn snapshotHydrateAgentMemory(ctx: *Context, obj: std.json.ObjectMap, options: S
         return error.Forbidden;
     }
     if (options.dry_run) return .{ .object_type = "agent_memory", .id = json.stringField(obj, "id") orelse key };
-    const owner_actor_id = json.stringField(obj, "owner_id") orelse json.stringField(obj, "actor_id") orelse (try access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope));
+    const explicit_owner_actor_id = json.stringField(obj, "owner_id") orelse json.stringField(obj, "actor_id");
+    const computed_owner_actor_id = if (explicit_owner_actor_id == null) try access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) else null;
+    defer if (computed_owner_actor_id) |owner| ctx.allocator.free(owner);
+    const owner_actor_id = explicit_owner_actor_id orelse computed_owner_actor_id.?;
     const route = try storage_routes.fromObject(ctx.allocator, obj);
     if (try ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, route)) |existing| {
         if (std.mem.eql(u8, existing.content, content) and std.mem.eql(u8, existing.category, category)) {
@@ -8762,6 +8860,7 @@ fn agentMemoryStoreParsedWithDefaultCategory(ctx: *Context, key: []const u8, obj
     }
     const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     const owner_actor_id = access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx);
+    defer ctx.allocator.free(owner_actor_id);
     const entry = ctx.store.agentMemoryStoreRouted(ctx.allocator, .{
         .key = key,
         .content = content,
@@ -8791,6 +8890,7 @@ fn agentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) HttpRespons
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     var entry = if (requested_scope) |scope| blk: {
         const owner_actor_id = access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx);
+        defer ctx.allocator.free(owner_actor_id);
         break :blk ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
@@ -8916,6 +9016,7 @@ fn agentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResp
         access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx)
     else
         ctx.actor_id;
+    defer if (requested_scope != null) ctx.allocator.free(owner_actor_id);
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const entry = ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
