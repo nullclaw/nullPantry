@@ -4221,6 +4221,7 @@ fn messageSliceContains(entries: []const Message, needle: Message) bool {
     for (entries) |entry| {
         if (!std.mem.eql(u8, entry.role, needle.role)) continue;
         if (!std.mem.eql(u8, entry.content, needle.content)) continue;
+        if (entry.created_at_ms != needle.created_at_ms) continue;
         return true;
     }
     return false;
@@ -4229,7 +4230,10 @@ fn messageSliceContains(entries: []const Message, needle: Message) bool {
 fn sortMessages(entries: []Message) void {
     std.mem.sort(Message, entries, {}, struct {
         fn lessThan(_: void, a: Message, b: Message) bool {
-            return a.created_at_ms < b.created_at_ms;
+            if (a.created_at_ms != b.created_at_ms) return a.created_at_ms < b.created_at_ms;
+            const role_order = std.mem.order(u8, a.role, b.role);
+            if (role_order != .eq) return role_order == .lt;
+            return std.mem.order(u8, a.content, b.content) == .lt;
         }
     }.lessThan);
 }
@@ -14571,6 +14575,49 @@ test "sqlite runtime agent memory mirrors deprecate stale versions per named sto
         \\    AND json_extract(s.metadata_json, '$.owner_id') = 'agent:lifecycle'
         \\)
     ));
+}
+
+test "sqlite federated session merge keeps repeated content with distinct timestamps" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "archive", .config = .{ .backend = .memory_lru } },
+        },
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const scratch = AgentMemoryStorageRoute.parse("scratch");
+    const archive = AgentMemoryStorageRoute.parse("archive");
+    const subset = AgentMemoryStorageRoute.fromStores(&.{ "scratch", "archive" });
+
+    try store.saveMessageRoutedAt("merge-session", "user", "same text", 101, "agent:merge", scratch);
+    try store.saveMessageRoutedAt("merge-session", "user", "same text", 202, "agent:merge", archive);
+    try store.saveMessageRoutedAt("merge-session", "assistant", "mirrored text", 303, "agent:merge", subset);
+
+    const messages = try store.loadMessagesRouted(alloc, "merge-session", "agent:merge", subset);
+    defer {
+        for (messages) |*message| freeMessageOwned(alloc, message);
+        alloc.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqual(@as(i64, 101), messages[0].created_at_ms);
+    try std.testing.expectEqualStrings("same text", messages[0].content);
+    try std.testing.expectEqual(@as(i64, 202), messages[1].created_at_ms);
+    try std.testing.expectEqualStrings("same text", messages[1].content);
+    try std.testing.expectEqual(@as(i64, 303), messages[2].created_at_ms);
+    try std.testing.expectEqualStrings("mirrored text", messages[2].content);
+
+    const paged = try store.historyRouted(alloc, "merge-session", 1, 1, "agent:merge", subset);
+    defer {
+        for (paged.messages) |*message| freeMessageOwned(alloc, message);
+        alloc.free(paged.messages);
+    }
+    try std.testing.expectEqual(@as(u64, 3), paged.total);
+    try std.testing.expectEqual(@as(usize, 1), paged.messages.len);
+    try std.testing.expectEqual(@as(i64, 202), paged.messages[0].created_at_ms);
+    try std.testing.expectEqualStrings("same text", paged.messages[0].content);
 }
 
 test "sqlite context pack can include guarded session history when requested" {
