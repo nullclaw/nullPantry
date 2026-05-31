@@ -2771,27 +2771,53 @@ fn apiBackendUrl(allocator: std.mem.Allocator, base_url: []const u8, path: []con
     return std.fmt.allocPrint(allocator, "{s}/v1{s}{s}", .{ trimmed, separator, path });
 }
 
-fn requestApiJson(allocator: std.mem.Allocator, method: std.http.Method, url: []const u8, cfg: ApiConfig, actor_id: ?[]const u8, scopes_json: ?[]const u8, payload: []const u8) !ApiHttpResponse {
-    var auth_header: ?[]u8 = null;
-    defer if (auth_header) |h| allocator.free(h);
+const ApiRequestHeaders = struct {
+    headers: [4]std.http.Header = undefined,
+    count: usize = 0,
+    auth_header: ?[]u8 = null,
 
-    var extra_headers_buf: [4]std.http.Header = undefined;
-    var header_count: usize = 0;
+    fn slice(self: *const ApiRequestHeaders) []const std.http.Header {
+        return self.headers[0..self.count];
+    }
+
+    fn deinit(self: *ApiRequestHeaders, allocator: std.mem.Allocator) void {
+        if (self.auth_header) |header| allocator.free(header);
+        self.* = .{};
+    }
+};
+
+fn buildApiRequestHeaders(allocator: std.mem.Allocator, cfg: ApiConfig, actor_id: ?[]const u8, scopes_json: ?[]const u8) !ApiRequestHeaders {
+    var out: ApiRequestHeaders = .{};
+    errdefer out.deinit(allocator);
+
     if (cfg.token) |token| {
-        auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
-        extra_headers_buf[header_count] = .{ .name = "Authorization", .value = auth_header.? };
-        header_count += 1;
+        out.auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+        out.headers[out.count] = .{ .name = "Authorization", .value = out.auth_header.? };
+        out.count += 1;
     }
     if (actor_id) |actor| {
         if (actor.len > 0) {
-            extra_headers_buf[header_count] = .{ .name = "X-NullPantry-Actor-Id", .value = actor };
-            header_count += 1;
+            out.headers[out.count] = .{ .name = "X-NullPantry-Actor-Id", .value = actor };
+            out.count += 1;
         }
     }
-    extra_headers_buf[header_count] = .{ .name = "X-NullPantry-Actor-Scopes", .value = scopes_json orelse cfg.actor_scopes_json };
-    header_count += 1;
-    extra_headers_buf[header_count] = .{ .name = "X-NullPantry-Actor-Capabilities", .value = cfg.actor_capabilities_json };
-    header_count += 1;
+    out.headers[out.count] = .{ .name = "X-NullPantry-Actor-Scopes", .value = scopes_json orelse cfg.actor_scopes_json };
+    out.count += 1;
+    out.headers[out.count] = .{ .name = "X-NullPantry-Actor-Capabilities", .value = cfg.actor_capabilities_json };
+    out.count += 1;
+    return out;
+}
+
+fn findHttpHeader(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+    }
+    return null;
+}
+
+fn requestApiJson(allocator: std.mem.Allocator, method: std.http.Method, url: []const u8, cfg: ApiConfig, actor_id: ?[]const u8, scopes_json: ?[]const u8, payload: []const u8) !ApiHttpResponse {
+    var request_headers = try buildApiRequestHeaders(allocator, cfg, actor_id, scopes_json);
+    defer request_headers.deinit(allocator);
 
     var client: std.http.Client = .{ .allocator = allocator, .io = compat.io() };
     defer client.deinit();
@@ -2805,7 +2831,7 @@ fn requestApiJson(allocator: std.mem.Allocator, method: std.http.Method, url: []
             .accept_encoding = .omit,
             .connection = .{ .override = "close" },
         },
-        .extra_headers = extra_headers_buf[0..header_count],
+        .extra_headers = request_headers.slice(),
     }) catch return error.AgentMemoryStorageUnavailable;
     defer req.deinit();
 
@@ -3453,6 +3479,29 @@ test "agent memory api backend builds urls and parses memory responses" {
     const url_v1 = try apiBackendUrl(std.testing.allocator, "https://pantry.example/v1/", "/agent-memory/key", "");
     defer std.testing.allocator.free(url_v1);
     try std.testing.expectEqualStrings("https://pantry.example/v1/agent-memory/key", url_v1);
+
+    var actor_headers = try buildApiRequestHeaders(std.testing.allocator, .{
+        .base_url = "https://pantry.example",
+        .token = "secret",
+        .actor_scopes_json = "[\"admin\"]",
+        .actor_capabilities_json = "[\"read\",\"feed_apply\"]",
+    }, "agent:a", "[\"team:alpha\"]");
+    defer actor_headers.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Bearer secret", findHttpHeader(actor_headers.slice(), "authorization").?);
+    try std.testing.expectEqualStrings("agent:a", findHttpHeader(actor_headers.slice(), "x-nullpantry-actor-id").?);
+    try std.testing.expectEqualStrings("[\"team:alpha\"]", findHttpHeader(actor_headers.slice(), "x-nullpantry-actor-scopes").?);
+    try std.testing.expectEqualStrings("[\"read\",\"feed_apply\"]", findHttpHeader(actor_headers.slice(), "x-nullpantry-actor-capabilities").?);
+
+    var default_headers = try buildApiRequestHeaders(std.testing.allocator, .{
+        .base_url = "https://pantry.example",
+        .actor_scopes_json = "[\"project:nullpantry\"]",
+        .actor_capabilities_json = "[\"read\"]",
+    }, "", null);
+    defer default_headers.deinit(std.testing.allocator);
+    try std.testing.expect(findHttpHeader(default_headers.slice(), "authorization") == null);
+    try std.testing.expect(findHttpHeader(default_headers.slice(), "x-nullpantry-actor-id") == null);
+    try std.testing.expectEqualStrings("[\"project:nullpantry\"]", findHttpHeader(default_headers.slice(), "x-nullpantry-actor-scopes").?);
+    try std.testing.expectEqualStrings("[\"read\"]", findHttpHeader(default_headers.slice(), "x-nullpantry-actor-capabilities").?);
 
     const encoded = try percentEncode(std.testing.allocator, "team pref/ru");
     defer std.testing.allocator.free(encoded);
