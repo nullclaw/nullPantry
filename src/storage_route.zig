@@ -89,16 +89,7 @@ pub fn fromCsv(allocator: std.mem.Allocator, value: []const u8) !Route {
         stores[used] = trimmed;
         used += 1;
     }
-    if (used == 0) {
-        allocator.free(stores);
-        return .{};
-    }
-    if (used == 1) {
-        const route = Route.parse(stores[0]);
-        allocator.free(stores);
-        return route;
-    }
-    return Route.fromStores(stores[0..used]);
+    return routeFromOwnedStoreNames(allocator, stores, used);
 }
 
 pub fn fromValue(allocator: std.mem.Allocator, value: std.json.Value) !Route {
@@ -112,19 +103,28 @@ pub fn fromValue(allocator: std.mem.Allocator, value: std.json.Value) !Route {
                 stores[count] = item.string;
                 count += 1;
             }
-            if (count == 0) {
-                allocator.free(stores);
-                break :blk Route{};
-            }
-            if (count == 1) {
-                const route = Route.parse(stores[0]);
-                allocator.free(stores);
-                break :blk route;
-            }
-            break :blk Route.fromStores(stores[0..count]);
+            break :blk try routeFromOwnedStoreNames(allocator, stores, count);
         },
         else => .{},
     };
+}
+
+fn routeFromOwnedStoreNames(allocator: std.mem.Allocator, stores: [][]const u8, used: usize) !Route {
+    if (used == 0) {
+        allocator.free(stores);
+        return .{};
+    }
+    if (used == 1) {
+        const route = Route.parse(stores[0]);
+        allocator.free(stores);
+        return route;
+    }
+    if (used == stores.len) return Route.fromStores(stores);
+
+    errdefer allocator.free(stores);
+    const compact = try allocator.dupe([]const u8, stores[0..used]);
+    allocator.free(stores);
+    return Route.fromStores(compact);
 }
 
 pub fn fromAliasedObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap, names: []const []const u8) !?Route {
@@ -209,6 +209,26 @@ test "storage route parses object and query selectors consistently" {
     const query_route = try fromQuery(allocator, "stores=scratch,archive");
     defer query_route.deinit(allocator);
     try std.testing.expectEqual(Target.subset, query_route.target);
+}
+
+test "storage route compacts sparse store selectors before ownership transfer" {
+    const allocator = std.testing.allocator;
+
+    const csv_route = try fromQuery(allocator, "stores=scratch,,archive,");
+    defer csv_route.deinit(allocator);
+    try std.testing.expectEqual(Target.subset, csv_route.target);
+    try std.testing.expectEqual(@as(usize, 2), csv_route.stores.len);
+    try std.testing.expectEqualStrings("scratch", csv_route.stores[0]);
+    try std.testing.expectEqualStrings("archive", csv_route.stores[1]);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"stores\":[\"scratch\",false,\"archive\",42]}", .{});
+    defer parsed.deinit();
+    const json_route = try fromObject(allocator, parsed.value.object);
+    defer json_route.deinit(allocator);
+    try std.testing.expectEqual(Target.subset, json_route.target);
+    try std.testing.expectEqual(@as(usize, 2), json_route.stores.len);
+    try std.testing.expectEqualStrings("scratch", json_route.stores[0]);
+    try std.testing.expectEqualStrings("archive", json_route.stores[1]);
 }
 
 test "storage route renders API and extraction JSON" {
