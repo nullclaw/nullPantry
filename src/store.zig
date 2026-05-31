@@ -1732,9 +1732,11 @@ pub const Store = struct {
         defer allocator.free(scope);
         const permissions = try contextPackFeedPermissions(allocator, pack);
         defer allocator.free(permissions);
-        if (!input.suppress_feed and pack.persisted) try self.appendContextPackPutFeedEvent(allocator, pack, scope, permissions, input.actor_id, input.agent_memory_route);
-        try self.mirrorKnowledgePrimitive(allocator, .context_pack, pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id, input.agent_memory_route);
-        if (pack.persisted) try self.enqueueLucidProjectionPut(allocator, "context_pack", pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id);
+        if (pack.persisted) {
+            if (!input.suppress_feed) try self.appendContextPackPutFeedEvent(allocator, pack, scope, permissions, input.actor_id, input.agent_memory_route);
+            try self.mirrorKnowledgePrimitive(allocator, .context_pack, pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id, input.agent_memory_route);
+            try self.enqueueLucidProjectionPut(allocator, "context_pack", pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id);
+        }
         return pack;
     }
 
@@ -13514,19 +13516,39 @@ test "sqlite context packs respect approximate token budget" {
 }
 
 test "sqlite context pack preview does not persist durable records" {
-    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory = .{ .backend = .memory_lru },
+        .agent_memory_stores = &.{.{ .name = "scratch", .config = .{ .backend = .memory_lru } }},
+    });
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    const route = AgentMemoryStorageRoute.parse("scratch");
 
-    const preview = try store.createContextPack(alloc, .{ .query = "ephemeral preview pack", .scopes_json = "[\"public\"]", .persist = false });
+    const preview = try store.createContextPack(alloc, .{
+        .query = "ephemeral preview pack",
+        .scopes_json = "[\"public\"]",
+        .persist = false,
+        .actor_id = "agent:preview",
+        .agent_memory_route = route,
+    });
     try std.testing.expect(!preview.persisted);
     try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store, "SELECT COUNT(*) FROM context_packs"));
+    const preview_mirrors = try store.agentMemoryListVisibleRouted(alloc, "primitive:context_pack", null, "agent:preview", "[\"public\"]", route);
+    try std.testing.expectEqual(@as(usize, 0), preview_mirrors.len);
 
-    const persisted = try store.createContextPack(alloc, .{ .query = "durable persisted pack", .scopes_json = "[\"public\"]", .persist = true });
+    const persisted = try store.createContextPack(alloc, .{
+        .query = "durable persisted pack",
+        .scopes_json = "[\"public\"]",
+        .persist = true,
+        .actor_id = "agent:preview",
+        .agent_memory_route = route,
+    });
     try std.testing.expect(persisted.persisted);
     try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM context_packs"));
+    const persisted_mirrors = try store.agentMemoryListVisibleRouted(alloc, "primitive:context_pack", null, "agent:preview", "[\"public\"]", route);
+    try std.testing.expectEqual(@as(usize, 1), persisted_mirrors.len);
 }
 
 test "sqlite context pack can include guarded session history when requested" {
