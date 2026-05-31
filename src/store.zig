@@ -10825,18 +10825,24 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO session_messages (session_id,actor_id,role,content,created_at_ms) VALUES ({s},{s},{s},{s},{d})", .{ try sqlString(allocator, session_id), try sqlString(allocator, actor), try sqlString(allocator, role), try sqlString(allocator, content), created_at_ms });
-        try self.runSql(sql);
+        const created_at_text = try std.fmt.allocPrint(allocator, "{d}", .{created_at_ms});
+        try self.runParams(
+            allocator,
+            "INSERT INTO session_messages (session_id,actor_id,role,content,created_at_ms) VALUES ($1,$2,$3,$4,$5::bigint)",
+            &.{ session_id, actor, role, content, created_at_text },
+        );
     }
 
     pub fn loadMessages(self: *PostgresStore, allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8) ![]Message {
-        const actor_filter = try pgSessionActorFilter(allocator, "", actor_id);
-        const inner = try std.fmt.allocPrint(allocator, "SELECT role,content,created_at_ms FROM session_messages WHERE session_id = {s} AND {s} ORDER BY id ASC", .{ try sqlString(allocator, session_id), actor_filter });
-        return try self.readMessagesArray(allocator, inner);
+        return try self.readMessagesArrayParams(
+            allocator,
+            "SELECT role,content,created_at_ms FROM session_messages WHERE session_id = $1 AND ($2::text IS NULL OR actor_id = $2) ORDER BY id ASC",
+            &.{ session_id, actor_id },
+        );
     }
 
-    fn readMessagesArray(self: *PostgresStore, allocator: std.mem.Allocator, inner: []const u8) ![]Message {
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+    fn readMessagesArrayParams(self: *PostgresStore, allocator: std.mem.Allocator, inner: []const u8, params: []const ?[]const u8) ![]Message {
+        const parsed = try self.queryParamsJson(allocator, try arrayJsonSql(allocator, inner), params);
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(Message) = .empty;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
@@ -10850,19 +10856,26 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const actor_filter = try pgSessionActorFilter(allocator, "", actor_id);
-        const sql = try std.fmt.allocPrint(allocator, "DELETE FROM session_messages WHERE session_id = {s} AND {s}; DELETE FROM session_usage WHERE session_id = {s} AND {s}", .{ try sqlString(allocator, session_id), actor_filter, try sqlString(allocator, session_id), actor_filter });
-        try self.runSql(sql);
+        try self.runParams(
+            allocator,
+            "WITH deleted_messages AS (" ++
+                "DELETE FROM session_messages WHERE session_id = $1 AND ($2::text IS NULL OR actor_id = $2) RETURNING 1" ++
+                "), deleted_usage AS (" ++
+                "DELETE FROM session_usage WHERE session_id = $1 AND ($2::text IS NULL OR actor_id = $2) RETURNING 1" ++
+                ") SELECT ((SELECT count(*) FROM deleted_messages) + (SELECT count(*) FROM deleted_usage))::text",
+            &.{ session_id, actor_id },
+        );
     }
 
     pub fn clearAutoSaved(self: *PostgresStore, session_id: ?[]const u8, actor_id: ?[]const u8) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const filter = if (session_id) |sid| try std.fmt.allocPrint(allocator, "session_id = {s} AND ", .{try sqlString(allocator, sid)}) else "";
-        const actor_filter = try pgSessionActorFilter(allocator, "", actor_id);
-        const sql = try std.fmt.allocPrint(allocator, "DELETE FROM session_messages WHERE {s}{s} AND (role = 'autosave_user' OR role = 'autosave_assistant')", .{ filter, actor_filter });
-        try self.runSql(sql);
+        try self.runParams(
+            allocator,
+            "DELETE FROM session_messages WHERE ($1::text IS NULL OR session_id = $1) AND ($2::text IS NULL OR actor_id = $2) AND (role = 'autosave_user' OR role = 'autosave_assistant')",
+            &.{ session_id, actor_id },
+        );
     }
 
     pub fn saveUsage(self: *PostgresStore, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8) !void {
@@ -10870,17 +10883,24 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO session_usage (session_id,actor_id,total_tokens,updated_at_ms) VALUES ({s},{s},{d},{d}) ON CONFLICT(session_id, actor_id) DO UPDATE SET total_tokens=excluded.total_tokens, updated_at_ms=excluded.updated_at_ms", .{ try sqlString(allocator, session_id), try sqlString(allocator, actor), total_tokens, ids.nowMs() });
-        try self.runSql(sql);
+        const total_tokens_text = try std.fmt.allocPrint(allocator, "{d}", .{total_tokens});
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
+        try self.runParams(
+            allocator,
+            "INSERT INTO session_usage (session_id,actor_id,total_tokens,updated_at_ms) VALUES ($1,$2,$3::bigint,$4::bigint) ON CONFLICT(session_id, actor_id) DO UPDATE SET total_tokens=excluded.total_tokens, updated_at_ms=excluded.updated_at_ms",
+            &.{ session_id, actor, total_tokens_text, now_text },
+        );
     }
 
     pub fn deleteUsage(self: *PostgresStore, session_id: []const u8, actor_id: ?[]const u8) !bool {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const actor_filter = try pgSessionActorFilter(allocator, "", actor_id);
-        const sql = try std.fmt.allocPrint(allocator, "WITH deleted AS (DELETE FROM session_usage WHERE session_id = {s} AND {s} RETURNING 1) SELECT count(*)::text FROM deleted", .{ try sqlString(allocator, session_id), actor_filter });
-        const text = try self.queryText(allocator, sql);
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH deleted AS (DELETE FROM session_usage WHERE session_id = $1 AND ($2::text IS NULL OR actor_id = $2) RETURNING 1) SELECT count(*)::text FROM deleted",
+            &.{ session_id, actor_id },
+        );
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
@@ -10888,22 +10908,29 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const actor_filter = try pgSessionActorFilter(allocator, "", actor_id);
-        const actor_order = if (actor_id) |actor| try std.fmt.allocPrint(allocator, "CASE WHEN actor_id = {s} THEN 0 ELSE 1 END", .{try sqlString(allocator, actor)}) else "updated_at_ms DESC";
-        const sql = try std.fmt.allocPrint(allocator, "SELECT coalesce((SELECT total_tokens::text FROM session_usage WHERE session_id = {s} AND {s} ORDER BY {s} LIMIT 1), '')", .{ try sqlString(allocator, session_id), actor_filter, actor_order });
-        const text = try self.queryText(allocator, sql);
+        const text = try self.queryParamsText(
+            allocator,
+            "SELECT coalesce((SELECT total_tokens::text FROM session_usage WHERE session_id = $1 AND ($2::text IS NULL OR actor_id = $2) ORDER BY CASE WHEN $2::text IS NOT NULL AND actor_id = $2 THEN 0 ELSE 1 END, updated_at_ms DESC LIMIT 1), '')",
+            &.{ session_id, actor_id },
+        );
         if (text.len == 0) return null;
         return std.fmt.parseInt(u64, text, 10) catch null;
     }
 
     pub fn listSessions(self: *PostgresStore, allocator: std.mem.Allocator, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryList {
-        const actor_filter = try pgSessionActorFilter(allocator, "", actor_id);
-        const role_filter = try std.fmt.allocPrint(allocator, "role <> {s}", .{try sqlString(allocator, domain.runtime_command_role)});
-        const total_sql = try std.fmt.allocPrint(allocator, "SELECT count(*)::text FROM (SELECT session_id FROM session_messages WHERE {s} AND {s} GROUP BY session_id) s", .{ actor_filter, role_filter });
-        const total_text = try self.queryText(allocator, total_sql);
+        const total_text = try self.queryParamsText(
+            allocator,
+            "SELECT count(*)::text FROM (SELECT session_id FROM session_messages WHERE ($1::text IS NULL OR actor_id = $1) AND role <> $2 GROUP BY session_id) s",
+            &.{ actor_id, domain.runtime_command_role },
+        );
         const total = std.fmt.parseInt(u64, total_text, 10) catch 0;
-        const inner = try std.fmt.allocPrint(allocator, "SELECT session_id, count(*) AS message_count, min(created_at_ms) AS first_message_at, max(created_at_ms) AS last_message_at FROM session_messages WHERE {s} AND {s} GROUP BY session_id ORDER BY max(created_at_ms) DESC LIMIT {d} OFFSET {d}", .{ actor_filter, role_filter, limit, offset });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{limit});
+        const offset_text = try std.fmt.allocPrint(allocator, "{d}", .{offset});
+        const parsed = try self.queryParamsJson(
+            allocator,
+            try arrayJsonSql(allocator, "SELECT session_id, count(*) AS message_count, min(created_at_ms) AS first_message_at, max(created_at_ms) AS last_message_at FROM session_messages WHERE ($1::text IS NULL OR actor_id = $1) AND role <> $2 GROUP BY session_id ORDER BY max(created_at_ms) DESC LIMIT $3::bigint OFFSET $4::bigint"),
+            &.{ actor_id, domain.runtime_command_role, limit_text, offset_text },
+        );
         defer parsed.deinit();
         var sessions: std.ArrayListUnmanaged(SessionInfo) = .empty;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
@@ -10914,12 +10941,21 @@ pub const PostgresStore = struct {
     }
 
     pub fn history(self: *PostgresStore, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryShow {
-        const actor_filter = try pgSessionActorFilter(allocator, "", actor_id);
-        const role_filter = try std.fmt.allocPrint(allocator, "role <> {s}", .{try sqlString(allocator, domain.runtime_command_role)});
-        const count_sql = try std.fmt.allocPrint(allocator, "SELECT count(*)::text FROM session_messages WHERE session_id = {s} AND {s} AND {s}", .{ try sqlString(allocator, session_id), actor_filter, role_filter });
-        const count_text = try self.queryText(allocator, count_sql);
-        const inner = try std.fmt.allocPrint(allocator, "SELECT role,content,created_at_ms FROM session_messages WHERE session_id = {s} AND {s} AND {s} ORDER BY id ASC LIMIT {d} OFFSET {d}", .{ try sqlString(allocator, session_id), actor_filter, role_filter, limit, offset });
-        return .{ .total = std.fmt.parseInt(u64, count_text, 10) catch 0, .messages = try self.readMessagesArray(allocator, inner) };
+        const count_text = try self.queryParamsText(
+            allocator,
+            "SELECT count(*)::text FROM session_messages WHERE session_id = $1 AND ($2::text IS NULL OR actor_id = $2) AND role <> $3",
+            &.{ session_id, actor_id, domain.runtime_command_role },
+        );
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{limit});
+        const offset_text = try std.fmt.allocPrint(allocator, "{d}", .{offset});
+        return .{
+            .total = std.fmt.parseInt(u64, count_text, 10) catch 0,
+            .messages = try self.readMessagesArrayParams(
+                allocator,
+                "SELECT role,content,created_at_ms FROM session_messages WHERE session_id = $1 AND ($2::text IS NULL OR actor_id = $2) AND role <> $3 ORDER BY id ASC LIMIT $4::bigint OFFSET $5::bigint",
+                &.{ session_id, actor_id, domain.runtime_command_role, limit_text, offset_text },
+            ),
+        };
     }
 
     pub fn createJob(self: *PostgresStore, allocator: std.mem.Allocator, input: JobInput) !Job {
