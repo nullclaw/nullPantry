@@ -57,6 +57,7 @@ pub const UpsertInput = struct {
     text: []const u8,
     scope: []const u8,
     permissions_json: []const u8,
+    heading_path_json: []const u8 = "[]",
     embedding_json: []const u8,
     model: ?[]const u8,
     dimensions: i64,
@@ -454,6 +455,8 @@ fn appendPayloadObject(allocator: std.mem.Allocator, out: *std.ArrayListUnmanage
     try json.appendString(out, allocator, input.scope);
     try out.appendSlice(allocator, ",\"permissions\":");
     try json.appendRawJsonOr(out, allocator, input.permissions_json, "[]");
+    try out.appendSlice(allocator, ",\"heading_path\":");
+    try json.appendRawJsonOr(out, allocator, input.heading_path_json, "[]");
     try out.appendSlice(allocator, ",\"model\":");
     try json.appendNullableString(out, allocator, input.model);
     try out.appendSlice(allocator, ",\"dimensions\":");
@@ -627,6 +630,7 @@ test "qdrant payload preserves vector id and ACL metadata" {
         .text = "hello",
         .scope = "project:nullpantry",
         .permissions_json = "[\"team:agents\"]",
+        .heading_path_json = "[\"# NullPantry\",\"## Memory\"]",
         .embedding_json = "[1,0]",
         .model = "test",
         .dimensions = 2,
@@ -634,6 +638,7 @@ test "qdrant payload preserves vector id and ACL metadata" {
     defer std.testing.allocator.free(payload);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"vector_id\":\"vec_atom_0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"permissions\":[\"team:agents\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"heading_path\":[\"# NullPantry\",\"## Memory\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"vector\":[1,0]") != null);
 }
 

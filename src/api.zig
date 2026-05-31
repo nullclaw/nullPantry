@@ -2459,7 +2459,8 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
     for (chunks) |chunk| {
         const chunk_text = chunk.text;
         if (chunk_text.len > 0) {
-            const payload = try store_mod.vectorEmbedPayloadJson(ctx.allocator, @intCast(count), chunk_text, scope, permissions_json, ctx.embedding_model, ctx.embedding_dimensions);
+            const heading_path_json = try vector_mod.chunkHeadingPathJson(ctx.allocator, text, chunk);
+            const payload = try store_mod.vectorEmbedPayloadJson(ctx.allocator, @intCast(count), chunk_text, scope, permissions_json, heading_path_json, ctx.embedding_model, ctx.embedding_dimensions);
             const outbox_id = try ctx.store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
             const embedding_result = providers.embedText(ctx.allocator, .{
                 .provider = ctx.embedding_provider,
@@ -2479,6 +2480,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
                 .text = chunk_text,
                 .scope = scope,
                 .permissions_json = permissions_json,
+                .heading_path_json = heading_path_json,
                 .embedding_json = embedding_json,
                 .model = embedding_result.model,
                 .dimensions = @intCast(embedding_result.embedding.len),
@@ -2738,6 +2740,10 @@ fn vectorUpsert(ctx: *Context, body: []const u8) HttpResponse {
     const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
     const requested_scope = json.stringField(obj, "scope") orelse "workspace";
     const requested_permissions = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    const heading_path_json = if (obj.get("heading_path") != null)
+        rawField(ctx.allocator, obj, "heading_path", "[]") catch return serverError(ctx)
+    else
+        rawField(ctx.allocator, obj, "heading_path_json", "[]") catch return serverError(ctx);
     const acl = resolveVectorAcl(ctx, object_type, object_id, requested_scope, requested_permissions) catch |err| switch (err) {
         error.NotFound => return json.errorResponse(ctx.allocator, 404, "not_found", "Vector target object not found"),
         error.Forbidden => return forbidden(ctx),
@@ -2755,6 +2761,7 @@ fn vectorUpsert(ctx: *Context, body: []const u8) HttpResponse {
         .text = json.stringField(obj, "text") orelse "",
         .scope = acl.scope,
         .permissions_json = acl.permissions_json,
+        .heading_path_json = heading_path_json,
         .embedding_json = embedding_json,
         .model = json.nullableStringField(obj, "model"),
         .dimensions = dims,
@@ -2770,6 +2777,8 @@ fn vectorUpsert(ctx: *Context, body: []const u8) HttpResponse {
     json.appendString(&out, ctx.allocator, chunk.object_id) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"scope\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, chunk.scope) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"heading_path\":") catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, chunk.heading_path_json, "[]") catch return serverError(ctx);
     out.print(ctx.allocator, ",\"dimensions\":{d}}}", .{chunk.dimensions}) catch return serverError(ctx);
     out.append(ctx.allocator, '}') catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
@@ -7271,7 +7280,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expectEqualStrings("200 OK", outbox_run.status);
     try std.testing.expect(std.mem.indexOf(u8, outbox_run.body, "\"processed\":2") != null);
 
-    const embed_payload = try store_mod.vectorEmbedPayloadJson(arena.allocator(), 1, "agent memory replay", "public", "[]", null, 4);
+    const embed_payload = try store_mod.vectorEmbedPayloadJson(arena.allocator(), 1, "agent memory replay", "public", "[]", "[\"# Agent Memory\"]", null, 4);
     _ = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = "memory_atom", .object_id = created_atom_id, .payload_json = embed_payload });
     const embed_outbox_run = handleRequest(&ctx, "POST", "/v1/vector/outbox/run", "{\"limit\":10}", "");
     try std.testing.expectEqualStrings("200 OK", embed_outbox_run.status);
@@ -8256,12 +8265,13 @@ test "api vector upsert inherits artifact acl instead of requested scope" {
     const alloc = arena.allocator();
 
     const artifact = try store.createArtifact(alloc, .{ .title = "Secret artifact", .body = "secret artifact body", .scope = "project:secret", .permissions_json = "[\"project:secret\"]" });
-    const body = try std.fmt.allocPrint(alloc, "{{\"object_type\":\"artifact\",\"object_id\":\"{s}\",\"text\":\"artifact vector leak\",\"scope\":\"public\",\"embedding\":[1,0],\"dimensions\":2}}", .{artifact.id});
+    const body = try std.fmt.allocPrint(alloc, "{{\"object_type\":\"artifact\",\"object_id\":\"{s}\",\"text\":\"artifact vector leak\",\"scope\":\"public\",\"heading_path\":[\"# Artifact\",\"## Security\"],\"embedding\":[1,0],\"dimensions\":2}}", .{artifact.id});
 
     var admin_ctx = Context{ .allocator = alloc, .store = &store };
     const inserted = handleRequest(&admin_ctx, "POST", "/v1/vector/upsert", body, "");
     try std.testing.expectEqualStrings("200 OK", inserted.status);
     try std.testing.expect(std.mem.indexOf(u8, inserted.body, "\"scope\":\"project:secret\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inserted.body, "\"heading_path\":[\"# Artifact\",\"## Security\"]") != null);
 
     var public_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\"]" };
     const public_search = handleRequest(&public_ctx, "POST", "/v1/vector/search", "{\"embedding\":[1,0],\"scopes\":[\"public\"]}", "");

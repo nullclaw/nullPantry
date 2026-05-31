@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const expected_schema_version: i64 = 22;
+pub const expected_schema_version: i64 = 23;
 
 pub const Migration = struct {
     version: i64,
@@ -31,6 +31,7 @@ pub const migration_manifest = [_]Migration{
     .{ .version = 20, .name = "sqlite_full_text_coverage", .checksum = "np-020-sqlite-full-text-coverage" },
     .{ .version = 21, .name = "postgres_full_text_coverage", .checksum = "np-021-postgres-full-text-coverage" },
     .{ .version = 22, .name = "expanded_vector_primitives", .checksum = "np-022-expanded-vector-primitives" },
+    .{ .version = 23, .name = "vector_chunk_heading_paths", .checksum = "np-023-vector-chunk-heading-paths" },
 };
 
 pub fn expectedMigration(version: i64) ?Migration {
@@ -159,6 +160,7 @@ pub const sqlite_schema =
     \\  text TEXT NOT NULL DEFAULT '',
     \\  scope TEXT NOT NULL DEFAULT 'workspace',
     \\  permissions_json TEXT NOT NULL DEFAULT '[]',
+    \\  heading_path_json TEXT NOT NULL DEFAULT '[]',
     \\  embedding_json TEXT NOT NULL,
     \\  model TEXT,
     \\  dimensions INTEGER NOT NULL,
@@ -388,6 +390,7 @@ pub const sqlite_schema =
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (20, 'sqlite_full_text_coverage', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (21, 'postgres_full_text_coverage', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (22, 'expanded_vector_primitives', strftime('%s','now') * 1000);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (23, 'vector_chunk_heading_paths', strftime('%s','now') * 1000);
 ;
 
 pub const postgres_schema =
@@ -516,6 +519,7 @@ pub const postgres_schema =
     \\  text text NOT NULL DEFAULT '',
     \\  scope text NOT NULL DEFAULT 'workspace',
     \\  permissions_json jsonb NOT NULL DEFAULT '[]',
+    \\  heading_path_json jsonb NOT NULL DEFAULT '[]',
     \\  embedding_json jsonb NOT NULL,
     \\  embedding vector,
     \\  model text,
@@ -754,6 +758,7 @@ pub const postgres_schema =
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (20, 'sqlite_full_text_coverage', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (21, 'postgres_full_text_coverage', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (22, 'expanded_vector_primitives', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (23, 'vector_chunk_heading_paths', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
 ;
 
 test "sqlite migration includes core primitive tables and indexes" {

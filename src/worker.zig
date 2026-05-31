@@ -402,7 +402,8 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
     for (chunks) |chunk| {
         const chunk_text = chunk.text;
         if (chunk_text.len > 0) {
-            const payload = try store_mod.vectorEmbedPayloadJson(allocator, @intCast(count), chunk_text, scope, permissions_json, options.embedding_model, options.embedding_dimensions);
+            const heading_path_json = try vector.chunkHeadingPathJson(allocator, text, chunk);
+            const payload = try store_mod.vectorEmbedPayloadJson(allocator, @intCast(count), chunk_text, scope, permissions_json, heading_path_json, options.embedding_model, options.embedding_dimensions);
             const outbox_id = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
             const embedding_result = providers.embedText(allocator, .{
                 .provider = options.embedding_provider,
@@ -422,6 +423,7 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
                 .text = chunk_text,
                 .scope = scope,
                 .permissions_json = permissions_json,
+                .heading_path_json = heading_path_json,
                 .embedding_json = embedding_json,
                 .model = embedding_result.model,
                 .dimensions = @intCast(embedding_result.embedding.len),
@@ -458,6 +460,10 @@ fn processEmbeddingOutboxEntry(allocator: std.mem.Allocator, store: *store_mod.S
     const text = json.stringField(obj, "text") orelse return error.InvalidVectorOutboxPayload;
     const scope = json.stringField(obj, "scope") orelse "workspace";
     const permissions_json = try rawJsonField(allocator, obj, "permissions", "[]");
+    const heading_path_json = if (obj.get("heading_path") != null)
+        try rawJsonField(allocator, obj, "heading_path", "[]")
+    else
+        try rawJsonField(allocator, obj, "heading_path_json", "[]");
     const chunk_ordinal = json.intField(obj, "chunk_ordinal") orelse 0;
     const dimensions: usize = @intCast(@max(@as(i64, 1), json.intField(obj, "dimensions") orelse @as(i64, @intCast(options.embedding_dimensions))));
     const embedding_result = try providers.embedText(allocator, .{
@@ -478,6 +484,7 @@ fn processEmbeddingOutboxEntry(allocator: std.mem.Allocator, store: *store_mod.S
         .text = text,
         .scope = scope,
         .permissions_json = permissions_json,
+        .heading_path_json = heading_path_json,
         .embedding_json = embedding_json,
         .model = embedding_result.model,
         .dimensions = @intCast(embedding_result.embedding.len),

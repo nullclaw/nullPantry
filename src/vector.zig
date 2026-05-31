@@ -7,6 +7,7 @@ pub const VectorRecord = struct {
     object_type: []const u8 = "memory_atom",
     text: []const u8 = "",
     scope: []const u8 = "workspace",
+    heading_path_json: []const u8 = "[]",
     embedding: []const f32,
 };
 
@@ -16,6 +17,7 @@ pub const VectorMatch = struct {
     object_type: []const u8,
     text: []const u8,
     scope: []const u8,
+    heading_path_json: []const u8 = "[]",
     score: f32,
 
     pub fn writeJson(self: VectorMatch, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
@@ -29,6 +31,8 @@ pub const VectorMatch = struct {
         try json.appendString(out, allocator, self.text);
         try out.appendSlice(allocator, ",\"scope\":");
         try json.appendString(out, allocator, self.scope);
+        try out.appendSlice(allocator, ",\"heading_path\":");
+        try json.appendRawJsonOr(out, allocator, self.heading_path_json, "[]");
         try out.print(allocator, ",\"score\":{d}}}", .{self.score});
     }
 };
@@ -116,6 +120,7 @@ pub fn bruteForceSearch(allocator: std.mem.Allocator, query: []const f32, record
             .object_type = record.object_type,
             .text = record.text,
             .scope = record.scope,
+            .heading_path_json = record.heading_path_json,
             .score = score,
         });
     }
@@ -171,6 +176,9 @@ fn sortMatches(items: []VectorMatch) void {
 pub const Chunk = struct {
     text: []const u8,
     ordinal: usize,
+    start: usize,
+    end: usize,
+    heading: ?[]const u8 = null,
 };
 
 pub fn chunkText(allocator: std.mem.Allocator, text: []const u8, max_chars: usize, overlap: usize) ![]Chunk {
@@ -185,13 +193,67 @@ pub fn chunkText(allocator: std.mem.Allocator, text: []const u8, max_chars: usiz
         const trimmed_start = skipWhitespaceForward(text, start, end);
         const trimmed_end = trimWhitespaceBackward(text, trimmed_start, end);
         if (trimmed_start < trimmed_end) {
-            try chunks.append(allocator, .{ .text = text[trimmed_start..trimmed_end], .ordinal = chunks.items.len });
+            try chunks.append(allocator, .{
+                .text = text[trimmed_start..trimmed_end],
+                .ordinal = chunks.items.len,
+                .start = trimmed_start,
+                .end = trimmed_end,
+                .heading = headingAt(text, trimmed_start),
+            });
         }
         if (end == text.len) break;
         start = if (overlap > 0 and end > overlap) previousUtf8Boundary(text, end - overlap, 0) else end;
         start = skipWhitespaceForward(text, start, text.len);
     }
     return chunks.toOwnedSlice(allocator);
+}
+
+pub fn chunkHeadingPathJson(allocator: std.mem.Allocator, text: []const u8, chunk: Chunk) ![]u8 {
+    return headingPathJsonAt(allocator, text, chunk.start);
+}
+
+fn headingAt(text: []const u8, pos: usize) ?[]const u8 {
+    var path: [6]?[]const u8 = .{ null, null, null, null, null, null };
+    scanHeadingPath(text, pos, &path);
+    var level: usize = path.len;
+    while (level > 0) : (level -= 1) {
+        if (path[level - 1]) |heading| return heading;
+    }
+    return null;
+}
+
+fn headingPathJsonAt(allocator: std.mem.Allocator, text: []const u8, pos: usize) ![]u8 {
+    var path: [6]?[]const u8 = .{ null, null, null, null, null, null };
+    scanHeadingPath(text, pos, &path);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    var wrote = false;
+    for (path) |maybe_heading| {
+        const heading = maybe_heading orelse continue;
+        if (wrote) try out.append(allocator, ',');
+        try json.appendString(&out, allocator, heading);
+        wrote = true;
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+fn scanHeadingPath(text: []const u8, pos: usize, path: *[6]?[]const u8) void {
+    const limit = @min(pos, text.len);
+    var line_start: usize = 0;
+    while (line_start < text.len and line_start <= limit) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        if (markdownHeadingLevelAt(text, line_start)) |level| {
+            const idx = level - 1;
+            path[idx] = std.mem.trim(u8, text[line_start..line_end], " \t\r\n");
+            var clear_idx = idx + 1;
+            while (clear_idx < path.len) : (clear_idx += 1) path[clear_idx] = null;
+        }
+        if (line_end == text.len) break;
+        line_start = line_end + 1;
+    }
 }
 
 fn chunkEnd(text: []const u8, start: usize, max_chars: usize) usize {
@@ -216,16 +278,21 @@ fn findNextMarkdownHeading(text: []const u8, start: usize, end: usize) ?usize {
 }
 
 fn isMarkdownHeadingAt(text: []const u8, pos: usize) bool {
-    if (pos > 0 and text[pos - 1] != '\n') return false;
+    return markdownHeadingLevelAt(text, pos) != null;
+}
+
+fn markdownHeadingLevelAt(text: []const u8, pos: usize) ?usize {
+    if (pos > 0 and text[pos - 1] != '\n') return null;
     var i = pos;
     var hashes: usize = 0;
     while (i < text.len and text[i] == '#' and hashes < 6) : ({
         i += 1;
         hashes += 1;
     }) {}
-    if (hashes == 0) return false;
-    if (i >= text.len) return true;
-    return text[i] == ' ' or text[i] == '\t';
+    if (hashes == 0) return null;
+    if (i >= text.len) return hashes;
+    if (text[i] == ' ' or text[i] == '\t') return hashes;
+    return null;
 }
 
 fn findPreviousParagraphBreak(text: []const u8, min_pos: usize, end: usize) ?usize {
@@ -330,6 +397,19 @@ test "vector chunker respects markdown heading boundaries" {
     try std.testing.expect(std.mem.startsWith(u8, chunks[0].text, "# First"));
     try std.testing.expect(std.mem.startsWith(u8, chunks[1].text, "## Second"));
     try std.testing.expect(std.mem.startsWith(u8, chunks[2].text, "## Third"));
+    try std.testing.expectEqualStrings("# First", chunks[0].heading.?);
+    try std.testing.expectEqualStrings("## Second", chunks[1].heading.?);
+    try std.testing.expectEqualStrings("## Third", chunks[2].heading.?);
+}
+
+test "vector chunker serializes heading path metadata" {
+    const text = "# Product\nIntro\n## Architecture\nDetails\n### Storage\nPostgres and SQLite";
+    const chunks = try chunkText(std.testing.allocator, text, 512, 0);
+    defer std.testing.allocator.free(chunks);
+    try std.testing.expectEqual(@as(usize, 3), chunks.len);
+    const path = try chunkHeadingPathJson(std.testing.allocator, text, chunks[2]);
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("[\"# Product\",\"## Architecture\",\"### Storage\"]", path);
 }
 
 test "vector chunker preserves utf8 boundaries" {

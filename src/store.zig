@@ -3047,6 +3047,7 @@ pub const VectorChunkInput = struct {
     text: []const u8 = "",
     scope: []const u8 = "workspace",
     permissions_json: []const u8 = "[]",
+    heading_path_json: []const u8 = "[]",
     embedding_json: []const u8,
     model: ?[]const u8 = null,
     dimensions: i64,
@@ -3061,6 +3062,7 @@ pub const VectorChunk = struct {
     text: []const u8,
     scope: []const u8,
     permissions_json: []const u8,
+    heading_path_json: []const u8 = "[]",
     embedding_json: []const u8,
     model: ?[]const u8,
     dimensions: i64,
@@ -3216,6 +3218,7 @@ fn vectorChunkUpsertInput(chunk: VectorChunk) vector_runtime.UpsertInput {
         .text = chunk.text,
         .scope = chunk.scope,
         .permissions_json = chunk.permissions_json,
+        .heading_path_json = chunk.heading_path_json,
         .embedding_json = chunk.embedding_json,
         .model = chunk.model,
         .dimensions = chunk.dimensions,
@@ -3228,6 +3231,7 @@ pub fn vectorEmbedPayloadJson(
     text: []const u8,
     scope: []const u8,
     permissions_json: []const u8,
+    heading_path_json: []const u8,
     model: ?[]const u8,
     dimensions: usize,
 ) ![]u8 {
@@ -3241,6 +3245,8 @@ pub fn vectorEmbedPayloadJson(
     try json.appendString(&out, allocator, scope);
     try out.appendSlice(allocator, ",\"permissions\":");
     try json.appendRawJsonOr(&out, allocator, permissions_json, "[]");
+    try out.appendSlice(allocator, ",\"heading_path\":");
+    try json.appendRawJsonOr(&out, allocator, heading_path_json, "[]");
     try out.appendSlice(allocator, ",\"model\":");
     try json.appendNullableString(&out, allocator, model);
     try out.appendSlice(allocator, ",\"dimensions\":");
@@ -3967,6 +3973,9 @@ pub const SQLiteStore = struct {
         if (!try self.columnExists("vector_chunks", "permissions_json")) {
             try self.exec("ALTER TABLE vector_chunks ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '[]'");
         }
+        if (!try self.columnExists("vector_chunks", "heading_path_json")) {
+            try self.exec("ALTER TABLE vector_chunks ADD COLUMN heading_path_json TEXT NOT NULL DEFAULT '[]'");
+        }
         if (!try self.columnExists("memory_feed_events", "dedupe_key")) {
             try self.exec("ALTER TABLE memory_feed_events ADD COLUMN dedupe_key TEXT");
         }
@@ -4172,6 +4181,8 @@ pub const SQLiteStore = struct {
         try self.exec("UPDATE schema_migrations SET name = 'vector_backing_invariant', checksum = 'np-007-vector-backing-invariant' WHERE version = 7");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (22, 'expanded_vector_primitives', 'np-022-expanded-vector-primitives', strftime('%s','now') * 1000)");
         try self.exec("UPDATE schema_migrations SET name = 'expanded_vector_primitives', checksum = 'np-022-expanded-vector-primitives' WHERE version = 22");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (23, 'vector_chunk_heading_paths', 'np-023-vector-chunk-heading-paths', strftime('%s','now') * 1000)");
+        try self.exec("UPDATE schema_migrations SET name = 'vector_chunk_heading_paths', checksum = 'np-023-vector-chunk-heading-paths' WHERE version = 23");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (8, 'agent_actor_isolation', 'np-008-agent-actor-isolation', strftime('%s','now') * 1000)");
         try self.exec("UPDATE schema_migrations SET name = 'agent_actor_isolation', checksum = 'np-008-agent-actor-isolation' WHERE version = 8");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (9, 'strict_actor_memory', 'np-009-strict-actor-memory', strftime('%s','now') * 1000)");
@@ -6514,7 +6525,7 @@ pub const SQLiteStore = struct {
         if (!try self.vectorBackingObjectExists(allocator, input.object_type, input.object_id)) return error.InvalidVectorTarget;
         const id = try std.fmt.allocPrint(allocator, "vec_{s}_{d}", .{ input.object_id, input.chunk_ordinal });
         const now = ids.nowMs();
-        const stmt = try self.prepare("INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(id) DO UPDATE SET text=excluded.text, scope=excluded.scope, permissions_json=excluded.permissions_json, embedding_json=excluded.embedding_json, model=excluded.model, dimensions=excluded.dimensions, updated_at_ms=excluded.updated_at_ms");
+        const stmt = try self.prepare("INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,heading_path_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(id) DO UPDATE SET text=excluded.text, scope=excluded.scope, permissions_json=excluded.permissions_json, heading_path_json=excluded.heading_path_json, embedding_json=excluded.embedding_json, model=excluded.model, dimensions=excluded.dimensions, updated_at_ms=excluded.updated_at_ms");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         bindText(stmt, 2, input.object_type);
@@ -6523,11 +6534,12 @@ pub const SQLiteStore = struct {
         bindText(stmt, 5, input.text);
         bindText(stmt, 6, input.scope);
         bindText(stmt, 7, input.permissions_json);
-        bindText(stmt, 8, input.embedding_json);
-        bindNullableText(stmt, 9, input.model);
-        _ = c.sqlite3_bind_int64(stmt, 10, input.dimensions);
-        _ = c.sqlite3_bind_int64(stmt, 11, now);
+        bindText(stmt, 8, input.heading_path_json);
+        bindText(stmt, 9, input.embedding_json);
+        bindNullableText(stmt, 10, input.model);
+        _ = c.sqlite3_bind_int64(stmt, 11, input.dimensions);
         _ = c.sqlite3_bind_int64(stmt, 12, now);
+        _ = c.sqlite3_bind_int64(stmt, 13, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
         const outbox_payload = try vectorUpsertPayloadJson(allocator, id);
         defer allocator.free(outbox_payload);
@@ -6541,6 +6553,7 @@ pub const SQLiteStore = struct {
             .text = input.text,
             .scope = input.scope,
             .permissions_json = input.permissions_json,
+            .heading_path_json = input.heading_path_json,
             .embedding_json = input.embedding_json,
             .model = input.model,
             .dimensions = input.dimensions,
@@ -6550,7 +6563,7 @@ pub const SQLiteStore = struct {
     }
 
     pub fn getVectorChunk(self: *Self, allocator: std.mem.Allocator, id: []const u8) !?VectorChunk {
-        const stmt = try self.prepare("SELECT id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms FROM vector_chunks WHERE id = ?1");
+        const stmt = try self.prepare("SELECT id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,heading_path_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms FROM vector_chunks WHERE id = ?1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
@@ -6558,7 +6571,7 @@ pub const SQLiteStore = struct {
     }
 
     pub fn listVectorChunks(self: *Self, allocator: std.mem.Allocator, limit: usize, offset: usize) ![]VectorChunk {
-        const stmt = try self.prepare("SELECT id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms FROM vector_chunks ORDER BY updated_at_ms DESC, id LIMIT ?1 OFFSET ?2");
+        const stmt = try self.prepare("SELECT id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,heading_path_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms FROM vector_chunks ORDER BY updated_at_ms DESC, id LIMIT ?1 OFFSET ?2");
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, @intCast(@max(@as(usize, 1), @min(limit, 10000))));
         _ = c.sqlite3_bind_int64(stmt, 2, @intCast(offset));
@@ -6591,7 +6604,7 @@ pub const SQLiteStore = struct {
     pub fn vectorSearch(self: *Self, allocator: std.mem.Allocator, input: VectorSearchInput) ![]vector_mod.VectorMatch {
         const query = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
         defer allocator.free(query);
-        const stmt = try self.prepare("SELECT id,object_id,object_type,text,scope,permissions_json,embedding_json FROM vector_chunks ORDER BY updated_at_ms DESC");
+        const stmt = try self.prepare("SELECT id,object_id,object_type,text,scope,permissions_json,heading_path_json,embedding_json FROM vector_chunks ORDER BY updated_at_ms DESC");
         defer _ = c.sqlite3_finalize(stmt);
         var records: std.ArrayListUnmanaged(vector_mod.VectorRecord) = .empty;
         defer records.deinit(allocator);
@@ -6602,7 +6615,8 @@ pub const SQLiteStore = struct {
             const text = try columnText(allocator, stmt, 3);
             const scope = try columnText(allocator, stmt, 4);
             const permissions = try columnText(allocator, stmt, 5);
-            const embedding_json = try columnText(allocator, stmt, 6);
+            const heading_path_json = try columnText(allocator, stmt, 6);
+            const embedding_json = try columnText(allocator, stmt, 7);
             if (!try self.vectorChunkObjectVisible(allocator, object_type, object_id, scope, permissions, input.scopes_json, input.actor_id, input.include_deprecated)) continue;
             const embedding = vector_mod.embeddingFromJson(allocator, embedding_json) catch continue;
             try records.append(allocator, .{
@@ -6611,6 +6625,7 @@ pub const SQLiteStore = struct {
                 .object_type = object_type,
                 .text = text,
                 .scope = scope,
+                .heading_path_json = heading_path_json,
                 .embedding = embedding,
             });
         }
@@ -6630,6 +6645,7 @@ pub const SQLiteStore = struct {
                 .object_type = chunk.object_type,
                 .text = chunk.text,
                 .scope = chunk.scope,
+                .heading_path_json = chunk.heading_path_json,
                 .score = candidate.score,
             });
             if (out.items.len >= capped) break;
@@ -6646,11 +6662,12 @@ pub const SQLiteStore = struct {
             .text = try columnText(allocator, stmt, 4),
             .scope = try columnText(allocator, stmt, 5),
             .permissions_json = try columnText(allocator, stmt, 6),
-            .embedding_json = try columnText(allocator, stmt, 7),
-            .model = try columnTextNullable(allocator, stmt, 8),
-            .dimensions = c.sqlite3_column_int64(stmt, 9),
-            .created_at_ms = c.sqlite3_column_int64(stmt, 10),
-            .updated_at_ms = c.sqlite3_column_int64(stmt, 11),
+            .heading_path_json = try columnText(allocator, stmt, 7),
+            .embedding_json = try columnText(allocator, stmt, 8),
+            .model = try columnTextNullable(allocator, stmt, 9),
+            .dimensions = c.sqlite3_column_int64(stmt, 10),
+            .created_at_ms = c.sqlite3_column_int64(stmt, 11),
+            .updated_at_ms = c.sqlite3_column_int64(stmt, 12),
         };
     }
 
@@ -8348,6 +8365,7 @@ pub const PostgresStore = struct {
             \\ALTER TABLE context_packs ADD COLUMN IF NOT EXISTS actor_id text;
             \\ALTER TABLE context_packs ADD COLUMN IF NOT EXISTS actor_isolated boolean NOT NULL DEFAULT false;
             \\ALTER TABLE context_packs ADD COLUMN IF NOT EXISTS included_result_refs_json jsonb NOT NULL DEFAULT '[]'::jsonb;
+            \\ALTER TABLE vector_chunks ADD COLUMN IF NOT EXISTS heading_path_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE jobs ADD COLUMN IF NOT EXISTS permissions_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE jobs ADD COLUMN IF NOT EXISTS locked_until_ms bigint;
             \\ALTER TABLE jobs ADD COLUMN IF NOT EXISTS worker_id text;
@@ -8479,6 +8497,8 @@ pub const PostgresStore = struct {
             \\UPDATE schema_migrations SET name = 'vector_backing_invariant', checksum = 'np-007-vector-backing-invariant' WHERE version = 7;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (22, 'expanded_vector_primitives', 'np-022-expanded-vector-primitives', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
             \\UPDATE schema_migrations SET name = 'expanded_vector_primitives', checksum = 'np-022-expanded-vector-primitives' WHERE version = 22;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (23, 'vector_chunk_heading_paths', 'np-023-vector-chunk-heading-paths', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\UPDATE schema_migrations SET name = 'vector_chunk_heading_paths', checksum = 'np-023-vector-chunk-heading-paths' WHERE version = 23;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (8, 'agent_actor_isolation', 'np-008-agent-actor-isolation', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
             \\UPDATE schema_migrations SET name = 'agent_actor_isolation', checksum = 'np-008-agent-actor-isolation' WHERE version = 8;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (9, 'strict_actor_memory', 'np-009-strict-actor-memory', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
@@ -9476,19 +9496,19 @@ pub const PostgresStore = struct {
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
         try self.runParams(
             allocator,
-            "INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,embedding,model,dimensions,created_at_ms,updated_at_ms) " ++
-                "VALUES ($1,$2,$3,$4::bigint,$5,$6,$7::jsonb,$8::jsonb,$9::vector,$10,$11::bigint,$12::bigint,$13::bigint) " ++
-                "ON CONFLICT(id) DO UPDATE SET text=excluded.text, scope=excluded.scope, permissions_json=excluded.permissions_json, embedding_json=excluded.embedding_json, embedding=excluded.embedding, model=excluded.model, dimensions=excluded.dimensions, updated_at_ms=excluded.updated_at_ms",
-            &.{ id, input.object_type, input.object_id, chunk_ordinal, input.text, input.scope, input.permissions_json, input.embedding_json, input.embedding_json, input.model, dimensions, now_text, now_text },
+            "INSERT INTO vector_chunks (id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,heading_path_json,embedding_json,embedding,model,dimensions,created_at_ms,updated_at_ms) " ++
+                "VALUES ($1,$2,$3,$4::bigint,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10::vector,$11,$12::bigint,$13::bigint,$14::bigint) " ++
+                "ON CONFLICT(id) DO UPDATE SET text=excluded.text, scope=excluded.scope, permissions_json=excluded.permissions_json, heading_path_json=excluded.heading_path_json, embedding_json=excluded.embedding_json, embedding=excluded.embedding, model=excluded.model, dimensions=excluded.dimensions, updated_at_ms=excluded.updated_at_ms",
+            &.{ id, input.object_type, input.object_id, chunk_ordinal, input.text, input.scope, input.permissions_json, input.heading_path_json, input.embedding_json, input.embedding_json, input.model, dimensions, now_text, now_text },
         );
         const outbox_payload = try vectorUpsertPayloadJson(allocator, id);
         _ = try self.enqueueVectorOutbox(.{ .action = "upsert", .object_type = input.object_type, .object_id = input.object_id, .payload_json = outbox_payload });
         try self.insertAudit(allocator, "vector_chunk.upserted", input.actor_id, "vector_chunk", id);
-        return .{ .id = id, .object_type = input.object_type, .object_id = input.object_id, .chunk_ordinal = input.chunk_ordinal, .text = input.text, .scope = input.scope, .permissions_json = input.permissions_json, .embedding_json = input.embedding_json, .model = input.model, .dimensions = input.dimensions, .created_at_ms = now, .updated_at_ms = now };
+        return .{ .id = id, .object_type = input.object_type, .object_id = input.object_id, .chunk_ordinal = input.chunk_ordinal, .text = input.text, .scope = input.scope, .permissions_json = input.permissions_json, .heading_path_json = input.heading_path_json, .embedding_json = input.embedding_json, .model = input.model, .dimensions = input.dimensions, .created_at_ms = now, .updated_at_ms = now };
     }
 
     pub fn getVectorChunk(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?VectorChunk {
-        const parsed = try self.queryParamsJson(allocator, try arrayJsonSql(allocator, "SELECT id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms FROM vector_chunks WHERE id = $1 LIMIT 1"), &.{id});
+        const parsed = try self.queryParamsJson(allocator, try arrayJsonSql(allocator, "SELECT id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,heading_path_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms FROM vector_chunks WHERE id = $1 LIMIT 1"), &.{id});
         defer parsed.deinit();
         if (parsed.value != .array or parsed.value.array.items.len == 0) return null;
         const item = parsed.value.array.items[0];
@@ -9498,7 +9518,7 @@ pub const PostgresStore = struct {
 
     pub fn listVectorChunks(self: *PostgresStore, allocator: std.mem.Allocator, limit: usize, offset: usize) ![]VectorChunk {
         const capped = @max(@as(usize, 1), @min(limit, 10000));
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms FROM vector_chunks ORDER BY updated_at_ms DESC, id LIMIT {d} OFFSET {d}", .{ capped, offset });
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,object_type,object_id,chunk_ordinal,text,scope,permissions_json,heading_path_json,embedding_json,model,dimensions,created_at_ms,updated_at_ms FROM vector_chunks ORDER BY updated_at_ms DESC, id LIMIT {d} OFFSET {d}", .{ capped, offset });
         const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(VectorChunk) = .empty;
@@ -9572,7 +9592,7 @@ pub const PostgresStore = struct {
             const agent_status_filter = if (input.include_deprecated) "" else " AND agma.status NOT IN ('rejected','deprecated','superseded')";
             const inner = try std.fmt.allocPrint(
                 allocator,
-                "SELECT vc.id,vc.object_id,vc.object_type,vc.text,vc.scope,vc.permissions_json,vc.embedding_json,(1 - (vc.embedding <=> {s})) AS score " ++
+                "SELECT vc.id,vc.object_id,vc.object_type,vc.text,vc.scope,vc.permissions_json,vc.heading_path_json,vc.embedding_json,(1 - (vc.embedding <=> {s})) AS score " ++
                     "FROM vector_chunks vc " ++
                     "LEFT JOIN memory_atoms ma ON vc.object_type = 'memory_atom' AND ma.id = vc.object_id " ++
                     "LEFT JOIN sources src ON vc.object_type = 'source' AND src.id = vc.object_id " ++
@@ -9637,6 +9657,7 @@ pub const PostgresStore = struct {
                         .object_type = object_type,
                         .text = try dupStringField(allocator, obj, "text", ""),
                         .scope = scope,
+                        .heading_path_json = try rawJsonField(allocator, obj, "heading_path_json", "[]"),
                         .score = @floatCast(json.floatField(obj, "score") orelse 0),
                     });
                     if (out.items.len >= @max(@as(usize, 1), @min(input.limit, 100))) break;
@@ -9659,6 +9680,7 @@ pub const PostgresStore = struct {
                 .object_type = chunk.object_type,
                 .text = chunk.text,
                 .scope = chunk.scope,
+                .heading_path_json = chunk.heading_path_json,
                 .score = candidate.score,
             });
             if (out.items.len >= capped) break;
@@ -11394,6 +11416,7 @@ fn readPgVectorChunk(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !Vec
         .text = try dupStringField(allocator, obj, "text", ""),
         .scope = try dupStringField(allocator, obj, "scope", "workspace"),
         .permissions_json = try rawJsonField(allocator, obj, "permissions_json", "[]"),
+        .heading_path_json = try rawJsonField(allocator, obj, "heading_path_json", "[]"),
         .embedding_json = try rawJsonField(allocator, obj, "embedding_json", "[]"),
         .model = try dupNullableStringField(allocator, obj, "model"),
         .dimensions = json.intField(obj, "dimensions") orelse 0,
@@ -12440,6 +12463,31 @@ test "sqlite vector lifecycle deletes chunks and rebuilds from canonical store" 
     const run = try store.runVectorOutbox(10);
     try std.testing.expectEqual(@as(usize, 3), run.processed);
     try std.testing.expectEqual(@as(usize, 3), try store.countVectorOutbox("indexed_local"));
+}
+
+test "sqlite vector chunks preserve heading path metadata" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    const atom = try store.createMemoryAtom(alloc, .{ .text = "structured vector memory", .scope = "public", .created_by = "human" });
+    const chunk = try store.upsertVectorChunk(alloc, .{
+        .object_id = atom.id,
+        .text = atom.text,
+        .scope = atom.scope,
+        .heading_path_json = "[\"# NullPantry\",\"## Storage\"]",
+        .embedding_json = embedding,
+        .dimensions = 2,
+    });
+
+    const fetched = (try store.getVectorChunk(alloc, chunk.id)).?;
+    try std.testing.expectEqualStrings("[\"# NullPantry\",\"## Storage\"]", fetched.heading_path_json);
+    const matches = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .limit = 5 });
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("[\"# NullPantry\",\"## Storage\"]", matches[0].heading_path_json);
 }
 
 test "lancedb external vector plane runs through canonical outbox and ACL hydration" {
