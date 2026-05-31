@@ -8332,6 +8332,43 @@ test "api memory checkpoint restore preserves named runtime storage plane" {
     try std.testing.expectEqualStrings("404 Not Found", native_get.status);
 }
 
+test "api direct agent memory mutations emit replayable merge and delete feed events" {
+    var source_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer source_store.deinit();
+    var target_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer target_store.deinit();
+    var source_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source_arena.deinit();
+    var target_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer target_arena.deinit();
+    var source_ctx = Context{ .allocator = source_arena.allocator(), .store = &source_store, .actor_id = "agent:feed" };
+    var target_ctx = Context{ .allocator = target_arena.allocator(), .store = &target_store, .actor_id = "agent:feed" };
+
+    const merge_a = handleRequest(&source_ctx, "PUT", "/v1/agent-memory/feed.merge", "{\"operation\":\"merge_string_set\",\"values\":[\"zig\"],\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", merge_a.status);
+    const merge_b = handleRequest(&source_ctx, "PUT", "/v1/agent-memory/feed.merge", "{\"operation\":\"merge_string_set\",\"values\":[\"postgres\",\"zig\"],\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", merge_b.status);
+    const delete_put = handleRequest(&source_ctx, "PUT", "/v1/agent-memory/feed.delete", "{\"content\":\"delete should replay\"}", "");
+    try std.testing.expectEqualStrings("200 OK", delete_put.status);
+    const delete_resp = handleRequest(&source_ctx, "DELETE", "/v1/agent-memory/feed.delete", "", "");
+    try std.testing.expectEqualStrings("200 OK", delete_resp.status);
+
+    const checkpoint = handleRequest(&source_ctx, "GET", "/v1/memory/checkpoint?limit=100", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"operation\":\"merge_string_set\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"values\":[\"zig\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"operation\":\"delete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"key\":\"feed.delete\"") != null);
+
+    const restore = handleRequest(&target_ctx, "POST", "/v1/memory/checkpoint", checkpoint.body, "");
+    try std.testing.expectEqualStrings("200 OK", restore.status);
+    const merged = handleRequest(&target_ctx, "GET", "/v1/agent-memory/feed.merge", "", "");
+    try std.testing.expectEqualStrings("200 OK", merged.status);
+    try std.testing.expect(std.mem.indexOf(u8, merged.body, "[\\\"postgres\\\",\\\"zig\\\"]") != null);
+    const deleted = handleRequest(&target_ctx, "GET", "/v1/agent-memory/feed.delete", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", deleted.status);
+}
+
 test "api memory checkpoint restore preserves primitive named runtime mirrors" {
     var source_store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
         .agent_memory = .{ .backend = .memory_lru },

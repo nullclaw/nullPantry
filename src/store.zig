@@ -180,7 +180,20 @@ fn isAgentMemorySourceMetadata(metadata_json: []const u8) bool {
         std.mem.indexOf(u8, metadata_json, "\"native\":\"agent_memory_runtime\"") != null;
 }
 
-fn agentMemoryFeedPayloadJson(allocator: std.mem.Allocator, store_name: []const u8, entry: domain.AgentMemory) ![]const u8 {
+fn agentMemoryWriteFeedEventType(store_name: []const u8, operation: domain.AgentMemoryOperation) []const u8 {
+    const native = std.mem.eql(u8, store_name, "native");
+    return switch (operation) {
+        .put => if (native) "agent_memory.put" else "agent_memory.runtime_put",
+        .merge_object => if (native) "agent_memory.merge_object" else "agent_memory.runtime_merge_object",
+        .merge_string_set => if (native) "agent_memory.merge_string_set" else "agent_memory.runtime_merge_string_set",
+    };
+}
+
+fn agentMemoryDeleteFeedEventType(store_name: []const u8) []const u8 {
+    return if (std.mem.eql(u8, store_name, "native")) "agent_memory.delete" else "agent_memory.runtime_delete";
+}
+
+fn agentMemoryFeedPayloadJson(allocator: std.mem.Allocator, store_name: []const u8, entry: domain.AgentMemory, operation: domain.AgentMemoryOperation, operation_content: []const u8) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"store\":");
@@ -201,6 +214,36 @@ fn agentMemoryFeedPayloadJson(allocator: std.mem.Allocator, store_name: []const 
     try json.appendString(&out, allocator, entry.actor_id);
     try out.appendSlice(allocator, ",\"writer_actor_id\":");
     try json.appendString(&out, allocator, if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id);
+    switch (operation) {
+        .put => {},
+        .merge_string_set => {
+            try out.appendSlice(allocator, ",\"values\":");
+            try json.appendRawJsonOr(&out, allocator, operation_content, "[]");
+        },
+        .merge_object => {
+            try out.appendSlice(allocator, ",\"object\":");
+            try json.appendRawJsonOr(&out, allocator, operation_content, "{}");
+        },
+    }
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+fn agentMemoryDeleteFeedPayloadJson(allocator: std.mem.Allocator, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, scope: []const u8, permissions_json: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"store\":");
+    try json.appendString(&out, allocator, store_name);
+    try out.appendSlice(allocator, ",\"key\":");
+    try json.appendString(&out, allocator, key);
+    try out.appendSlice(allocator, ",\"session_id\":");
+    try json.appendNullableString(&out, allocator, session_id);
+    try out.appendSlice(allocator, ",\"scope\":");
+    try json.appendString(&out, allocator, scope);
+    try out.appendSlice(allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(&out, allocator, permissions_json, "[]");
+    try out.appendSlice(allocator, ",\"owner_id\":");
+    try json.appendString(&out, allocator, owner_actor_id);
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
 }
@@ -1821,7 +1864,7 @@ pub const Store = struct {
             object_id = saved.id;
             entry = saved;
         } else if (input.delete_key) |key| {
-            deleted = try self.agentMemoryDeleteRouted(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, route);
+            deleted = try self.agentMemoryDeleteRoutedInner(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, route, true);
             object_id = key;
         }
 
@@ -1915,7 +1958,7 @@ pub const Store = struct {
             agent_memory_runtime.freeAgentMemory(allocator, &cleanup);
         }
         try self.materializeRuntimeAgentMemory(allocator, entry, store_name);
-        if (!input.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, store_name, "agent_memory.runtime_put");
+        if (!input.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, store_name, input.operation, input.content);
         try self.enqueueAgentMemoryLucidPut(allocator, entry, input.writer_actor_id orelse input.actor_id);
         return entry;
     }
@@ -1930,7 +1973,7 @@ pub const Store = struct {
             var cleanup = entry;
             agent_memory_runtime.freeAgentMemory(allocator, &cleanup);
         }
-        if (!input.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, "native", "agent_memory.put");
+        if (!input.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, "native", input.operation, input.content);
         try self.enqueueAgentMemoryLucidPut(allocator, entry, input.writer_actor_id orelse input.actor_id);
         return entry;
     }
@@ -2000,18 +2043,54 @@ pub const Store = struct {
         };
     }
 
-    fn appendAgentMemoryFeedEvent(self: *Store, allocator: std.mem.Allocator, entry: domain.AgentMemory, store_name: []const u8, event_type: []const u8) !void {
+    fn appendAgentMemoryFeedEvent(self: *Store, allocator: std.mem.Allocator, entry: domain.AgentMemory, store_name: []const u8, operation: domain.AgentMemoryOperation, operation_content: []const u8) !void {
         if (domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) return;
-        const payload = try agentMemoryFeedPayloadJson(allocator, store_name, entry);
+        const payload = try agentMemoryFeedPayloadJson(allocator, store_name, entry, operation, operation_content);
         defer allocator.free(payload);
         _ = try self.appendFeedEvent(.{
-            .event_type = event_type,
-            .operation = "put",
+            .event_type = agentMemoryWriteFeedEventType(store_name, operation),
+            .operation = operation.name(),
             .object_type = "agent_memory",
             .object_id = entry.id,
             .scope = entry.scope,
             .permissions_json = entry.permissions_json,
             .actor_id = if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id,
+            .payload_json = payload,
+            .status = "applied",
+        });
+    }
+
+    fn agentMemoryDeleteRouteStoreName(self: *Store, route: AgentMemoryStorageRoute) []const u8 {
+        return switch (route.target) {
+            .primary => if (self.agent_memory.isExternal()) "runtime" else "native",
+            .native => "native",
+            .runtime => "runtime",
+            .named => route.name orelse "named",
+            .subset, .all => "multiple",
+        };
+    }
+
+    fn appendAgentMemoryDeleteFeedEvent(self: *Store, allocator: std.mem.Allocator, route: AgentMemoryStorageRoute, key: []const u8, session_id: ?[]const u8, requested_owner_actor_id: ?[]const u8, writer_actor_id: ?[]const u8, existing: ?domain.AgentMemory) !void {
+        if (domain.isInternalMemoryKey(key)) return;
+        const store_name = self.agentMemoryDeleteRouteStoreName(route);
+        const owner_actor_id = requested_owner_actor_id orelse if (existing) |entry| entry.actor_id else return;
+        var fallback_scope: ?[]const u8 = null;
+        defer if (fallback_scope) |scope| allocator.free(scope);
+        const scope = if (existing) |entry| entry.scope else blk: {
+            fallback_scope = try agentMemoryScope(allocator, owner_actor_id, session_id, null);
+            break :blk fallback_scope.?;
+        };
+        const permissions_json = if (existing) |entry| entry.permissions_json else "[]";
+        const payload = try agentMemoryDeleteFeedPayloadJson(allocator, store_name, key, session_id, owner_actor_id, scope, permissions_json);
+        defer allocator.free(payload);
+        _ = try self.appendFeedEvent(.{
+            .event_type = agentMemoryDeleteFeedEventType(store_name),
+            .operation = "delete",
+            .object_type = "agent_memory",
+            .object_id = key,
+            .scope = scope,
+            .permissions_json = permissions_json,
+            .actor_id = writer_actor_id orelse owner_actor_id,
             .payload_json = payload,
             .status = "applied",
         });
@@ -2154,10 +2233,14 @@ pub const Store = struct {
     }
 
     fn agentMemoryDeleteSubset(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror!bool {
+        return self.agentMemoryDeleteSubsetInner(key, session_id, actor_id, writer_actor_id, route, false);
+    }
+
+    fn agentMemoryDeleteSubsetInner(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) anyerror!bool {
         const stores = try requireSubsetStores(route);
         var deleted = false;
         for (stores) |store_name| {
-            deleted = (try self.agentMemoryDeleteRouted(key, session_id, actor_id, writer_actor_id, routeForSubsetStoreName(store_name))) or deleted;
+            deleted = (try self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, routeForSubsetStoreName(store_name), suppress_feed)) or deleted;
         }
         return deleted;
     }
@@ -2533,25 +2616,39 @@ pub const Store = struct {
     }
 
     pub fn agentMemoryDeleteRouted(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
-        var existing = if (self.lucid_projection.isEnabled()) self.agentMemoryGetRouted(self.allocator, key, session_id, actor_id, route) catch null else null;
+        return self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, route, false);
+    }
+
+    fn agentMemoryDeleteRoutedInner(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !bool {
+        switch (route.target) {
+            .subset => return self.agentMemoryDeleteSubsetInner(key, session_id, actor_id, writer_actor_id, route, suppress_feed),
+            .all => {
+                var deleted = try self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, .{ .target = .native }, suppress_feed);
+                if (self.agent_memory.isExternal()) {
+                    deleted = (try self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, .{ .target = .runtime }, suppress_feed)) or deleted;
+                }
+                for (self.agent_memory_stores.stores.items) |named| {
+                    deleted = (try self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, .{ .target = .named, .name = named.name }, suppress_feed)) or deleted;
+                }
+                return deleted;
+            },
+            else => {},
+        }
+
+        var existing = self.agentMemoryGetRouted(self.allocator, key, session_id, actor_id, route) catch null;
         defer if (existing) |*entry| agent_memory_runtime.freeAgentMemory(self.allocator, entry);
         const deleted = try switch (route.target) {
             .primary => self.agentMemoryDelete(key, session_id, actor_id, writer_actor_id),
             .native => self.agentMemoryDeleteNative(key, session_id, actor_id, writer_actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.delete(key, session_id, actor_id, writer_actor_id) else error.AgentMemoryStorageUnavailable,
             .named => (try self.namedAgentMemoryRuntime(route)).delete(key, session_id, actor_id, writer_actor_id),
-            .subset => self.agentMemoryDeleteSubset(key, session_id, actor_id, writer_actor_id, route),
-            .all => blk: {
-                var deleted = try self.agentMemoryDeleteNative(key, session_id, actor_id, writer_actor_id);
-                if (self.agent_memory.isExternal()) deleted = (try self.agent_memory.delete(key, session_id, actor_id, writer_actor_id)) or deleted;
-                for (self.agent_memory_stores.stores.items) |*named| {
-                    deleted = (try named.runtime.delete(key, session_id, actor_id, writer_actor_id)) or deleted;
-                }
-                break :blk deleted;
-            },
+            .subset, .all => unreachable,
         };
         if (deleted) {
             try self.deprecateRuntimeAgentMemoryMirrorsForDelete(key, session_id, actor_id, writer_actor_id, route);
+            if (!suppress_feed) {
+                try self.appendAgentMemoryDeleteFeedEvent(self.allocator, route, key, session_id, actor_id, writer_actor_id, existing);
+            }
             if (existing) |entry| {
                 const owner_actor_id: ?[]const u8 = if (actor_id) |owner| owner else entry.actor_id;
                 try self.enqueueAgentMemoryLucidDelete(self.allocator, key, session_id, owner_actor_id, entry.scope, entry.permissions_json, writer_actor_id);
