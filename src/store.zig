@@ -9820,8 +9820,11 @@ pub const PostgresStore = struct {
         defer allocator.free(query);
         if (query.len == 0) return allocator.alloc(vector_mod.VectorMatch, 0);
         {
-            const embedding_sql = try std.fmt.allocPrint(allocator, "{s}::vector", .{try sqlString(allocator, input.embedding_json)});
             const candidate_limit = pgSearchCandidateLimit(input.limit, 20, 5000);
+            const dimensions_text = try std.fmt.allocPrint(allocator, "{d}", .{query.len});
+            defer allocator.free(dimensions_text);
+            const candidate_limit_text = try std.fmt.allocPrint(allocator, "{d}", .{candidate_limit});
+            defer allocator.free(candidate_limit_text);
             const ma_visible = try pgRecordVisibleSql(allocator, "ma.scope", "ma.permissions_json", input.scopes_json, input.actor_id);
             const source_visible = try pgRecordVisibleSql(allocator, "src.scope", "src.permissions_json", input.scopes_json, input.actor_id);
             const artifact_visible = try pgRecordVisibleSql(allocator, "art.scope", "art.permissions_json", input.scopes_json, input.actor_id);
@@ -9832,17 +9835,14 @@ pub const PostgresStore = struct {
             const agent_memory_visible = try pgRecordVisibleSql(allocator, "ami.scope", "ami.permissions_json", input.scopes_json, input.actor_id);
             const space_visible = try pgRecordVisibleSql(allocator, "sp.scope", "sp.permissions_json", input.scopes_json, input.actor_id);
             const policy_visible = try pgRecordVisibleSql(allocator, "ps.scope", "ps.permissions_json", input.scopes_json, input.actor_id);
-            const context_actor_filter = if (input.actor_id) |actor|
-                try std.fmt.allocPrint(allocator, "(cp.actor_isolated = false OR cp.actor_id = {s})", .{try sqlString(allocator, actor)})
-            else
-                "(cp.actor_isolated = false)";
+            const context_actor_filter = "(cp.actor_isolated = false OR ($2::text IS NOT NULL AND cp.actor_id = $2))";
             const ma_status_filter = if (input.include_deprecated) "" else " AND ma.status NOT IN ('rejected','deprecated','superseded')";
             const artifact_status_filter = if (input.include_deprecated) "" else " AND art.status NOT IN ('rejected','deprecated','superseded')";
             const relation_status_filter = if (input.include_deprecated) "" else " AND rel.status NOT IN ('rejected','deprecated','superseded')";
             const agent_status_filter = if (input.include_deprecated) "" else " AND agma.status NOT IN ('rejected','deprecated','superseded')";
             const inner = try std.fmt.allocPrint(
                 allocator,
-                "SELECT vc.id,vc.object_id,vc.object_type,vc.text,vc.scope,vc.permissions_json,vc.heading_path_json,vc.embedding_json,(1 - (vc.embedding <=> {s})) AS score " ++
+                "SELECT vc.id,vc.object_id,vc.object_type,vc.text,vc.scope,vc.permissions_json,vc.heading_path_json,vc.embedding_json,(1 - (vc.embedding <=> $1::vector)) AS score " ++
                     "FROM vector_chunks vc " ++
                     "LEFT JOIN memory_atoms ma ON vc.object_type = 'memory_atom' AND ma.id = vc.object_id " ++
                     "LEFT JOIN sources src ON vc.object_type = 'source' AND src.id = vc.object_id " ++
@@ -9856,7 +9856,7 @@ pub const PostgresStore = struct {
                     "LEFT JOIN memory_atoms agma ON agma.id = ami.memory_atom_id " ++
                     "LEFT JOIN spaces sp ON vc.object_type = 'space' AND sp.id = vc.object_id " ++
                     "LEFT JOIN policy_scopes ps ON vc.object_type = 'policy_scope' AND ps.scope = vc.object_id " ++
-                    "WHERE vc.embedding IS NOT NULL AND vc.dimensions = {d} AND ((" ++
+                    "WHERE vc.embedding IS NOT NULL AND vc.dimensions = $3::bigint AND ((" ++
                     "vc.object_type = 'memory_atom' AND ma.id IS NOT NULL{s} AND ({s})) OR (" ++
                     "vc.object_type = 'source' AND src.id IS NOT NULL AND ({s})) OR (" ++
                     "vc.object_type = 'artifact' AND art.id IS NOT NULL{s} AND ({s})) OR (" ++
@@ -9866,10 +9866,8 @@ pub const PostgresStore = struct {
                     "vc.object_type = 'agent_memory' AND ami.id IS NOT NULL AND agma.id IS NOT NULL{s} AND ({s})) OR (" ++
                     "vc.object_type = 'space' AND sp.id IS NOT NULL AND ({s})) OR (" ++
                     "vc.object_type = 'policy_scope' AND ps.scope IS NOT NULL AND ({s}))) " ++
-                    "ORDER BY vc.embedding <=> {s} LIMIT {d}",
+                    "ORDER BY vc.embedding <=> $1::vector LIMIT $4::bigint",
                 .{
-                    embedding_sql,
-                    query.len,
                     ma_status_filter,
                     ma_visible,
                     source_visible,
@@ -9885,11 +9883,9 @@ pub const PostgresStore = struct {
                     agent_memory_visible,
                     space_visible,
                     policy_visible,
-                    embedding_sql,
-                    candidate_limit,
                 },
             );
-            const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+            const parsed = try self.queryArrayParamsJson(allocator, inner, &.{ input.embedding_json, input.actor_id, dimensions_text, candidate_limit_text });
             defer parsed.deinit();
             var out: std.ArrayListUnmanaged(vector_mod.VectorMatch) = .empty;
             if (parsed.value == .array) {
