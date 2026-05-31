@@ -10289,8 +10289,12 @@ pub const PostgresStore = struct {
         const floor = try self.feedCursorFloor(allocator);
         if (!input.ignore_cursor_floor and input.since_id < floor) return error.CursorExpired;
         const visible_limit = @max(@as(usize, 1), @min(input.limit, 500));
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms,compacted_at_ms FROM memory_feed_events WHERE id > {d} ORDER BY id ASC", .{input.since_id});
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const since_text = try std.fmt.allocPrint(allocator, "{d}", .{input.since_id});
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT id,event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms,compacted_at_ms FROM memory_feed_events WHERE id > $1::bigint ORDER BY id ASC",
+            &.{since_text},
+        );
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(FeedEvent) = .empty;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
@@ -10319,8 +10323,12 @@ pub const PostgresStore = struct {
         const floor = try self.feedCursorFloor(allocator);
         const max_text = try self.queryText(allocator, "SELECT coalesce(max(id), 0)::text FROM memory_feed_events");
         const max_id = std.fmt.parseInt(i64, max_text, 10) catch 0;
-        const inner = try std.fmt.allocPrint(allocator, "SELECT scope,permissions_json,status FROM memory_feed_events WHERE id > {d}", .{floor});
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const floor_text = try std.fmt.allocPrint(allocator, "{d}", .{floor});
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT scope,permissions_json,status FROM memory_feed_events WHERE id > $1::bigint",
+            &.{floor_text},
+        );
         defer parsed.deinit();
         var visible: usize = 0;
         var pending: usize = 0;
