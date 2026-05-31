@@ -9429,65 +9429,41 @@ pub const PostgresStore = struct {
     }
 
     pub fn applyFeedAgentMemoryAtomic(self: *PostgresStore, allocator: std.mem.Allocator, input: FeedAgentMemoryApplyInput) !FeedAgentMemoryApplyResult {
-        const event_id = if (input.reserved_event_id) |reserved| reserved else blk: {
-            const text = try self.queryText(allocator, "SELECT nextval(pg_get_serial_sequence('memory_feed_events','id'))::text");
-            defer allocator.free(text);
-            break :blk try std.fmt.parseInt(i64, text, 10);
-        };
-
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer sql.deinit(allocator);
-        try sql.appendSlice(allocator, "BEGIN;\n");
+        try self.runSql("BEGIN");
+        errdefer self.runSql("ROLLBACK") catch {};
 
         var object_id: []const u8 = input.delete_key orelse "agent_memory";
         var entry: ?domain.AgentMemory = null;
         var deleted = false;
         if (input.input) |memory_input| {
-            const owner_actor_id = try requiredActorId(memory_input.actor_id);
-            const writer_actor_id = memory_input.writer_actor_id orelse input.writer_actor_id orelse input.event.actor_id orelse owner_actor_id;
-            const source_title = try std.fmt.allocPrint(allocator, "Agent memory: {s}", .{memory_input.key});
-            const source_id = try ids.make(allocator, "src_");
-            const atom_id = try ids.make(allocator, "mem_");
-            const item_id = try ids.make(allocator, "agm_");
-            const source_ids = try singleJsonString(allocator, source_id);
-            const evidence = try evidenceRangeJson(allocator, source_id, memory_input.content.len, "agent_memory");
-            const now = ids.nowMs();
-            const scope = try agentMemoryScope(allocator, owner_actor_id, memory_input.session_id, memory_input.scope);
-            const effective_permissions = try agentMemoryPermissions(allocator, owner_actor_id, memory_input.scope, memory_input.permissions_json);
-            const status = domain.defaultMemoryStatus("agent", scope);
-            const session_filter = try pgAgentMemorySessionFilterQualified(allocator, "agent_memory_items.", memory_input.session_id, owner_actor_id);
-            try sql.print(allocator, "UPDATE memory_atoms SET status = 'deprecated' WHERE id IN (SELECT memory_atom_id FROM agent_memory_items WHERE key = {s} AND {s});\n", .{ try sqlString(allocator, memory_input.key), session_filter });
-            try sql.print(allocator, "DELETE FROM agent_memory_items WHERE key = {s} AND {s};\n", .{ try sqlString(allocator, memory_input.key), session_filter });
-            try sql.print(allocator, "INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json) VALUES ({s},'agent_observation',{s},NULL,{s},NULL,'[]'::jsonb,{s},{s},{d},{d},NULL,NULL,'[]'::jsonb,'{{\"native\":\"agent_memory\"}}'::jsonb);\n", .{ try sqlString(allocator, source_id), try sqlString(allocator, source_title), try sqlString(allocator, memory_input.content), try sqlJsonb(allocator, effective_permissions), try sqlString(allocator, scope), now, now });
-            try sql.print(allocator, "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) VALUES ({s},NULL,'agent.memory',{s},{s},{s},0.8,{s},{s},{s},'agent',{d},NULL,NULL,NULL,NULL,{s},'[\"agent_memory\"]'::jsonb);\n", .{ try sqlString(allocator, atom_id), try sqlString(allocator, memory_input.key), try sqlString(allocator, memory_input.content), try sqlString(allocator, scope), try sqlString(allocator, status), try sqlJsonb(allocator, source_ids), try sqlJsonb(allocator, evidence), now, try sqlJsonb(allocator, effective_permissions) });
-            try sql.print(allocator, "INSERT INTO agent_memory_items (id,key,session_id,actor_id,writer_actor_id,scope,permissions_json,memory_atom_id,category,timestamp_ms,metadata_json) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{s});\n", .{ try sqlString(allocator, item_id), try sqlString(allocator, memory_input.key), try sqlNullableString(allocator, memory_input.session_id), try sqlString(allocator, owner_actor_id), try sqlString(allocator, writer_actor_id), try sqlString(allocator, scope), try sqlJsonb(allocator, effective_permissions), try sqlString(allocator, atom_id), try sqlString(allocator, memory_input.category), now, try sqlJsonb(allocator, memory_input.metadata_json) });
-            try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('source.created',{s},'source',{s},'{{}}'::jsonb,{d});\n", .{ try sqlString(allocator, writer_actor_id), try sqlString(allocator, source_id), now });
-            try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_atom.created',{s},'memory_atom',{s},'{{}}'::jsonb,{d});\n", .{ try sqlString(allocator, writer_actor_id), try sqlString(allocator, atom_id), now });
-            try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('agent_memory.upserted',{s},'agent_memory',{s},'{{}}'::jsonb,{d});\n", .{ try sqlString(allocator, writer_actor_id), try sqlString(allocator, item_id), now });
-            object_id = item_id;
+            var auditable = memory_input;
+            if (auditable.writer_actor_id == null) auditable.writer_actor_id = input.writer_actor_id orelse input.event.actor_id;
+            const saved = try self.agentMemoryStore(allocator, auditable);
+            object_id = saved.id;
+            entry = saved;
         } else if (input.delete_key) |key| {
-            const writer_actor_id = input.writer_actor_id orelse input.event.actor_id;
-            const owner_actor_id = input.delete_owner_actor_id orelse input.event.actor_id;
-            const session_filter = try pgAgentMemorySessionFilter(allocator, input.delete_session_id, owner_actor_id);
-            try sql.print(allocator, "WITH rows AS (DELETE FROM agent_memory_items WHERE key = {s} AND {s} RETURNING memory_atom_id), upd AS (UPDATE memory_atoms SET status='deprecated' WHERE id IN (SELECT memory_atom_id FROM rows) RETURNING 1) SELECT count(*) FROM rows;\n", .{ try sqlString(allocator, key), session_filter });
-            try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('agent_memory.deleted',{s},'agent_memory',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, writer_actor_id), try sqlString(allocator, key), ids.nowMs() });
+            deleted = try self.agentMemoryDelete(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id);
             object_id = key;
-            deleted = true;
         }
 
-        const event_now = ids.nowMs();
-        if (input.reserved_event_id != null) {
-            try sql.print(allocator, "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM memory_feed_events WHERE id = {d} AND status = 'applying') THEN RAISE EXCEPTION 'feed reservation consumed'; END IF; END $$;\nUPDATE memory_feed_events SET object_type = {s}, object_id = {s}, payload_json = {s}, status = 'applied', applied_at_ms = {d} WHERE id = {d} AND status = 'applying';\n", .{ event_id, try sqlString(allocator, input.event.object_type), try sqlString(allocator, object_id), try sqlJsonb(allocator, input.event.payload_json), event_now, event_id });
-        } else {
-            try sql.print(allocator, "INSERT INTO memory_feed_events (id,event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms) VALUES ({d},{s},{s},{s},{s},{s},{s},{s},{s},{s},{s},'applied',{d},{d});\n", .{ event_id, try sqlString(allocator, input.event.event_type), try sqlString(allocator, input.event.operation), try sqlString(allocator, input.event.object_type), try sqlString(allocator, object_id), try sqlString(allocator, input.event.scope), try sqlJsonb(allocator, input.event.permissions_json), try sqlNullableString(allocator, input.event.actor_id), try sqlNullableString(allocator, input.event.dedupe_key), try sqlJsonb(allocator, input.event.causality_json), try sqlJsonb(allocator, input.event.payload_json), event_now, event_now });
-        }
-        try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_feed.applied',{s},'memory_feed_event',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, input.event.actor_id), try sqlString(allocator, object_id), event_now });
-        try sql.appendSlice(allocator, "COMMIT;\n");
-        try self.runSql(sql.items);
+        const event_id = if (input.reserved_event_id) |reserved| blk: {
+            if (!try self.markFeedEventApplied(reserved, input.event.object_type, object_id, input.event.payload_json)) return error.FeedReservationConsumed;
+            break :blk reserved;
+        } else try self.appendFeedEvent(.{
+            .event_type = input.event.event_type,
+            .operation = input.event.operation,
+            .object_type = input.event.object_type,
+            .object_id = object_id,
+            .scope = input.event.scope,
+            .permissions_json = input.event.permissions_json,
+            .actor_id = input.event.actor_id,
+            .dedupe_key = input.event.dedupe_key,
+            .causality_json = input.event.causality_json,
+            .payload_json = input.event.payload_json,
+            .status = "applied",
+        });
 
-        if (input.input) |memory_input| {
-            entry = try self.agentMemoryGet(allocator, memory_input.key, memory_input.session_id, memory_input.actor_id);
-        }
+        try self.runSql("COMMIT");
         return .{ .event_id = event_id, .object_id = object_id, .entry = entry, .deleted = deleted };
     }
 
