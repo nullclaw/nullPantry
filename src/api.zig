@@ -199,7 +199,7 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
     } else if (eql(seg1, "memory") and (eql(seg2, "feed") or eql(seg2, "events")) and is_get) {
         return memoryFeed(ctx, parsed.query);
     } else if (eql(seg1, "memory") and (eql(seg2, "feed") or eql(seg2, "events")) and is_post) {
-        return appendMemoryFeed(ctx, body);
+        return appendMemoryFeed(ctx, body, parsed.query);
     } else if (eql(seg1, "memory") and eql(seg2, "status") and is_get) {
         return memoryFeedStatus(ctx, parsed.query);
     } else if (eql(seg1, "memory") and eql(seg2, "compact") and is_post) {
@@ -4530,7 +4530,7 @@ fn memoryFeedCheckpointRestoreInternal(ctx: *Context, body: []const u8, query: [
         const status = json.stringField(event_obj, "status") orelse "applied";
         var local_event_id: ?i64 = null;
         if (std.mem.eql(u8, status, "pending")) {
-            local_event_id = restorePendingCheckpointEvent(ctx, event_obj) catch |err| switch (err) {
+            local_event_id = restorePendingCheckpointEvent(ctx, event_obj, storage_route) catch |err| switch (err) {
                 error.Forbidden => return forbidden(ctx),
                 error.FeedDedupeMismatch => return feedDedupeConflict(ctx),
                 error.UnsupportedObjectType => return json.errorResponse(ctx.allocator, 400, "bad_request", "Unsupported feed object_type"),
@@ -4793,7 +4793,7 @@ fn responseEventId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
     return json.intField(parsed.value.object, "event_id");
 }
 
-fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !i64 {
+fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap, fallback_route: store_mod.AgentMemoryStorageRoute) !i64 {
     const event_type = json.stringField(obj, "event_type") orelse return error.InvalidPayload;
     const operation = json.stringField(obj, "operation") orelse operationFromEventType(event_type);
     const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
@@ -4802,14 +4802,18 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !i64 {
     const event_actor_id = json.stringField(obj, "actor_id") orelse ctx.actor_id;
     if (!canApplyAsActor(ctx, event_actor_id)) return error.Forbidden;
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return error.InvalidPayload;
-    const scope = feedEventScope(ctx, obj, object_type, payload_json, event_actor_id) catch return error.InvalidPayload;
-    const permissions_json = feedEventPermissions(ctx, obj, object_type, payload_json, event_actor_id) catch return error.InvalidPayload;
+    const explicit_or_fallback_route = agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route) catch return error.InvalidPayload;
+    const payload_route = feedObjectPayloadRoute(ctx, object_type, explicit_or_fallback_route);
+    const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, payload_route) catch return error.InvalidPayload;
+    defer ctx.allocator.free(event_payload_json);
+    const scope = feedEventScope(ctx, obj, object_type, event_payload_json, event_actor_id) catch return error.InvalidPayload;
+    const permissions_json = feedEventPermissions(ctx, obj, object_type, event_payload_json, event_actor_id) catch return error.InvalidPayload;
     const dedupe_key = feedEventDedupeKey(ctx, obj) catch return error.InvalidPayload;
     if (std.mem.eql(u8, object_type, "agent_memory")) {
-        if (try feedAgentMemoryPayloadIsInternal(ctx, payload_json)) return error.InternalAgentMemory;
+        if (try feedAgentMemoryPayloadIsInternal(ctx, event_payload_json)) return error.InternalAgentMemory;
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
     } else if (std.mem.eql(u8, object_type, "agent_session_message")) {
-        if (try feedAgentSessionMessagePayloadIsInternal(ctx, payload_json)) return error.InternalAgentSessionMessage;
+        if (try feedAgentSessionMessagePayloadIsInternal(ctx, event_payload_json)) return error.InternalAgentSessionMessage;
         if (!canProposeAgentSessionEvent(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
     } else if (isAgentSessionFeedObject(object_type)) {
         if (!canProposeAgentSessionEvent(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
@@ -4819,7 +4823,7 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !i64 {
     if (dedupe_key) |key| {
         if (try ctx.store.getFeedEventByDedupeKey(ctx.allocator, key)) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return error.Forbidden;
-            if (!feedDedupeMatches(event, event_type, operation, object_type, object_id, scope, permissions_json, event_actor_id, causality_json, payload_json)) return error.FeedDedupeMismatch;
+            if (!feedDedupeMatches(event, event_type, operation, object_type, object_id, scope, permissions_json, event_actor_id, causality_json, event_payload_json)) return error.FeedDedupeMismatch;
             return event.id;
         }
     }
@@ -4834,12 +4838,12 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !i64 {
         .actor_id = event_actor_id,
         .dedupe_key = dedupe_key,
         .causality_json = causality_json,
-        .payload_json = payload_json,
+        .payload_json = event_payload_json,
         .status = "pending",
     });
 }
 
-fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
+fn appendMemoryFeed(ctx: *Context, body: []const u8, query: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
@@ -4849,15 +4853,19 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
         return json.errorResponse(ctx.allocator, 400, "bad_request", "Unsupported feed object_type");
     }
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
-    const scope = feedEventScope(ctx, obj, object_type, payload_json, ctx.actor_id) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid feed payload");
-    const permissions_json = feedEventPermissions(ctx, obj, object_type, payload_json, ctx.actor_id) catch return serverError(ctx);
+    const storage_route = agentMemoryStorageTargetFromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
+    const payload_route = feedObjectPayloadRoute(ctx, object_type, storage_route);
+    const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, payload_route) catch return serverError(ctx);
+    defer ctx.allocator.free(event_payload_json);
+    const scope = feedEventScope(ctx, obj, object_type, event_payload_json, ctx.actor_id) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid feed payload");
+    const permissions_json = feedEventPermissions(ctx, obj, object_type, event_payload_json, ctx.actor_id) catch return serverError(ctx);
     const dedupe_key = feedEventDedupeKey(ctx, obj) catch return serverError(ctx);
     if (std.mem.eql(u8, object_type, "agent_memory")) {
-        const internal_payload = feedAgentMemoryPayloadIsInternal(ctx, payload_json) catch return serverError(ctx);
+        const internal_payload = feedAgentMemoryPayloadIsInternal(ctx, event_payload_json) catch return serverError(ctx);
         if (internal_payload) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be queued through the feed");
         if (!canProposeRecord(ctx, scope, permissions_json) and !canApplyAgentMemoryScope(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
     } else if (std.mem.eql(u8, object_type, "agent_session_message")) {
-        const internal_payload = feedAgentSessionMessagePayloadIsInternal(ctx, payload_json) catch return serverError(ctx);
+        const internal_payload = feedAgentSessionMessagePayloadIsInternal(ctx, event_payload_json) catch return serverError(ctx);
         if (internal_payload) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be queued through the feed");
         if (!canProposeAgentSessionEvent(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
     } else if (isAgentSessionFeedObject(object_type)) {
@@ -4867,7 +4875,7 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
     if (dedupe_key) |key| {
         if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, key) catch return serverError(ctx)) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return forbidden(ctx);
-            if (!feedDedupeMatches(event, event_type, json.stringField(obj, "operation") orelse "put", object_type, event_object_id, scope, permissions_json, ctx.actor_id, rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx), payload_json)) {
+            if (!feedDedupeMatches(event, event_type, json.stringField(obj, "operation") orelse "put", object_type, event_object_id, scope, permissions_json, ctx.actor_id, rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx), event_payload_json)) {
                 return feedDedupeConflict(ctx);
             }
             const response = std.fmt.allocPrint(ctx.allocator, "{{\"event_id\":{d},\"queued\":true}}", .{event.id}) catch return serverError(ctx);
@@ -4884,7 +4892,7 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
         .actor_id = ctx.actor_id,
         .dedupe_key = dedupe_key,
         .causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx),
-        .payload_json = payload_json,
+        .payload_json = event_payload_json,
         .status = "pending",
     }) catch |err| switch (err) {
         error.FeedDedupeMismatch => return feedDedupeConflict(ctx),
@@ -4896,13 +4904,13 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
 
 fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResponse {
     if (!canApplyFeed(ctx)) return forbidden(ctx);
-    const storage_route = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
-    if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
-        return runtimeMemoryFeedApply(ctx, runtime, body);
-    }
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
+    const storage_route = agentMemoryStorageTargetFromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
+    if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
+        return runtimeMemoryFeedApply(ctx, runtime, body);
+    }
     const event_type = json.stringField(obj, "event_type") orelse "memory_atom.upsert";
     const operation = json.stringField(obj, "operation") orelse operationFromEventType(event_type);
     const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
@@ -4913,24 +4921,27 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     const event_actor_id = json.stringField(obj, "actor_id") orelse ctx.actor_id;
     if (!canApplyAsActor(ctx, event_actor_id)) return forbidden(ctx);
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
+    const event_payload_route = feedObjectPayloadRoute(ctx, object_type, storage_route);
+    const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, event_payload_route) catch return serverError(ctx);
+    defer ctx.allocator.free(event_payload_json);
     const causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx);
     const event_dedupe_key = feedEventDedupeKey(ctx, obj) catch return serverError(ctx);
     if (isLifecycleFeedOperation(operation) and !std.mem.eql(u8, object_type, "agent_memory") and !isAgentSessionFeedObject(object_type)) {
-        return applyFeedLifecycleMutation(ctx, obj, event_type, operation, object_type, event_actor_id, payload_json, causality_json);
+        return applyFeedLifecycleMutation(ctx, obj, event_type, operation, object_type, event_actor_id, event_payload_json, causality_json);
     }
-    const scope = feedEventScope(ctx, obj, object_type, payload_json, event_actor_id) catch return serverError(ctx);
-    const event_permissions_json = feedEventPermissions(ctx, obj, object_type, payload_json, event_actor_id) catch return serverError(ctx);
+    const scope = feedEventScope(ctx, obj, object_type, event_payload_json, event_actor_id) catch return serverError(ctx);
+    const event_permissions_json = feedEventPermissions(ctx, obj, object_type, event_payload_json, event_actor_id) catch return serverError(ctx);
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
     } else if (std.mem.eql(u8, object_type, "agent_session_message")) {
-        if (feedAgentSessionMessagePayloadIsInternal(ctx, payload_json) catch return serverError(ctx)) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be applied through the feed");
+        if (feedAgentSessionMessagePayloadIsInternal(ctx, event_payload_json) catch return serverError(ctx)) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be applied through the feed");
         if (!canApplyAgentSessionEvent(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
     } else if (isAgentSessionFeedObject(object_type)) {
         if (!canApplyAgentSessionEvent(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
     } else if (!canWriteRecord(ctx, scope, event_permissions_json)) return forbidden(ctx);
     var memory_input: ?store_mod.MemoryAtomInput = null;
     if (std.mem.eql(u8, object_type, "memory_atom")) {
-        memory_input = buildAppliedMemoryAtomInput(ctx, payload_json, scope, event_object_id, storage_route) catch |err| switch (err) {
+        memory_input = buildAppliedMemoryAtomInput(ctx, event_payload_json, scope, event_object_id, event_payload_route) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.MissingText, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Memory apply payload must include text/content"),
             else => return serverError(ctx),
@@ -4943,7 +4954,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     var agent_memory_delete_all = false;
     var agent_memory_route: store_mod.AgentMemoryStorageRoute = .{};
     if (std.mem.eql(u8, object_type, "agent_memory")) {
-        const prepared = buildAppliedAgentMemoryInput(ctx, operation, payload_json, event_object_id, event_actor_id, storage_route) catch |err| switch (err) {
+        const prepared = buildAppliedAgentMemoryInput(ctx, operation, event_payload_json, event_object_id, event_actor_id, event_payload_route) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.InternalAgentMemory => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be applied through the feed"),
             error.MissingKey, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Agent memory apply payload must include key/object_id and valid merge content"),
@@ -4961,7 +4972,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     }
     var session_message_input: ?AgentSessionMessageApplyInput = null;
     if (std.mem.eql(u8, object_type, "agent_session_message")) {
-        session_message_input = buildAppliedAgentSessionMessageInput(ctx, operation, payload_json, event_actor_id, storage_route) catch |err| switch (err) {
+        session_message_input = buildAppliedAgentSessionMessageInput(ctx, operation, event_payload_json, event_actor_id, event_payload_route) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.InternalAgentSessionMessage => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent session messages cannot be applied through the feed"),
             error.MissingRequiredField, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Session message feed payload must include session_id, role and content"),
@@ -4970,7 +4981,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     }
     var session_usage_input: ?AgentSessionUsageApplyInput = null;
     if (std.mem.eql(u8, object_type, "agent_session_usage")) {
-        session_usage_input = buildAppliedAgentSessionUsageInput(ctx, operation, payload_json, event_actor_id, storage_route) catch |err| switch (err) {
+        session_usage_input = buildAppliedAgentSessionUsageInput(ctx, operation, event_payload_json, event_actor_id, event_payload_route) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.MissingRequiredField, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Session usage feed payload must include session_id and total_tokens"),
             else => return serverError(ctx),
@@ -4988,7 +4999,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
                     return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying");
                 }
             } else {
-                if (!feedDedupeMatches(event, event_type, operation, object_type, event_object_id, scope, event_permissions_json, event_actor_id, causality_json, payload_json)) return feedDedupeConflict(ctx);
+                if (!feedDedupeMatches(event, event_type, operation, object_type, event_object_id, scope, event_permissions_json, event_actor_id, causality_json, event_payload_json)) return feedDedupeConflict(ctx);
                 return appliedFeedObjectResponse(ctx, event.id, event.object_type, event.object_id, if (std.mem.eql(u8, event.object_type, "memory_atom")) event.object_id else null);
             }
         }
@@ -5003,13 +5014,13 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
             .actor_id = event_actor_id,
             .dedupe_key = dedupe_key,
             .causality_json = causality_json,
-            .payload_json = payload_json,
+            .payload_json = event_payload_json,
             .status = "applying",
         }) catch return serverError(ctx);
         const reservation = (ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key) catch return serverError(ctx)) orelse return serverError(ctx);
         if (reservation.id != reserved_event_id.? or !std.mem.eql(u8, reservation.status, "applying") or !std.mem.eql(u8, reservation.object_id, reservation_id)) {
             if (std.mem.eql(u8, reservation.status, "applied")) {
-                if (!feedDedupeMatches(reservation, event_type, operation, object_type, event_object_id, scope, event_permissions_json, event_actor_id, causality_json, payload_json)) return feedDedupeConflict(ctx);
+                if (!feedDedupeMatches(reservation, event_type, operation, object_type, event_object_id, scope, event_permissions_json, event_actor_id, causality_json, event_payload_json)) return feedDedupeConflict(ctx);
                 return appliedFeedObjectResponse(ctx, reservation.id, reservation.object_type, reservation.object_id, if (std.mem.eql(u8, reservation.object_type, "memory_atom")) reservation.object_id else null);
             }
             return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying");
@@ -5039,7 +5050,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
                 .actor_id = event_actor_id,
                 .dedupe_key = event_dedupe_key,
                 .causality_json = causality_json,
-                .payload_json = payload_json,
+                .payload_json = event_payload_json,
                 .status = "applied",
             },
             .prepared = prepared,
@@ -5068,7 +5079,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
                 .actor_id = event_actor_id,
                 .dedupe_key = event_dedupe_key,
                 .causality_json = causality_json,
-                .payload_json = payload_json,
+                .payload_json = event_payload_json,
                 .status = "applied",
             },
             .input = input,
@@ -5099,7 +5110,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
                 .actor_id = event_actor_id,
                 .dedupe_key = event_dedupe_key,
                 .causality_json = causality_json,
-                .payload_json = payload_json,
+                .payload_json = event_payload_json,
                 .status = "applied",
             },
             .delete_key = delete_key,
@@ -5153,8 +5164,6 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
                 };
             };
         }
-        const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, ctx.store.effectiveAgentMemoryEventRoute(input.route)) catch return serverError(ctx);
-        defer ctx.allocator.free(event_payload_json);
         const event_id = if (reserved_event_id) |event_id| blk: {
             if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, event_payload_json) catch return serverError(ctx))) {
                 return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event reservation was already consumed");
@@ -5194,8 +5203,6 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
                 };
             };
         }
-        const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, ctx.store.effectiveAgentMemoryEventRoute(input.route)) catch return serverError(ctx);
-        defer ctx.allocator.free(event_payload_json);
         const event_id = if (reserved_event_id) |event_id| blk: {
             if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, event_payload_json) catch return serverError(ctx))) {
                 return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event reservation was already consumed");
@@ -5217,14 +5224,14 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
         return appliedFeedObjectResponse(ctx, event_id, object_type, object_id, null);
     }
     if (!std.mem.eql(u8, object_type, "memory_atom") and !std.mem.eql(u8, object_type, "agent_memory")) {
-        const object_id = applyFeedObjectPut(ctx, object_type, payload_json, scope, event_permissions_json, event_actor_id, event_object_id) catch |err| switch (err) {
+        const object_id = applyFeedObjectPut(ctx, object_type, event_payload_json, scope, event_permissions_json, event_actor_id, event_object_id, event_payload_route) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.InvalidPayload, error.MissingRequiredField => return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid feed payload for object_type"),
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
         };
         const event_id = if (reserved_event_id) |event_id| blk: {
-            if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, payload_json) catch return serverError(ctx))) {
+            if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, event_payload_json) catch return serverError(ctx))) {
                 return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event reservation was already consumed");
             }
             break :blk event_id;
@@ -5238,14 +5245,14 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
             .actor_id = event_actor_id,
             .dedupe_key = event_dedupe_key,
             .causality_json = causality_json,
-            .payload_json = payload_json,
+            .payload_json = event_payload_json,
             .status = "applied",
         }) catch return serverError(ctx);
         return appliedFeedObjectResponse(ctx, event_id, object_type, object_id, null);
     }
     if (reserved_event_id) |event_id| {
         const object_id = memory_atom_id orelse (event_object_id orelse "unknown");
-        if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, payload_json) catch return serverError(ctx))) {
+        if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, event_payload_json) catch return serverError(ctx))) {
             return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event reservation was already consumed");
         }
         return appliedFeedResponse(ctx, event_id, memory_atom_id);
@@ -5260,7 +5267,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
         .actor_id = event_actor_id,
         .dedupe_key = event_dedupe_key,
         .causality_json = causality_json,
-        .payload_json = payload_json,
+        .payload_json = event_payload_json,
         .status = "applied",
     }) catch return serverError(ctx);
     return appliedFeedResponse(ctx, id, memory_atom_id);
@@ -9100,6 +9107,25 @@ fn feedObjectTypeSupported(object_type: []const u8) bool {
         std.mem.eql(u8, object_type, "policy_scope");
 }
 
+fn feedObjectPayloadRoute(ctx: *Context, object_type: []const u8, fallback: store_mod.AgentMemoryStorageRoute) store_mod.AgentMemoryStorageRoute {
+    if (std.mem.eql(u8, object_type, "agent_memory") or
+        std.mem.eql(u8, object_type, "agent_session_message") or
+        std.mem.eql(u8, object_type, "agent_session_usage"))
+    {
+        return ctx.store.effectiveAgentMemoryEventRoute(fallback);
+    }
+    if (std.mem.eql(u8, object_type, "memory_atom") or
+        std.mem.eql(u8, object_type, "source") or
+        std.mem.eql(u8, object_type, "artifact") or
+        std.mem.eql(u8, object_type, "entity") or
+        std.mem.eql(u8, object_type, "relation") or
+        std.mem.eql(u8, object_type, "context_pack"))
+    {
+        return fallback;
+    }
+    return .{};
+}
+
 fn isAgentSessionFeedObject(object_type: []const u8) bool {
     return std.mem.eql(u8, object_type, "agent_session_message") or
         std.mem.eql(u8, object_type, "agent_session_usage");
@@ -9269,33 +9295,33 @@ fn applyOrAppendFeedEventRecord(ctx: *Context, obj: std.json.ObjectMap, event_ty
     });
 }
 
-fn applyFeedObjectPut(ctx: *Context, object_type: []const u8, payload_json: []const u8, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8) ![]const u8 {
+fn applyFeedObjectPut(ctx: *Context, object_type: []const u8, payload_json: []const u8, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8, fallback_route: store_mod.AgentMemoryStorageRoute) ![]const u8 {
     const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
     defer payload.deinit();
     if (payload.value != .object) return error.InvalidPayload;
     const obj = payload.value.object;
     if (std.mem.eql(u8, object_type, "source")) {
-        const input = try buildAppliedSourceInput(ctx, obj, fallback_scope, fallback_permissions_json, event_actor_id, event_object_id);
+        const input = try buildAppliedSourceInput(ctx, obj, fallback_scope, fallback_permissions_json, event_actor_id, event_object_id, fallback_route);
         const source = try ctx.store.createSource(ctx.allocator, input);
         return source.id;
     }
     if (std.mem.eql(u8, object_type, "artifact")) {
-        const input = try buildAppliedArtifactInput(ctx, obj, fallback_scope, fallback_permissions_json, event_actor_id, event_object_id);
+        const input = try buildAppliedArtifactInput(ctx, obj, fallback_scope, fallback_permissions_json, event_actor_id, event_object_id, fallback_route);
         const artifact = try ctx.store.createArtifact(ctx.allocator, input);
         return artifact.id;
     }
     if (std.mem.eql(u8, object_type, "entity")) {
-        const input = try buildAppliedEntityInput(ctx, obj, fallback_scope, fallback_permissions_json, event_actor_id, event_object_id);
+        const input = try buildAppliedEntityInput(ctx, obj, fallback_scope, fallback_permissions_json, event_actor_id, event_object_id, fallback_route);
         const entity = try ctx.store.resolveEntity(ctx.allocator, input);
         return entity.id;
     }
     if (std.mem.eql(u8, object_type, "relation")) {
-        const input = try buildAppliedRelationInput(ctx, obj, fallback_scope, fallback_permissions_json, event_actor_id, event_object_id);
+        const input = try buildAppliedRelationInput(ctx, obj, fallback_scope, fallback_permissions_json, event_actor_id, event_object_id, fallback_route);
         const relation = try ctx.store.createRelation(ctx.allocator, input);
         return relation.id;
     }
     if (std.mem.eql(u8, object_type, "context_pack")) {
-        const input = try buildAppliedContextPackInput(ctx, obj, event_actor_id, event_object_id);
+        const input = try buildAppliedContextPackInput(ctx, obj, event_actor_id, event_object_id, fallback_route);
         const context = try ctx.store.createContextPack(ctx.allocator, input);
         return context.id;
     }
@@ -9320,7 +9346,7 @@ fn payloadPermissions(ctx: *Context, obj: std.json.ObjectMap, fallback_permissio
     return rawField(ctx.allocator, obj, "permissions", fallback_permissions_json);
 }
 
-fn buildAppliedSourceInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8) !store_mod.SourceInput {
+fn buildAppliedSourceInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !store_mod.SourceInput {
     const scope = payloadScope(obj, fallback_scope);
     const permissions_json = try payloadPermissions(ctx, obj, fallback_permissions_json);
     if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
@@ -9339,12 +9365,12 @@ fn buildAppliedSourceInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scop
         .related_entities_json = rawField(ctx.allocator, obj, "related_entities", "[]") catch "[]",
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch "{}",
         .actor_id = event_actor_id,
-        .storage_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        .storage_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
 }
 
-fn buildAppliedArtifactInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8) !store_mod.ArtifactInput {
+fn buildAppliedArtifactInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !store_mod.ArtifactInput {
     const scope = payloadScope(obj, fallback_scope);
     const permissions_json = try payloadPermissions(ctx, obj, fallback_permissions_json);
     if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
@@ -9370,12 +9396,12 @@ fn buildAppliedArtifactInput(ctx: *Context, obj: std.json.ObjectMap, fallback_sc
         .summary = json.nullableStringField(obj, "summary"),
         .agent_summary = json.nullableStringField(obj, "agent_summary"),
         .actor_id = event_actor_id,
-        .storage_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        .storage_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
 }
 
-fn buildAppliedEntityInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8) !store_mod.EntityInput {
+fn buildAppliedEntityInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !store_mod.EntityInput {
     const scope = payloadScope(obj, fallback_scope);
     const permissions_json = try payloadPermissions(ctx, obj, fallback_permissions_json);
     if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
@@ -9390,12 +9416,12 @@ fn buildAppliedEntityInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scop
         .permissions_json = permissions_json,
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch "{}",
         .actor_id = event_actor_id,
-        .storage_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        .storage_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
 }
 
-fn buildAppliedRelationInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8) !store_mod.RelationInput {
+fn buildAppliedRelationInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scope: []const u8, fallback_permissions_json: []const u8, event_actor_id: []const u8, event_object_id: ?[]const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !store_mod.RelationInput {
     const scope = payloadScope(obj, fallback_scope);
     const permissions_json = try payloadPermissions(ctx, obj, fallback_permissions_json);
     if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
@@ -9416,12 +9442,12 @@ fn buildAppliedRelationInput(ctx: *Context, obj: std.json.ObjectMap, fallback_sc
         .confidence = json.floatField(obj, "confidence") orelse 0.5,
         .status = json.stringField(obj, "status") orelse "proposed",
         .actor_id = event_actor_id,
-        .storage_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        .storage_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
 }
 
-fn buildAppliedContextPackInput(ctx: *Context, obj: std.json.ObjectMap, event_actor_id: []const u8, event_object_id: ?[]const u8) !store_mod.ContextPackInput {
+fn buildAppliedContextPackInput(ctx: *Context, obj: std.json.ObjectMap, event_actor_id: []const u8, event_object_id: ?[]const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !store_mod.ContextPackInput {
     const query = json.stringField(obj, "query") orelse json.stringField(obj, "task") orelse return error.MissingRequiredField;
     return .{
         .id = try feedIdOverride(obj, event_object_id, "ctx_"),
@@ -9442,7 +9468,7 @@ fn buildAppliedContextPackInput(ctx: *Context, obj: std.json.ObjectMap, event_ac
         .allow_reranker = json.boolField(obj, "allow_reranker") orelse false,
         .min_relevance = minRelevanceFromObject(obj),
         .actor_id = event_actor_id,
-        .agent_memory_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        .agent_memory_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
 }
@@ -11176,6 +11202,26 @@ test "api memory feed endpoints honor named runtime route selection" {
     const atom_apply = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"memory_atom.put\",\"object_type\":\"memory_atom\",\"scope\":\"public\",\"payload\":{\"text\":\"Scratch routed atom feed\",\"scope\":\"public\"}}", "");
     try std.testing.expectEqualStrings("200 OK", atom_apply.status);
 
+    const source_apply_body = "{\"event_type\":\"source.put\",\"operation\":\"put\",\"object_type\":\"source\",\"object_id\":\"src_routed_apply\",\"origin_instance_id\":\"route-test\",\"origin_sequence\":1,\"scope\":\"public\",\"payload\":{\"title\":\"Scratch routed source feed\",\"content\":\"Scratch routed source body\",\"scope\":\"public\"}}";
+    const source_apply = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", source_apply_body, "");
+    try std.testing.expectEqualStrings("200 OK", source_apply.status);
+    const source_retry = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", source_apply_body, "");
+    try std.testing.expectEqualStrings("200 OK", source_retry.status);
+    const scratch_source = handleRequest(&ctx, "GET", "/v1/agent-memory/primitive:source:src_routed_apply?store=scratch&scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_source.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_source.body, "Scratch routed source body") != null);
+    const native_source = handleRequest(&ctx, "GET", "/v1/agent-memory/primitive:source:src_routed_apply?storage=native&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", native_source.status);
+
+    const queued_source_body = "{\"event_type\":\"source.put\",\"operation\":\"put\",\"object_type\":\"source\",\"object_id\":\"src_queued_route\",\"origin_instance_id\":\"route-test\",\"origin_sequence\":2,\"scope\":\"public\",\"payload\":{\"title\":\"Scratch queued source feed\",\"content\":\"Scratch queued source body\",\"scope\":\"public\"}}";
+    const queued_source = handleRequest(&ctx, "POST", "/v1/memory/events?store=scratch", queued_source_body, "");
+    try std.testing.expectEqualStrings("200 OK", queued_source.status);
+    const queued_source_retry = handleRequest(&ctx, "POST", "/v1/memory/events?store=scratch", queued_source_body, "");
+    try std.testing.expectEqualStrings("200 OK", queued_source_retry.status);
+
+    const pending_restore = handleRequest(&ctx, "POST", "/v1/memory/checkpoint?store=scratch", "{\"events\":[{\"event_type\":\"source.put\",\"operation\":\"put\",\"object_type\":\"source\",\"object_id\":\"src_restored_pending_route\",\"status\":\"pending\",\"scope\":\"public\",\"payload\":{\"title\":\"Scratch restored pending source feed\",\"content\":\"Scratch restored pending source body\",\"scope\":\"public\"}}]}", "");
+    try std.testing.expectEqualStrings("200 OK", pending_restore.status);
+
     const session_apply = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_session_message.put\",\"object_type\":\"agent_session_message\",\"payload\":{\"session_id\":\"feed-route-session\",\"role\":\"user\",\"content\":\"Scratch routed session feed\",\"created_at_ms\":77}}", "");
     try std.testing.expectEqualStrings("200 OK", session_apply.status);
     const scratch_messages = handleRequest(&ctx, "GET", "/v1/agent-sessions/feed-route-session/messages?store=scratch", "", "");
@@ -11198,6 +11244,9 @@ test "api memory feed endpoints honor named runtime route selection" {
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "\"store\":\"scratch\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed feed apply") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed atom feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed source feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch queued source feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch restored pending source feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed session feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "\"total_tokens\":123") != null);
 
@@ -11208,6 +11257,9 @@ test "api memory feed endpoints honor named runtime route selection" {
     try std.testing.expectEqualStrings("200 OK", native_feed.status);
     try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Native feed survives route compact") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch routed feed apply") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch routed source feed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch queued source feed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch restored pending source feed") == null);
     try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch routed session feed") == null);
 
     const named_checkpoint = handleRequest(&ctx, "GET", "/v1/memory/checkpoint?store=scratch", "", "");
@@ -11215,6 +11267,9 @@ test "api memory feed endpoints honor named runtime route selection" {
     try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "\"store\":\"scratch\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch routed feed apply") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch routed atom feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch routed source feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch queued source feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch restored pending source feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch routed session feed") != null);
 
     const named_compact = handleRequest(&ctx, "POST", "/v1/memory/compact?store=scratch", "{}", "");
