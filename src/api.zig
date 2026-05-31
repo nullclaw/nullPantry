@@ -3259,20 +3259,30 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    const scope = json.stringField(obj, "scope") orelse "workspace";
+    const event_type = json.stringField(obj, "event_type") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing event_type");
+    const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
+    if (!feedObjectTypeSupported(object_type)) {
+        return json.errorResponse(ctx.allocator, 400, "bad_request", "Unsupported feed object_type");
+    }
+    const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
+    const scope = feedEventScope(ctx, obj, object_type, payload_json, ctx.actor_id) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid feed payload");
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
-    if (!canProposeRecord(ctx, scope, permissions_json)) return forbidden(ctx);
+    if (std.mem.eql(u8, object_type, "agent_memory")) {
+        const internal_payload = feedAgentMemoryPayloadIsInternal(ctx, payload_json) catch return serverError(ctx);
+        if (internal_payload) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be queued through the feed");
+        if (!canProposeRecord(ctx, scope, permissions_json) and !canApplyAgentMemoryScope(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
+    } else if (!canProposeRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     const id = ctx.store.appendFeedEvent(.{
-        .event_type = json.stringField(obj, "event_type") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing event_type"),
+        .event_type = event_type,
         .operation = json.stringField(obj, "operation") orelse "put",
-        .object_type = json.stringField(obj, "object_type") orelse "memory_atom",
+        .object_type = object_type,
         .object_id = json.stringField(obj, "object_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing object_id"),
         .scope = scope,
         .permissions_json = permissions_json,
         .actor_id = ctx.actor_id,
         .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
         .causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx),
-        .payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx),
+        .payload_json = payload_json,
         .status = "pending",
     }) catch return serverError(ctx);
     const response = std.fmt.allocPrint(ctx.allocator, "{{\"event_id\":{d},\"queued\":true}}", .{id}) catch return serverError(ctx);
@@ -8163,7 +8173,7 @@ test "api memory feed does not expose internal agent autosave payloads" {
     var admin_ctx = Context{ .allocator = alloc, .store = &store };
     const manual_body = "{\"event_type\":\"agent_memory.put\",\"operation\":\"put\",\"object_type\":\"agent_memory\",\"object_id\":\"ami_legacy_internal\",\"scope\":\"agent:autosave\",\"permissions\":[\"actor:agent:autosave\"],\"payload\":{\"key\":\"autosave_user_1\",\"content\":\"manual internal autosave payload\",\"scope\":\"agent:autosave\"}}";
     const manual = handleRequest(&admin_ctx, "POST", "/v1/memory/feed", manual_body, "");
-    try std.testing.expectEqualStrings("200 OK", manual.status);
+    try std.testing.expectEqualStrings("400 Bad Request", manual.status);
     const redacted = handleRequest(&actor_ctx, "GET", "/v1/memory/events?limit=50", "", "");
     try std.testing.expectEqualStrings("200 OK", redacted.status);
     try std.testing.expect(std.mem.indexOf(u8, redacted.body, "manual internal autosave payload") == null);
@@ -8182,6 +8192,10 @@ test "api memory feed apply rejects internal agent memory payloads" {
     try std.testing.expectEqualStrings("400 Bad Request", direct_apply.status);
     try std.testing.expect(std.mem.indexOf(u8, direct_apply.body, "Internal agent memory") != null);
     try std.testing.expect((try store.agentMemoryGet(alloc, "autosave_user_1", null, "agent:sync")) == null);
+
+    const queued_alias = handleRequest(&admin_ctx, "POST", "/v1/memory/events", "{\"event_type\":\"agent_memory.put\",\"operation\":\"put\",\"object_type\":\"agent_memory\",\"object_id\":\"ami_internal_alias\",\"actor_id\":\"agent:sync\",\"payload\":{\"key\":\"autosave_user_2\",\"content\":\"internal queued alias\"}}", "");
+    try std.testing.expectEqualStrings("400 Bad Request", queued_alias.status);
+    try std.testing.expect((try store.agentMemoryGet(alloc, "autosave_user_2", null, "agent:sync")) == null);
 
     const markdown_apply = handleRequest(&admin_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"operation\":\"put\",\"object_type\":\"agent_memory\",\"actor_id\":\"agent:sync\",\"payload\":{\"key\":\"normal.key\",\"content\":\"**autosave_assistant_1**: internal markdown replay\"}}", "");
     try std.testing.expectEqualStrings("400 Bad Request", markdown_apply.status);
