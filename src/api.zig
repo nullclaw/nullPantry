@@ -3212,17 +3212,20 @@ fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const events_value = checkpointEventsValue(parsed.value.object) orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Checkpoint restore requires an events array");
     if (events_value != .array) return json.errorResponse(ctx.allocator, 400, "bad_request", "Checkpoint restore requires an events array");
+    const checkpoint_compacted_through = checkpointCompactedThrough(parsed.value.object);
 
     var restored: usize = 0;
     var applied: usize = 0;
     var queued: usize = 0;
     var skipped: usize = 0;
+    var local_compact_floor: i64 = 0;
     for (events_value.array.items) |event_value| {
         if (event_value != .object) return json.errorResponse(ctx.allocator, 400, "bad_request", "Checkpoint events must be JSON objects");
         const event_obj = event_value.object;
         const status = json.stringField(event_obj, "status") orelse "applied";
+        var local_event_id: ?i64 = null;
         if (std.mem.eql(u8, status, "pending")) {
-            restorePendingCheckpointEvent(ctx, event_obj) catch |err| switch (err) {
+            local_event_id = restorePendingCheckpointEvent(ctx, event_obj) catch |err| switch (err) {
                 error.Forbidden => return forbidden(ctx),
                 error.FeedDedupeMismatch => return feedDedupeConflict(ctx),
                 error.UnsupportedObjectType => return json.errorResponse(ctx.allocator, 400, "bad_request", "Unsupported feed object_type"),
@@ -3236,14 +3239,30 @@ fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8) HttpResponse {
             const event_body = json.jsonFromValue(ctx.allocator, event_value) catch return serverError(ctx);
             const response = applyMemoryEvent(ctx, event_body);
             if (!std.mem.eql(u8, response.status, "200 OK")) return response;
+            local_event_id = responseEventId(ctx.allocator, response.body);
             applied += 1;
         } else {
             skipped += 1;
         }
+        if (local_event_id) |event_id| {
+            if (checkpointEventSequence(event_obj)) |source_sequence| {
+                if (source_sequence <= checkpoint_compacted_through and event_id > local_compact_floor) {
+                    local_compact_floor = event_id;
+                }
+            }
+        }
         restored += 1;
     }
 
-    const response = std.fmt.allocPrint(ctx.allocator, "{{\"restored_events\":{d},\"applied_events\":{d},\"queued_events\":{d},\"skipped_events\":{d}}}", .{ restored, applied, queued, skipped }) catch return serverError(ctx);
+    var restored_cursor_floor: i64 = 0;
+    var cursor_floor_restored = false;
+    if (checkpoint_compacted_through > 0 and local_compact_floor > 0) {
+        const compacted = ctx.store.compactFeed(local_compact_floor, ctx.actor_id) catch return serverError(ctx);
+        restored_cursor_floor = compacted.cursor_floor;
+        cursor_floor_restored = true;
+    }
+
+    const response = std.fmt.allocPrint(ctx.allocator, "{{\"restored_events\":{d},\"applied_events\":{d},\"queued_events\":{d},\"skipped_events\":{d},\"checkpoint_compacted_through_sequence\":{d},\"restored_cursor_floor\":{d},\"cursor_floor_restored\":{s}}}", .{ restored, applied, queued, skipped, checkpoint_compacted_through, restored_cursor_floor, if (cursor_floor_restored) "true" else "false" }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
 }
 
@@ -3255,7 +3274,32 @@ fn checkpointEventsValue(obj: std.json.ObjectMap) ?std.json.Value {
     return null;
 }
 
-fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !void {
+fn checkpointCompactedThrough(obj: std.json.ObjectMap) i64 {
+    if (json.intField(obj, "compacted_through_sequence")) |value| return value;
+    if (json.intField(obj, "cursor_floor")) |value| return value;
+    if (obj.get("checkpoint")) |checkpoint| {
+        if (checkpoint == .object) {
+            if (json.intField(checkpoint.object, "compacted_through_sequence")) |value| return value;
+            if (json.intField(checkpoint.object, "cursor_floor")) |value| return value;
+        }
+    }
+    return 0;
+}
+
+fn checkpointEventSequence(obj: std.json.ObjectMap) ?i64 {
+    return json.intField(obj, "id") orelse
+        json.intField(obj, "sequence") orelse
+        json.intField(obj, "event_id");
+}
+
+fn responseEventId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    return json.intField(parsed.value.object, "event_id");
+}
+
+fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !i64 {
     const event_type = json.stringField(obj, "event_type") orelse return error.InvalidPayload;
     const operation = json.stringField(obj, "operation") orelse operationFromEventType(event_type);
     const object_type = json.stringField(obj, "object_type") orelse "memory_atom";
@@ -3281,11 +3325,11 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !void {
         if (try ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key)) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return error.Forbidden;
             if (!feedDedupeMatches(event, event_type, operation, object_type, object_id, scope, permissions_json, event_actor_id, causality_json, payload_json)) return error.FeedDedupeMismatch;
-            return;
+            return event.id;
         }
     }
 
-    _ = try ctx.store.appendFeedEvent(.{
+    return try ctx.store.appendFeedEvent(.{
         .event_type = event_type,
         .operation = operation,
         .object_type = object_type,
@@ -10076,6 +10120,54 @@ test "api memory compact defaults through current feed head" {
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"compacted_through_sequence\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "default_compact_one") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "default_compact_two") != null);
+}
+
+test "api memory checkpoint restore preserves compacted cursor floor" {
+    var source_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer source_store.deinit();
+    var target_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer target_store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var source_ctx = Context{ .allocator = alloc, .store = &source_store };
+    var target_ctx = Context{ .allocator = alloc, .store = &target_store };
+
+    const first = handleRequest(&source_ctx, "POST", "/v1/memory/events", "{\"event_type\":\"memory.note\",\"operation\":\"put\",\"object_type\":\"memory_atom\",\"object_id\":\"restore_floor_one\",\"scope\":\"public\",\"payload\":{\"text\":\"one\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", first.status);
+    const second = handleRequest(&source_ctx, "POST", "/v1/memory/events", "{\"event_type\":\"memory.note\",\"operation\":\"put\",\"object_type\":\"memory_atom\",\"object_id\":\"restore_floor_two\",\"scope\":\"public\",\"payload\":{\"text\":\"two\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", second.status);
+
+    const compact = handleRequest(&source_ctx, "POST", "/v1/memory/compact", "{\"before_sequence\":1}", "");
+    try std.testing.expectEqualStrings("200 OK", compact.status);
+    try std.testing.expect(std.mem.indexOf(u8, compact.body, "\"compacted_through_sequence\":1") != null);
+
+    const checkpoint = handleRequest(&source_ctx, "GET", "/v1/memory/checkpoint?after_sequence=0&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"compacted_through_sequence\":1") != null);
+
+    const restore = handleRequest(&target_ctx, "POST", "/v1/memory/checkpoint", checkpoint.body, "");
+    try std.testing.expectEqualStrings("200 OK", restore.status);
+    try std.testing.expect(std.mem.indexOf(u8, restore.body, "\"queued_events\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restore.body, "\"checkpoint_compacted_through_sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restore.body, "\"restored_cursor_floor\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restore.body, "\"cursor_floor_restored\":true") != null);
+
+    const target_status = handleRequest(&target_ctx, "GET", "/v1/memory/status", "", "");
+    try std.testing.expectEqualStrings("200 OK", target_status.status);
+    try std.testing.expect(std.mem.indexOf(u8, target_status.body, "\"cursor_floor\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target_status.body, "\"compacted_through_sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target_status.body, "\"oldest_available_sequence\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target_status.body, "\"last_sequence\":2") != null);
+
+    const expired = handleRequest(&target_ctx, "GET", "/v1/memory/events?after=0", "", "");
+    try std.testing.expectEqualStrings("410 Gone", expired.status);
+    try std.testing.expect(std.mem.indexOf(u8, expired.body, "cursor_expired") != null);
+
+    const recovery_checkpoint = handleRequest(&target_ctx, "GET", "/v1/memory/checkpoint?after=0&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", recovery_checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, recovery_checkpoint.body, "restore_floor_one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recovery_checkpoint.body, "restore_floor_two") != null);
 }
 
 test "api memory checkpoint restore preserves actors and session deletes" {
