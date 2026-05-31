@@ -215,19 +215,24 @@ pub fn buildPlanWithAdaptive(allocator: std.mem.Allocator, query: []const u8, ha
     var expansion = try expandQueryDetailed(allocator, query);
     errdefer expansion.deinit(allocator);
     const analysis = analyzeQuery(query, adaptive);
-    const vector_available = has_vectorIndexWorthy(query) and has_vector_index;
-    const use_vector = switch (analysis.recommended_strategy) {
+    const has_backend_terms = expansion.websearch_query.len > 0;
+    const vector_available = has_backend_terms and has_vectorIndexWorthy(expansion.websearch_query) and has_vector_index;
+    const use_vector = if (!has_backend_terms)
+        false
+    else switch (analysis.recommended_strategy) {
         .keyword_only => false,
         .vector_only, .hybrid => vector_available,
     };
-    const use_keyword = switch (analysis.recommended_strategy) {
+    const use_keyword = if (!has_backend_terms)
+        false
+    else switch (analysis.recommended_strategy) {
         .vector_only => !use_vector,
         .keyword_only, .hybrid => true,
     };
     return .{
         .use_keyword = use_keyword,
         .use_vector = use_vector,
-        .use_graph = hasEntityHint(query),
+        .use_graph = has_backend_terms and hasEntityHint(query),
         .use_reranker = allow_reranker,
         .adaptive_enabled = adaptive.enabled,
         .strategy = analysis.recommended_strategy,
@@ -873,6 +878,16 @@ test "retrieval websearch query builder sanitizes operators and expansion terms"
     try std.testing.expect(std.mem.indexOf(u8, web, "???") == null);
     try std.testing.expect(std.mem.indexOf(u8, web, " OR OR ") == null);
     try std.testing.expect(std.mem.indexOf(u8, web, "decision OR decision") == null);
+}
+
+test "retrieval plan disables backend retrieval for empty sanitized queries" {
+    var plan = try buildPlan(std.testing.allocator, "??? OR AND the", true, true);
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expect(!plan.use_keyword);
+    try std.testing.expect(!plan.use_vector);
+    try std.testing.expect(!plan.use_graph);
+    try std.testing.expectEqualStrings("", plan.websearch_query);
 }
 
 test "retrieval adaptive strategy selects keyword vector and hybrid modes" {
