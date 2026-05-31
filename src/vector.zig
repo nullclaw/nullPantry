@@ -177,15 +177,98 @@ pub fn chunkText(allocator: std.mem.Allocator, text: []const u8, max_chars: usiz
     if (max_chars == 0 or overlap >= max_chars) return error.InvalidChunkConfig;
     var chunks: std.ArrayListUnmanaged(Chunk) = .empty;
     errdefer chunks.deinit(allocator);
-    var start: usize = 0;
-    var ordinal: usize = 0;
-    while (start < text.len) : (ordinal += 1) {
-        const end = @min(text.len, start + max_chars);
-        try chunks.append(allocator, .{ .text = text[start..end], .ordinal = ordinal });
+
+    const debommed_start: usize = if (text.len >= 3 and text[0] == 0xEF and text[1] == 0xBB and text[2] == 0xBF) 3 else 0;
+    var start = skipWhitespaceForward(text, debommed_start, text.len);
+    while (start < text.len) {
+        const end = chunkEnd(text, start, max_chars);
+        const trimmed_start = skipWhitespaceForward(text, start, end);
+        const trimmed_end = trimWhitespaceBackward(text, trimmed_start, end);
+        if (trimmed_start < trimmed_end) {
+            try chunks.append(allocator, .{ .text = text[trimmed_start..trimmed_end], .ordinal = chunks.items.len });
+        }
         if (end == text.len) break;
-        start = end - overlap;
+        start = if (overlap > 0 and end > overlap) previousUtf8Boundary(text, end - overlap, 0) else end;
+        start = skipWhitespaceForward(text, start, text.len);
     }
     return chunks.toOwnedSlice(allocator);
+}
+
+fn chunkEnd(text: []const u8, start: usize, max_chars: usize) usize {
+    const hard_end = previousUtf8Boundary(text, @min(text.len, start + max_chars), start + 1);
+    if (findNextMarkdownHeading(text, start + 1, hard_end)) |heading_start| return heading_start;
+    if (hard_end >= text.len) return text.len;
+    const min_split = @min(hard_end, start + @min(max_chars / 3, 600));
+    if (findPreviousParagraphBreak(text, min_split, hard_end)) |paragraph_end| return paragraph_end;
+    if (findPreviousLineBreak(text, min_split, hard_end)) |line_end| return line_end;
+    if (findPreviousWhitespace(text, min_split, hard_end)) |space_end| return space_end;
+    return hard_end;
+}
+
+fn findNextMarkdownHeading(text: []const u8, start: usize, end: usize) ?usize {
+    var pos = start;
+    while (pos < end) : (pos += 1) {
+        if (text[pos] != '\n') continue;
+        const line_start = pos + 1;
+        if (line_start < end and isMarkdownHeadingAt(text, line_start)) return line_start;
+    }
+    return null;
+}
+
+fn isMarkdownHeadingAt(text: []const u8, pos: usize) bool {
+    if (pos > 0 and text[pos - 1] != '\n') return false;
+    var i = pos;
+    var hashes: usize = 0;
+    while (i < text.len and text[i] == '#' and hashes < 6) : ({
+        i += 1;
+        hashes += 1;
+    }) {}
+    if (hashes == 0) return false;
+    if (i >= text.len) return true;
+    return text[i] == ' ' or text[i] == '\t';
+}
+
+fn findPreviousParagraphBreak(text: []const u8, min_pos: usize, end: usize) ?usize {
+    if (end < 2) return null;
+    var pos = end;
+    while (pos > min_pos + 1) : (pos -= 1) {
+        if (text[pos - 1] == '\n' and text[pos - 2] == '\n') return pos;
+    }
+    return null;
+}
+
+fn findPreviousLineBreak(text: []const u8, min_pos: usize, end: usize) ?usize {
+    var pos = end;
+    while (pos > min_pos) : (pos -= 1) {
+        if (text[pos - 1] == '\n') return pos;
+    }
+    return null;
+}
+
+fn findPreviousWhitespace(text: []const u8, min_pos: usize, end: usize) ?usize {
+    var pos = end;
+    while (pos > min_pos) : (pos -= 1) {
+        if (std.ascii.isWhitespace(text[pos - 1])) return pos;
+    }
+    return null;
+}
+
+fn skipWhitespaceForward(text: []const u8, start: usize, end: usize) usize {
+    var pos = start;
+    while (pos < end and std.ascii.isWhitespace(text[pos])) : (pos += 1) {}
+    return pos;
+}
+
+fn trimWhitespaceBackward(text: []const u8, start: usize, end: usize) usize {
+    var pos = end;
+    while (pos > start and std.ascii.isWhitespace(text[pos - 1])) : (pos -= 1) {}
+    return pos;
+}
+
+fn previousUtf8Boundary(text: []const u8, pos: usize, min_pos: usize) usize {
+    var out = @min(pos, text.len);
+    while (out > min_pos and out < text.len and (text[out] & 0b1100_0000) == 0b1000_0000) : (out -= 1) {}
+    return out;
 }
 
 test "vector cosine handles common edge cases" {
@@ -237,4 +320,29 @@ test "vector chunker uses overlap" {
     try std.testing.expectEqual(@as(usize, 3), chunks.len);
     try std.testing.expectEqualStrings("abcd", chunks[0].text);
     try std.testing.expectEqualStrings("defg", chunks[1].text);
+}
+
+test "vector chunker respects markdown heading boundaries" {
+    const text = "# First\nAlpha\n## Second\nBeta\n## Third\nGamma";
+    const chunks = try chunkText(std.testing.allocator, text, 64, 0);
+    defer std.testing.allocator.free(chunks);
+    try std.testing.expectEqual(@as(usize, 3), chunks.len);
+    try std.testing.expect(std.mem.startsWith(u8, chunks[0].text, "# First"));
+    try std.testing.expect(std.mem.startsWith(u8, chunks[1].text, "## Second"));
+    try std.testing.expect(std.mem.startsWith(u8, chunks[2].text, "## Third"));
+}
+
+test "vector chunker preserves utf8 boundaries" {
+    const text = "Знание Знание Знание Знание Знание";
+    const chunks = try chunkText(std.testing.allocator, text, 10, 0);
+    defer std.testing.allocator.free(chunks);
+    try std.testing.expect(chunks.len > 1);
+    for (chunks) |chunk| try std.testing.expect(std.unicode.utf8ValidateSlice(chunk.text));
+}
+
+test "vector chunker strips bom and whitespace" {
+    const chunks = try chunkText(std.testing.allocator, "\xEF\xBB\xBF  # Title\nBody  \n", 64, 0);
+    defer std.testing.allocator.free(chunks);
+    try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    try std.testing.expectEqualStrings("# Title\nBody", chunks[0].text);
 }

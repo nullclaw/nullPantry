@@ -397,10 +397,10 @@ fn resolveEntities(allocator: std.mem.Allocator, store: *store_mod.Store, names_
 fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: RunOptions, object_type: []const u8, object_id: []const u8, text: []const u8, scope: []const u8, permissions_json: []const u8) !usize {
     if (text.len == 0) return 0;
     var count: usize = 0;
-    var start: usize = 0;
-    while (start < text.len) {
-        const end = vectorChunkEnd(text, start);
-        const chunk_text = std.mem.trim(u8, text[start..end], " \t\r\n");
+    const chunks = try vector.chunkText(allocator, text, 1800, 0);
+    defer allocator.free(chunks);
+    for (chunks) |chunk| {
+        const chunk_text = chunk.text;
         if (chunk_text.len > 0) {
             const payload = try store_mod.vectorEmbedPayloadJson(allocator, @intCast(count), chunk_text, scope, permissions_json, options.embedding_model, options.embedding_dimensions);
             const outbox_id = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
@@ -430,7 +430,6 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
             _ = try store.finishVectorOutbox(outbox_id, "embedded");
             count += 1;
         }
-        start = end;
     }
     return count;
 }
@@ -490,18 +489,6 @@ fn rawJsonField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, name: []c
     const value = obj.get(name) orelse return allocator.dupe(u8, fallback);
     if (value == .null) return allocator.dupe(u8, fallback);
     return try json.jsonFromValue(allocator, value);
-}
-
-fn vectorChunkEnd(text: []const u8, start: usize) usize {
-    const max_chars: usize = 1800;
-    const min_chars: usize = 600;
-    const end = @min(text.len, start + max_chars);
-    if (end == text.len) return end;
-    var scan = end;
-    while (scan > start + min_chars) : (scan -= 1) {
-        if (text[scan - 1] == '\n') return scan;
-    }
-    return end;
 }
 
 test "worker processes vector outbox and queued hygiene job" {

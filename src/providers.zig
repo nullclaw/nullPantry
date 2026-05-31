@@ -11,6 +11,7 @@ pub const EmbeddingProviderKind = enum {
     local_deterministic,
     openai_compatible,
     gemini,
+    ollama,
     voyage,
 
     pub fn parse(raw: []const u8) EmbeddingProviderKind {
@@ -26,6 +27,12 @@ pub const EmbeddingProviderKind = enum {
         {
             return .gemini;
         }
+        if (std.ascii.eqlIgnoreCase(raw, "ollama") or
+            std.ascii.eqlIgnoreCase(raw, "ollama-api") or
+            std.ascii.eqlIgnoreCase(raw, "ollama-native"))
+        {
+            return .ollama;
+        }
         if (std.ascii.eqlIgnoreCase(raw, "voyage") or
             std.ascii.eqlIgnoreCase(raw, "voyageai") or
             std.ascii.eqlIgnoreCase(raw, "voyage-ai"))
@@ -40,6 +47,7 @@ pub const EmbeddingProviderKind = enum {
             .local_deterministic => "local-deterministic",
             .openai_compatible => "openai-compatible",
             .gemini => "gemini",
+            .ollama => "ollama",
             .voyage => "voyage",
         };
     }
@@ -57,6 +65,7 @@ pub const EmbeddingEndpointConfig = struct {
         return switch (self.provider) {
             .local_deterministic => false,
             .openai_compatible => self.base_url != null and self.model != null,
+            .ollama => true,
             .gemini, .voyage => self.api_key != null,
         };
     }
@@ -296,10 +305,11 @@ pub const provider_descriptors = [_]ProviderDescriptor{
     .{ .name = "openai-compatible-embeddings", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "gemini", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /v1beta/models/{model}:embedContent", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "voyage", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /v1/embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
+    .{ .name = "ollama", .role = "local query and chunk embeddings", .status = "built_in", .protocol = "POST /api/embed", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "embedding-fallback-chain", .role = "server-side embedding failover between configured providers", .status = "built_in", .protocol = "NULLPANTRY_EMBEDDING_FALLBACKS string or JSON", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "provider-circuit-breaker", .role = "shared runtime provider health, cooldown, and half-open probing", .status = "built_in", .protocol = "diagnostics.providers", .env_prefix = "NULLPANTRY_PROVIDER_" },
     .{ .name = "openai-compatible-chat", .role = "ask synthesis, structured extraction, and optional reranking", .status = "built_in", .protocol = "POST /chat/completions", .env_prefix = "NULLPANTRY_LLM_" },
-    .{ .name = "ollama", .role = "local provider via OpenAI-compatible endpoint", .status = "compatible", .protocol = "configure Ollama OpenAI compatibility base URL", .env_prefix = "NULLPANTRY_EMBEDDING_|NULLPANTRY_LLM_" },
+    .{ .name = "ollama-openai-compatible", .role = "local chat or embedding provider through Ollama's OpenAI-compatible endpoint", .status = "compatible", .protocol = "configure Ollama OpenAI compatibility base URL", .env_prefix = "NULLPANTRY_EMBEDDING_|NULLPANTRY_LLM_" },
 };
 
 pub fn appendProvidersJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
@@ -378,6 +388,7 @@ fn embedWithEndpoint(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfig,
         .local_deterministic => unreachable,
         .openai_compatible => try callOpenAICompatibleEmbedding(allocator, cfg, text),
         .gemini => try callGeminiEmbedding(allocator, cfg, text),
+        .ollama => try callOllamaEmbedding(allocator, cfg, text),
         .voyage => try callVoyageEmbedding(allocator, cfg, text),
     };
     return .{
@@ -392,6 +403,7 @@ fn embeddingModel(cfg: EmbeddingEndpointConfig) []const u8 {
         .local_deterministic => "local-deterministic",
         .openai_compatible => "unknown",
         .gemini => "text-embedding-004",
+        .ollama => "nomic-embed-text",
         .voyage => "voyage-3-lite",
     };
 }
@@ -544,6 +556,20 @@ fn callVoyageEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfi
     return parseEmbeddingResponse(allocator, response);
 }
 
+fn callOllamaEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfig, text: []const u8) ![]f32 {
+    if (text.len == 0) return allocator.alloc(f32, 0);
+    const base_url = cfg.base_url orelse "http://localhost:11434";
+    const model = cfg.model orelse "nomic-embed-text";
+    const url = try providerUrl(allocator, base_url, "/api/embed");
+    defer allocator.free(url);
+
+    const body = try ollamaEmbeddingPayload(allocator, model, text);
+    defer allocator.free(body);
+    const response = try postJson(allocator, url, cfg.api_key, cfg.timeout_secs, body);
+    defer allocator.free(response);
+    return parseOllamaEmbeddingResponse(allocator, response);
+}
+
 fn geminiEmbeddingPayload(allocator: std.mem.Allocator, model: []const u8, text: []const u8) ![]u8 {
     var payload: std.ArrayListUnmanaged(u8) = .empty;
     errdefer payload.deinit(allocator);
@@ -554,6 +580,17 @@ fn geminiEmbeddingPayload(allocator: std.mem.Allocator, model: []const u8, text:
     try payload.appendSlice(allocator, ",\"content\":{\"parts\":[{\"text\":");
     try json.appendString(&payload, allocator, text);
     try payload.appendSlice(allocator, "}]}}");
+    return payload.toOwnedSlice(allocator);
+}
+
+fn ollamaEmbeddingPayload(allocator: std.mem.Allocator, model: []const u8, text: []const u8) ![]u8 {
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer payload.deinit(allocator);
+    try payload.appendSlice(allocator, "{\"model\":");
+    try json.appendString(&payload, allocator, model);
+    try payload.appendSlice(allocator, ",\"input\":");
+    try json.appendString(&payload, allocator, text);
+    try payload.append(allocator, '}');
     return payload.toOwnedSlice(allocator);
 }
 
@@ -725,6 +762,22 @@ fn parseGeminiEmbeddingResponse(allocator: std.mem.Allocator, body: []const u8) 
     return embeddingFromValue(allocator, embedding.get("values") orelse return error.ProviderInvalidResponse);
 }
 
+fn parseOllamaEmbeddingResponse(allocator: std.mem.Allocator, body: []const u8) ![]f32 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.ProviderInvalidResponse;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.ProviderInvalidResponse,
+    };
+    if (root.get("embedding")) |embedding| return embeddingFromValue(allocator, embedding);
+    const embeddings = switch (root.get("embeddings") orelse return error.ProviderInvalidResponse) {
+        .array => |a| a,
+        else => return error.ProviderInvalidResponse,
+    };
+    if (embeddings.items.len == 0) return error.ProviderInvalidResponse;
+    return embeddingFromValue(allocator, embeddings.items[0]);
+}
+
 fn parseChatResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.ProviderInvalidResponse;
     defer parsed.deinit();
@@ -776,38 +829,62 @@ test "providers build native embedding payloads" {
     defer std.testing.allocator.free(voyage);
     try std.testing.expect(std.mem.indexOf(u8, voyage, "\"model\":\"voyage-3-lite\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, voyage, "\"input_type\":\"document\"") != null);
+
+    const ollama = try ollamaEmbeddingPayload(std.testing.allocator, "nomic-embed-text", "hello \"local\"");
+    defer std.testing.allocator.free(ollama);
+    try std.testing.expect(std.mem.indexOf(u8, ollama, "\"model\":\"nomic-embed-text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ollama, "hello \\\"local\\\"") != null);
 }
 
 test "embedding provider kind parsing and defaults" {
     try std.testing.expectEqual(EmbeddingProviderKind.gemini, EmbeddingProviderKind.parse("google-gemini"));
+    try std.testing.expectEqual(EmbeddingProviderKind.ollama, EmbeddingProviderKind.parse("ollama-native"));
     try std.testing.expectEqual(EmbeddingProviderKind.voyage, EmbeddingProviderKind.parse("voyage-ai"));
     try std.testing.expectEqual(EmbeddingProviderKind.local_deterministic, EmbeddingProviderKind.parse("deterministic"));
     try std.testing.expectEqual(EmbeddingProviderKind.openai_compatible, EmbeddingProviderKind.parse("unknown"));
     try std.testing.expect((EmbeddingConfig{ .provider = .gemini, .api_key = "key" }).enabled());
+    try std.testing.expect((EmbeddingConfig{ .provider = .ollama }).enabled());
     try std.testing.expect((EmbeddingConfig{ .provider = .voyage, .api_key = "key" }).enabled());
     try std.testing.expect(!(EmbeddingConfig{ .provider = .gemini }).enabled());
 }
 
 test "embedding fallback parsing supports csv and json endpoint specs" {
     const base = EmbeddingConfig{ .base_url = "https://example.test/v1", .api_key = "key", .model = "model", .dimensions = 42, .timeout_secs = 7 };
-    const csv = try parseEmbeddingFallbacks(std.testing.allocator, "voyage, local-deterministic", base);
+    const csv = try parseEmbeddingFallbacks(std.testing.allocator, "voyage, ollama, local-deterministic", base);
     defer std.testing.allocator.free(csv);
-    try std.testing.expectEqual(@as(usize, 2), csv.len);
+    try std.testing.expectEqual(@as(usize, 3), csv.len);
     try std.testing.expectEqual(EmbeddingProviderKind.voyage, csv[0].provider);
     try std.testing.expectEqualStrings("key", csv[0].api_key.?);
-    try std.testing.expectEqual(EmbeddingProviderKind.local_deterministic, csv[1].provider);
+    try std.testing.expectEqual(EmbeddingProviderKind.ollama, csv[1].provider);
+    try std.testing.expectEqual(EmbeddingProviderKind.local_deterministic, csv[2].provider);
 
     const json_spec =
-        \\[{"provider":"gemini","api_key":"g","model":"text-embedding-004","dimensions":768},{"provider":"local-deterministic"}]
+        \\[{"provider":"gemini","api_key":"g","model":"text-embedding-004","dimensions":768},{"provider":"ollama","base_url":"http://localhost:11434","model":"nomic-embed-text"},{"provider":"local-deterministic"}]
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const parsed = try parseEmbeddingFallbacks(arena.allocator(), json_spec, base);
-    try std.testing.expectEqual(@as(usize, 2), parsed.len);
+    try std.testing.expectEqual(@as(usize, 3), parsed.len);
     try std.testing.expectEqual(EmbeddingProviderKind.gemini, parsed[0].provider);
     try std.testing.expectEqualStrings("g", parsed[0].api_key.?);
     try std.testing.expectEqual(@as(usize, 768), parsed[0].dimensions);
-    try std.testing.expectEqual(EmbeddingProviderKind.local_deterministic, parsed[1].provider);
+    try std.testing.expectEqual(EmbeddingProviderKind.ollama, parsed[1].provider);
+    try std.testing.expectEqualStrings("http://localhost:11434", parsed[1].base_url.?);
+    try std.testing.expectEqualStrings("nomic-embed-text", parsed[1].model.?);
+    try std.testing.expectEqual(EmbeddingProviderKind.local_deterministic, parsed[2].provider);
+}
+
+test "providers parse ollama embedding response" {
+    const current = try parseOllamaEmbeddingResponse(std.testing.allocator, "{\"embeddings\":[[0,3,4]]}");
+    defer std.testing.allocator.free(current);
+    try std.testing.expectEqual(@as(usize, 3), current.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), current[1], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), current[2], 0.0001);
+
+    const legacy = try parseOllamaEmbeddingResponse(std.testing.allocator, "{\"embedding\":[1,0,0]}");
+    defer std.testing.allocator.free(legacy);
+    try std.testing.expectEqual(@as(usize, 3), legacy.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), legacy[0], 0.0001);
 }
 
 test "embedding fallback chain can recover to deterministic local embeddings" {
