@@ -10151,9 +10151,6 @@ pub const PostgresStore = struct {
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
             if (item != .object) continue;
             const event = try readPgFeedEvent(allocator, item.object);
-            if (event.dedupe_key) |dedupe| {
-                if (std.mem.startsWith(u8, dedupe, "direct:")) continue;
-            }
             if (!try self.recordVisibleWithPolicy(allocator, event.scope, event.permissions_json, input.scopes_json)) continue;
             try out.append(allocator, event);
             if (out.items.len >= visible_limit) break;
@@ -11155,6 +11152,9 @@ pub const PostgresStore = struct {
         for (parsed.value.array.items) |item| {
             if (item != .object) continue;
             const event = try readPgFeedEvent(allocator, item.object);
+            if (event.dedupe_key) |dedupe| {
+                if (std.mem.startsWith(u8, dedupe, "direct:")) continue;
+            }
             if (!try self.recordVisibleWithPolicyForActor(allocator, event.scope, event.permissions_json, input.scopes_json, input.actor_id)) continue;
             if (!try self.feedEventObjectVisibleForSearch(allocator, event.status, event.object_type, event.object_id, input.scopes_json, input.actor_id, input.include_deprecated)) continue;
             if (!try self.feedPayloadReferencesVisibleForActor(allocator, event.payload_json, input.scopes_json, input.actor_id, input.include_deprecated)) continue;
@@ -14500,8 +14500,37 @@ test "postgres storage contract covers primitives when configured" {
         if (event.id == feed_id) saw_feed = true;
     }
     try std.testing.expect(saw_feed);
+
+    const direct_source = try store.createSource(alloc, .{
+        .title = "Postgres direct feed source",
+        .content = "postgres direct feed source content",
+        .scope = "team:pg",
+        .permissions_json = "[\"team:pg\"]",
+        .actor_id = "agent:pg-a",
+    });
+    const direct_feed = try store.listFeedEvents(alloc, .{ .since_id = feed_id - 1, .scopes_json = "[\"team:pg\"]", .limit = 20 });
+    var saw_direct_source = false;
+    for (direct_feed) |event| {
+        if (std.mem.eql(u8, event.object_id, direct_source.id)) {
+            saw_direct_source = true;
+            try std.testing.expectEqualStrings("source.put", event.event_type);
+            try std.testing.expect(event.dedupe_key != null);
+            try std.testing.expect(std.mem.startsWith(u8, event.dedupe_key.?, "direct:source:"));
+        }
+    }
+    try std.testing.expect(saw_direct_source);
+    const direct_search = try store.search(alloc, .{ .query = "postgres direct feed source", .scopes_json = "[\"team:pg\"]", .limit = 20, .use_vector = false });
+    for (direct_search) |result| {
+        if (!std.mem.eql(u8, result.result_type, "feed_event")) continue;
+        try std.testing.expect(std.mem.indexOf(u8, result.text, direct_source.id) == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.text, "Postgres direct feed source") == null);
+    }
+
     const hidden_feed = try store.listFeedEvents(alloc, .{ .since_id = feed_id - 1, .scopes_json = "[\"public\"]", .limit = 10 });
-    for (hidden_feed) |event| try std.testing.expect(event.id != feed_id);
+    for (hidden_feed) |event| {
+        try std.testing.expect(event.id != feed_id);
+        try std.testing.expect(!std.mem.eql(u8, event.object_id, direct_source.id));
+    }
     const compacted = try store.compactFeed(feed_id, "agent:pg-a");
     try std.testing.expect(compacted.cursor_floor >= feed_id);
     try std.testing.expectError(error.CursorExpired, store.listFeedEvents(alloc, .{ .since_id = feed_id - 1, .scopes_json = "[\"team:pg\"]", .limit = 10 }));
