@@ -2425,15 +2425,14 @@ pub const ApiAgentMemory = struct {
         defer allocator.free(query);
         const response = try self.request(allocator, .GET, "/memory/events", query, actor_id, scopes_json, "");
         defer allocator.free(response.body);
-        if (response.status == .gone) return error.CursorExpired;
-        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        try requireApiFeedOk(response.status);
         return parseFeedEventsWrapper(allocator, response.body);
     }
 
     pub fn feedStatus(self: *ApiAgentMemory, allocator: std.mem.Allocator, actor_id: ?[]const u8, scopes_json: []const u8) !FeedStatus {
         const response = try self.request(allocator, .GET, "/memory/status", "", actor_id, scopes_json, "");
         defer allocator.free(response.body);
-        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        try requireApiFeedOk(response.status);
         return parseFeedStatus(allocator, response.body);
     }
 
@@ -2442,7 +2441,7 @@ pub const ApiAgentMemory = struct {
         defer allocator.free(body);
         const response = try self.request(allocator, .POST, "/memory/compact", "", actor_id, scopes_json, body);
         defer allocator.free(response.body);
-        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        try requireApiFeedOk(response.status);
         return parseFeedCompactResult(response.body);
     }
 
@@ -2450,23 +2449,23 @@ pub const ApiAgentMemory = struct {
         const query = try feedCheckpointQuery(allocator, since_id, limit);
         defer allocator.free(query);
         const response = try self.request(allocator, .GET, "/memory/checkpoint", query, actor_id, scopes_json, "");
-        if (response.status != .ok) {
+        requireApiFeedOk(response.status) catch |err| {
             allocator.free(response.body);
-            return error.AgentMemoryStorageUnavailable;
-        }
+            return err;
+        };
         return response.body;
     }
 
     pub fn restoreFeedCheckpoint(self: *ApiAgentMemory, allocator: std.mem.Allocator, checkpoint_json: []const u8, actor_id: ?[]const u8, scopes_json: []const u8) !void {
         const response = try self.request(allocator, .POST, "/memory/checkpoint", "", actor_id, scopes_json, checkpoint_json);
         defer allocator.free(response.body);
-        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        try requireApiFeedOk(response.status);
     }
 
     pub fn applyFeedEventJson(self: *ApiAgentMemory, allocator: std.mem.Allocator, event_json: []const u8, actor_id: ?[]const u8, scopes_json: []const u8) !void {
         const response = try self.request(allocator, .POST, "/memory/apply", "", actor_id, scopes_json, event_json);
         defer allocator.free(response.body);
-        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        try requireApiFeedOk(response.status);
     }
 
     fn getWithScopes(self: *ApiAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, explicit_scope: ?[]const u8) !?domain.AgentMemory {
@@ -2489,6 +2488,12 @@ pub const ApiAgentMemory = struct {
         return requestApiJson(allocator, method, url, self.config, actor_id, scopes_json, payload);
     }
 };
+
+fn requireApiFeedOk(status: std.http.Status) !void {
+    if (status == .ok) return;
+    if (status == .gone) return error.CursorExpired;
+    return error.AgentMemoryStorageUnavailable;
+}
 
 fn agentMemoryStorePayload(allocator: std.mem.Allocator, input: Input) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -3618,6 +3623,10 @@ test "agent memory api backend builds urls and parses memory responses" {
     const compact = try parseFeedCompactResult("{\"cursor_floor\":4,\"compacted_through_sequence\":4,\"max_event_id\":9,\"compacted_events\":3}");
     try std.testing.expectEqual(@as(i64, 4), compact.cursor_floor);
     try std.testing.expectEqual(@as(usize, 3), compact.compacted_events);
+
+    try requireApiFeedOk(.ok);
+    try std.testing.expectError(error.CursorExpired, requireApiFeedOk(.gone));
+    try std.testing.expectError(error.AgentMemoryStorageUnavailable, requireApiFeedOk(.bad_gateway));
 }
 
 test "named runtime registry rejects reserved duplicate and native stores" {
