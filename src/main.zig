@@ -1272,6 +1272,7 @@ test {
     _ = @import("agent_memory_reducer.zig");
     _ = @import("markdown_adapter.zig");
     _ = @import("markdown_filesystem.zig");
+    _ = @import("qmd_adapter.zig");
     _ = @import("artifacts.zig");
     _ = @import("extraction.zig");
     _ = @import("worker.zig");

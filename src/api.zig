@@ -20,6 +20,7 @@ const access = @import("access.zig");
 const auth = @import("auth.zig");
 const markdown_adapter = @import("markdown_adapter.zig");
 const markdown_filesystem = @import("markdown_filesystem.zig");
+const qmd_adapter = @import("qmd_adapter.zig");
 const compat = @import("compat.zig");
 const graph_mod = @import("graph.zig");
 const agent_memory_reducer = @import("agent_memory_reducer.zig");
@@ -1199,7 +1200,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -1213,7 +1214,7 @@ fn providerRegistry(ctx: *Context) HttpResponse {
 
 fn connectors(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"connectors":[{"name":"manual","status":"built_in","source_types":["manual","text"],"ingest":"POST /v1/connectors/manual/ingest","cursor":"GET|POST /v1/connectors/manual/cursor"},{"name":"markdown","status":"built_in_filesystem_import_export","source_types":["markdown","md"],"ingest":"POST /v1/connectors/markdown/ingest","import":"POST /v1/markdown/import","import_directory":"POST /v1/markdown/import-directory","export":"POST /v1/markdown/export","export_directory":"POST /v1/markdown/export-directory","cursor":"GET|POST /v1/connectors/markdown/cursor"},{"name":"transcript","status":"built_in","source_types":["transcript","chat"],"ingest":"POST /v1/connectors/transcript/ingest","cursor":"GET|POST /v1/connectors/transcript/cursor"},{"name":"ticket","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/ticket/ingest","cursor":"GET|POST /v1/connectors/ticket/cursor"},{"name":"git","status":"built_in_push","source_types":["pr","commit","repo"],"ingest":"POST /v1/connectors/git/ingest","cursor":"GET|POST /v1/connectors/git/cursor"},{"name":"incident","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/incident/ingest","cursor":"GET|POST /v1/connectors/incident/cursor"},{"name":"nulltickets","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/nulltickets/ingest","cursor":"GET|POST /v1/connectors/nulltickets/cursor"},{"name":"nullwatch","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/nullwatch/ingest","cursor":"GET|POST /v1/connectors/nullwatch/cursor"},{"name":"nullhub","status":"consumer"}]}
+        \\{"connectors":[{"name":"manual","status":"built_in","source_types":["manual","text"],"ingest":"POST /v1/connectors/manual/ingest","cursor":"GET|POST /v1/connectors/manual/cursor"},{"name":"markdown","status":"built_in_filesystem_import_export","source_types":["markdown","md"],"ingest":"POST /v1/connectors/markdown/ingest","import":"POST /v1/markdown/import","import_directory":"POST /v1/markdown/import-directory","export":"POST /v1/markdown/export","export_directory":"POST /v1/markdown/export-directory","cursor":"GET|POST /v1/connectors/markdown/cursor"},{"name":"qmd","status":"built_in_qmd_json_ingest","source_types":["qmd","markdown","session_export"],"ingest":"POST /v1/connectors/qmd/ingest","cursor":"GET|POST /v1/connectors/qmd/cursor","note":"Accepts qmd search JSON results and stores them as canonical Sources before extraction/retrieval."},{"name":"transcript","status":"built_in","source_types":["transcript","chat"],"ingest":"POST /v1/connectors/transcript/ingest","cursor":"GET|POST /v1/connectors/transcript/cursor"},{"name":"ticket","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/ticket/ingest","cursor":"GET|POST /v1/connectors/ticket/cursor"},{"name":"git","status":"built_in_push","source_types":["pr","commit","repo"],"ingest":"POST /v1/connectors/git/ingest","cursor":"GET|POST /v1/connectors/git/cursor"},{"name":"incident","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/incident/ingest","cursor":"GET|POST /v1/connectors/incident/cursor"},{"name":"nulltickets","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/nulltickets/ingest","cursor":"GET|POST /v1/connectors/nulltickets/cursor"},{"name":"nullwatch","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/nullwatch/ingest","cursor":"GET|POST /v1/connectors/nullwatch/cursor"},{"name":"nullhub","status":"consumer"}]}
     );
 }
 
@@ -1258,6 +1259,7 @@ fn connectorIngest(ctx: *Context, connector: []const u8, body: []const u8) HttpR
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
+    if (std.mem.eql(u8, connector, "qmd")) return qmdConnectorIngest(ctx, connector, obj, body);
     const default_scope = json.stringField(obj, "scope") orelse "workspace";
     const default_permissions = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
     const run_now = json.boolField(obj, "run_now") orelse false;
@@ -1316,6 +1318,75 @@ fn connectorIngest(ctx: *Context, connector: []const u8, body: []const u8) HttpR
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
+fn qmdConnectorIngest(ctx: *Context, connector: []const u8, obj: std.json.ObjectMap, body: []const u8) HttpResponse {
+    const default_scope = json.stringField(obj, "scope") orelse "workspace";
+    const default_permissions = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
+    if (!canProposeRecord(ctx, default_scope, default_permissions)) return forbidden(ctx);
+
+    const result_value = obj.get("results") orelse obj.get("items") orelse std.json.Value{ .object = obj };
+    const items = qmd_adapter.normalizeValue(ctx.allocator, result_value, qmd_adapter.limitsFromObject(obj)) catch return badJson(ctx);
+    defer qmd_adapter.deinitItems(ctx.allocator, items);
+    if (items.len == 0) return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing QMD results");
+
+    const run_now = json.boolField(obj, "run_now") orelse false;
+    const cursor_input = connectorCursorInputFromIngest(ctx, connector, obj, default_scope, default_permissions) catch |err| switch (err) {
+        error.Forbidden => return forbidden(ctx),
+        error.InvalidPayload => return badJson(ctx),
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"connector\":\"qmd\",\"sources\":[") catch return serverError(ctx);
+
+    var jobs_queued: usize = 0;
+    var atoms_extracted: usize = 0;
+    var vector_chunks: usize = 0;
+    for (items, 0..) |item, i| {
+        const source = ctx.store.createSource(ctx.allocator, .{
+            .source_type = json.stringField(obj, "type") orelse "qmd",
+            .title = item.title,
+            .raw_content_uri = item.raw_content_uri,
+            .content = item.content,
+            .author = json.nullableStringField(obj, "author"),
+            .participants_json = rawField(ctx.allocator, obj, "participants", "[]") catch return serverError(ctx),
+            .permissions_json = default_permissions,
+            .scope = default_scope,
+            .checksum = item.checksum,
+            .language = json.nullableStringField(obj, "language") orelse "markdown",
+            .related_entities_json = rawField(ctx.allocator, obj, "related_entities", "[]") catch return serverError(ctx),
+            .metadata_json = item.metadata_json,
+            .actor_id = ctx.actor_id,
+            .storage_route = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx),
+        }) catch return serverError(ctx);
+
+        var source_atoms: usize = 0;
+        var source_vectors: usize = 0;
+        if (run_now) {
+            const output = runExtraction(ctx, source, extractionOptionsFromObject(ctx, obj, true, true) catch return serverError(ctx)) catch return serverError(ctx);
+            source_atoms = output.atoms.len;
+            source_vectors = output.vector_chunks;
+            atoms_extracted += source_atoms;
+            vector_chunks += source_vectors;
+        } else {
+            _ = ctx.store.createJob(ctx.allocator, .{ .job_type = "ingest", .scope = source.scope, .permissions_json = source.permissions_json, .object_type = "source", .object_id = source.id, .input_json = body, .actor_id = ctx.actor_id }) catch return serverError(ctx);
+            jobs_queued += 1;
+        }
+
+        if (i > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, "{\"source\":") catch return serverError(ctx);
+        source.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+        out.print(ctx.allocator, ",\"job_queued\":{s},\"atoms_extracted\":{d},\"vector_chunks\":{d}}}", .{ if (run_now) "false" else "true", source_atoms, source_vectors }) catch return serverError(ctx);
+    }
+
+    out.print(ctx.allocator, "],\"count\":{d},\"run_now\":{s},\"jobs_queued\":{d},\"atoms_extracted\":{d},\"vector_chunks\":{d}", .{ items.len, if (run_now) "true" else "false", jobs_queued, atoms_extracted, vector_chunks }) catch return serverError(ctx);
+    if (cursor_input) |input| {
+        const cursor = ctx.store.upsertConnectorCursor(ctx.allocator, input) catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, ",\"cursor\":") catch return serverError(ctx);
+        cursor.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+    }
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
 fn connectorCursorInputFromIngest(ctx: *Context, connector: []const u8, obj: std.json.ObjectMap, default_scope: []const u8, default_permissions: []const u8) !?store_mod.ConnectorCursorInput {
     const cursor_value = json.stringField(obj, "next_cursor") orelse json.stringField(obj, "cursor") orelse return null;
     const scope = json.stringField(obj, "cursor_scope") orelse default_scope;
@@ -1361,6 +1432,7 @@ fn connectorDefaultSourceType(connector: []const u8) []const u8 {
     if (std.mem.eql(u8, connector, "incident") or std.mem.eql(u8, connector, "nullwatch")) return "incident";
     if (std.mem.eql(u8, connector, "transcript")) return "transcript";
     if (std.mem.eql(u8, connector, "markdown")) return "markdown";
+    if (std.mem.eql(u8, connector, "qmd")) return "qmd";
     return "manual";
 }
 
@@ -8492,6 +8564,7 @@ test "api manifest and connector endpoints describe headless service contracts" 
     try std.testing.expectEqualStrings("200 OK", connector_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, connector_resp.body, "\"name\":\"nullclaw\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, connector_resp.body, "\"name\":\"nullwatch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connector_resp.body, "\"name\":\"qmd\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, connector_resp.body, "\"built_in_push\"") != null);
 
     const connector_ingest = handleRequest(&ctx, "POST", "/v1/connectors/ticket/ingest",
@@ -8525,6 +8598,32 @@ test "api manifest and connector endpoints describe headless service contracts" 
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "GET /v1/agent-sessions") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/vector/rebuild") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/vector/reconcile") != null);
+}
+
+test "api qmd connector canonicalizes search results before extraction and retrieval" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = Context{ .allocator = arena.allocator(), .store = &store, .actor_scopes_json = "[\"public\",\"write:public\"]", .actor_capabilities_json = "[\"read\",\"write\",\"propose\"]" };
+
+    const qmd_ingest = handleRequest(&ctx, "POST", "/v1/connectors/qmd/ingest",
+        \\{"scope":"public","run_now":true,"next_cursor":"qmd-2","results":[{"path":"docs/memory.md","content":"Decision: QMD search results become canonical pantry sources.","start_line":5,"end_line":8},{"title":"Session Export","text":"Constraint: session exports must be permission checked."}]}
+    , "");
+    try std.testing.expectEqualStrings("200 OK", qmd_ingest.status);
+    try std.testing.expect(std.mem.indexOf(u8, qmd_ingest.body, "\"connector\":\"qmd\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, qmd_ingest.body, "\"count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, qmd_ingest.body, "\"type\":\"qmd\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, qmd_ingest.body, "\"start_line\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, qmd_ingest.body, "\"atoms_extracted\":2") != null);
+
+    const cursor = handleRequest(&ctx, "GET", "/v1/connectors/qmd/cursor?scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", cursor.status);
+    try std.testing.expect(std.mem.indexOf(u8, cursor.body, "\"qmd-2\"") != null);
+
+    const search_resp = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"canonical pantry sources\",\"scopes\":[\"public\"],\"use_vector\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", search_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "QMD search results become canonical pantry sources") != null);
 }
 
 test "api connector ingest only advances cursor after all items succeed" {

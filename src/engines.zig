@@ -4,6 +4,7 @@ pub const EngineKind = enum {
     none,
     sqlite,
     markdown,
+    qmd,
     memory_lru,
     lucid,
     postgres,
@@ -19,6 +20,7 @@ pub const EngineKind = enum {
             .none => "none",
             .sqlite => "sqlite",
             .markdown => "markdown",
+            .qmd => "qmd",
             .memory_lru => "memory_lru",
             .lucid => "lucid",
             .postgres => "postgres",
@@ -48,6 +50,7 @@ pub const descriptors = [_]EngineDescriptor{
     .{ .kind = .none, .role = "disabled memory plane", .durability = "none", .planes_json = "[\"agent_memory\",\"session\",\"usage\"]", .primary_for = "agent_memory,session,usage", .nullpantry_strategy = "explicit no-op runtime plane for parity with NullClaw none mode and controlled memory-disabled deployments", .nullclaw_boundary = "NullClaw baseline disabled memory mode; NullPantry can expose the same mode centrally", .runtime_supported = true, .remote_primary_supported = false },
     .{ .kind = .sqlite, .role = "local-dev relational memory", .durability = "durable", .planes_json = "[\"record\",\"agent_memory\",\"session\",\"vector\",\"cache\",\"lifecycle\",\"feed\"]", .primary_for = "record,agent_memory,session,vector,cache,lifecycle,feed", .nullpantry_strategy = "native SQLite service backend with FTS5 and local vector search", .nullclaw_boundary = "NullClaw baseline local engine; NullPantry local/dev system-of-record", .runtime_supported = true, .remote_primary_supported = true },
     .{ .kind = .markdown, .role = "filesystem knowledge documents", .durability = "filesystem", .planes_json = "[\"record\",\"filesystem\",\"import_export\",\"snapshot\"]", .primary_for = "source,artifact,filesystem_import_export", .nullpantry_strategy = "recursive Markdown directory import/export with frontmatter, path identity, permissions, checksum metadata, and source/artifact projection", .nullclaw_boundary = "NullClaw baseline local file engine can be replaced by NullPantry Markdown filesystem ingestion for shared knowledge documents", .runtime_supported = true, .remote_primary_supported = false },
+    .{ .kind = .qmd, .role = "QMD-compatible markdown/session result ingestion", .durability = "canonicalized", .planes_json = "[\"connector\",\"retrieval_source\",\"import_export\"]", .primary_for = "qmd_search_results,session_exports,markdown_corpus", .nullpantry_strategy = "normalize qmd JSON results into canonical Sources with provenance metadata, ACL, extraction, vectors, feed, and lifecycle instead of serving them as an ungoverned sidecar", .nullclaw_boundary = "NullClaw QMD retrieval adapter moves to NullPantry connector ingestion so agents query governed central knowledge", .runtime_supported = true, .remote_primary_supported = false },
     .{ .kind = .memory_lru, .role = "ephemeral process memory", .durability = "ephemeral", .planes_json = "[\"agent_memory\",\"session\",\"usage\",\"cache\",\"test\"]", .primary_for = "agent_memory,session,usage,cache,test", .nullpantry_strategy = "in-process runtime plane for tests, single-process agents, and named scratch stores; not durable shared memory", .nullclaw_boundary = "NullClaw baseline in-process engine; NullPantry can expose it centrally for parity and scratch stores", .runtime_supported = true, .remote_primary_supported = false },
     .{ .kind = .lucid, .role = "local semantic memory projection", .durability = "durable", .planes_json = "[\"projection\",\"semantic_context\"]", .primary_for = "projection", .nullpantry_strategy = "optional Lucid CLI projection adapter backed by durable projection jobs, lifecycle retractions, status, and rebuild; NullPantry remains source of truth and ACL gate", .nullclaw_boundary = "advanced semantic memory projection belongs in NullPantry, not NullClaw core", .runtime_supported = true, .remote_primary_supported = false },
     .{ .kind = .postgres, .role = "durable relational memory target", .durability = "durable", .planes_json = "[\"record\",\"agent_memory\",\"session\",\"vector\",\"cache\",\"lifecycle\",\"feed\"]", .primary_for = "record,agent_memory,session,vector,cache,lifecycle,feed", .nullpantry_strategy = "native libpq runtime adapter with pgvector schema", .nullclaw_boundary = "shared durable memory belongs in NullPantry service", .runtime_supported = true, .remote_primary_supported = true },
@@ -93,6 +96,7 @@ test "engine registry includes storage and adapter contracts" {
     try std.testing.expect(parse("none") == .none);
     try std.testing.expect(parse("sqlite") == .sqlite);
     try std.testing.expect(parse("markdown") == .markdown);
+    try std.testing.expect(parse("qmd") == .qmd);
     try std.testing.expect(parse("memory_lru") == .memory_lru);
     try std.testing.expect(parse("lucid") == .lucid);
     try std.testing.expect(parse("postgres") == .postgres);
