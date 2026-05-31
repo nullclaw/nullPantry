@@ -11579,27 +11579,23 @@ pub const PostgresStore = struct {
 
     fn searchPgAgentMemories(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const ami_visible = try pgRecordVisibleSql(allocator, "ami.scope", "ami.permissions_json", input.scopes_json, input.actor_id);
-        const actor_filter = if (input.actor_id) |actor|
-            try std.fmt.allocPrint(allocator, "(ami.actor_id = {s} OR ({s}))", .{ try sqlString(allocator, actor), ami_visible })
-        else
-            try std.fmt.allocPrint(allocator, "({s})", .{ami_visible});
-        const session_filter = if (input.session_id) |sid|
-            try std.fmt.allocPrint(allocator, " AND ami.session_id = {s}", .{try sqlString(allocator, sid)})
-        else if (input.include_sessions)
-            ""
-        else
-            " AND ami.session_id IS NULL";
+        const actor_filter = try std.fmt.allocPrint(allocator, "(($1::text IS NOT NULL AND ami.actor_id = $1) OR ({s}))", .{ami_visible});
+        const session_filter = " AND (($2::text IS NOT NULL AND ami.session_id = $2) OR ($2::text IS NULL AND ($3::boolean OR ami.session_id IS NULL)))";
         const status_sql = if (input.include_deprecated) "" else " AND ma.status NOT IN ('rejected','deprecated','superseded')";
         const query_filter = if (input.query.len > 0) blk: {
-            const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, " AND (ami.search_tsv @@ websearch_to_tsquery('simple',{s}) OR ma.search_tsv @@ websearch_to_tsquery('simple',{s}))", .{ q, q });
+            break :blk " AND (ami.search_tsv @@ websearch_to_tsquery('simple',$4) OR ma.search_tsv @@ websearch_to_tsquery('simple',$4))";
         } else "";
         const order_sql = if (input.query.len > 0) blk: {
-            const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, "greatest(ts_rank_cd(ami.search_tsv, websearch_to_tsquery('simple',{s})), ts_rank_cd(ma.search_tsv, websearch_to_tsquery('simple',{s}))) DESC, ami.timestamp_ms DESC", .{ q, q });
+            break :blk "greatest(ts_rank_cd(ami.search_tsv, websearch_to_tsquery('simple',$4)), ts_rank_cd(ma.search_tsv, websearch_to_tsquery('simple',$4))) DESC, ami.timestamp_ms DESC";
         } else "ami.timestamp_ms DESC";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT ami.id,ami.key,ami.category,ami.session_id,ami.timestamp_ms,ami.actor_id,ami.scope,ami.permissions_json,ma.id AS memory_atom_id,ma.text,ma.status,ma.confidence,ma.source_ids_json FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE {s}{s}{s}{s} ORDER BY {s} LIMIT {d}", .{ actor_filter, session_filter, status_sql, query_filter, order_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const include_sessions_text = if (input.include_sessions) "true" else "false";
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{pgSearchCandidateLimit(input.limit, 20, 5000)});
+        const limit_param: usize = if (input.query.len > 0) 5 else 4;
+        const inner = try std.fmt.allocPrint(allocator, "SELECT ami.id,ami.key,ami.category,ami.session_id,ami.timestamp_ms,ami.actor_id,ami.scope,ami.permissions_json,ma.id AS memory_atom_id,ma.text,ma.status,ma.confidence,ma.source_ids_json FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE {s}{s}{s}{s} ORDER BY {s} LIMIT ${d}::bigint", .{ actor_filter, session_filter, status_sql, query_filter, order_sql, limit_param });
+        const parsed = if (input.query.len > 0)
+            try self.queryArrayParamsJson(allocator, inner, &.{ input.actor_id, input.session_id, include_sessions_text, input.query, limit_text })
+        else
+            try self.queryArrayParamsJson(allocator, inner, &.{ input.actor_id, input.session_id, include_sessions_text, limit_text });
         defer parsed.deinit();
         if (parsed.value != .array) return;
         for (parsed.value.array.items) |item| {
@@ -11653,25 +11649,20 @@ pub const PostgresStore = struct {
     }
 
     fn searchPgSessions(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const actor_filter = if (input.actor_id) |actor|
-            try std.fmt.allocPrint(allocator, "actor_id = {s}", .{try sqlString(allocator, actor)})
-        else
-            "FALSE";
-        const role_filter = try std.fmt.allocPrint(allocator, " AND role <> {s}", .{try sqlString(allocator, domain.runtime_command_role)});
-        const session_filter = if (input.session_id) |sid|
-            try std.fmt.allocPrint(allocator, " AND session_id = {s}", .{try sqlString(allocator, sid)})
-        else
-            "";
+        const actor = input.actor_id orelse return;
         const query_filter = if (input.query.len > 0) blk: {
-            const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, " AND search_tsv @@ websearch_to_tsquery('simple',{s})", .{q});
+            break :blk " AND search_tsv @@ websearch_to_tsquery('simple',$4)";
         } else "";
         const order_sql = if (input.query.len > 0) blk: {
-            const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, "ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, id DESC", .{q});
+            break :blk "ts_rank_cd(search_tsv, websearch_to_tsquery('simple',$4)) DESC, id DESC";
         } else "id DESC";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,session_id,actor_id,role,content,created_at_ms FROM session_messages WHERE {s}{s}{s}{s} ORDER BY {s} LIMIT {d}", .{ actor_filter, role_filter, session_filter, query_filter, order_sql, pgSearchCandidateLimit(input.limit, 20, 5000) });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{pgSearchCandidateLimit(input.limit, 20, 5000)});
+        const limit_param: usize = if (input.query.len > 0) 5 else 4;
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,session_id,actor_id,role,content,created_at_ms FROM session_messages WHERE actor_id = $1 AND role <> $2 AND ($3::text IS NULL OR session_id = $3){s} ORDER BY {s} LIMIT ${d}::bigint", .{ query_filter, order_sql, limit_param });
+        const parsed = if (input.query.len > 0)
+            try self.queryArrayParamsJson(allocator, inner, &.{ actor, domain.runtime_command_role, input.session_id, input.query, limit_text })
+        else
+            try self.queryArrayParamsJson(allocator, inner, &.{ actor, domain.runtime_command_role, input.session_id, limit_text });
         defer parsed.deinit();
         if (parsed.value != .array) return;
         for (parsed.value.array.items) |item| {
