@@ -339,6 +339,121 @@ fn contextPackFeedPayloadJson(allocator: std.mem.Allocator, pack: ContextPackRes
     return out.toOwnedSlice(allocator);
 }
 
+fn agentSessionScope(allocator: std.mem.Allocator, session_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "session:{s}", .{session_id});
+}
+
+fn agentSessionPermissionsJson(allocator: std.mem.Allocator, actor_id: ?[]const u8) ![]u8 {
+    if (actor_id) |actor| return domain.actorGrantJson(allocator, actor);
+    return allocator.dupe(u8, "[]");
+}
+
+pub fn agentSessionMessageObjectId(allocator: std.mem.Allocator, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(session_id);
+    hasher.update("\n");
+    hasher.update(actor_id orelse "");
+    hasher.update("\n");
+    hasher.update(role);
+    hasher.update("\n");
+    hasher.update(content);
+    hasher.update("\n");
+    var ms_buf: [32]u8 = undefined;
+    const ms = try std.fmt.bufPrint(&ms_buf, "{d}", .{created_at_ms});
+    hasher.update(ms);
+    return std.fmt.allocPrint(allocator, "agsm_{x}", .{hasher.final()});
+}
+
+pub fn agentSessionMessageSetObjectId(allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(session_id);
+    hasher.update("\n");
+    hasher.update(actor_id orelse "");
+    return std.fmt.allocPrint(allocator, "agsm_clear_{x}", .{hasher.final()});
+}
+
+pub fn agentSessionUsageObjectId(allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(session_id);
+    hasher.update("\n");
+    hasher.update(actor_id orelse "");
+    return std.fmt.allocPrint(allocator, "agsu_{x}", .{hasher.final()});
+}
+
+fn agentSessionMessageFeedPayloadJson(allocator: std.mem.Allocator, route: AgentMemoryStorageRoute, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, scope: []const u8, permissions_json: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"session_id\":");
+    try json.appendString(&out, allocator, session_id);
+    try out.appendSlice(allocator, ",\"actor_id\":");
+    try json.appendNullableString(&out, allocator, actor_id);
+    try out.appendSlice(allocator, ",\"role\":");
+    try json.appendString(&out, allocator, role);
+    try out.appendSlice(allocator, ",\"content\":");
+    try json.appendString(&out, allocator, content);
+    try out.print(allocator, ",\"created_at_ms\":{d}", .{created_at_ms});
+    try out.appendSlice(allocator, ",\"scope\":");
+    try json.appendString(&out, allocator, scope);
+    try out.appendSlice(allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(&out, allocator, permissions_json, "[]");
+    try out.append(allocator, '}');
+    const payload = try out.toOwnedSlice(allocator);
+    defer allocator.free(payload);
+    return payloadWithStorageRouteJson(allocator, payload, route);
+}
+
+fn agentSessionMessageDeleteFeedPayloadJson(allocator: std.mem.Allocator, route: AgentMemoryStorageRoute, session_id: []const u8, actor_id: ?[]const u8, scope: []const u8, permissions_json: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"session_id\":");
+    try json.appendString(&out, allocator, session_id);
+    try out.appendSlice(allocator, ",\"actor_id\":");
+    try json.appendNullableString(&out, allocator, actor_id);
+    try out.appendSlice(allocator, ",\"delete_all\":true,\"scope\":");
+    try json.appendString(&out, allocator, scope);
+    try out.appendSlice(allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(&out, allocator, permissions_json, "[]");
+    try out.append(allocator, '}');
+    const payload = try out.toOwnedSlice(allocator);
+    defer allocator.free(payload);
+    return payloadWithStorageRouteJson(allocator, payload, route);
+}
+
+fn agentSessionUsageFeedPayloadJson(allocator: std.mem.Allocator, route: AgentMemoryStorageRoute, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8, scope: []const u8, permissions_json: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"session_id\":");
+    try json.appendString(&out, allocator, session_id);
+    try out.appendSlice(allocator, ",\"actor_id\":");
+    try json.appendNullableString(&out, allocator, actor_id);
+    try out.print(allocator, ",\"total_tokens\":{d}", .{total_tokens});
+    try out.appendSlice(allocator, ",\"scope\":");
+    try json.appendString(&out, allocator, scope);
+    try out.appendSlice(allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(&out, allocator, permissions_json, "[]");
+    try out.append(allocator, '}');
+    const payload = try out.toOwnedSlice(allocator);
+    defer allocator.free(payload);
+    return payloadWithStorageRouteJson(allocator, payload, route);
+}
+
+fn agentSessionUsageDeleteFeedPayloadJson(allocator: std.mem.Allocator, route: AgentMemoryStorageRoute, session_id: []const u8, actor_id: ?[]const u8, scope: []const u8, permissions_json: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"session_id\":");
+    try json.appendString(&out, allocator, session_id);
+    try out.appendSlice(allocator, ",\"actor_id\":");
+    try json.appendNullableString(&out, allocator, actor_id);
+    try out.appendSlice(allocator, ",\"scope\":");
+    try json.appendString(&out, allocator, scope);
+    try out.appendSlice(allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(&out, allocator, permissions_json, "[]");
+    try out.append(allocator, '}');
+    const payload = try out.toOwnedSlice(allocator);
+    defer allocator.free(payload);
+    return payloadWithStorageRouteJson(allocator, payload, route);
+}
+
 fn firstScopeOrDefault(allocator: std.mem.Allocator, scopes_json: []const u8, fallback: []const u8) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, scopes_json, .{}) catch return allocator.dupe(u8, fallback);
     defer parsed.deinit();
@@ -2162,6 +2277,97 @@ pub const Store = struct {
         try self.appendAppliedPrimitiveFeedEvent(allocator, "context_pack.put", "context_pack", pack.id, scope, permissions_json, actor_id, payload, route);
     }
 
+    fn appendAgentSessionMessagePutFeedEvent(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        const object_id = try agentSessionMessageObjectId(allocator, session_id, role, content, created_at_ms, actor_id);
+        defer allocator.free(object_id);
+        const scope = try agentSessionScope(allocator, session_id);
+        defer allocator.free(scope);
+        const permissions_json = try agentSessionPermissionsJson(allocator, actor_id);
+        defer allocator.free(permissions_json);
+        const payload = try agentSessionMessageFeedPayloadJson(allocator, route, session_id, role, content, created_at_ms, actor_id, scope, permissions_json);
+        defer allocator.free(payload);
+        const dedupe_key = try std.fmt.allocPrint(allocator, "direct:agent_session_message:{s}", .{object_id});
+        defer allocator.free(dedupe_key);
+        _ = try self.appendFeedEvent(.{
+            .event_type = "agent_session_message.put",
+            .operation = "put",
+            .object_type = "agent_session_message",
+            .object_id = object_id,
+            .scope = scope,
+            .permissions_json = permissions_json,
+            .actor_id = actor_id,
+            .dedupe_key = dedupe_key,
+            .payload_json = payload,
+            .status = "applied",
+        });
+    }
+
+    fn appendAgentSessionMessageDeleteFeedEvent(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        const object_id = try agentSessionMessageSetObjectId(allocator, session_id, actor_id);
+        defer allocator.free(object_id);
+        const scope = try agentSessionScope(allocator, session_id);
+        defer allocator.free(scope);
+        const permissions_json = try agentSessionPermissionsJson(allocator, actor_id);
+        defer allocator.free(permissions_json);
+        const payload = try agentSessionMessageDeleteFeedPayloadJson(allocator, route, session_id, actor_id, scope, permissions_json);
+        defer allocator.free(payload);
+        _ = try self.appendFeedEvent(.{
+            .event_type = "agent_session_message.delete",
+            .operation = "delete",
+            .object_type = "agent_session_message",
+            .object_id = object_id,
+            .scope = scope,
+            .permissions_json = permissions_json,
+            .actor_id = actor_id,
+            .payload_json = payload,
+            .status = "applied",
+        });
+    }
+
+    fn appendAgentSessionUsagePutFeedEvent(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        const object_id = try agentSessionUsageObjectId(allocator, session_id, actor_id);
+        defer allocator.free(object_id);
+        const scope = try agentSessionScope(allocator, session_id);
+        defer allocator.free(scope);
+        const permissions_json = try agentSessionPermissionsJson(allocator, actor_id);
+        defer allocator.free(permissions_json);
+        const payload = try agentSessionUsageFeedPayloadJson(allocator, route, session_id, total_tokens, actor_id, scope, permissions_json);
+        defer allocator.free(payload);
+        _ = try self.appendFeedEvent(.{
+            .event_type = "agent_session_usage.put",
+            .operation = "put",
+            .object_type = "agent_session_usage",
+            .object_id = object_id,
+            .scope = scope,
+            .permissions_json = permissions_json,
+            .actor_id = actor_id,
+            .payload_json = payload,
+            .status = "applied",
+        });
+    }
+
+    fn appendAgentSessionUsageDeleteFeedEvent(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        const object_id = try agentSessionUsageObjectId(allocator, session_id, actor_id);
+        defer allocator.free(object_id);
+        const scope = try agentSessionScope(allocator, session_id);
+        defer allocator.free(scope);
+        const permissions_json = try agentSessionPermissionsJson(allocator, actor_id);
+        defer allocator.free(permissions_json);
+        const payload = try agentSessionUsageDeleteFeedPayloadJson(allocator, route, session_id, actor_id, scope, permissions_json);
+        defer allocator.free(payload);
+        _ = try self.appendFeedEvent(.{
+            .event_type = "agent_session_usage.delete",
+            .operation = "delete",
+            .object_type = "agent_session_usage",
+            .object_id = object_id,
+            .scope = scope,
+            .permissions_json = permissions_json,
+            .actor_id = actor_id,
+            .payload_json = payload,
+            .status = "applied",
+        });
+    }
+
     fn routeForSubsetStoreName(name: []const u8) AgentMemoryStorageRoute {
         return AgentMemoryStorageRoute.parse(name);
     }
@@ -2252,7 +2458,7 @@ pub const Store = struct {
     fn saveMessageSubsetAt(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror!void {
         const stores = try requireSubsetStores(route);
         for (stores) |store_name| {
-            try self.saveMessageRoutedAt(session_id, role, content, created_at_ms, actor_id, routeForSubsetStoreName(store_name));
+            try self.saveMessageRoutedAtInner(session_id, role, content, created_at_ms, actor_id, routeForSubsetStoreName(store_name), true);
         }
     }
 
@@ -2279,7 +2485,7 @@ pub const Store = struct {
     fn clearMessagesSubset(self: *Store, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror!void {
         const stores = try requireSubsetStores(route);
         for (stores) |store_name| {
-            try self.clearMessagesRouted(session_id, actor_id, routeForSubsetStoreName(store_name));
+            try self.clearMessagesRoutedInner(session_id, actor_id, routeForSubsetStoreName(store_name), true);
         }
     }
 
@@ -2293,7 +2499,7 @@ pub const Store = struct {
     fn saveUsageSubset(self: *Store, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror!void {
         const stores = try requireSubsetStores(route);
         for (stores) |store_name| {
-            try self.saveUsageRouted(session_id, total_tokens, actor_id, routeForSubsetStoreName(store_name));
+            try self.saveUsageRoutedInner(session_id, total_tokens, actor_id, routeForSubsetStoreName(store_name), true);
         }
     }
 
@@ -2301,7 +2507,7 @@ pub const Store = struct {
         const stores = try requireSubsetStores(route);
         var deleted = false;
         for (stores) |store_name| {
-            deleted = (try self.deleteUsageRouted(session_id, actor_id, routeForSubsetStoreName(store_name))) or deleted;
+            deleted = (try self.deleteUsageRoutedInner(session_id, actor_id, routeForSubsetStoreName(store_name), true)) or deleted;
         }
         return deleted;
     }
@@ -2690,7 +2896,15 @@ pub const Store = struct {
     }
 
     pub fn saveMessageRoutedAt(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
-        return switch (route.target) {
+        return self.saveMessageRoutedAtInner(session_id, role, content, created_at_ms, actor_id, route, false);
+    }
+
+    pub fn saveMessageRoutedAtSuppressFeed(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        return self.saveMessageRoutedAtInner(session_id, role, content, created_at_ms, actor_id, route, true);
+    }
+
+    fn saveMessageRoutedAtInner(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !void {
+        try switch (route.target) {
             .primary => self.saveMessageAt(session_id, role, content, created_at_ms, actor_id),
             .native => self.saveMessageNativeAt(session_id, role, content, created_at_ms, actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.saveMessageAt(session_id, role, content, created_at_ms, actor_id) else error.AgentMemoryStorageUnavailable,
@@ -2704,6 +2918,7 @@ pub const Store = struct {
                 }
             },
         };
+        if (!suppress_feed) try self.appendAgentSessionMessagePutFeedEvent(self.allocator, session_id, role, content, created_at_ms, actor_id, route);
     }
 
     fn saveMessageNative(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
@@ -2769,7 +2984,15 @@ pub const Store = struct {
     }
 
     pub fn clearMessagesRouted(self: *Store, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
-        return switch (route.target) {
+        return self.clearMessagesRoutedInner(session_id, actor_id, route, false);
+    }
+
+    pub fn clearMessagesRoutedSuppressFeed(self: *Store, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        return self.clearMessagesRoutedInner(session_id, actor_id, route, true);
+    }
+
+    fn clearMessagesRoutedInner(self: *Store, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !void {
+        try switch (route.target) {
             .primary => self.clearMessages(session_id, actor_id),
             .native => self.clearMessagesNative(session_id, actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.clearMessages(session_id, actor_id) else error.AgentMemoryStorageUnavailable,
@@ -2783,6 +3006,7 @@ pub const Store = struct {
                 }
             },
         };
+        if (!suppress_feed) try self.appendAgentSessionMessageDeleteFeedEvent(self.allocator, session_id, actor_id, route);
     }
 
     fn clearMessagesNative(self: *Store, session_id: []const u8, actor_id: ?[]const u8) !void {
@@ -2827,7 +3051,15 @@ pub const Store = struct {
     }
 
     pub fn saveUsageRouted(self: *Store, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
-        return switch (route.target) {
+        return self.saveUsageRoutedInner(session_id, total_tokens, actor_id, route, false);
+    }
+
+    pub fn saveUsageRoutedSuppressFeed(self: *Store, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        return self.saveUsageRoutedInner(session_id, total_tokens, actor_id, route, true);
+    }
+
+    fn saveUsageRoutedInner(self: *Store, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !void {
+        try switch (route.target) {
             .primary => self.saveUsage(session_id, total_tokens, actor_id),
             .native => self.saveUsageNative(session_id, total_tokens, actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.saveUsage(session_id, total_tokens, actor_id) else error.AgentMemoryStorageUnavailable,
@@ -2841,6 +3073,7 @@ pub const Store = struct {
                 }
             },
         };
+        if (!suppress_feed) try self.appendAgentSessionUsagePutFeedEvent(self.allocator, session_id, total_tokens, actor_id, route);
     }
 
     fn saveUsageNative(self: *Store, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8) !void {
@@ -2856,7 +3089,15 @@ pub const Store = struct {
     }
 
     pub fn deleteUsageRouted(self: *Store, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
-        return switch (route.target) {
+        return self.deleteUsageRoutedInner(session_id, actor_id, route, false);
+    }
+
+    pub fn deleteUsageRoutedSuppressFeed(self: *Store, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
+        return self.deleteUsageRoutedInner(session_id, actor_id, route, true);
+    }
+
+    fn deleteUsageRoutedInner(self: *Store, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !bool {
+        const deleted = try switch (route.target) {
             .primary => self.deleteUsage(session_id, actor_id),
             .native => self.deleteUsageNative(session_id, actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.deleteUsage(session_id, actor_id) else error.AgentMemoryStorageUnavailable,
@@ -2871,6 +3112,8 @@ pub const Store = struct {
                 break :blk deleted;
             },
         };
+        if (deleted and !suppress_feed) try self.appendAgentSessionUsageDeleteFeedEvent(self.allocator, session_id, actor_id, route);
+        return deleted;
     }
 
     fn deleteUsageNative(self: *Store, session_id: []const u8, actor_id: ?[]const u8) !bool {

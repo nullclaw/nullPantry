@@ -3248,10 +3248,12 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !void {
     if (!canApplyAsActor(ctx, event_actor_id)) return error.Forbidden;
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return error.InvalidPayload;
     const scope = feedEventScope(ctx, obj, object_type, payload_json, event_actor_id) catch return error.InvalidPayload;
-    const permissions_json = feedEventPermissions(ctx, obj, payload_json) catch return error.InvalidPayload;
+    const permissions_json = feedEventPermissions(ctx, obj, object_type, payload_json, event_actor_id) catch return error.InvalidPayload;
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         if (try feedAgentMemoryPayloadIsInternal(ctx, payload_json)) return error.InternalAgentMemory;
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
+    } else if (isAgentSessionFeedObject(object_type)) {
+        if (!canProposeAgentSessionEvent(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
     } else if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
 
     _ = try ctx.store.appendFeedEvent(.{
@@ -3280,11 +3282,13 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
     }
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
     const scope = feedEventScope(ctx, obj, object_type, payload_json, ctx.actor_id) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid feed payload");
-    const permissions_json = feedEventPermissions(ctx, obj, payload_json) catch return serverError(ctx);
+    const permissions_json = feedEventPermissions(ctx, obj, object_type, payload_json, ctx.actor_id) catch return serverError(ctx);
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         const internal_payload = feedAgentMemoryPayloadIsInternal(ctx, payload_json) catch return serverError(ctx);
         if (internal_payload) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be queued through the feed");
         if (!canProposeRecord(ctx, scope, permissions_json) and !canApplyAgentMemoryScope(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
+    } else if (isAgentSessionFeedObject(object_type)) {
+        if (!canProposeAgentSessionEvent(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
     } else if (!canProposeRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     const id = ctx.store.appendFeedEvent(.{
         .event_type = event_type,
@@ -3319,13 +3323,15 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     if (!canApplyAsActor(ctx, event_actor_id)) return forbidden(ctx);
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
     const causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx);
-    if (isLifecycleFeedOperation(operation) and !std.mem.eql(u8, object_type, "agent_memory")) {
+    if (isLifecycleFeedOperation(operation) and !std.mem.eql(u8, object_type, "agent_memory") and !isAgentSessionFeedObject(object_type)) {
         return applyFeedLifecycleMutation(ctx, obj, event_type, operation, object_type, event_actor_id, payload_json, causality_json);
     }
     const scope = feedEventScope(ctx, obj, object_type, payload_json, event_actor_id) catch return serverError(ctx);
-    const event_permissions_json = feedEventPermissions(ctx, obj, payload_json) catch return serverError(ctx);
+    const event_permissions_json = feedEventPermissions(ctx, obj, object_type, payload_json, event_actor_id) catch return serverError(ctx);
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
+    } else if (isAgentSessionFeedObject(object_type)) {
+        if (!canApplyAgentSessionEvent(ctx, event_actor_id, scope, event_permissions_json)) return forbidden(ctx);
     } else if (!canWriteRecord(ctx, scope, event_permissions_json)) return forbidden(ctx);
     var memory_input: ?store_mod.MemoryAtomInput = null;
     if (std.mem.eql(u8, object_type, "memory_atom")) {
@@ -3355,6 +3361,22 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
         } else {
             agent_memory_input = prepared.input;
         }
+    }
+    var session_message_input: ?AgentSessionMessageApplyInput = null;
+    if (std.mem.eql(u8, object_type, "agent_session_message")) {
+        session_message_input = buildAppliedAgentSessionMessageInput(ctx, operation, payload_json, event_actor_id) catch |err| switch (err) {
+            error.Forbidden => return forbidden(ctx),
+            error.MissingRequiredField, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Session message feed payload must include session_id, role and content"),
+            else => return serverError(ctx),
+        };
+    }
+    var session_usage_input: ?AgentSessionUsageApplyInput = null;
+    if (std.mem.eql(u8, object_type, "agent_session_usage")) {
+        session_usage_input = buildAppliedAgentSessionUsageInput(ctx, operation, payload_json, event_actor_id) catch |err| switch (err) {
+            error.Forbidden => return forbidden(ctx),
+            error.MissingRequiredField, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Session usage feed payload must include session_id and total_tokens"),
+            else => return serverError(ctx),
+        };
     }
     var reserved_event_id: ?i64 = null;
     if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| {
@@ -3494,6 +3516,87 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
         };
         return appliedFeedObjectResponse(ctx, applied.event_id, object_type, applied.object_id, null);
     }
+    if (session_message_input) |input| {
+        const object_id = event_object_id orelse blk: {
+            if (input.delete_all) break :blk store_mod.agentSessionMessageSetObjectId(ctx.allocator, input.session_id, input.actor_id) catch return serverError(ctx);
+            break :blk store_mod.agentSessionMessageObjectId(ctx.allocator, input.session_id, input.role, input.content, input.created_at_ms, input.actor_id) catch return serverError(ctx);
+        };
+        if (input.delete_all) {
+            ctx.store.clearMessagesRoutedSuppressFeed(input.session_id, input.actor_id, input.route) catch |err| {
+                if (reserved_event_id) |event_id| _ = ctx.store.releaseFeedEventReservation(event_id) catch {};
+                return switch (err) {
+                    error.AgentMemoryStorageUnavailable => agentMemoryStorageUnavailable(ctx),
+                    else => serverError(ctx),
+                };
+            };
+        } else {
+            ctx.store.saveMessageRoutedAtSuppressFeed(input.session_id, input.role, input.content, input.created_at_ms, input.actor_id, input.route) catch |err| {
+                if (reserved_event_id) |event_id| _ = ctx.store.releaseFeedEventReservation(event_id) catch {};
+                return switch (err) {
+                    error.AgentMemoryStorageUnavailable => agentMemoryStorageUnavailable(ctx),
+                    else => serverError(ctx),
+                };
+            };
+        }
+        const event_id = if (reserved_event_id) |event_id| blk: {
+            if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, payload_json) catch return serverError(ctx))) {
+                return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event reservation was already consumed");
+            }
+            break :blk event_id;
+        } else ctx.store.appendFeedEvent(.{
+            .event_type = event_type,
+            .operation = operation,
+            .object_type = object_type,
+            .object_id = object_id,
+            .scope = scope,
+            .permissions_json = event_permissions_json,
+            .actor_id = event_actor_id,
+            .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+            .causality_json = causality_json,
+            .payload_json = payload_json,
+            .status = "applied",
+        }) catch return serverError(ctx);
+        return appliedFeedObjectResponse(ctx, event_id, object_type, object_id, null);
+    }
+    if (session_usage_input) |input| {
+        const object_id = event_object_id orelse (store_mod.agentSessionUsageObjectId(ctx.allocator, input.session_id, input.actor_id) catch return serverError(ctx));
+        if (input.delete_usage) {
+            _ = ctx.store.deleteUsageRoutedSuppressFeed(input.session_id, input.actor_id, input.route) catch |err| {
+                if (reserved_event_id) |event_id| _ = ctx.store.releaseFeedEventReservation(event_id) catch {};
+                return switch (err) {
+                    error.AgentMemoryStorageUnavailable => agentMemoryStorageUnavailable(ctx),
+                    else => serverError(ctx),
+                };
+            };
+        } else {
+            ctx.store.saveUsageRoutedSuppressFeed(input.session_id, input.total_tokens, input.actor_id, input.route) catch |err| {
+                if (reserved_event_id) |event_id| _ = ctx.store.releaseFeedEventReservation(event_id) catch {};
+                return switch (err) {
+                    error.AgentMemoryStorageUnavailable => agentMemoryStorageUnavailable(ctx),
+                    else => serverError(ctx),
+                };
+            };
+        }
+        const event_id = if (reserved_event_id) |event_id| blk: {
+            if (!(ctx.store.markFeedEventApplied(event_id, object_type, object_id, payload_json) catch return serverError(ctx))) {
+                return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event reservation was already consumed");
+            }
+            break :blk event_id;
+        } else ctx.store.appendFeedEvent(.{
+            .event_type = event_type,
+            .operation = operation,
+            .object_type = object_type,
+            .object_id = object_id,
+            .scope = scope,
+            .permissions_json = event_permissions_json,
+            .actor_id = event_actor_id,
+            .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+            .causality_json = causality_json,
+            .payload_json = payload_json,
+            .status = "applied",
+        }) catch return serverError(ctx);
+        return appliedFeedObjectResponse(ctx, event_id, object_type, object_id, null);
+    }
     if (!std.mem.eql(u8, object_type, "memory_atom") and !std.mem.eql(u8, object_type, "agent_memory")) {
         const object_id = applyFeedObjectPut(ctx, object_type, payload_json, scope, event_permissions_json, event_actor_id, event_object_id) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
@@ -3595,6 +3698,24 @@ const AgentMemoryApplyInput = struct {
     route: store_mod.AgentMemoryStorageRoute = .{},
 };
 
+const AgentSessionMessageApplyInput = struct {
+    session_id: []const u8,
+    role: []const u8 = "",
+    content: []const u8 = "",
+    created_at_ms: i64 = 0,
+    actor_id: ?[]const u8,
+    delete_all: bool = false,
+    route: store_mod.AgentMemoryStorageRoute = .{},
+};
+
+const AgentSessionUsageApplyInput = struct {
+    session_id: []const u8,
+    total_tokens: u64 = 0,
+    actor_id: ?[]const u8,
+    delete_usage: bool = false,
+    route: store_mod.AgentMemoryStorageRoute = .{},
+};
+
 fn operationFromEventType(event_type: []const u8) []const u8 {
     if (std.mem.endsWith(u8, event_type, ".delete") or std.mem.endsWith(u8, event_type, ".forget")) return "delete";
     if (std.mem.endsWith(u8, event_type, ".merge_object")) return "merge_object";
@@ -3608,12 +3729,16 @@ fn feedEventScope(ctx: *Context, obj: std.json.ObjectMap, object_type: []const u
     // The returned scope may borrow from this request-arena parse tree.
     if (payload.value == .object) {
         if (json.stringField(payload.value.object, "scope")) |scope| return scope;
+        if (isAgentSessionFeedObject(object_type)) {
+            const session_id = json.stringField(payload.value.object, "session_id") orelse return error.InvalidPayload;
+            return std.fmt.allocPrint(ctx.allocator, "session:{s}", .{session_id});
+        }
     }
     if (!std.mem.eql(u8, object_type, "agent_memory")) return "workspace";
     return domain.defaultAgentMemoryScope(ctx.allocator, event_actor_id);
 }
 
-fn feedEventPermissions(ctx: *Context, obj: std.json.ObjectMap, payload_json: []const u8) ![]const u8 {
+fn feedEventPermissions(ctx: *Context, obj: std.json.ObjectMap, object_type: []const u8, payload_json: []const u8, event_actor_id: []const u8) ![]const u8 {
     if (obj.get("permissions")) |value| {
         if (value == .null) return "[]";
         return try json.jsonFromValue(ctx.allocator, value);
@@ -3626,6 +3751,7 @@ fn feedEventPermissions(ctx: *Context, obj: std.json.ObjectMap, payload_json: []
             return try json.jsonFromValue(ctx.allocator, value);
         }
     }
+    if (isAgentSessionFeedObject(object_type)) return domain.actorGrantJson(ctx.allocator, event_actor_id);
     return "[]";
 }
 
@@ -3638,6 +3764,20 @@ fn canApplyAgentMemoryScope(ctx: *Context, event_actor_id: []const u8, scope: []
     if (!domain.isActorOwnedAgentMemoryScope(scope, event_actor_id)) return false;
     return (hasCapability(ctx, "write") or hasCapability(ctx, "propose")) and
         access.permissionsVisibleForActor(ctx.allocator, permissions_json, ctx.actor_scopes_json, event_actor_id);
+}
+
+fn canApplyAgentSessionEvent(ctx: *Context, event_actor_id: []const u8, scope: []const u8, permissions_json: []const u8) bool {
+    if (!std.mem.startsWith(u8, scope, "session:")) return false;
+    if (!hasCapability(ctx, "write")) return false;
+    if (!domain.scopeWritable(scope, ctx.actor_scopes_json)) return false;
+    return access.permissionsVisibleForActor(ctx.allocator, permissions_json, ctx.actor_scopes_json, event_actor_id);
+}
+
+fn canProposeAgentSessionEvent(ctx: *Context, event_actor_id: []const u8, scope: []const u8, permissions_json: []const u8) bool {
+    if (!std.mem.startsWith(u8, scope, "session:")) return false;
+    if (!(hasCapability(ctx, "write") or hasCapability(ctx, "propose"))) return false;
+    if (!domain.scopeVisible(scope, ctx.actor_scopes_json)) return false;
+    return access.permissionsVisibleForActor(ctx.allocator, permissions_json, ctx.actor_scopes_json, event_actor_id);
 }
 
 fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_json: []const u8, object_id: ?[]const u8, event_actor_id: []const u8) !AgentMemoryApplyInput {
@@ -3687,6 +3827,53 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
         .writer_actor_id = event_actor_id,
         .operation = memory_operation,
     }, .route = route };
+}
+
+fn buildAppliedAgentSessionMessageInput(ctx: *Context, operation: []const u8, payload_json: []const u8, event_actor_id: []const u8) !AgentSessionMessageApplyInput {
+    const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
+    // Returned input fields borrow slices from this request-arena parse tree.
+    if (payload.value != .object) return error.InvalidPayload;
+    const obj = payload.value.object;
+    const session_id = json.stringField(obj, "session_id") orelse return error.MissingRequiredField;
+    if (!agentSessionWriteAllowed(ctx, session_id)) return error.Forbidden;
+    const payload_actor = json.nullableStringField(obj, "actor_id") orelse event_actor_id;
+    if (!std.mem.eql(u8, payload_actor, event_actor_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
+    const route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    if (std.mem.eql(u8, operation, "delete") or std.mem.eql(u8, operation, "forget")) {
+        return .{ .session_id = session_id, .actor_id = payload_actor, .delete_all = true, .route = route };
+    }
+    const role = json.stringField(obj, "role") orelse return error.MissingRequiredField;
+    const content = json.stringField(obj, "content") orelse return error.MissingRequiredField;
+    return .{
+        .session_id = session_id,
+        .role = role,
+        .content = content,
+        .created_at_ms = json.intField(obj, "created_at_ms") orelse ids.nowMs(),
+        .actor_id = payload_actor,
+        .route = route,
+    };
+}
+
+fn buildAppliedAgentSessionUsageInput(ctx: *Context, operation: []const u8, payload_json: []const u8, event_actor_id: []const u8) !AgentSessionUsageApplyInput {
+    const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
+    // Returned input fields borrow slices from this request-arena parse tree.
+    if (payload.value != .object) return error.InvalidPayload;
+    const obj = payload.value.object;
+    const session_id = json.stringField(obj, "session_id") orelse return error.MissingRequiredField;
+    if (!agentSessionWriteAllowed(ctx, session_id)) return error.Forbidden;
+    const payload_actor = json.nullableStringField(obj, "actor_id") orelse event_actor_id;
+    if (!std.mem.eql(u8, payload_actor, event_actor_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
+    const route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    if (std.mem.eql(u8, operation, "delete") or std.mem.eql(u8, operation, "forget")) {
+        return .{ .session_id = session_id, .actor_id = payload_actor, .delete_usage = true, .route = route };
+    }
+    const total = json.intField(obj, "total_tokens") orelse return error.MissingRequiredField;
+    return .{
+        .session_id = session_id,
+        .total_tokens = @intCast(@max(total, 0)),
+        .actor_id = payload_actor,
+        .route = route,
+    };
 }
 
 fn lifecycleDiagnostics(ctx: *Context) HttpResponse {
@@ -6754,6 +6941,9 @@ fn feedEventObjectVisibleToActor(ctx: *Context, event: store_mod.FeedEvent) bool
     if (std.mem.eql(u8, event.object_type, "agent_memory")) {
         return feedRecordVisibleToActor(ctx, event.scope, event.permissions_json);
     }
+    if (isAgentSessionFeedObject(event.object_type)) {
+        return feedRecordVisibleToActor(ctx, event.scope, event.permissions_json);
+    }
     return true;
 }
 
@@ -6834,7 +7024,14 @@ fn feedObjectTypeSupported(object_type: []const u8) bool {
         std.mem.eql(u8, object_type, "entity") or
         std.mem.eql(u8, object_type, "relation") or
         std.mem.eql(u8, object_type, "agent_memory") or
+        std.mem.eql(u8, object_type, "agent_session_message") or
+        std.mem.eql(u8, object_type, "agent_session_usage") or
         std.mem.eql(u8, object_type, "context_pack");
+}
+
+fn isAgentSessionFeedObject(object_type: []const u8) bool {
+    return std.mem.eql(u8, object_type, "agent_session_message") or
+        std.mem.eql(u8, object_type, "agent_session_usage");
 }
 
 fn feedLifecycleUsesOverlay(object_type: []const u8) bool {
@@ -7615,6 +7812,10 @@ fn recordVisibleToActor(ctx: *Context, scope: []const u8, permissions_json: []co
 
 fn feedRecordVisibleToActor(ctx: *Context, scope: []const u8, permissions_json: []const u8) bool {
     if (recordVisibleToActor(ctx, scope, permissions_json)) return true;
+    if (std.mem.startsWith(u8, scope, "session:")) {
+        if (!domain.scopeVisible(scope, ctx.actor_scopes_json)) return false;
+        return access.permissionsVisibleForActor(ctx.allocator, permissions_json, ctx.actor_scopes_json, ctx.actor_id);
+    }
     if (!domain.isActorOwnedAgentMemoryScope(scope, ctx.actor_id)) return false;
     const policy = ctx.store.getPolicyScope(ctx.allocator, scope) catch return false;
     if (policy) |p| {
@@ -9762,6 +9963,58 @@ test "api memory checkpoint restore preserves actors and session deletes" {
     const source_apply = handleRequest(&admin_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"source.put\",\"object_type\":\"source\",\"scope\":\"public\",\"payload\":{\"title\":\"restored source\",\"content\":\"source feed content\"}}", "");
     try std.testing.expectEqualStrings("200 OK", source_apply.status);
     try std.testing.expect(std.mem.indexOf(u8, source_apply.body, "\"object_type\":\"source\"") != null);
+}
+
+test "api memory checkpoint restore replays isolated agent session messages and usage" {
+    var source_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer source_store.deinit();
+    var target_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer target_store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var source_a = Context{ .allocator = alloc, .store = &source_store, .actor_id = "agent:a", .actor_scopes_json = "[\"session:sync\",\"write:session:sync\"]" };
+    var source_b = Context{ .allocator = alloc, .store = &source_store, .actor_id = "agent:b", .actor_scopes_json = "[\"session:sync\",\"write:session:sync\"]" };
+    var source_admin = Context{ .allocator = alloc, .store = &source_store };
+
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&source_a, "POST", "/v1/agent-sessions/sync/messages", "{\"role\":\"user\",\"content\":\"Agent A deleted session note\",\"created_at_ms\":101}", "").status);
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&source_a, "PUT", "/v1/agent-sessions/sync/usage", "{\"total_tokens\":17}", "").status);
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&source_b, "POST", "/v1/agent-sessions/sync/messages", "{\"role\":\"assistant\",\"content\":\"Agent B restored session note\",\"created_at_ms\":202}", "").status);
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&source_b, "PUT", "/v1/agent-sessions/sync/usage", "{\"total_tokens\":29}", "").status);
+
+    const feed_a = handleRequest(&source_a, "GET", "/v1/memory/events?limit=100", "", "");
+    try std.testing.expectEqualStrings("200 OK", feed_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, feed_a.body, "Agent A deleted session note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed_a.body, "Agent B restored session note") == null);
+
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&source_a, "DELETE", "/v1/agent-sessions/sync/messages", "", "").status);
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&source_a, "DELETE", "/v1/agent-sessions/sync/usage", "", "").status);
+
+    const checkpoint = handleRequest(&source_admin, "GET", "/v1/memory/checkpoint?limit=100", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"object_type\":\"agent_session_message\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"object_type\":\"agent_session_usage\"") != null);
+
+    var target_admin = Context{ .allocator = alloc, .store = &target_store };
+    const restore = handleRequest(&target_admin, "POST", "/v1/memory/checkpoint", checkpoint.body, "");
+    try std.testing.expectEqualStrings("200 OK", restore.status);
+
+    var target_a = Context{ .allocator = alloc, .store = &target_store, .actor_id = "agent:a", .actor_scopes_json = "[\"session:sync\",\"write:session:sync\"]" };
+    var target_b = Context{ .allocator = alloc, .store = &target_store, .actor_id = "agent:b", .actor_scopes_json = "[\"session:sync\",\"write:session:sync\"]" };
+    const restored_a_messages = handleRequest(&target_a, "GET", "/v1/agent-sessions/sync/messages", "", "");
+    try std.testing.expectEqualStrings("200 OK", restored_a_messages.status);
+    try std.testing.expect(std.mem.indexOf(u8, restored_a_messages.body, "Agent A deleted session note") == null);
+    const restored_a_usage = handleRequest(&target_a, "GET", "/v1/agent-sessions/sync/usage", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", restored_a_usage.status);
+
+    const restored_b_messages = handleRequest(&target_b, "GET", "/v1/agent-sessions/sync/messages", "", "");
+    try std.testing.expectEqualStrings("200 OK", restored_b_messages.status);
+    try std.testing.expect(std.mem.indexOf(u8, restored_b_messages.body, "Agent B restored session note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored_b_messages.body, "Agent A deleted session note") == null);
+    const restored_b_usage = handleRequest(&target_b, "GET", "/v1/agent-sessions/sync/usage", "", "");
+    try std.testing.expectEqualStrings("200 OK", restored_b_usage.status);
+    try std.testing.expect(std.mem.indexOf(u8, restored_b_usage.body, "\"total_tokens\":29") != null);
 }
 
 test "api memory checkpoint restore preserves primitive ids and links" {
