@@ -5055,10 +5055,12 @@ fn nullClawCheckpointToNativeFeedCheckpoint(ctx: *Context, body: []const u8) ![]
         if (i > 0) try out.append(ctx.allocator, ',');
         if (isNullClawTopLevelMemoryEvent(event_value.object)) {
             const native = try nullClawEventToNativeFeedEvent(ctx, event_value.object);
+            defer ctx.allocator.free(native);
             try out.appendSlice(ctx.allocator, native);
             transformed_any = true;
         } else {
             const raw = try json.jsonFromValue(ctx.allocator, event_value);
+            defer ctx.allocator.free(raw);
             try out.appendSlice(ctx.allocator, raw);
         }
     }
@@ -5112,7 +5114,7 @@ fn nullClawMemoryOperationSupported(operation: []const u8) bool {
 fn appendNullClawEventPayload(ctx: *Context, out: *std.ArrayListUnmanaged(u8), obj: std.json.ObjectMap, operation: []const u8, key: []const u8) !void {
     try appendJsonStringField(ctx.allocator, out, "key", key, true);
     if (json.stringField(obj, "category")) |category| try appendJsonStringField(ctx.allocator, out, "category", category, false);
-    if (json.nullableStringField(obj, "session_id")) |session_id| try appendJsonStringField(ctx.allocator, out, "session_id", session_id, false);
+    if (nullableStringFieldAlias(obj, "session_id", "session")) |session_id| try appendJsonStringField(ctx.allocator, out, "session_id", session_id, false);
     try appendOptionalRawField(ctx.allocator, out, obj, "scope");
     try appendOptionalRawField(ctx.allocator, out, obj, "permissions");
     try appendOptionalRawField(ctx.allocator, out, obj, "store");
@@ -5197,6 +5199,7 @@ fn appendNullClawCausalityField(allocator: std.mem.Allocator, out: *std.ArrayLis
 
 fn appendRawJsonValue(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value) !void {
     const raw = try json.jsonFromValue(allocator, value);
+    defer allocator.free(raw);
     try out.appendSlice(allocator, raw);
 }
 
@@ -10974,6 +10977,9 @@ test "api nullclaw agent adapter matches current nullclaw memory engine contract
     try std.testing.expectEqualStrings("200 OK", search_explicit_null_session.status);
     try std.testing.expect(std.mem.indexOf(u8, search_explicit_null_session.body, "Agent A session adapter value") == null);
     try std.testing.expect(std.mem.indexOf(u8, search_explicit_null_session.body, "Agent B session adapter value") == null);
+    const search_explicit_null_session_alias = handleRequest(&ctx, "POST", "/v1/agent/memories/search", "{\"query\":\"session alias adapter value\",\"limit\":10,\"session\":null}", "POST /v1/agent/memories/search HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", search_explicit_null_session_alias.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_explicit_null_session_alias.body, "Agent A session alias adapter value") == null);
     const search_global_explicit_null_session = handleRequest(&ctx, "POST", "/v1/agent/memories/search", "{\"query\":\"Agent A adapter value\",\"limit\":10,\"session_id\":null}", "POST /v1/agent/memories/search HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", search_global_explicit_null_session.status);
     try std.testing.expect(std.mem.indexOf(u8, search_global_explicit_null_session.body, "Agent A adapter value") != null);
@@ -11793,6 +11799,47 @@ test "api nullclaw memory adapter exposes replayable api-memory feed contract" {
     try std.testing.expect(std.mem.indexOf(u8, restored_checkpoint.body, "\"origin_instance_id\":\"nullclaw-a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, restored_checkpoint.body, "\"origin_sequence\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, restored_checkpoint.body, "\"timestamp_ms\":123") != null);
+}
+
+test "api nullclaw top-level feed apply deletes scoped and all session variants" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .store = &store,
+        .actor_id = "agent:nullclaw-delete",
+        .actor_scopes_json = "[\"public\",\"write:public\",\"session:*\",\"write:session:*\",\"actor:agent:nullclaw-delete\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"delete\",\"export\",\"feed_apply\"]",
+    };
+
+    const put_global = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-delete\",\"origin_sequence\":10,\"operation\":\"put\",\"key\":\"top.delete\",\"category\":\"core\",\"content\":\"Top global value\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", put_global.status);
+    const put_session = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-delete\",\"origin_sequence\":11,\"operation\":\"put\",\"key\":\"top.delete\",\"session_id\":\"s1\",\"category\":\"core\",\"content\":\"Top session value\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", put_session.status);
+    const put_session_alias = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-delete\",\"origin_sequence\":111,\"operation\":\"put\",\"key\":\"top.delete.alias\",\"session\":\"s-alias\",\"category\":\"core\",\"content\":\"Top session alias value\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", put_session_alias.status);
+    const session_alias_get = handleRequest(&ctx, "GET", "/v1/agent-memory/top.delete.alias?session=s-alias", "", "");
+    try std.testing.expectEqualStrings("200 OK", session_alias_get.status);
+    try std.testing.expect(std.mem.indexOf(u8, session_alias_get.body, "Top session alias value") != null);
+
+    const delete_scoped = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-delete\",\"origin_sequence\":12,\"operation\":\"delete_scoped\",\"key\":\"top.delete\",\"session_id\":\"s1\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", delete_scoped.status);
+    const global_after_scoped_delete = handleRequest(&ctx, "GET", "/v1/agent-memory/top.delete", "", "");
+    try std.testing.expectEqualStrings("200 OK", global_after_scoped_delete.status);
+    try std.testing.expect(std.mem.indexOf(u8, global_after_scoped_delete.body, "Top global value") != null);
+    const session_after_scoped_delete = handleRequest(&ctx, "GET", "/v1/agent-memory/top.delete?session_id=s1", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", session_after_scoped_delete.status);
+
+    const put_session_again = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-delete\",\"origin_sequence\":13,\"operation\":\"put\",\"key\":\"top.delete\",\"session_id\":\"s1\",\"category\":\"core\",\"content\":\"Top session value again\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", put_session_again.status);
+    const delete_all = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-delete\",\"origin_sequence\":14,\"operation\":\"delete_all\",\"key\":\"top.delete\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", delete_all.status);
+    const global_after_delete_all = handleRequest(&ctx, "GET", "/v1/agent-memory/top.delete", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", global_after_delete_all.status);
+    const session_after_delete_all = handleRequest(&ctx, "GET", "/v1/agent-memory/top.delete?session_id=s1", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", session_after_delete_all.status);
 }
 
 test "api nullclaw memory apply uses configured primary runtime backend" {
