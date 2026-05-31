@@ -758,7 +758,7 @@ fn nullClawAgentMemoryStore(ctx: *Context, key: []const u8, body: []const u8) Ht
     const stored = agentMemoryStoreParsed(ctx, key, obj);
     if (!std.mem.eql(u8, stored.status, "200 OK")) return stored;
 
-    const session_id = json.nullableStringField(obj, "session_id");
+    const session_id = nullableStringFieldAlias(obj, "session_id", "session");
     const requested_scope = json.nullableStringField(obj, "scope");
     const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     const entry = loadAgentMemoryForRequest(ctx, key, session_id, requested_scope, storage_target) catch |err| switch (err) {
@@ -781,7 +781,7 @@ fn nullClawAgentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) Htt
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
-    const effective_entry = if (entry == null and session_id == null and requested_scope == null)
+    const effective_entry = if (entry == null and session_id == null and requested_scope == null and queryBool(query, "include_sessions", false))
         ctx.store.agentMemoryGetAnyVisibleRouted(ctx.allocator, key, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
@@ -844,7 +844,7 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
+    const session_id = nullableStringFieldAlias(obj, "session_id", "session");
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
@@ -938,7 +938,7 @@ fn memoryCommandUpdateKey(ctx: *Context, key: []const u8, body: []const u8) Http
 }
 
 fn memoryCommandMutationParsed(ctx: *Context, action: []const u8, key: []const u8, obj: std.json.ObjectMap, require_existing: bool) HttpResponse {
-    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
+    const session_id = nullableStringFieldAlias(obj, "session_id", "session");
     const requested_scope = json.nullableStringField(obj, "scope");
     const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx);
     if (require_existing) {
@@ -981,7 +981,7 @@ fn memoryCommandDeleteBody(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const key = json.stringField(obj, "key") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing key");
-    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
+    const session_id = nullableStringFieldAlias(obj, "session_id", "session");
     const requested_scope = json.nullableStringField(obj, "scope");
     const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx);
     const delete_all = (json.boolField(obj, "all_sessions") orelse false) or (json.boolField(obj, "delete_all") orelse false);
@@ -1041,7 +1041,7 @@ fn memoryCommandExportJsonl(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const category = json.stringField(obj, "category");
-    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
+    const session_id = nullableStringFieldAlias(obj, "session_id", "session");
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
@@ -5334,6 +5334,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
+    if (checkpointEventsValue(obj) != null) return memoryFeedCheckpointRestoreInternal(ctx, body, query, null);
     const storage_route = storage_routes.fromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
         return runtimeMemoryFeedApply(ctx, runtime, body);
@@ -8586,7 +8587,7 @@ fn agentMemoryStoreParsedWithDefaultCategory(ctx: *Context, key: []const u8, obj
         .merge_string_set => agent_memory_reducer.stringSetPatchFromObject(ctx.allocator, obj) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid string-set merge payload"),
         .merge_object => agent_memory_reducer.objectPatchFromObject(ctx.allocator, obj) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid object merge payload"),
     };
-    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
+    const session_id = nullableStringFieldAlias(obj, "session_id", "session");
     if (session_id) |sid| {
         if (!agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
     }
@@ -8700,7 +8701,7 @@ fn agentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
+    const session_id = nullableStringFieldAlias(obj, "session_id", "session");
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
@@ -10702,6 +10703,10 @@ fn queryParamDecodedAlias(ctx: *Context, query: []const u8, primary: []const u8,
     return try json.queryParamDecoded(ctx.allocator, query, alias);
 }
 
+fn nullableStringFieldAlias(obj: std.json.ObjectMap, primary: []const u8, alias: []const u8) ?[]const u8 {
+    return json.nullableStringField(obj, primary) orelse json.nullableStringField(obj, alias);
+}
+
 fn queryBool(query: []const u8, name: []const u8, default_value: bool) bool {
     const raw = json.queryParam(query, name) orelse return default_value;
     return std.ascii.eqlIgnoreCase(raw, "true") or
@@ -10938,10 +10943,20 @@ test "api nullclaw agent adapter matches current nullclaw memory engine contract
     try std.testing.expectEqualStrings("200 OK", put_session_a.status);
     const put_session_b = handleRequest(&ctx, "PUT", "/v1/agent/memories/pref.session", "{\"content\":\"Agent B session adapter value\",\"category\":\"core\",\"session_id\":\"sid-1\"}", "PUT /v1/agent/memories/pref.session HTTP/1.1\r\nAuthorization: Bearer agent-b\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", put_session_b.status);
+    const put_session_alias = handleRequest(&ctx, "PUT", "/v1/agent/memories/pref.session.alias", "{\"content\":\"Agent A session alias adapter value\",\"category\":\"core\",\"session\":\"sid-alias\"}", "PUT /v1/agent/memories/pref.session.alias HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", put_session_alias.status);
+    try std.testing.expect(std.mem.indexOf(u8, put_session_alias.body, "\"entry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, put_session_alias.body, "\"session_id\":\"sid-alias\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, put_session_alias.body, "Agent A session alias adapter value") != null);
+    const get_session_alias = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.session.alias?session=sid-alias", "", "GET /v1/agent/memories/pref.session.alias?session=sid-alias HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", get_session_alias.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_session_alias.body, "Agent A session alias adapter value") != null);
     const get_session_a_without_sid = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.session", "", "GET /v1/agent/memories/pref.session HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
-    try std.testing.expectEqualStrings("200 OK", get_session_a_without_sid.status);
-    try std.testing.expect(std.mem.indexOf(u8, get_session_a_without_sid.body, "Agent A session adapter value") != null);
-    try std.testing.expect(std.mem.indexOf(u8, get_session_a_without_sid.body, "Agent B session adapter value") == null);
+    try std.testing.expectEqualStrings("404 Not Found", get_session_a_without_sid.status);
+    const get_session_a_with_include_sessions = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.session?include_sessions=true", "", "GET /v1/agent/memories/pref.session?include_sessions=true HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", get_session_a_with_include_sessions.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_session_a_with_include_sessions.body, "Agent A session adapter value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_session_a_with_include_sessions.body, "Agent B session adapter value") == null);
     const list_session_a_without_sid = handleRequest(&ctx, "GET", "/v1/agent/memories?category=core", "", "GET /v1/agent/memories?category=core HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", list_session_a_without_sid.status);
     try std.testing.expect(std.mem.indexOf(u8, list_session_a_without_sid.body, "Agent A session adapter value") != null);
@@ -13779,6 +13794,31 @@ test "api memory checkpoint restore is idempotent without explicit dedupe keys" 
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expect(events[0].dedupe_key != null);
     try std.testing.expect(std.mem.startsWith(u8, events[0].dedupe_key.?, "origin:nullpantry:"));
+}
+
+test "api memory apply accepts checkpoint restore payloads" {
+    var source_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer source_store.deinit();
+    var target_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer target_store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var source_ctx = Context{ .allocator = alloc, .store = &source_store, .actor_id = "agent:origin" };
+    const source_put = handleRequest(&source_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"apply.checkpoint.pref\",\"content\":\"checkpoint restored through apply\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", source_put.status);
+    const checkpoint = handleRequest(&source_ctx, "GET", "/v1/memory/checkpoint?limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "apply.checkpoint.pref") != null);
+
+    var target_ctx = Context{ .allocator = alloc, .store = &target_store, .actor_id = "agent:origin" };
+    const restore = handleRequest(&target_ctx, "POST", "/v1/memory/apply", checkpoint.body, "");
+    try std.testing.expectEqualStrings("200 OK", restore.status);
+    try std.testing.expect(std.mem.indexOf(u8, restore.body, "\"restored_events\":1") != null);
+
+    const restored = (try target_store.agentMemoryGet(alloc, "apply.checkpoint.pref", null, "agent:origin")).?;
+    try std.testing.expectEqualStrings("checkpoint restored through apply", restored.content);
 }
 
 test "api memory checkpoint origin identity is instance specific" {
