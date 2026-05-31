@@ -6529,6 +6529,30 @@ test "api agent memory supports named stores and federated runtime reads" {
     try std.testing.expect(std.mem.indexOf(u8, federated_same_search.body, "\"store\":\"scratch\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, federated_same_search.body, "\"store\":\"archive\"") != null);
 
+    const federated_same_context = handleRequest(&ctx, "POST", "/v1/context-packs", "{\"task\":\"Cross Store Same Key Marker\",\"stores\":[\"scratch\",\"archive\"],\"use_vector\":false,\"use_temporal_decay\":false,\"use_mmr\":false,\"limit\":10,\"persist\":false}", "POST /v1/context-packs HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", federated_same_context.status);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_context.body, "[store:scratch] Cross Store Same Key Scratch Marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_context.body, "[store:archive] Cross Store Same Key Archive Marker") != null);
+    var federated_same_context_parsed = try std.json.parseFromSlice(std.json.Value, alloc, federated_same_context.body, .{});
+    defer federated_same_context_parsed.deinit();
+    const context_object = federated_same_context_parsed.value.object.get("context_pack").?.object;
+    const context_refs = context_object.get("included_result_refs").?.array.items;
+    var saw_scratch_ref = false;
+    var saw_archive_ref = false;
+    for (context_refs) |ref_value| {
+        const ref = ref_value.object;
+        const ref_store = ref.get("store") orelse continue;
+        if (std.mem.eql(u8, ref_store.string, "scratch")) {
+            try std.testing.expect(std.mem.eql(u8, ref.get("storage").?.string, "scratch"));
+            saw_scratch_ref = true;
+        } else if (std.mem.eql(u8, ref_store.string, "archive")) {
+            try std.testing.expect(std.mem.eql(u8, ref.get("storage").?.string, "archive"));
+            saw_archive_ref = true;
+        }
+    }
+    try std.testing.expect(saw_scratch_ref);
+    try std.testing.expect(saw_archive_ref);
+
     const global_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Named Archive Unique\",\"use_vector\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", global_search.status);
     try std.testing.expect(std.mem.indexOf(u8, global_search.body, "Named Archive Unique") != null);

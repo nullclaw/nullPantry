@@ -119,6 +119,16 @@ pub fn resultRefsJson(allocator: std.mem.Allocator, results: []const domain.Sear
         try json.appendString(&out, allocator, "actor_isolated");
         try out.append(allocator, ':');
         try out.appendSlice(allocator, if (result.actor_isolated) "true" else "false");
+        if (result.store.len > 0) {
+            try out.append(allocator, ',');
+            try json.appendString(&out, allocator, "store");
+            try out.append(allocator, ':');
+            try json.appendString(&out, allocator, result.store);
+            try out.append(allocator, ',');
+            try json.appendString(&out, allocator, "storage");
+            try out.append(allocator, ':');
+            try json.appendString(&out, allocator, result.store);
+        }
         try out.append(allocator, '}');
     }
     try out.append(allocator, ']');
@@ -258,12 +268,20 @@ fn appendSectionText(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(
         if (!sectionIncludes(result, result_type, contains)) continue;
         if (std.mem.eql(u8, title, "Verified decisions") and !verifiedOrAccepted(result)) continue;
         try out.appendSlice(allocator, "- ");
+        try appendStorePrefix(allocator, out, result);
         try appendHeadingPathPrefix(allocator, out, result);
         try out.appendSlice(allocator, result.text);
         try out.append(allocator, '\n');
         count += 1;
     }
     if (count == 0) try out.appendSlice(allocator, "- None found.\n");
+}
+
+fn appendStorePrefix(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), result: domain.SearchResult) !void {
+    if (result.store.len == 0) return;
+    try out.appendSlice(allocator, "[store:");
+    try out.appendSlice(allocator, result.store);
+    try out.appendSlice(allocator, "] ");
 }
 
 fn appendHeadingPathPrefix(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), result: domain.SearchResult) !void {
@@ -512,4 +530,49 @@ test "context pack result refs preserve non-primitive acl metadata" {
     try std.testing.expect(std.mem.indexOf(u8, refs, "\"heading_path\":[\"# Agent\",\"## Memory\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, refs, "\"required_scopes\":[\"agent:agent:a\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, refs, "\"actor_isolated\":true") != null);
+}
+
+test "context pack summary and refs preserve agent memory store identity" {
+    const items = [_]domain.SearchResult{
+        .{
+            .id = "agent_memory:scratch:agm_same",
+            .result_type = "agent_memory",
+            .title = "named.same",
+            .text = "Scratch store preference",
+            .scope = "agent:agent:a",
+            .status = "verified",
+            .score = 1,
+            .source_ids_json = "[]",
+            .required_scopes_json = "[\"agent:agent:a\"]",
+            .actor_isolated = true,
+            .store = "scratch",
+        },
+        .{
+            .id = "agent_memory:archive:agm_same",
+            .result_type = "agent_memory",
+            .title = "named.same",
+            .text = "Archive store preference",
+            .scope = "agent:agent:a",
+            .status = "verified",
+            .score = 1,
+            .source_ids_json = "[]",
+            .required_scopes_json = "[\"agent:agent:a\"]",
+            .actor_isolated = true,
+            .store = "archive",
+        },
+    };
+
+    const summary = try buildSummary(std.testing.allocator, "named.same", &items);
+    defer std.testing.allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "[store:scratch] Scratch store preference") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "[store:archive] Archive store preference") != null);
+
+    const refs = try resultRefsJson(std.testing.allocator, &items);
+    defer std.testing.allocator.free(refs);
+    try std.testing.expect(std.mem.indexOf(u8, refs, "\"id\":\"agent_memory:scratch:agm_same\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refs, "\"store\":\"scratch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refs, "\"storage\":\"scratch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refs, "\"id\":\"agent_memory:archive:agm_same\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refs, "\"store\":\"archive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refs, "\"storage\":\"archive\"") != null);
 }
