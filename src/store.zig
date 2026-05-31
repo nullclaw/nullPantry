@@ -11154,9 +11154,12 @@ pub const PostgresStore = struct {
     }
 
     pub fn listConflicts(self: *PostgresStore, allocator: std.mem.Allocator, input: ConflictListInput) ![]KnowledgeConflict {
-        const status_filter = if (input.status) |status| try std.fmt.allocPrint(allocator, "WHERE status = {s}", .{try sqlString(allocator, status)}) else "";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,permissions_json,status,summary,created_at_ms,resolved_at_ms FROM knowledge_conflicts {s} ORDER BY created_at_ms DESC LIMIT {d}", .{ status_filter, @max(@as(usize, 1), @min(input.limit, 500)) });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{@max(@as(usize, 1), @min(input.limit, 500))});
+        defer allocator.free(limit_text);
+        const parsed = if (input.status) |status|
+            try self.queryArrayParamsJson(allocator, "SELECT id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,permissions_json,status,summary,created_at_ms,resolved_at_ms FROM knowledge_conflicts WHERE status = $1 ORDER BY created_at_ms DESC LIMIT $2::bigint", &.{ status, limit_text })
+        else
+            try self.queryArrayParamsJson(allocator, "SELECT id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,permissions_json,status,summary,created_at_ms,resolved_at_ms FROM knowledge_conflicts ORDER BY created_at_ms DESC LIMIT $1::bigint", &.{limit_text});
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(KnowledgeConflict) = .empty;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
@@ -11918,19 +11921,26 @@ pub const PostgresStore = struct {
         const a_id = if (std.mem.lessThan(u8, a.id, b.id)) a.id else b.id;
         const b_id = if (std.mem.lessThan(u8, a.id, b.id)) b.id else a.id;
         const summary = try std.fmt.allocPrint(allocator, "Potential conflicting {s}: {s} vs {s}", .{ a.predicate, a.object, b.object });
+        defer allocator.free(summary);
         const permissions = try combinedPermissionsJson(allocator, a.permissions_json, b.permissions_json);
+        defer allocator.free(permissions);
         const id = try ids.make(allocator, "cnf_");
+        defer allocator.free(id);
         const now = ids.nowMs();
-        const sql = try std.fmt.allocPrint(
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        defer allocator.free(now_text);
+        const changed_text = try self.queryParamsText(
             allocator,
             "WITH inserted AS (" ++
                 "INSERT INTO knowledge_conflicts (id,conflict_type,object_a_type,object_a_id,object_b_type,object_b_id,scope,permissions_json,status,summary,created_at_ms,resolved_at_ms) " ++
-                "VALUES ({s},'memory_atom_conflict','memory_atom',{s},'memory_atom',{s},{s},{s},'open',{s},{d},NULL) " ++
+                "VALUES ($1,'memory_atom_conflict','memory_atom',$2,'memory_atom',$3,$4,$5::jsonb,'open',$6,$7::bigint,NULL) " ++
                 "ON CONFLICT(conflict_type,object_a_id,object_b_id) DO NOTHING RETURNING id" ++
-                ") INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'conflict.detected',NULL,'knowledge_conflict',id,'{{}}'::jsonb,{d} FROM inserted",
-            .{ try sqlString(allocator, id), try sqlString(allocator, a_id), try sqlString(allocator, b_id), try sqlString(allocator, a.scope), try sqlJsonb(allocator, permissions), try sqlString(allocator, summary), now, now },
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'conflict.detected',NULL,'knowledge_conflict',id,'{}'::jsonb,$7::bigint FROM inserted RETURNING 1" ++
+                ") SELECT count(*)::text FROM inserted",
+            &.{ id, a_id, b_id, a.scope, permissions, summary, now_text },
         );
-        try self.runSql(sql);
+        defer allocator.free(changed_text);
     }
 };
 
@@ -14990,6 +15000,33 @@ test "postgres storage contract covers primitives when configured" {
     try std.testing.expectEqual(@as(usize, 1), visible_cursors.len);
     const hidden_cursors = try store.listConnectorCursors(alloc, .{ .connector = cursor_connector, .scopes_json = "[\"public\"]", .limit = 10 });
     try std.testing.expectEqual(@as(usize, 0), hidden_cursors.len);
+
+    _ = try store.createMemoryAtom(alloc, .{
+        .predicate = "decision.postgres.conflict",
+        .object = "sqlite",
+        .text = "Postgres contract conflict says SQLite.",
+        .scope = "team:pg",
+        .permissions_json = "[\"team:pg\"]",
+        .created_by = "human",
+    });
+    _ = try store.createMemoryAtom(alloc, .{
+        .predicate = "decision.postgres.conflict",
+        .object = "postgres",
+        .text = "Postgres contract conflict says Postgres.",
+        .scope = "team:pg",
+        .permissions_json = "[\"team:pg\"]",
+        .created_by = "human",
+    });
+    const pg_conflicts = try store.scanConflicts(alloc, .{ .scopes_json = "[\"team:pg\"]", .status = "open", .limit = 20 });
+    var saw_pg_conflict = false;
+    for (pg_conflicts) |conflict| {
+        if (std.mem.indexOf(u8, conflict.summary, "decision.postgres.conflict") != null) saw_pg_conflict = true;
+    }
+    try std.testing.expect(saw_pg_conflict);
+    const hidden_pg_conflicts = try store.listConflicts(alloc, .{ .scopes_json = "[\"public\"]", .status = "open", .limit = 20 });
+    for (hidden_pg_conflicts) |conflict| {
+        try std.testing.expect(std.mem.indexOf(u8, conflict.summary, "decision.postgres.conflict") == null);
+    }
 
     const cache_key = try std.fmt.allocPrint(alloc, "{s}.response-cache", .{unique});
     try store.putResponseCache(.{
