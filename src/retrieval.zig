@@ -232,7 +232,7 @@ pub fn buildPlanWithAdaptive(allocator: std.mem.Allocator, query: []const u8, ha
     return .{
         .use_keyword = use_keyword,
         .use_vector = use_vector,
-        .use_graph = has_backend_terms and hasEntityHint(query),
+        .use_graph = has_backend_terms and queryHasEntityHint(query),
         .use_reranker = allow_reranker,
         .adaptive_enabled = adaptive.enabled,
         .strategy = analysis.recommended_strategy,
@@ -549,6 +549,10 @@ fn buildWebsearchQuery(allocator: std.mem.Allocator, query: []const u8, terms: [
     return joinWebsearchClauses(allocator, clauses.items);
 }
 
+pub fn buildExactWebsearchQuery(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
+    return buildWebsearchQuery(allocator, query, &.{});
+}
+
 fn collectSearchTerms(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
     var it = std.mem.tokenizeAny(u8, text, search_token_delimiters);
     while (it.next()) |raw| {
@@ -722,7 +726,7 @@ fn has_vectorIndexWorthy(query: []const u8) bool {
     return query.len > 8;
 }
 
-fn hasEntityHint(query: []const u8) bool {
+pub fn queryHasEntityHint(query: []const u8) bool {
     var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n.,;()[]{}<>!?\"'");
     while (tokens.next()) |token| {
         if (token.len < 3) continue;

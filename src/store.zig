@@ -6179,21 +6179,23 @@ pub const SQLiteStore = struct {
         keyword_input.query = plan.keyword_query;
         const fts_query = try retrieval_mod.buildFts5Query(allocator, keyword_input.query);
         defer allocator.free(fts_query);
-        const original_fts_query = try retrieval_mod.buildFts5Query(allocator, input.query);
-        defer allocator.free(original_fts_query);
         const use_fts = fts_query.len > 0;
-        const use_original_fts = original_fts_query.len > 0;
+        const exact_graph_query = retrieval_mod.queryHasEntityHint(input.query);
+        const graph_input = if (exact_graph_query) input else keyword_input;
+        const graph_fts_query = if (exact_graph_query) try retrieval_mod.buildFts5Query(allocator, input.query) else fts_query;
+        defer if (exact_graph_query) allocator.free(graph_fts_query);
+        const use_graph_fts = graph_fts_query.len > 0;
         var keyword_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         errdefer keyword_results.deinit(allocator);
 
         if (plan.use_keyword) {
             try self.searchMemoryAtoms(allocator, keyword_input, fts_query, use_fts, &keyword_results);
-            try self.searchSpaces(allocator, input, original_fts_query, use_original_fts, &keyword_results);
-            try self.searchPolicyScopes(allocator, input, original_fts_query, use_original_fts, &keyword_results);
+            try self.searchSpaces(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+            try self.searchPolicyScopes(allocator, keyword_input, fts_query, use_fts, &keyword_results);
             try self.searchSources(allocator, keyword_input, fts_query, use_fts, &keyword_results);
             try self.searchArtifacts(allocator, keyword_input, fts_query, use_fts, &keyword_results);
-            try self.searchEntities(allocator, input, original_fts_query, use_original_fts, &keyword_results);
-            try self.searchRelations(allocator, input, original_fts_query, use_original_fts, &keyword_results);
+            try self.searchEntities(allocator, graph_input, graph_fts_query, use_graph_fts, &keyword_results);
+            try self.searchRelations(allocator, graph_input, graph_fts_query, use_graph_fts, &keyword_results);
             try self.searchContextPacks(allocator, keyword_input, fts_query, use_fts, &keyword_results);
             try self.searchFeedEvents(allocator, keyword_input, fts_query, use_fts, &keyword_results);
             try self.searchAgentMemories(allocator, keyword_input, fts_query, use_fts, &keyword_results);
@@ -6202,12 +6204,12 @@ pub const SQLiteStore = struct {
             }
             if (keyword_results.items.len == 0 and use_fts) {
                 try self.searchMemoryAtoms(allocator, keyword_input, "", false, &keyword_results);
-                try self.searchSpaces(allocator, input, "", false, &keyword_results);
-                try self.searchPolicyScopes(allocator, input, "", false, &keyword_results);
+                try self.searchSpaces(allocator, keyword_input, "", false, &keyword_results);
+                try self.searchPolicyScopes(allocator, keyword_input, "", false, &keyword_results);
                 try self.searchSources(allocator, keyword_input, "", false, &keyword_results);
                 try self.searchArtifacts(allocator, keyword_input, "", false, &keyword_results);
-                try self.searchEntities(allocator, input, "", false, &keyword_results);
-                try self.searchRelations(allocator, input, "", false, &keyword_results);
+                try self.searchEntities(allocator, graph_input, "", false, &keyword_results);
+                try self.searchRelations(allocator, graph_input, "", false, &keyword_results);
                 try self.searchContextPacks(allocator, keyword_input, "", false, &keyword_results);
                 try self.searchFeedEvents(allocator, keyword_input, "", false, &keyword_results);
                 try self.searchAgentMemories(allocator, keyword_input, "", false, &keyword_results);
@@ -10305,10 +10307,17 @@ pub const PostgresStore = struct {
         defer plan.deinit(allocator);
         var semantic_input = input;
         semantic_input.query = plan.websearch_query;
+        var graph_input = semantic_input;
+        var exact_graph_query: ?[]u8 = null;
+        if (retrieval_mod.queryHasEntityHint(input.query)) {
+            exact_graph_query = try retrieval_mod.buildExactWebsearchQuery(allocator, input.query);
+            graph_input.query = exact_graph_query.?;
+        }
+        defer if (exact_graph_query) |query| allocator.free(query);
         var keyword_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         errdefer keyword_results.deinit(allocator);
 
-        if (plan.use_keyword) try self.searchPgKeywordCandidates(allocator, semantic_input, &keyword_results);
+        if (plan.use_keyword) try self.searchPgKeywordCandidates(allocator, semantic_input, graph_input, &keyword_results);
         pgSortSearchResults(keyword_results.items);
 
         var vector_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
@@ -10323,14 +10332,14 @@ pub const PostgresStore = struct {
         return try self.fusePgSearchResults(allocator, input, keyword_results.items, vector_results.items, limit);
     }
 
-    fn searchPgKeywordCandidates(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+    fn searchPgKeywordCandidates(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, graph_input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         try self.searchPgMemoryAtoms(allocator, input, results);
         try self.searchPgSpaces(allocator, input, results);
         try self.searchPgPolicyScopes(allocator, input, results);
         try self.searchPgSources(allocator, input, results);
         try self.searchPgArtifacts(allocator, input, results);
-        try self.searchPgEntities(allocator, input, results);
-        try self.searchPgRelations(allocator, input, results);
+        try self.searchPgEntities(allocator, graph_input, results);
+        try self.searchPgRelations(allocator, graph_input, results);
         try self.searchPgContextPacks(allocator, input, results);
         try self.searchPgFeedEvents(allocator, input, results);
         try self.searchPgAgentMemories(allocator, input, results);
@@ -13463,6 +13472,34 @@ test "sqlite search applies query expansion to keyword retrieval" {
         if (std.mem.eql(u8, result.id, atom.id)) saw_atom = true;
     }
     try std.testing.expect(saw_atom);
+}
+
+test "sqlite search applies query expansion across first class graph primitives" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const from = try store.resolveEntity(alloc, .{ .entity_type = "service", .name = "Checkout", .scope = "public" });
+    const to = try store.resolveEntity(alloc, .{ .entity_type = "decision", .name = "ADR Boundary", .description = "ADR rationale for context serving", .scope = "public" });
+    _ = try store.createRelation(alloc, .{ .from_entity_id = from.id, .relation_type = "related_to", .to_entity_id = to.id, .scope = "public" });
+
+    const results = try store.search(alloc, .{
+        .query = "decision",
+        .scopes_json = "[\"public\"]",
+        .limit = 20,
+        .use_vector = false,
+    });
+
+    var saw_entity = false;
+    var saw_relation = false;
+    for (results) |result| {
+        if (std.mem.eql(u8, result.result_type, "entity") and std.mem.eql(u8, result.id, to.id)) saw_entity = true;
+        if (std.mem.eql(u8, result.result_type, "relation") and std.mem.indexOf(u8, result.text, "ADR Boundary") != null) saw_relation = true;
+    }
+    try std.testing.expect(saw_entity);
+    try std.testing.expect(saw_relation);
 }
 
 test "sqlite primitive creates fail closed when audit is unavailable" {
