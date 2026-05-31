@@ -3679,20 +3679,24 @@ fn memoryFeedCompact(ctx: *Context, body: []const u8, query: []const u8) HttpRes
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const storage_route = agentMemoryStorageTargetFromObjectOrQuery(ctx.allocator, parsed.value.object, query) catch return serverError(ctx);
+    const requested_before_id = feedCompactCursorFromObject(parsed.value.object);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
-        return runtimeMemoryFeedCompact(ctx, runtime);
+        return runtimeMemoryFeedCompact(ctx, runtime, requested_before_id);
     }
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
     const status = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
-    const before_id = json.intField(parsed.value.object, "before_id") orelse
-        json.intField(parsed.value.object, "before_event_id") orelse
-        json.intField(parsed.value.object, "before_sequence") orelse
-        json.intField(parsed.value.object, "through_id") orelse
-        json.intField(parsed.value.object, "through_sequence") orelse
-        status.max_event_id;
+    const before_id = requested_before_id orelse status.max_event_id;
     const result = ctx.store.compactFeed(before_id, ctx.actor_id) catch return serverError(ctx);
     const response = std.fmt.allocPrint(ctx.allocator, "{{\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"compacted_events\":{d}}}", .{ result.cursor_floor, result.cursor_floor, result.max_event_id, result.max_event_id, result.compacted_events }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
+}
+
+fn feedCompactCursorFromObject(obj: std.json.ObjectMap) ?i64 {
+    return json.intField(obj, "before_id") orelse
+        json.intField(obj, "before_event_id") orelse
+        json.intField(obj, "before_sequence") orelse
+        json.intField(obj, "through_id") orelse
+        json.intField(obj, "through_sequence");
 }
 
 fn memoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
@@ -3883,9 +3887,9 @@ fn runtimeMemoryFeedStatus(ctx: *Context, runtime: *agent_memory_runtime.Runtime
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
-fn runtimeMemoryFeedCompact(ctx: *Context, runtime: *agent_memory_runtime.Runtime) HttpResponse {
+fn runtimeMemoryFeedCompact(ctx: *Context, runtime: *agent_memory_runtime.Runtime, before_id: ?i64) HttpResponse {
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
-    const result = runtime.compactFeed(ctx.allocator, ctx.actor_id, feed_scopes) catch |err| switch (err) {
+    const result = runtime.compactFeed(ctx.allocator, ctx.actor_id, feed_scopes, before_id) catch |err| switch (err) {
         error.NotSupported, error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };

@@ -450,9 +450,9 @@ pub const Runtime = union(BackendKind) {
         };
     }
 
-    pub fn compactFeed(self: *Runtime, allocator: std.mem.Allocator, actor_id: ?[]const u8, scopes_json: []const u8) !FeedCompactResult {
+    pub fn compactFeed(self: *Runtime, allocator: std.mem.Allocator, actor_id: ?[]const u8, scopes_json: []const u8, before_id: ?i64) !FeedCompactResult {
         return switch (self.*) {
-            .api => |*engine| engine.compactFeed(allocator, actor_id, scopes_json),
+            .api => |*engine| engine.compactFeed(allocator, actor_id, scopes_json, before_id),
             else => error.NotSupported,
         };
     }
@@ -2357,8 +2357,10 @@ pub const ApiAgentMemory = struct {
         return parseFeedStatus(allocator, response.body);
     }
 
-    pub fn compactFeed(self: *ApiAgentMemory, allocator: std.mem.Allocator, actor_id: ?[]const u8, scopes_json: []const u8) !FeedCompactResult {
-        const response = try self.request(allocator, .POST, "/memory/compact", "", actor_id, scopes_json, "{}");
+    pub fn compactFeed(self: *ApiAgentMemory, allocator: std.mem.Allocator, actor_id: ?[]const u8, scopes_json: []const u8, before_id: ?i64) !FeedCompactResult {
+        const body = try feedCompactPayload(allocator, before_id);
+        defer allocator.free(body);
+        const response = try self.request(allocator, .POST, "/memory/compact", "", actor_id, scopes_json, body);
         defer allocator.free(response.body);
         if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
         return parseFeedCompactResult(response.body);
@@ -2575,6 +2577,11 @@ fn feedCheckpointQuery(allocator: std.mem.Allocator, since_id: ?i64, limit: ?usi
     }
     if (limit) |value| try appendQueryUsize(allocator, &out, &first, "limit", value);
     return out.toOwnedSlice(allocator);
+}
+
+fn feedCompactPayload(allocator: std.mem.Allocator, before_id: ?i64) ![]u8 {
+    if (before_id) |value| return std.fmt.allocPrint(allocator, "{{\"before_id\":{d}}}", .{value});
+    return allocator.dupe(u8, "{}");
 }
 
 fn sessionPath(allocator: std.mem.Allocator, session_id: []const u8, suffix: []const u8) ![]u8 {
@@ -3405,6 +3412,13 @@ test "agent memory api backend builds urls and parses memory responses" {
     const checkpoint_query = try feedCheckpointQuery(std.testing.allocator, 12, 50);
     defer std.testing.allocator.free(checkpoint_query);
     try std.testing.expectEqualStrings("since_id=12&limit=50", checkpoint_query);
+
+    const compact_payload = try feedCompactPayload(std.testing.allocator, 12);
+    defer std.testing.allocator.free(compact_payload);
+    try std.testing.expectEqualStrings("{\"before_id\":12}", compact_payload);
+    const compact_default_payload = try feedCompactPayload(std.testing.allocator, null);
+    defer std.testing.allocator.free(compact_default_payload);
+    try std.testing.expectEqualStrings("{}", compact_default_payload);
 
     const feed_url = try apiBackendUrl(std.testing.allocator, "https://pantry.example/v1", "/memory/events", feed_query);
     defer std.testing.allocator.free(feed_url);

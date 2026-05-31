@@ -1604,9 +1604,14 @@ pub const Store = struct {
     fn enqueueVectorUpsertsFromCanonical(self: *Store, allocator: std.mem.Allocator, limit: usize) !VectorMaintenanceResult {
         const capped = @max(@as(usize, 1), @min(limit, 10000));
         const chunks = try self.listVectorChunks(allocator, capped, 0);
+        defer {
+            for (chunks) |*chunk| deinitVectorChunk(allocator, chunk);
+            allocator.free(chunks);
+        }
         var enqueued: usize = 0;
         for (chunks) |chunk| {
             const payload = try vectorUpsertPayloadJson(allocator, chunk.id);
+            defer allocator.free(payload);
             _ = try self.enqueueVectorOutbox(.{
                 .action = "upsert",
                 .object_type = chunk.object_type,
@@ -5648,6 +5653,10 @@ pub const SQLiteStore = struct {
 
     fn deleteVectorChunksForObject(self: *Self, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, actor_id: ?[]const u8) !usize {
         var ids_to_delete: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (ids_to_delete.items) |chunk_id| allocator.free(chunk_id);
+            ids_to_delete.deinit(allocator);
+        }
         {
             const stmt = try self.prepare("SELECT id FROM vector_chunks WHERE object_type = ?1 AND object_id = ?2 ORDER BY id");
             defer _ = c.sqlite3_finalize(stmt);
@@ -7886,13 +7895,15 @@ pub const SQLiteStore = struct {
     }
 
     pub fn deleteVectorChunk(self: *Self, allocator: std.mem.Allocator, id: []const u8, actor_id: ?[]const u8) !bool {
-        const chunk = (try self.getVectorChunk(allocator, id)) orelse return false;
+        var chunk = (try self.getVectorChunk(allocator, id)) orelse return false;
+        defer deinitVectorChunk(allocator, &chunk);
         const stmt = try self.prepare("DELETE FROM vector_chunks WHERE id = ?1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
         if (c.sqlite3_changes(self.db) <= 0) return false;
         const outbox_payload = try vectorUpsertPayloadJson(allocator, id);
+        defer allocator.free(outbox_payload);
         _ = try self.enqueueVectorOutbox(.{
             .action = "delete",
             .object_type = chunk.object_type,
@@ -11146,7 +11157,8 @@ pub const PostgresStore = struct {
     }
 
     pub fn deleteVectorChunk(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8, actor_id: ?[]const u8) !bool {
-        const chunk = (try self.getVectorChunk(allocator, id)) orelse return false;
+        var chunk = (try self.getVectorChunk(allocator, id)) orelse return false;
+        defer deinitVectorChunk(allocator, &chunk);
         const text = try self.queryParamsText(allocator, "WITH deleted AS (DELETE FROM vector_chunks WHERE id = $1 RETURNING 1) SELECT count(*)::text FROM deleted", &.{id});
         defer allocator.free(text);
         const changed = (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
@@ -11167,6 +11179,10 @@ pub const PostgresStore = struct {
         const parsed = try self.queryArrayParamsJson(allocator, "SELECT id FROM vector_chunks WHERE object_type = $1 AND object_id = $2 ORDER BY id", &.{ object_type, object_id });
         defer parsed.deinit();
         var ids_to_delete: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (ids_to_delete.items) |chunk_id| allocator.free(chunk_id);
+            ids_to_delete.deinit(allocator);
+        }
         if (parsed.value == .array) {
             for (parsed.value.array.items) |item| {
                 if (item != .object) continue;
