@@ -5530,6 +5530,8 @@ fn appendRuntimeDiagnostics(ctx: *Context, out: *std.ArrayListUnmanaged(u8), sch
     try out.appendSlice(ctx.allocator, if (ctx.store.health()) "true" else "false");
     try out.print(ctx.allocator, ",\"schema_version\":{d},\"expected_schema_version\":{d},\"schema_ok\":{s},\"agent_memory_backend\":", .{ schema_version, migrations.expected_schema_version, if (schema_ok) "true" else "false" });
     try json.appendString(out, ctx.allocator, ctx.store.agentMemoryBackendName());
+    try out.appendSlice(ctx.allocator, ",\"agent_memory\":");
+    try appendAgentMemoryRuntimeDiagnostics(ctx, out);
     try out.appendSlice(ctx.allocator, ",\"vector\":{\"backend\":");
     try json.appendString(out, ctx.allocator, ctx.store.vectorBackendName());
     try out.appendSlice(ctx.allocator, ",\"external_enabled\":");
@@ -5561,6 +5563,31 @@ fn appendRuntimeDiagnostics(ctx: *Context, out: *std.ArrayListUnmanaged(u8), sch
     try out.appendSlice(ctx.allocator, ",\"completion_provider\":{\"configured\":");
     try out.appendSlice(ctx.allocator, if (ctx.llm_base_url != null and ctx.llm_model != null) "true" else "false");
     try out.appendSlice(ctx.allocator, "}}");
+}
+
+fn appendAgentMemoryRuntimeDiagnostics(ctx: *Context, out: *std.ArrayListUnmanaged(u8)) !void {
+    try out.appendSlice(ctx.allocator, "{\"backend\":");
+    try json.appendString(out, ctx.allocator, ctx.store.agent_memory.backendName());
+    try out.appendSlice(ctx.allocator, ",\"external\":");
+    try out.appendSlice(ctx.allocator, if (ctx.store.agent_memory.isExternal()) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"noop\":");
+    try out.appendSlice(ctx.allocator, if (ctx.store.agent_memory.isNoop()) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"supports_feed\":");
+    try out.appendSlice(ctx.allocator, if (ctx.store.agent_memory.supportsFeed()) "true" else "false");
+    try out.print(ctx.allocator, ",\"named_store_count\":{d},\"named_stores\":[", .{ctx.store.agent_memory_stores.count()});
+    for (ctx.store.agent_memory_stores.stores.items, 0..) |*named, i| {
+        if (i > 0) try out.append(ctx.allocator, ',');
+        try out.appendSlice(ctx.allocator, "{\"name\":");
+        try json.appendString(out, ctx.allocator, named.name);
+        try out.appendSlice(ctx.allocator, ",\"backend\":");
+        try json.appendString(out, ctx.allocator, named.runtime.backendName());
+        try out.appendSlice(ctx.allocator, ",\"noop\":");
+        try out.appendSlice(ctx.allocator, if (named.runtime.isNoop()) "true" else "false");
+        try out.appendSlice(ctx.allocator, ",\"supports_feed\":");
+        try out.appendSlice(ctx.allocator, if (named.runtime.supportsFeed()) "true" else "false");
+        try out.append(ctx.allocator, '}');
+    }
+    try out.appendSlice(ctx.allocator, "]}");
 }
 
 fn embeddingProviderConfigured(ctx: *Context) bool {
@@ -10800,6 +10827,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"record_backend_healthy\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"schema_ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"agent_memory_backend\":\"native\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"agent_memory\":{\"backend\":\"native\",\"external\":false,\"noop\":false,\"supports_feed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"vector\":{\"backend\":\"local\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"circuit_breaker\":{\"enabled\":true,\"state\":\"closed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"retrieval\":{\"keyword\":true,\"vector\":true,\"adaptive_retrieval\":true,\"graph\":true") != null);
@@ -10814,6 +10842,28 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const snapshot = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot", "{\"type\":\"manual\",\"summary\":{\"memory_atoms\":1}}", "");
     try std.testing.expectEqualStrings("200 OK", snapshot.status);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.body, "\"snap_") != null);
+}
+
+test "api diagnostics expose agent memory runtime planes" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory = .{ .backend = .none },
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "disabled", .config = .{ .backend = .none } },
+        },
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Context{ .allocator = alloc, .store = &store };
+
+    const diagnostics = handleRequest(&ctx, "GET", "/v1/lifecycle/diagnostics", "", "");
+    try std.testing.expectEqualStrings("200 OK", diagnostics.status);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"agent_memory_backend\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"agent_memory\":{\"backend\":\"none\",\"external\":true,\"noop\":true,\"supports_feed\":false,\"named_store_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"name\":\"scratch\",\"backend\":\"memory_lru\",\"noop\":false,\"supports_feed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"name\":\"disabled\",\"backend\":\"none\",\"noop\":true,\"supports_feed\":false") != null);
 }
 
 test "api lifecycle snapshot export and import are permission aware" {

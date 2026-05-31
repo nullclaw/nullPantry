@@ -218,9 +218,13 @@ pub const Runtime = union(BackendKind) {
         };
     }
 
+    pub fn isNoop(self: *const Runtime) bool {
+        return self.* == .none;
+    }
+
     pub fn store(self: *Runtime, allocator: std.mem.Allocator, input: Input) !domain.AgentMemory {
         return switch (self.*) {
-            .none => error.AgentMemoryStorageUnavailable,
+            .none => noopAgentMemory(allocator, input),
             .native => error.NativeAgentMemoryRuntime,
             .memory_lru => |*engine| engine.store(allocator, input),
             .redis => |*engine| engine.store(allocator, input),
@@ -559,6 +563,33 @@ const MemoryEntry = struct {
     entry: domain.AgentMemory,
     last_access_ms: i64,
 };
+
+fn noopAgentMemory(allocator: std.mem.Allocator, input: Input) !domain.AgentMemory {
+    const request_actor = try access.requiredActorId(input.actor_id);
+    const owner_actor = try access.agentMemoryOwner(allocator, request_actor, input.scope);
+    defer allocator.free(owner_actor);
+    const writer_actor = input.writer_actor_id orelse request_actor;
+    const scope = try access.agentMemoryScope(allocator, owner_actor, input.session_id, input.scope);
+    defer allocator.free(scope);
+    const permissions = try access.agentMemoryPermissions(allocator, owner_actor, input.scope, input.permissions_json);
+    defer allocator.free(permissions);
+    const content = try agent_memory_reducer.reduceContent(allocator, input.operation, null, input.content);
+    defer allocator.free(content);
+
+    return .{
+        .id = try memoryEntryId(allocator, owner_actor, input.session_id, input.key),
+        .key = try allocator.dupe(u8, input.key),
+        .content = try allocator.dupe(u8, content),
+        .category = try allocator.dupe(u8, input.category),
+        .timestamp = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()}),
+        .session_id = if (input.session_id) |sid| try allocator.dupe(u8, sid) else null,
+        .actor_id = try allocator.dupe(u8, owner_actor),
+        .writer_actor_id = try allocator.dupe(u8, writer_actor),
+        .scope = try allocator.dupe(u8, scope),
+        .permissions_json = try allocator.dupe(u8, permissions),
+        .store = try allocator.dupe(u8, "none"),
+    };
+}
 
 pub const MemoryAgentMemory = struct {
     allocator: std.mem.Allocator,
@@ -3444,10 +3475,19 @@ test "memory_lru and none agent memory runtimes match agent memory contract" {
     defer none_runtime.deinit();
     try std.testing.expect(none_runtime.isExternal());
     try std.testing.expectEqualStrings("none", none_runtime.backendName());
-    try std.testing.expectError(error.AgentMemoryStorageUnavailable, none_runtime.store(std.testing.allocator, .{ .key = "ignored", .content = "ignored", .actor_id = "agent:none" }));
+    const none_saved = try none_runtime.store(std.testing.allocator, .{ .key = "ignored", .content = "ignored", .actor_id = "agent:none" });
+    defer {
+        var copy = none_saved;
+        freeAgentMemory(std.testing.allocator, &copy);
+    }
+    try std.testing.expectEqualStrings("ignored", none_saved.key);
+    try std.testing.expectEqualStrings("none", none_saved.store);
+    try std.testing.expect((try none_runtime.get(std.testing.allocator, "ignored", null, "agent:none")) == null);
     const none_list = try none_runtime.listVisible(std.testing.allocator, null, null, "agent:none", "[\"public\"]");
     defer std.testing.allocator.free(none_list);
     try std.testing.expectEqual(@as(usize, 0), none_list.len);
+    try std.testing.expectEqual(@as(usize, 0), try none_runtime.count("agent:none", "[\"public\"]"));
+    try std.testing.expect(!try none_runtime.delete("ignored", null, "agent:none", "agent:none"));
 
     var runtime = try Runtime.init(std.testing.allocator, .{ .backend = .memory_lru });
     defer runtime.deinit();

@@ -2111,9 +2111,17 @@ pub const Store = struct {
             .subset => self.agentMemoryStoreSubset(allocator, input, route),
             .all => blk: {
                 var result = try self.agentMemoryStoreNative(allocator, input);
-                if (self.agent_memory.isExternal()) result = try self.agentMemoryStoreRuntime(allocator, input);
+                errdefer agent_memory_runtime.freeAgentMemory(allocator, &result);
+                if (self.agent_memory.isExternal() and !self.agent_memory.isNoop()) {
+                    const next = try self.agentMemoryStoreRuntime(allocator, input);
+                    agent_memory_runtime.freeAgentMemory(allocator, &result);
+                    result = next;
+                }
                 for (self.agent_memory_stores.stores.items) |*named| {
-                    result = try self.agentMemoryStoreInRuntime(allocator, &named.runtime, input, named.name);
+                    if (named.runtime.isNoop()) continue;
+                    const next = try self.agentMemoryStoreInRuntime(allocator, &named.runtime, input, named.name);
+                    agent_memory_runtime.freeAgentMemory(allocator, &result);
+                    result = next;
                 }
                 break :blk result;
             },
@@ -2153,6 +2161,7 @@ pub const Store = struct {
             var cleanup = entry;
             agent_memory_runtime.freeAgentMemory(allocator, &cleanup);
         }
+        if (runtime.isNoop()) return entry;
         try self.materializeRuntimeAgentMemory(allocator, entry, store_name);
         if (!input.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, store_name, input.operation, input.content);
         try self.enqueueAgentMemoryLucidPut(allocator, entry, input.writer_actor_id orelse input.actor_id);
@@ -2177,7 +2186,9 @@ pub const Store = struct {
     fn materializeRuntimeAgentMemory(self: *Store, allocator: std.mem.Allocator, entry: domain.AgentMemory, store_name: []const u8) !void {
         try self.deprecateRuntimeAgentMemoryMirrors(allocator, store_name, entry.key, entry.session_id, entry.actor_id, if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id);
         const source_title = try std.fmt.allocPrint(allocator, "Runtime agent memory: {s}:{s}", .{ store_name, entry.key });
+        defer allocator.free(source_title);
         const metadata = try agentMemoryRuntimeMetadataJson(allocator, store_name, entry);
+        defer allocator.free(metadata);
         const source = try self.createRuntimeAgentMemorySource(allocator, .{
             .source_type = "agent_observation",
             .title = source_title,
@@ -2187,9 +2198,12 @@ pub const Store = struct {
             .metadata_json = metadata,
             .actor_id = if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id,
         });
+        defer allocator.free(source.id);
         const source_ids = try singleJsonString(allocator, source.id);
+        defer allocator.free(source_ids);
         const evidence = try evidenceRangeJson(allocator, source.id, entry.content.len, "agent_memory_runtime");
-        _ = try self.createMemoryAtom(allocator, .{
+        defer allocator.free(evidence);
+        const atom = try self.createMemoryAtom(allocator, .{
             .predicate = "agent.memory",
             .object = entry.key,
             .text = entry.content,
@@ -2203,6 +2217,7 @@ pub const Store = struct {
             .tags_json = "[\"agent_memory\",\"runtime\"]",
             .actor_id = if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id,
         });
+        defer allocator.free(atom.id);
     }
 
     fn deprecateRuntimeAgentMemoryMirrors(self: *Store, allocator: std.mem.Allocator, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, writer_actor_id: ?[]const u8) !void {
@@ -2537,13 +2552,35 @@ pub const Store = struct {
         const stores = try requireSubsetStores(route);
         var result: ?domain.AgentMemory = null;
         errdefer if (result) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+        var noop_result: ?domain.AgentMemory = null;
+        errdefer if (noop_result) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
 
         for (stores) |store_name| {
-            const next = try self.agentMemoryStoreRouted(allocator, input, routeForSubsetStoreName(store_name));
+            const store_route = routeForSubsetStoreName(store_name);
+            const next = try self.agentMemoryStoreRouted(allocator, input, store_route);
+            if (try self.agentMemoryRouteIsNoop(store_route)) {
+                if (noop_result) |*previous| agent_memory_runtime.freeAgentMemory(allocator, previous);
+                noop_result = next;
+                continue;
+            }
             if (result) |*previous| agent_memory_runtime.freeAgentMemory(allocator, previous);
             result = next;
         }
-        return result orelse error.AgentMemoryStorageUnavailable;
+        if (result) |entry| {
+            if (noop_result) |*previous| agent_memory_runtime.freeAgentMemory(allocator, previous);
+            return entry;
+        }
+        return noop_result orelse error.AgentMemoryStorageUnavailable;
+    }
+
+    fn agentMemoryRouteIsNoop(self: *Store, route: AgentMemoryStorageRoute) !bool {
+        return switch (route.target) {
+            .primary => self.agent_memory.isExternal() and self.agent_memory.isNoop(),
+            .native => false,
+            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.isNoop() else error.AgentMemoryStorageUnavailable,
+            .named => (try self.namedAgentMemoryRuntime(route)).isNoop(),
+            .subset, .all => false,
+        };
     }
 
     fn agentMemoryGetSubset(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror!?domain.AgentMemory {
@@ -8866,12 +8903,15 @@ pub const SQLiteStore = struct {
         const owner_actor_id = try requiredActorId(input.actor_id);
         const writer_actor_id = input.writer_actor_id orelse owner_actor_id;
         const scope = try agentMemoryScope(allocator, owner_actor_id, input.session_id, input.scope);
+        defer allocator.free(scope);
         const effective_permissions = try agentMemoryPermissions(allocator, owner_actor_id, input.scope, input.permissions_json);
+        defer allocator.free(effective_permissions);
         const existing_content = try self.agentMemoryContentInTx(allocator, input.key, input.session_id, owner_actor_id);
         defer if (existing_content) |content| allocator.free(content);
         const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, existing_content, input.content);
         defer allocator.free(reduced_content);
         const source_title = try std.fmt.allocPrint(allocator, "Agent memory: {s}", .{input.key});
+        defer allocator.free(source_title);
         const source = try self.createSource(allocator, .{
             .source_type = "agent_observation",
             .title = source_title,
@@ -8881,8 +8921,11 @@ pub const SQLiteStore = struct {
             .metadata_json = "{\"native\":\"agent_memory\"}",
             .actor_id = writer_actor_id,
         });
+        defer allocator.free(source.id);
         const source_ids = try singleJsonString(allocator, source.id);
+        defer allocator.free(source_ids);
         const evidence = try evidenceRangeJson(allocator, source.id, reduced_content.len, "agent_memory");
+        defer allocator.free(evidence);
         const status = domain.defaultMemoryStatus("agent", scope);
         const atom = try self.createMemoryAtom(allocator, .{
             .predicate = "agent.memory",
@@ -8898,8 +8941,10 @@ pub const SQLiteStore = struct {
             .tags_json = "[\"agent_memory\"]",
             .actor_id = writer_actor_id,
         });
+        defer allocator.free(atom.id);
         try self.agentMemoryDeleteExact(input.key, input.session_id, owner_actor_id, writer_actor_id);
         const id = try ids.make(allocator, "agm_");
+        defer allocator.free(id);
         const stmt = try self.prepare("INSERT INTO agent_memory_items (id, key, session_id, actor_id, writer_actor_id, scope, permissions_json, memory_atom_id, category, timestamp_ms, metadata_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
@@ -16006,6 +16051,91 @@ test "native agent memory maps keyed memory to memory atoms" {
     for (internal_search) |result| {
         try std.testing.expect(std.mem.indexOf(u8, result.text, "internal autosave payload") == null);
     }
+}
+
+test "none agent memory runtime is a true no-op storage plane" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory = .{ .backend = .none },
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const saved = try store.agentMemoryStore(alloc, .{
+        .key = "noop.pref",
+        .content = "none runtime must not materialize this",
+        .actor_id = "agent:none",
+    });
+    try std.testing.expectEqualStrings("noop.pref", saved.key);
+    try std.testing.expectEqualStrings("runtime", saved.store);
+    try std.testing.expect((try store.agentMemoryGet(alloc, "noop.pref", null, "agent:none")) == null);
+    try std.testing.expectEqual(@as(usize, 0), try store.agentMemoryCount("agent:none", "[]"));
+
+    const search = try store.search(alloc, .{
+        .query = "none runtime must not materialize this",
+        .scopes_json = "[]",
+        .limit = 10,
+        .use_vector = false,
+        .actor_id = "agent:none",
+    });
+    try std.testing.expectEqual(@as(usize, 0), search.len);
+
+    const feed = try store.listFeedEvents(alloc, .{ .limit = 10, .actor_id = "agent:none", .scopes_json = "[]" });
+    try std.testing.expectEqual(@as(usize, 0), feed.len);
+}
+
+test "agent memory fanout keeps real store results ahead of no-op planes" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory = .{ .backend = .none },
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "disabled", .config = .{ .backend = .none } },
+        },
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const all_saved = try store.agentMemoryStoreRouted(alloc, .{
+        .key = "fanout.pref",
+        .content = "fanout real value",
+        .actor_id = "agent:fanout",
+    }, .{ .target = .all });
+    try std.testing.expectEqualStrings("scratch", all_saved.store);
+    try std.testing.expect((try store.agentMemoryGetRouted(alloc, "fanout.pref", null, "agent:fanout", .{ .target = .native })) != null);
+    try std.testing.expect((try store.agentMemoryGetRouted(alloc, "fanout.pref", null, "agent:fanout", AgentMemoryStorageRoute.parse("scratch"))) != null);
+    try std.testing.expect((try store.agentMemoryGetRouted(alloc, "fanout.pref", null, "agent:fanout", AgentMemoryStorageRoute.parse("disabled"))) == null);
+
+    const subset_stores = [_][]const u8{ "scratch", "disabled" };
+    const subset_saved = try store.agentMemoryStoreRouted(alloc, .{
+        .key = "subset.pref",
+        .content = "subset real value",
+        .actor_id = "agent:fanout",
+    }, AgentMemoryStorageRoute.fromStores(&subset_stores));
+    try std.testing.expectEqualStrings("scratch", subset_saved.store);
+    try std.testing.expect((try store.agentMemoryGetRouted(alloc, "subset.pref", null, "agent:fanout", AgentMemoryStorageRoute.parse("scratch"))) != null);
+    try std.testing.expect((try store.agentMemoryGetRouted(alloc, "subset.pref", null, "agent:fanout", AgentMemoryStorageRoute.parse("disabled"))) == null);
+}
+
+test "agent memory all fanout releases overwritten result ownership" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory = .{ .backend = .memory_lru },
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "archive", .config = .{ .backend = .memory_lru } },
+        },
+    });
+    defer store.deinit();
+
+    var saved = try store.agentMemoryStoreRouted(std.testing.allocator, .{
+        .key = "fanout.ownership",
+        .content = "fanout ownership value",
+        .actor_id = "agent:fanout",
+    }, .{ .target = .all });
+    defer agent_memory_runtime.freeAgentMemory(std.testing.allocator, &saved);
+    try std.testing.expectEqualStrings("archive", saved.store);
 }
 
 test "native agent memory backing rows do not leak through generic search" {
