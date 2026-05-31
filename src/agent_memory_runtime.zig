@@ -1740,10 +1740,17 @@ pub const ApiAgentMemory = struct {
 
     pub fn list(self: *ApiAgentMemory, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
         const actor = actor_id orelse return allocator.alloc(domain.AgentMemory, 0);
-        return self.listVisible(allocator, category, session_id, actor, "[]");
+        const scope = sharedScopeFromOwner(actor);
+        const scopes = if (scope) |s| try scopesJson(allocator, &.{s}) else try allocator.dupe(u8, "[]");
+        defer allocator.free(scopes);
+        return self.listWithScopes(allocator, category, session_id, actor, scopes, scope);
     }
 
     pub fn listVisible(self: *ApiAgentMemory, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
+        return self.listWithScopes(allocator, category, session_id, actor_id, scopes_json, null);
+    }
+
+    fn listWithScopes(self: *ApiAgentMemory, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, exact_scope: ?[]const u8) ![]domain.AgentMemory {
         var all: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
         errdefer {
             for (all.items) |*entry| freeAgentMemory(allocator, entry);
@@ -1753,7 +1760,7 @@ pub const ApiAgentMemory = struct {
         var offset: usize = 0;
         const page_size: usize = 500;
         while (true) {
-            const query = try agentMemoryListQuery(allocator, category, session_id, page_size, offset);
+            const query = try agentMemoryListQuery(allocator, category, session_id, exact_scope, page_size, offset);
             defer allocator.free(query);
             const response = try self.request(allocator, .GET, "/agent-memory", query, actor_id, scopes_json, "");
             defer allocator.free(response.body);
@@ -2021,7 +2028,7 @@ fn agentMemorySearchPayload(allocator: std.mem.Allocator, query_text: []const u8
     return out.toOwnedSlice(allocator);
 }
 
-fn agentMemoryListQuery(allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, limit: usize, offset: usize) ![]u8 {
+fn agentMemoryListQuery(allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, scope: ?[]const u8, limit: usize, offset: usize) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     var first = true;
@@ -2029,6 +2036,7 @@ fn agentMemoryListQuery(allocator: std.mem.Allocator, category: ?[]const u8, ses
     try appendQueryUsize(allocator, &out, &first, "offset", offset);
     if (category) |value| try appendQueryString(allocator, &out, &first, "category", value);
     if (session_id) |value| try appendQueryString(allocator, &out, &first, "session_id", value);
+    if (scope) |value| try appendQueryString(allocator, &out, &first, "scope", value);
     return out.toOwnedSlice(allocator);
 }
 
@@ -2706,6 +2714,10 @@ test "agent memory api backend builds urls and parses memory responses" {
     const exact_query = try agentMemoryExactQuery(std.testing.allocator, null, "team:alpha");
     defer std.testing.allocator.free(exact_query);
     try std.testing.expectEqualStrings("scope=team%3Aalpha", exact_query);
+
+    const scoped_list_query = try agentMemoryListQuery(std.testing.allocator, "prefs", "sess", "team:alpha", 25, 50);
+    defer std.testing.allocator.free(scoped_list_query);
+    try std.testing.expectEqualStrings("limit=25&offset=50&category=prefs&session_id=sess&scope=team%3Aalpha", scoped_list_query);
 }
 
 test "named runtime registry rejects reserved duplicate and native stores" {

@@ -6454,6 +6454,7 @@ fn agentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const category = json.queryParamDecoded(ctx.allocator, query, "category") catch return serverError(ctx);
     const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
@@ -6462,14 +6463,22 @@ fn agentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const offset = parseLimit(json.queryParam(query, "offset"), 0);
     const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const exact_owner = if (requested_scope) |scope| access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx) else null;
+    defer if (exact_owner) |owner| ctx.allocator.free(owner);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-    const primary = ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, session_id, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+    const primary = if (exact_owner) |owner| ctx.store.agentMemoryListRouted(ctx.allocator, category, session_id, owner, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    } else ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, session_id, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
     appendAgentMemoryEntries(ctx.allocator, &entries, primary) catch return serverError(ctx);
     if (include_global and session_id != null) {
-        const global = ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, null, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+        const global = if (exact_owner) |owner| ctx.store.agentMemoryListRouted(ctx.allocator, category, null, owner, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        } else ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, null, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
         };
@@ -9115,6 +9124,15 @@ test "api native agent memory supports private and shared team ownership" {
 
     const team_c_get = handleRequest(&ctx, "GET", "/v1/agent-memory/team.pref?scope=team:alpha", "", raw_c);
     try std.testing.expectEqualStrings("404 Not Found", team_c_get.status);
+    const team_b_list = handleRequest(&ctx, "GET", "/v1/agent-memory?scope=team:alpha", "", "GET /v1/agent-memory?scope=team:alpha HTTP/1.1\r\nAuthorization: Bearer agent-b\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", team_b_list.status);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, team_b_list.body, "\"key\":\"team.pref\""));
+    try std.testing.expect(std.mem.indexOf(u8, team_b_list.body, "team alpha value v2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, team_b_list.body, "agent a private value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, team_b_list.body, "\"actor_id\":\"shared:team:alpha\"") != null);
+    const team_c_list = handleRequest(&ctx, "GET", "/v1/agent-memory?scope=team:alpha", "", "GET /v1/agent-memory?scope=team:alpha HTTP/1.1\r\nAuthorization: Bearer agent-c\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", team_c_list.status);
+    try std.testing.expect(std.mem.indexOf(u8, team_c_list.body, "team alpha value v2") == null);
     const team_b_delete = handleRequest(&ctx, "DELETE", "/v1/agent-memory/team.pref?scope=team:alpha", "", "DELETE /v1/agent-memory/team.pref?scope=team:alpha HTTP/1.1\r\nAuthorization: Bearer agent-b\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", team_b_delete.status);
     const deleted_team = handleRequest(&ctx, "GET", "/v1/agent-memory/team.pref?scope=team:alpha", "", "GET /v1/agent-memory/team.pref?scope=team:alpha HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
