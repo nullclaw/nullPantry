@@ -1049,7 +1049,7 @@ pub const Store = struct {
             .runtime => try self.appendDefaultRuntimeSearchResults(allocator, input, results),
             .named => {
                 const runtime = try self.namedAgentMemoryRuntime(route);
-                try self.appendRuntimeSearchResults(allocator, input, runtime, results);
+                try self.appendRuntimeSearchResults(allocator, input, runtime, route.name orelse "named", results);
             },
             .subset => {
                 const stores = try requireSubsetStores(route);
@@ -1111,7 +1111,7 @@ pub const Store = struct {
     fn appendDefaultRuntimeSearchResults(self: *Store, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         if (input.actor_id) |_| {
             if (self.agent_memory.isExternal()) {
-                try self.appendRuntimeSearchResults(allocator, input, &self.agent_memory, results);
+                try self.appendRuntimeSearchResults(allocator, input, &self.agent_memory, "runtime", results);
                 return;
             }
         }
@@ -1121,14 +1121,14 @@ pub const Store = struct {
     fn appendAllRuntimeSearchResults(self: *Store, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         if (input.actor_id == null) return;
         if (self.agent_memory.isExternal()) {
-            try self.appendRuntimeSearchResults(allocator, input, &self.agent_memory, results);
+            try self.appendRuntimeSearchResults(allocator, input, &self.agent_memory, "runtime", results);
         }
         for (self.agent_memory_stores.stores.items) |*named| {
-            try self.appendRuntimeSearchResults(allocator, input, &named.runtime, results);
+            try self.appendRuntimeSearchResults(allocator, input, &named.runtime, named.name, results);
         }
     }
 
-    fn appendRuntimeSearchResults(self: *Store, allocator: std.mem.Allocator, input: SearchInput, runtime: *agent_memory_runtime.Runtime, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+    fn appendRuntimeSearchResults(self: *Store, allocator: std.mem.Allocator, input: SearchInput, runtime: *agent_memory_runtime.Runtime, store_name: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const actor = input.actor_id orelse return;
         const external = try runtime.search(
             allocator,
@@ -1153,8 +1153,11 @@ pub const Store = struct {
                 try primitiveRuntimeTitle(allocator, kind, entry.key)
             else
                 try std.fmt.allocPrint(allocator, "agent_memory:{s}", .{entry.key});
+            const result_store = if (entry.store.len > 0) entry.store else store_name;
             const id = if (primitive_type != null)
                 try primitiveRuntimeObjectId(allocator, entry.key, entry.id)
+            else if (result_store.len > 0)
+                try std.fmt.allocPrint(allocator, "agent_memory:{s}:{s}", .{ result_store, entry.id })
             else
                 try allocator.dupe(u8, entry.id);
             const text = try allocator.dupe(u8, entry.content);
@@ -1173,6 +1176,7 @@ pub const Store = struct {
                 .actor_isolated = !access.isSharedAgentMemoryOwner(entry.actor_id),
                 .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0,
                 .confidence = 0.8,
+                .store = if (primitive_type == null) result_store else "",
             });
         }
     }
@@ -6120,6 +6124,7 @@ pub const SQLiteStore = struct {
                 .actor_isolated = resultActorIsolatedGlobal(allocator, "agent_memory", scope, permissions, input.actor_id),
                 .created_at_ms = timestamp_ms,
                 .confidence = confidence,
+                .store = "native",
             });
         }
     }
@@ -6322,6 +6327,7 @@ pub const SQLiteStore = struct {
                 .actor_isolated = !isSharedAgentMemoryOwner(entry.actor_id),
                 .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0,
                 .confidence = entry.score orelse 0.7,
+                .store = "native",
             };
         }
         if (std.mem.eql(u8, match.object_type, "space")) {
@@ -11261,7 +11267,21 @@ pub const PostgresStore = struct {
             const relevance = pgScoreText(input.query, text);
             if (relevance <= 0 and input.query.len > 0) continue;
             const confidence = json.floatField(obj, "confidence") orelse 0.5;
-            try results.append(allocator, .{ .id = try dupStringField(allocator, obj, "id", ""), .result_type = "agent_memory", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ json.stringField(obj, "category") orelse "", json.stringField(obj, "key") orelse "" }), .text = text, .scope = scope, .status = status, .score = relevance + confidence, .source_ids_json = try self.sanitizeSourceIdsForActor(allocator, try rawJsonField(allocator, obj, "source_ids_json", "[]"), input.scopes_json, input.actor_id), .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "agent_memory", scope, permissions, input.actor_id), .created_at_ms = json.intField(obj, "timestamp_ms") orelse 0, .confidence = confidence });
+            try results.append(allocator, .{
+                .id = try dupStringField(allocator, obj, "id", ""),
+                .result_type = "agent_memory",
+                .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ json.stringField(obj, "category") orelse "", json.stringField(obj, "key") orelse "" }),
+                .text = text,
+                .scope = scope,
+                .status = status,
+                .score = relevance + confidence,
+                .source_ids_json = try self.sanitizeSourceIdsForActor(allocator, try rawJsonField(allocator, obj, "source_ids_json", "[]"), input.scopes_json, input.actor_id),
+                .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id),
+                .actor_isolated = resultActorIsolatedGlobal(allocator, "agent_memory", scope, permissions, input.actor_id),
+                .created_at_ms = json.intField(obj, "timestamp_ms") orelse 0,
+                .confidence = confidence,
+                .store = "native",
+            });
         }
     }
 
@@ -11374,7 +11394,22 @@ pub const PostgresStore = struct {
             const entry = (try self.agentMemoryById(allocator, match.object_id)) orelse return null;
             if (!try self.agentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, input.scopes_json, input.actor_id)) return null;
             if (domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) return null;
-            return .{ .id = entry.id, .result_type = "agent_memory", .title = entry.key, .text = vectorMatchedText(match, entry.content), .scope = entry.scope, .status = "active", .score = match.score + (entry.score orelse 0.5), .source_ids_json = "[]", .heading_path_json = match.heading_path_json, .required_scopes_json = try requiredAccessJsonGlobal(allocator, entry.scope, entry.permissions_json, input.actor_id), .actor_isolated = !isSharedAgentMemoryOwner(entry.actor_id), .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0, .confidence = entry.score orelse 0.7 };
+            return .{
+                .id = entry.id,
+                .result_type = "agent_memory",
+                .title = entry.key,
+                .text = vectorMatchedText(match, entry.content),
+                .scope = entry.scope,
+                .status = "active",
+                .score = match.score + (entry.score orelse 0.5),
+                .source_ids_json = "[]",
+                .heading_path_json = match.heading_path_json,
+                .required_scopes_json = try requiredAccessJsonGlobal(allocator, entry.scope, entry.permissions_json, input.actor_id),
+                .actor_isolated = !isSharedAgentMemoryOwner(entry.actor_id),
+                .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0,
+                .confidence = entry.score orelse 0.7,
+                .store = "native",
+            };
         }
         if (std.mem.eql(u8, match.object_type, "space")) {
             const space = (try self.getSpace(allocator, match.object_id)) orelse return null;
@@ -11900,7 +11935,7 @@ fn finalizeSearchResults(allocator: std.mem.Allocator, input: SearchInput, candi
     errdefer unique.deinit(allocator);
     for (candidates) |candidate| {
         if (!searchResultAllowedForSession(input, candidate)) continue;
-        if (findSearchResultIndex(unique.items, candidate.id)) |idx| {
+        if (findSearchResultIndex(unique.items, candidate)) |idx| {
             if (candidate.score > unique.items[idx].score) unique.items[idx] = candidate;
         } else {
             try unique.append(allocator, candidate);
@@ -11954,11 +11989,20 @@ fn searchResultAllowedForSession(_: SearchInput, _: domain.SearchResult) bool {
     return true;
 }
 
-fn findSearchResultIndex(results: []const domain.SearchResult, id_text: []const u8) ?usize {
+fn findSearchResultIndex(results: []const domain.SearchResult, candidate: domain.SearchResult) ?usize {
     for (results, 0..) |result, i| {
-        if (std.mem.eql(u8, result.id, id_text)) return i;
+        if (sameSearchResultIdentity(result, candidate)) return i;
     }
     return null;
+}
+
+fn sameSearchResultIdentity(a: domain.SearchResult, b: domain.SearchResult) bool {
+    if (!std.mem.eql(u8, a.id, b.id)) return false;
+    if (!std.mem.eql(u8, a.result_type, b.result_type)) return false;
+    if (std.mem.eql(u8, a.result_type, "agent_memory") or a.store.len > 0 or b.store.len > 0) {
+        return std.mem.eql(u8, a.store, b.store);
+    }
+    return true;
 }
 
 fn findSearchResultByIdGlobal(results: []const domain.SearchResult, id_text: []const u8) ?domain.SearchResult {

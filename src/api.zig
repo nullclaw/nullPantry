@@ -6518,6 +6518,17 @@ test "api agent memory supports named stores and federated runtime reads" {
     try std.testing.expect(std.mem.indexOf(u8, subset_query_list.body, "Named Exact Subset Unique") != null);
     try std.testing.expect(std.mem.indexOf(u8, subset_query_list.body, "Named Default Runtime Unique") == null);
 
+    const scratch_same = handleRequest(&ctx, "PUT", "/v1/agent-memory/named.same", "{\"content\":\"Cross Store Same Key Scratch Marker\",\"store\":\"scratch\"}", raw);
+    try std.testing.expectEqualStrings("200 OK", scratch_same.status);
+    const archive_same = handleRequest(&ctx, "PUT", "/v1/agent-memory/named.same", "{\"content\":\"Cross Store Same Key Archive Marker\",\"store\":\"archive\"}", raw);
+    try std.testing.expectEqualStrings("200 OK", archive_same.status);
+    const federated_same_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Cross Store Same Key Marker\",\"stores\":[\"scratch\",\"archive\"],\"use_vector\":false,\"use_temporal_decay\":false,\"use_mmr\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", federated_same_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_search.body, "Cross Store Same Key Scratch Marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_search.body, "Cross Store Same Key Archive Marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_search.body, "\"store\":\"scratch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_search.body, "\"store\":\"archive\"") != null);
+
     const global_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Named Archive Unique\",\"use_vector\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", global_search.status);
     try std.testing.expect(std.mem.indexOf(u8, global_search.body, "Named Archive Unique") != null);

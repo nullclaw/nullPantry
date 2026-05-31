@@ -246,6 +246,7 @@ pub const SearchResult = struct {
     actor_isolated: bool = false,
     created_at_ms: i64 = 0,
     confidence: f64 = 0.5,
+    store: []const u8 = "",
 
     pub fn writeJson(self: SearchResult, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
         try out.appendSlice(allocator, "{\"id\":");
@@ -260,6 +261,12 @@ pub const SearchResult = struct {
         try json.appendString(out, allocator, self.scope);
         try out.appendSlice(allocator, ",\"status\":");
         try json.appendString(out, allocator, self.status);
+        if (self.store.len > 0) {
+            try out.appendSlice(allocator, ",\"store\":");
+            try json.appendString(out, allocator, self.store);
+            try out.appendSlice(allocator, ",\"storage\":");
+            try json.appendString(out, allocator, self.store);
+        }
         try out.print(allocator, ",\"score\":{d},\"created_at_ms\":{d},\"confidence\":{d},\"actor_isolated\":{s},\"required_scopes\":", .{ self.score, self.created_at_ms, self.confidence, if (self.actor_isolated) "true" else "false" });
         try json.appendRawJsonOr(out, allocator, self.required_scopes_json, "[]");
         try out.appendSlice(allocator, ",\"citations\":");
