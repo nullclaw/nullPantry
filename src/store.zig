@@ -9370,62 +9370,36 @@ pub const PostgresStore = struct {
     }
 
     pub fn applyFeedMemoryAtomAtomic(self: *PostgresStore, allocator: std.mem.Allocator, input: FeedMemoryApplyInput) !FeedMemoryApplyResult {
-        const event_id = if (input.reserved_event_id) |reserved| reserved else blk: {
-            const text = try self.queryText(allocator, "SELECT nextval(pg_get_serial_sequence('memory_feed_events','id'))::text");
-            defer allocator.free(text);
-            break :blk try std.fmt.parseInt(i64, text, 10);
-        };
+        try self.runSql("BEGIN");
+        errdefer self.runSql("ROLLBACK") catch {};
 
         var atom_input = input.prepared.atom;
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer sql.deinit(allocator);
-        try sql.appendSlice(allocator, "BEGIN;\n");
-
         if (input.prepared.generated_source) |source_input| {
-            const source_id = try ids.make(allocator, "src_");
-            const source_now = ids.nowMs();
-            atom_input.source_ids_json = try singleJsonString(allocator, source_id);
-            atom_input.evidence_ranges_json = try evidenceRangeJson(allocator, source_id, atom_input.text.len, "generated_source");
-            try sql.print(
-                allocator,
-                "INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{d},{s},{s},{s},{s});\n",
-                .{ try sqlString(allocator, source_id), try sqlString(allocator, source_input.source_type), try sqlString(allocator, source_input.title), try sqlNullableString(allocator, source_input.raw_content_uri), try sqlString(allocator, source_input.content), try sqlNullableString(allocator, source_input.author), try sqlJsonb(allocator, source_input.participants_json), try sqlJsonb(allocator, source_input.permissions_json), try sqlString(allocator, source_input.scope), source_now, source_now, try sqlNullableString(allocator, source_input.checksum), try sqlNullableString(allocator, source_input.language), try sqlJsonb(allocator, source_input.related_entities_json), try sqlJsonb(allocator, source_input.metadata_json) },
-            );
-            try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('source.created',{s},'source',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, source_input.actor_id), try sqlString(allocator, source_id), source_now });
+            const source = try self.createSource(allocator, source_input);
+            atom_input.source_ids_json = try singleJsonString(allocator, source.id);
+            atom_input.evidence_ranges_json = try evidenceRangeJson(allocator, source.id, atom_input.text.len, "generated_source");
         }
 
-        const atom_id = try ids.make(allocator, "mem_");
-        const atom_now = ids.nowMs();
-        const atom_status = atom_input.status orelse domain.defaultMemoryStatus(atom_input.created_by, atom_input.scope);
-        try sql.print(
-            allocator,
-            "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) VALUES ({s},{s},{s},{s},{s},{s},{d},{s},{s},{s},{s},{d},{s},{s},NULL,{s},{s},{s});\n",
-            .{ try sqlString(allocator, atom_id), try sqlNullableString(allocator, atom_input.subject_entity_id), try sqlString(allocator, atom_input.predicate), try sqlString(allocator, atom_input.object), try sqlString(allocator, atom_input.text), try sqlString(allocator, atom_input.scope), atom_input.confidence, try sqlString(allocator, atom_status), try sqlJsonb(allocator, atom_input.source_ids_json), try sqlJsonb(allocator, atom_input.evidence_ranges_json), try sqlString(allocator, atom_input.created_by), atom_now, try sqlNullableInt(allocator, atom_input.valid_from_ms), try sqlNullableInt(allocator, atom_input.valid_until_ms), try sqlNullableString(allocator, atom_input.owner), try sqlJsonb(allocator, atom_input.permissions_json), try sqlJsonb(allocator, atom_input.tags_json) },
-        );
-        try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_atom.created',{s},'memory_atom',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, atom_input.actor_id), try sqlString(allocator, atom_id), atom_now });
+        const atom = try self.createMemoryAtom(allocator, atom_input);
+        const event_id = if (input.reserved_event_id) |reserved| blk: {
+            if (!try self.markFeedEventApplied(reserved, input.event.object_type, atom.id, input.event.payload_json)) return error.FeedReservationConsumed;
+            break :blk reserved;
+        } else try self.appendFeedEvent(.{
+            .event_type = input.event.event_type,
+            .operation = input.event.operation,
+            .object_type = input.event.object_type,
+            .object_id = atom.id,
+            .scope = input.event.scope,
+            .permissions_json = input.event.permissions_json,
+            .actor_id = input.event.actor_id,
+            .dedupe_key = input.event.dedupe_key,
+            .causality_json = input.event.causality_json,
+            .payload_json = input.event.payload_json,
+            .status = "applied",
+        });
 
-        const event_now = ids.nowMs();
-        if (input.reserved_event_id != null) {
-            try sql.print(
-                allocator,
-                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM memory_feed_events WHERE id = {d} AND status = 'applying') THEN RAISE EXCEPTION 'feed reservation consumed'; END IF; END $$;\nUPDATE memory_feed_events SET object_type = {s}, object_id = {s}, payload_json = {s}, status = 'applied', applied_at_ms = {d} WHERE id = {d} AND status = 'applying';\n",
-                .{ event_id, try sqlString(allocator, input.event.object_type), try sqlString(allocator, atom_id), try sqlJsonb(allocator, input.event.payload_json), event_now, event_id },
-            );
-        } else {
-            try sql.print(
-                allocator,
-                "INSERT INTO memory_feed_events (id,event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms) VALUES ({d},{s},{s},{s},{s},{s},{s},{s},{s},{s},{s},'applied',{d},{d});\n",
-                .{ event_id, try sqlString(allocator, input.event.event_type), try sqlString(allocator, input.event.operation), try sqlString(allocator, input.event.object_type), try sqlString(allocator, atom_id), try sqlString(allocator, input.event.scope), try sqlJsonb(allocator, input.event.permissions_json), try sqlNullableString(allocator, input.event.actor_id), try sqlNullableString(allocator, input.event.dedupe_key), try sqlJsonb(allocator, input.event.causality_json), try sqlJsonb(allocator, input.event.payload_json), event_now, event_now },
-            );
-        }
-        try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_feed.applied',{s},'memory_feed_event',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, input.event.actor_id), try sqlString(allocator, atom_id), event_now });
-        try sql.appendSlice(allocator, "COMMIT;\n");
-        try self.runSql(sql.items);
-
-        return .{
-            .event_id = event_id,
-            .atom = .{ .id = atom_id, .subject_entity_id = atom_input.subject_entity_id, .predicate = atom_input.predicate, .object = atom_input.object, .text = atom_input.text, .scope = atom_input.scope, .confidence = atom_input.confidence, .status = atom_status, .source_ids_json = atom_input.source_ids_json, .evidence_ranges_json = atom_input.evidence_ranges_json, .created_by = atom_input.created_by, .created_at_ms = atom_now, .valid_from_ms = atom_input.valid_from_ms, .valid_until_ms = atom_input.valid_until_ms, .last_verified_at_ms = null, .owner = atom_input.owner, .permissions_json = atom_input.permissions_json, .tags_json = atom_input.tags_json },
-        };
+        try self.runSql("COMMIT");
+        return .{ .event_id = event_id, .atom = atom };
     }
 
     pub fn applyFeedAgentMemoryAtomic(self: *PostgresStore, allocator: std.mem.Allocator, input: FeedAgentMemoryApplyInput) !FeedAgentMemoryApplyResult {
@@ -10353,7 +10327,9 @@ pub const PostgresStore = struct {
             "WITH updated AS (UPDATE memory_feed_events SET object_type = $1, object_id = $2, payload_json = $3::jsonb, status = 'applied', applied_at_ms = $4::bigint WHERE id = $5::bigint AND status = 'applying' RETURNING id) SELECT count(*)::text FROM updated",
             &.{ object_type, object_id, payload_json, now_text, id_text },
         );
-        return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
+        const changed = (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
+        if (changed) try self.insertAudit(self.allocator, "memory_feed.applied", null, "memory_feed_event", object_id);
+        return changed;
     }
 
     pub fn releaseFeedEventReservation(self: *PostgresStore, id: i64) !bool {
