@@ -11225,11 +11225,14 @@ pub const PostgresStore = struct {
         const candidate_limit = pgSearchCandidateLimit(input.limit, 20, 5000);
         const visible_sql = try pgRecordVisibleSql(allocator, "scope", "permissions_json", input.scopes_json, input.actor_id);
         const status_sql = if (input.include_deprecated) "" else " AND status NOT IN ('rejected','deprecated','superseded')";
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{candidate_limit});
         const inner = if (input.query.len > 0) blk: {
-            const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, "SELECT id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json FROM memory_atoms WHERE predicate <> 'agent.memory' AND ({s}){s} AND search_tsv @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, created_at_ms DESC LIMIT {d}", .{ visible_sql, status_sql, q, q, candidate_limit });
-        } else try std.fmt.allocPrint(allocator, "SELECT id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json FROM memory_atoms WHERE predicate <> 'agent.memory' AND ({s}){s} ORDER BY created_at_ms DESC LIMIT {d}", .{ visible_sql, status_sql, candidate_limit });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+            break :blk try std.fmt.allocPrint(allocator, "SELECT id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json FROM memory_atoms WHERE predicate <> 'agent.memory' AND ({s}){s} AND search_tsv @@ websearch_to_tsquery('simple',$1::text) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',$1::text)) DESC, created_at_ms DESC LIMIT $2::bigint", .{ visible_sql, status_sql });
+        } else try std.fmt.allocPrint(allocator, "SELECT id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json FROM memory_atoms WHERE predicate <> 'agent.memory' AND ({s}){s} ORDER BY created_at_ms DESC LIMIT $1::bigint", .{ visible_sql, status_sql });
+        const parsed = if (input.query.len > 0)
+            try self.queryArrayParamsJson(allocator, inner, &.{ input.query, limit_text })
+        else
+            try self.queryArrayParamsJson(allocator, inner, &.{limit_text});
         defer parsed.deinit();
         if (parsed.value != .array) return;
         for (parsed.value.array.items) |item| {
@@ -11287,11 +11290,14 @@ pub const PostgresStore = struct {
     fn searchPgSources(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
         const candidate_limit = pgSearchCandidateLimit(input.limit, 20, 5000);
         const visible_sql = try pgRecordVisibleSql(allocator, "scope", "permissions_json", input.scopes_json, input.actor_id);
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{candidate_limit});
         const inner = if (input.query.len > 0) blk: {
-            const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, "SELECT id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json FROM sources WHERE ({s}) AND search_tsv @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, imported_at_ms DESC LIMIT {d}", .{ visible_sql, q, q, candidate_limit });
-        } else try std.fmt.allocPrint(allocator, "SELECT id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json FROM sources WHERE ({s}) ORDER BY imported_at_ms DESC LIMIT {d}", .{ visible_sql, candidate_limit });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+            break :blk try std.fmt.allocPrint(allocator, "SELECT id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json FROM sources WHERE ({s}) AND search_tsv @@ websearch_to_tsquery('simple',$1::text) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',$1::text)) DESC, imported_at_ms DESC LIMIT $2::bigint", .{visible_sql});
+        } else try std.fmt.allocPrint(allocator, "SELECT id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json FROM sources WHERE ({s}) ORDER BY imported_at_ms DESC LIMIT $1::bigint", .{visible_sql});
+        const parsed = if (input.query.len > 0)
+            try self.queryArrayParamsJson(allocator, inner, &.{ input.query, limit_text })
+        else
+            try self.queryArrayParamsJson(allocator, inner, &.{limit_text});
         defer parsed.deinit();
         if (parsed.value != .array) return;
         for (parsed.value.array.items) |item| {
@@ -11311,11 +11317,14 @@ pub const PostgresStore = struct {
         const candidate_limit = pgSearchCandidateLimit(input.limit, 20, 5000);
         const visible_sql = try pgRecordVisibleSql(allocator, "scope", "permissions_json", input.scopes_json, input.actor_id);
         const status_sql = if (input.include_deprecated) "" else " AND status NOT IN ('rejected','deprecated','superseded')";
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{candidate_limit});
         const inner = if (input.query.len > 0) blk: {
-            const q = try sqlString(allocator, input.query);
-            break :blk try std.fmt.allocPrint(allocator, "SELECT id,type,title,body,status,owner,space_id,version,created_at_ms,updated_at_ms,last_verified_at_ms,scope,source_ids_json,related_entities_json,permissions_json,fields_json,summary,agent_summary FROM artifacts WHERE ({s}){s} AND search_tsv @@ websearch_to_tsquery('simple',{s}) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',{s})) DESC, updated_at_ms DESC LIMIT {d}", .{ visible_sql, status_sql, q, q, candidate_limit });
-        } else try std.fmt.allocPrint(allocator, "SELECT id,type,title,body,status,owner,space_id,version,created_at_ms,updated_at_ms,last_verified_at_ms,scope,source_ids_json,related_entities_json,permissions_json,fields_json,summary,agent_summary FROM artifacts WHERE ({s}){s} ORDER BY updated_at_ms DESC LIMIT {d}", .{ visible_sql, status_sql, candidate_limit });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+            break :blk try std.fmt.allocPrint(allocator, "SELECT id,type,title,body,status,owner,space_id,version,created_at_ms,updated_at_ms,last_verified_at_ms,scope,source_ids_json,related_entities_json,permissions_json,fields_json,summary,agent_summary FROM artifacts WHERE ({s}){s} AND search_tsv @@ websearch_to_tsquery('simple',$1::text) ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('simple',$1::text)) DESC, updated_at_ms DESC LIMIT $2::bigint", .{ visible_sql, status_sql });
+        } else try std.fmt.allocPrint(allocator, "SELECT id,type,title,body,status,owner,space_id,version,created_at_ms,updated_at_ms,last_verified_at_ms,scope,source_ids_json,related_entities_json,permissions_json,fields_json,summary,agent_summary FROM artifacts WHERE ({s}){s} ORDER BY updated_at_ms DESC LIMIT $1::bigint", .{ visible_sql, status_sql });
+        const parsed = if (input.query.len > 0)
+            try self.queryArrayParamsJson(allocator, inner, &.{ input.query, limit_text })
+        else
+            try self.queryArrayParamsJson(allocator, inner, &.{limit_text});
         defer parsed.deinit();
         if (parsed.value != .array) return;
         for (parsed.value.array.items) |item| {
