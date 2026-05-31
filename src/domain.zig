@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = @import("json_util.zig");
+const bootstrap_prompts = @import("bootstrap_prompts.zig");
 
 pub const runtime_command_role = "__runtime_command__";
 
@@ -421,7 +422,17 @@ pub fn isDefaultVisibleStatus(status: []const u8) bool {
         std.mem.eql(u8, status, "superseded"));
 }
 
-pub const prompt_bootstrap_key_prefix = "__bootstrap.prompt.";
+pub const prompt_bootstrap_key_prefix = bootstrap_prompts.key_prefix;
+pub const PromptBootstrapDoc = bootstrap_prompts.Doc;
+pub const prompt_bootstrap_docs = bootstrap_prompts.docs;
+
+pub fn promptBootstrapMemoryKey(filename: []const u8) ?[]const u8 {
+    return bootstrap_prompts.memoryKey(filename);
+}
+
+pub fn usesWorkspaceBootstrapFiles(memory_backend: ?[]const u8) bool {
+    return bootstrap_prompts.usesWorkspaceFiles(memory_backend);
+}
 
 pub fn isInternalMemoryKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "autosave_user_") or

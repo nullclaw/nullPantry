@@ -25,6 +25,7 @@ const compat = @import("compat.zig");
 const graph_mod = @import("graph.zig");
 const agent_memory_reducer = @import("agent_memory_reducer.zig");
 const agent_memory_runtime = @import("agent_memory_runtime.zig");
+const bootstrap_prompts = @import("bootstrap_prompts.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -60,6 +61,7 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
     const seg1 = decodeSegment(ctx.allocator, json.segment(path, 1)) catch return serverError(ctx);
     const seg2 = decodeSegment(ctx.allocator, json.segment(path, 2)) catch return serverError(ctx);
     const seg3 = decodeSegment(ctx.allocator, json.segment(path, 3)) catch return serverError(ctx);
+    const seg4 = decodeSegment(ctx.allocator, json.segment(path, 4)) catch return serverError(ctx);
 
     const is_get = std.mem.eql(u8, method, "GET");
     const is_post = std.mem.eql(u8, method, "POST");
@@ -105,6 +107,8 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         if (is_post and eql(seg2, "import-directory")) return markdownImportDirectory(ctx, body);
         if (is_post and eql(seg2, "export")) return markdownExport(ctx, body);
         if (is_post and eql(seg2, "export-directory")) return markdownExportDirectory(ctx, body);
+    } else if (eql(seg1, "bootstrap") and eql(seg2, "prompts")) {
+        return handleBootstrapPrompts(ctx, method, parsed.query, seg3, seg4, body);
     } else if (eql(seg1, "artifact-types") and is_get) {
         return artifactTypes(ctx);
     } else if (eql(seg1, "spaces")) {
@@ -138,6 +142,8 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         if (is_delete and seg2 != null and seg3 == null) return agentMemoryDelete(ctx, seg2.?, parsed.query);
     } else if (eql(seg1, "agent-sessions")) {
         return handleAgentSessions(ctx, method, parsed.query, seg2, seg3, body);
+    } else if (eql(seg1, "agent")) {
+        return handleNullClawAgentAdapter(ctx, method, parsed.query, seg2, seg3, seg4, body);
     } else if (eql(seg1, "sources")) {
         if (is_post and seg2 == null) return createSource(ctx, body);
         if (is_get and seg2 != null and seg3 == null) return getSource(ctx, seg2.?);
@@ -333,6 +339,441 @@ fn handleAgentSessions(ctx: *Context, method: []const u8, query: []const u8, seg
     }
 
     return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
+}
+
+fn handleNullClawAgentAdapter(ctx: *Context, method: []const u8, query: []const u8, seg2: ?[]u8, seg3: ?[]u8, seg4: ?[]u8, body: []const u8) HttpResponse {
+    const is_get = std.mem.eql(u8, method, "GET");
+    const is_post = std.mem.eql(u8, method, "POST");
+    const is_put = std.mem.eql(u8, method, "PUT");
+    const is_delete = std.mem.eql(u8, method, "DELETE");
+
+    if (is_get and eql(seg2, "health") and seg3 == null) {
+        return ok(ctx, "{\"ok\":true,\"service\":\"nullpantry\",\"adapter\":\"nullclaw-api-memory\"}");
+    }
+
+    if (eql(seg2, "memories")) {
+        if (is_post and eql(seg3, "search") and seg4 == null) return nullClawAgentMemorySearch(ctx, body);
+        if ((is_put or is_post) and seg3 != null and seg4 == null) return nullClawAgentMemoryStore(ctx, seg3.?, body);
+        if (is_get and seg3 == null) return nullClawAgentMemoryList(ctx, query);
+        if (is_get and eql(seg3, "count") and seg4 == null) return agentMemoryCount(ctx, query);
+        if (is_get and seg3 != null and seg4 == null) return nullClawAgentMemoryGet(ctx, seg3.?, query);
+        if (is_delete and seg3 != null and seg4 == null) return agentMemoryDelete(ctx, seg3.?, query);
+    }
+
+    if (eql(seg2, "sessions")) {
+        if (eql(seg3, "auto-saved") and seg4 == null) return handleAgentSessions(ctx, method, query, seg3, null, body);
+        if (seg3 != null and seg4 != null) return handleAgentSessions(ctx, method, query, seg3, seg4, body);
+        if (seg3 == null and is_get) return handleAgentSessions(ctx, method, query, null, null, body);
+    }
+
+    if (eql(seg2, "history")) {
+        if (is_get and seg3 == null) return handleAgentSessions(ctx, method, query, null, null, body);
+        if (is_get and seg3 != null and seg4 == null) return handleAgentSessions(ctx, method, query, seg3, null, body);
+    }
+
+    return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
+}
+
+fn handleBootstrapPrompts(ctx: *Context, method: []const u8, query: []const u8, seg3: ?[]u8, seg4: ?[]u8, body: []const u8) HttpResponse {
+    const is_get = std.mem.eql(u8, method, "GET");
+    const is_put = std.mem.eql(u8, method, "PUT");
+    const is_post = std.mem.eql(u8, method, "POST");
+    const is_delete = std.mem.eql(u8, method, "DELETE");
+
+    if (seg3 == null and is_get) return bootstrapPromptsList(ctx, query);
+    if (eql(seg3, "fingerprint") and seg4 == null and is_get) return bootstrapPromptsFingerprint(ctx, query);
+    if (eql(seg3, "import-directory") and seg4 == null and is_post) return bootstrapPromptsImportDirectory(ctx, body);
+    if (seg3 != null and eql(seg4, "exists") and is_get) return bootstrapPromptExists(ctx, seg3.?, query);
+    if (seg3 != null and seg4 == null and is_get) return bootstrapPromptGet(ctx, seg3.?, query);
+    if (seg3 != null and seg4 == null and (is_put or is_post)) return bootstrapPromptStore(ctx, seg3.?, body);
+    if (seg3 != null and seg4 == null and is_delete) return bootstrapPromptDelete(ctx, seg3.?, query);
+
+    return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
+}
+
+fn bootstrapPromptsList(ctx: *Context, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
+    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"prefix\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, bootstrap_prompts.key_prefix) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"prompts\":[") catch return serverError(ctx);
+    for (bootstrap_prompts.docs, 0..) |doc, i| {
+        if (i > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
+        const entry = loadAgentMemoryForRequest(ctx, doc.memory_key, null, requested_scope, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        out.appendSlice(ctx.allocator, "{\"filename\":") catch return serverError(ctx);
+        json.appendString(&out, ctx.allocator, doc.filename) catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, ",\"memory_key\":") catch return serverError(ctx);
+        json.appendString(&out, ctx.allocator, doc.memory_key) catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, ",\"exists\":") catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, if (entry != null) "true" else "false") catch return serverError(ctx);
+        if (entry) |value| {
+            out.appendSlice(ctx.allocator, ",\"content_bytes\":") catch return serverError(ctx);
+            out.print(ctx.allocator, "{d}", .{value.content.len}) catch return serverError(ctx);
+            if (value.store.len > 0) {
+                out.appendSlice(ctx.allocator, ",\"store\":") catch return serverError(ctx);
+                json.appendString(&out, ctx.allocator, value.store) catch return serverError(ctx);
+            }
+        }
+        out.append(ctx.allocator, '}') catch return serverError(ctx);
+    }
+    out.appendSlice(ctx.allocator, "]}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn bootstrapPromptsFingerprint(ctx: *Context, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
+    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    var entries = ctx.allocator.alloc(?[]const u8, bootstrap_prompts.docs.len) catch return serverError(ctx);
+    @memset(entries, null);
+    for (bootstrap_prompts.docs, 0..) |doc, i| {
+        const entry = loadAgentMemoryForRequest(ctx, doc.memory_key, null, requested_scope, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        if (entry) |value| {
+            entries[i] = value.content;
+        }
+    }
+    const fp = bootstrap_prompts.fingerprint(entries);
+    const body = std.fmt.allocPrint(ctx.allocator, "{{\"fingerprint\":{d},\"fingerprint_hex\":\"{x}\",\"present\":{d},\"total\":{d}}}", .{ fp.value, fp.value, fp.present, fp.total }) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = body };
+}
+
+fn bootstrapPromptGet(ctx: *Context, filename: []const u8, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const key = bootstrap_prompts.memoryKey(filename) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Bootstrap prompt is not registered");
+    const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
+    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const max_bytes = if (json.queryParam(query, "max_bytes")) |value| parseLimit(value, 0) else 0;
+    const entry = loadAgentMemoryForRequest(ctx, key, null, requested_scope, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    if (entry == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Bootstrap prompt not found");
+    return bootstrapPromptResponse(ctx, filename, key, entry.?, max_bytes);
+}
+
+fn bootstrapPromptExists(ctx: *Context, filename: []const u8, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const key = bootstrap_prompts.memoryKey(filename) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Bootstrap prompt is not registered");
+    const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
+    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const entry = loadAgentMemoryForRequest(ctx, key, null, requested_scope, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"filename\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, filename) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"memory_key\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, key) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"exists\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (entry != null) "true" else "false") catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn bootstrapPromptStore(ctx: *Context, filename: []const u8, body: []const u8) HttpResponse {
+    const key = bootstrap_prompts.memoryKey(filename) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Bootstrap prompt is not registered");
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const stored = agentMemoryStoreParsed(ctx, key, parsed.value.object);
+    if (!std.mem.eql(u8, stored.status, "200 OK")) return stored;
+    const requested_scope = json.nullableStringField(parsed.value.object, "scope");
+    const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, parsed.value.object) catch return serverError(ctx);
+    const entry = loadAgentMemoryForRequest(ctx, key, null, requested_scope, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    if (entry == null) return ok(ctx, "{\"ok\":true}");
+    return bootstrapPromptResponse(ctx, filename, key, entry.?, 0);
+}
+
+fn bootstrapPromptDelete(ctx: *Context, filename: []const u8, query: []const u8) HttpResponse {
+    const key = bootstrap_prompts.memoryKey(filename) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Bootstrap prompt is not registered");
+    return agentMemoryDelete(ctx, key, query);
+}
+
+fn bootstrapPromptsImportDirectory(ctx: *Context, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const root_path = json.stringField(obj, "path") orelse json.stringField(obj, "directory") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing path");
+    if (root_path.len == 0) return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing path");
+    const max_file_bytes = positiveBounded(json.intField(obj, "max_file_bytes"), 10 * 1024 * 1024, 100 * 1024 * 1024);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"imported\":[") catch return serverError(ctx);
+    var imported: usize = 0;
+    for (bootstrap_prompts.docs) |doc| {
+        const file_path = std.fs.path.join(ctx.allocator, &.{ root_path, doc.filename }) catch return serverError(ctx);
+        const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), file_path, ctx.allocator, .limited(max_file_bytes)) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            error.StreamTooLong => return json.errorResponse(ctx.allocator, 413, "payload_too_large", "Bootstrap prompt file exceeds max_file_bytes"),
+            else => return serverError(ctx),
+        };
+        const store_body = bootstrapPromptStoreBody(ctx, obj, content) catch return serverError(ctx);
+        const stored = agentMemoryStoreKey(ctx, doc.memory_key, store_body);
+        if (!std.mem.eql(u8, stored.status, "200 OK")) return stored;
+        if (imported > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, "{\"filename\":") catch return serverError(ctx);
+        json.appendString(&out, ctx.allocator, doc.filename) catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, ",\"memory_key\":") catch return serverError(ctx);
+        json.appendString(&out, ctx.allocator, doc.memory_key) catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, ",\"content_bytes\":") catch return serverError(ctx);
+        out.print(ctx.allocator, "{d}", .{content.len}) catch return serverError(ctx);
+        out.append(ctx.allocator, '}') catch return serverError(ctx);
+        imported += 1;
+    }
+    out.print(ctx.allocator, "],\"imported_count\":{d}}}", .{imported}) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn bootstrapPromptStoreBody(ctx: *Context, obj: std.json.ObjectMap, content: []const u8) ![]const u8 {
+    return bootstrap_prompts.buildStoreBody(ctx.allocator, content, .{
+        .scope = json.nullableStringField(obj, "scope"),
+        .permissions_json = try rawField(ctx.allocator, obj, "permissions", "[]"),
+        .storage = json.stringField(obj, "storage"),
+        .store = json.stringField(obj, "store"),
+        .target_store = json.stringField(obj, "target_store"),
+        .stores_json = if (obj.get("stores") != null) try rawField(ctx.allocator, obj, "stores", "[]") else null,
+    });
+}
+
+fn bootstrapPromptResponse(ctx: *Context, filename: []const u8, key: []const u8, entry: domain.AgentMemory, max_bytes: usize) HttpResponse {
+    const excerpt = bootstrap_prompts.excerpt(ctx.allocator, entry.content, max_bytes) catch return serverError(ctx);
+    const content = excerpt.content;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"prompt\":{\"filename\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, filename) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"memory_key\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, key) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"content\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, content) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"content_bytes\":") catch return serverError(ctx);
+    out.print(ctx.allocator, "{d}", .{entry.content.len}) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"truncated\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (excerpt.truncated) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"memory\":") catch return serverError(ctx);
+    if (max_bytes > 0) {
+        appendBootstrapPromptMemoryJson(ctx, &out, entry, content) catch return serverError(ctx);
+    } else {
+        entry.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+    }
+    out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn appendBootstrapPromptMemoryJson(ctx: *Context, out: *std.ArrayListUnmanaged(u8), entry: domain.AgentMemory, content: []const u8) !void {
+    try out.appendSlice(ctx.allocator, "{\"id\":");
+    try json.appendString(out, ctx.allocator, entry.id);
+    try out.appendSlice(ctx.allocator, ",\"key\":");
+    try json.appendString(out, ctx.allocator, entry.key);
+    try out.appendSlice(ctx.allocator, ",\"content\":");
+    try json.appendString(out, ctx.allocator, content);
+    try out.appendSlice(ctx.allocator, ",\"category\":");
+    try json.appendString(out, ctx.allocator, entry.category);
+    try out.appendSlice(ctx.allocator, ",\"timestamp\":");
+    try json.appendString(out, ctx.allocator, entry.timestamp);
+    try out.appendSlice(ctx.allocator, ",\"session_id\":");
+    try json.appendNullableString(out, ctx.allocator, entry.session_id);
+    try out.appendSlice(ctx.allocator, ",\"actor_id\":");
+    try json.appendString(out, ctx.allocator, entry.actor_id);
+    try out.appendSlice(ctx.allocator, ",\"owner_id\":");
+    try json.appendString(out, ctx.allocator, entry.actor_id);
+    try out.appendSlice(ctx.allocator, ",\"created_by_actor_id\":");
+    try json.appendString(out, ctx.allocator, if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id);
+    try out.appendSlice(ctx.allocator, ",\"scope\":");
+    try json.appendString(out, ctx.allocator, entry.scope);
+    try out.appendSlice(ctx.allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(out, ctx.allocator, entry.permissions_json, "[]");
+    if (entry.store.len > 0) {
+        try out.appendSlice(ctx.allocator, ",\"store\":");
+        try json.appendString(out, ctx.allocator, entry.store);
+        try out.appendSlice(ctx.allocator, ",\"storage\":");
+        try json.appendString(out, ctx.allocator, entry.store);
+    }
+    try out.appendSlice(ctx.allocator, ",\"score\":");
+    if (entry.score) |score| try out.print(ctx.allocator, "{d}", .{score}) else try out.appendSlice(ctx.allocator, "null");
+    try out.append(ctx.allocator, '}');
+}
+
+fn nullClawAgentMemoryStore(ctx: *Context, key: []const u8, body: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const stored = agentMemoryStoreParsed(ctx, key, obj);
+    if (!std.mem.eql(u8, stored.status, "200 OK")) return stored;
+
+    const session_id = json.nullableStringField(obj, "session_id");
+    const requested_scope = json.nullableStringField(obj, "scope");
+    const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    const entry = loadAgentMemoryForRequest(ctx, key, session_id, requested_scope, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    if (entry == null) return ok(ctx, "{\"ok\":true}");
+    return nullClawAgentMemoryEntryResponse(ctx, entry.?);
+}
+
+fn nullClawAgentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
+    if (session_id) |sid| {
+        if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
+    }
+    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const entry = loadAgentMemoryForRequest(ctx, key, session_id, requested_scope, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    if (entry == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
+    return nullClawAgentMemoryEntryResponse(ctx, entry.?);
+}
+
+fn nullClawAgentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const category = json.queryParamDecoded(ctx.allocator, query, "category") catch return serverError(ctx);
+    const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
+    if (session_id) |sid| {
+        if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
+    }
+    const include_global = queryBool(query, "include_global", false);
+    const include_internal = queryBool(query, "include_internal", false);
+    const limit = parseLimit(json.queryParam(query, "limit"), std.math.maxInt(usize));
+    const offset = parseLimit(json.queryParam(query, "offset"), 0);
+    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const exact_owner = if (requested_scope) |scope| access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx) else null;
+    defer if (exact_owner) |owner| ctx.allocator.free(owner);
+    var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+    const primary = if (exact_owner) |owner| ctx.store.agentMemoryListRouted(ctx.allocator, category, session_id, owner, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    } else ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, session_id, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    appendAgentMemoryEntries(ctx.allocator, &entries, primary) catch return serverError(ctx);
+    if (include_global and session_id != null) {
+        const global = if (exact_owner) |owner| ctx.store.agentMemoryListRouted(ctx.allocator, category, null, owner, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        } else ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, null, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        appendMissingAgentMemoryEntries(ctx.allocator, &entries, global) catch return serverError(ctx);
+    }
+    dedupeAgentMemoryEntries(ctx.allocator, &entries);
+    return nullClawAgentMemoryEntriesResponse(ctx, entries.items, include_internal, limit, offset);
+}
+
+fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const session_id = json.nullableStringField(obj, "session_id");
+    if (session_id) |sid| {
+        if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
+    }
+    const query = json.stringField(obj, "query") orelse json.stringField(obj, "q") orelse "";
+    const scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx);
+    const limit = positiveLimit(json.intField(obj, "limit"), 10);
+    const include_global = json.boolField(obj, "include_global") orelse false;
+    const include_internal = json.boolField(obj, "include_internal") orelse false;
+    const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+    const primary = ctx.store.agentMemorySearchRouted(ctx.allocator, query, limit, session_id, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    appendAgentMemoryEntries(ctx.allocator, &entries, primary) catch return serverError(ctx);
+    if (include_global and session_id != null) {
+        const global = ctx.store.agentMemorySearchRouted(ctx.allocator, query, limit, null, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        appendMissingAgentMemoryEntries(ctx.allocator, &entries, global) catch return serverError(ctx);
+    }
+    dedupeAgentMemoryEntries(ctx.allocator, &entries);
+    return nullClawAgentMemoryEntriesResponse(ctx, entries.items, include_internal, limit, 0);
+}
+
+fn loadAgentMemoryForRequest(ctx: *Context, key: []const u8, session_id: ?[]const u8, requested_scope: ?[]const u8, storage_target: store_mod.AgentMemoryStorageRoute) !?domain.AgentMemory {
+    const entry = if (requested_scope) |scope| blk: {
+        const owner_actor_id = try access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope);
+        defer ctx.allocator.free(owner_actor_id);
+        break :blk try ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, storage_target);
+    } else try ctx.store.agentMemoryGetVisibleRouted(ctx.allocator, key, session_id, ctx.actor_id, ctx.actor_scopes_json, storage_target);
+    if (entry) |value| {
+        if (!agentMemoryEntryVisible(ctx, value)) {
+            var cleanup = value;
+            agent_memory_runtime.freeAgentMemory(ctx.allocator, &cleanup);
+            return null;
+        }
+    }
+    return entry;
+}
+
+fn nullClawAgentMemoryEntryResponse(ctx: *Context, entry: domain.AgentMemory) HttpResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"entry\":") catch return serverError(ctx);
+    appendNullClawAgentMemoryEntry(ctx, &out, entry) catch return serverError(ctx);
+    out.append(ctx.allocator, '}') catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn nullClawAgentMemoryEntriesResponse(ctx: *Context, entries: []domain.AgentMemory, include_internal: bool, limit: usize, offset: usize) HttpResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"entries\":[") catch return serverError(ctx);
+    var visible_seen: usize = 0;
+    var written: usize = 0;
+    for (entries) |entry| {
+        if (!agentMemoryEntryVisible(ctx, entry)) continue;
+        if (!include_internal and domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+        if (visible_seen < offset) {
+            visible_seen += 1;
+            continue;
+        }
+        visible_seen += 1;
+        if (written >= limit) continue;
+        if (written > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
+        appendNullClawAgentMemoryEntry(ctx, &out, entry) catch return serverError(ctx);
+        written += 1;
+    }
+    out.appendSlice(ctx.allocator, "]}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn appendNullClawAgentMemoryEntry(ctx: *Context, out: *std.ArrayListUnmanaged(u8), entry: domain.AgentMemory) !void {
+    try out.appendSlice(ctx.allocator, "{\"id\":");
+    try json.appendString(out, ctx.allocator, entry.id);
+    try out.appendSlice(ctx.allocator, ",\"key\":");
+    try json.appendString(out, ctx.allocator, entry.key);
+    try out.appendSlice(ctx.allocator, ",\"content\":");
+    try json.appendString(out, ctx.allocator, entry.content);
+    try out.appendSlice(ctx.allocator, ",\"category\":");
+    try json.appendString(out, ctx.allocator, entry.category);
+    try out.appendSlice(ctx.allocator, ",\"timestamp\":");
+    try json.appendString(out, ctx.allocator, entry.timestamp);
+    try out.appendSlice(ctx.allocator, ",\"session_id\":");
+    try json.appendNullableString(out, ctx.allocator, entry.session_id);
+    try out.appendSlice(ctx.allocator, ",\"score\":");
+    if (entry.score) |score| try out.print(ctx.allocator, "{d}", .{score}) else try out.appendSlice(ctx.allocator, "null");
+    if (entry.store.len > 0) {
+        try out.appendSlice(ctx.allocator, ",\"store\":");
+        try json.appendString(out, ctx.allocator, entry.store);
+    }
+    try out.append(ctx.allocator, '}');
 }
 
 fn agentSessionReadAllowed(ctx: *Context, session_id: []const u8) bool {
@@ -1216,7 +1657,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","lifecycle_migrate","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","nullclaw_api_memory_adapter","bootstrap_prompts","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","lifecycle_migrate","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -2161,7 +2602,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -8548,6 +8989,179 @@ test "api native agent memory is actor isolated" {
     const session_get = handleRequest(&ctx, "GET", "/v1/agent-memory/session.pref?session_id=sess_api", "", raw_a);
     try std.testing.expectEqualStrings("200 OK", session_get.status);
     try std.testing.expect(std.mem.indexOf(u8, session_get.body, "Agent A session API value") != null);
+}
+
+test "api nullclaw agent adapter matches current nullclaw memory engine contract" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const principals =
+        \\{"agent-a":{"actor_id":"agent:a","scopes":["session:*","write:session:*"],"capabilities":["read","write","delete"]},"agent-b":{"actor_id":"agent:b","scopes":["session:*","write:session:*"],"capabilities":["read","write","delete"]}}
+    ;
+    var ctx = Context{ .allocator = alloc, .store = &store, .token_principals_json = principals };
+
+    const raw_a = "PUT /v1/agent/memories/pref.lang HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}";
+    const raw_b = "PUT /v1/agent/memories/pref.lang HTTP/1.1\r\nAuthorization: Bearer agent-b\r\n\r\n{}";
+    const put_a = handleRequest(&ctx, "PUT", "/v1/agent/memories/pref.lang", "{\"content\":\"Agent A adapter value\",\"category\":\"core\",\"session_id\":null}", raw_a);
+    try std.testing.expectEqualStrings("200 OK", put_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, put_a.body, "\"entry\"") != null);
+    const put_b = handleRequest(&ctx, "PUT", "/v1/agent/memories/pref.lang", "{\"content\":\"Agent B adapter value\",\"category\":\"core\",\"session_id\":null}", raw_b);
+    try std.testing.expectEqualStrings("200 OK", put_b.status);
+
+    const get_a = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.lang", "", "GET /v1/agent/memories/pref.lang HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", get_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_a.body, "\"entry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_a.body, "\"key\":\"pref.lang\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_a.body, "Agent A adapter value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_a.body, "Agent B adapter value") == null);
+
+    const list_a = handleRequest(&ctx, "GET", "/v1/agent/memories?category=core", "", "GET /v1/agent/memories?category=core HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", list_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, list_a.body, "\"entries\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_a.body, "Agent A adapter value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_a.body, "Agent B adapter value") == null);
+
+    const search_a = handleRequest(&ctx, "POST", "/v1/agent/memories/search", "{\"query\":\"Agent B\",\"limit\":10}", "POST /v1/agent/memories/search HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", search_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_a.body, "\"entries\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_a.body, "Agent B adapter value") == null);
+
+    const count_a = handleRequest(&ctx, "GET", "/v1/agent/memories/count", "", "GET /v1/agent/memories/count HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", count_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, count_a.body, "\"count\":1") != null);
+
+    const deleted = handleRequest(&ctx, "DELETE", "/v1/agent/memories/pref.lang", "", "DELETE /v1/agent/memories/pref.lang HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", deleted.status);
+    const missing = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.lang", "", "GET /v1/agent/memories/pref.lang HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("404 Not Found", missing.status);
+}
+
+test "api nullclaw agent adapter matches current nullclaw session engine contract" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const principals =
+        \\{"agent-a":{"actor_id":"agent:a","scopes":["session:*","write:session:*"],"capabilities":["read","write","delete"]}}
+    ;
+    var ctx = Context{ .allocator = alloc, .store = &store, .token_principals_json = principals };
+    const raw = "POST /v1/agent/sessions/sid-1/messages HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}";
+
+    const adapter_health = handleRequest(&ctx, "GET", "/v1/agent/health", "", "GET /v1/agent/health HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", adapter_health.status);
+    try std.testing.expect(std.mem.indexOf(u8, adapter_health.body, "nullclaw-api-memory") != null);
+
+    const save_msg = handleRequest(&ctx, "POST", "/v1/agent/sessions/sid-1/messages", "{\"role\":\"user\",\"content\":\"adapter session message\"}", raw);
+    try std.testing.expectEqualStrings("200 OK", save_msg.status);
+    const messages = handleRequest(&ctx, "GET", "/v1/agent/sessions/sid-1/messages", "", "GET /v1/agent/sessions/sid-1/messages HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", messages.status);
+    try std.testing.expect(std.mem.indexOf(u8, messages.body, "\"messages\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages.body, "adapter session message") != null);
+
+    const save_usage = handleRequest(&ctx, "PUT", "/v1/agent/sessions/sid-1/usage", "{\"total_tokens\":123}", "PUT /v1/agent/sessions/sid-1/usage HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", save_usage.status);
+    const usage = handleRequest(&ctx, "GET", "/v1/agent/sessions/sid-1/usage", "", "GET /v1/agent/sessions/sid-1/usage HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", usage.status);
+    try std.testing.expect(std.mem.indexOf(u8, usage.body, "\"total_tokens\":123") != null);
+
+    const history = handleRequest(&ctx, "GET", "/v1/agent/history?limit=10&offset=0", "", "GET /v1/agent/history?limit=10&offset=0 HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", history.status);
+    try std.testing.expect(std.mem.indexOf(u8, history.body, "\"sessions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history.body, "\"session_id\":\"sid-1\"") != null);
+
+    const history_show = handleRequest(&ctx, "GET", "/v1/agent/history/sid-1?limit=10&offset=0", "", "GET /v1/agent/history/sid-1?limit=10&offset=0 HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", history_show.status);
+    try std.testing.expect(std.mem.indexOf(u8, history_show.body, "\"messages\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history_show.body, "\"created_at\"") != null);
+
+    const clear_messages = handleRequest(&ctx, "DELETE", "/v1/agent/sessions/sid-1/messages", "", "DELETE /v1/agent/sessions/sid-1/messages HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", clear_messages.status);
+    const clear_usage = handleRequest(&ctx, "DELETE", "/v1/agent/sessions/sid-1/usage", "", "DELETE /v1/agent/sessions/sid-1/usage HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", clear_usage.status);
+}
+
+test "api bootstrap prompt memory stores known nullclaw prompt documents" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Context{ .allocator = alloc, .store = &store };
+
+    try std.testing.expect(domain.promptBootstrapMemoryKey("AGENTS.md") != null);
+    try std.testing.expect(domain.promptBootstrapMemoryKey("README.md") == null);
+    try std.testing.expect(!domain.usesWorkspaceBootstrapFiles("redis"));
+    try std.testing.expect(domain.usesWorkspaceBootstrapFiles("markdown"));
+
+    const listed_empty = handleRequest(&ctx, "GET", "/v1/bootstrap/prompts", "", "");
+    try std.testing.expectEqualStrings("200 OK", listed_empty.status);
+    try std.testing.expect(std.mem.indexOf(u8, listed_empty.body, "\"filename\":\"AGENTS.md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed_empty.body, "\"exists\":false") != null);
+
+    const put = handleRequest(&ctx, "PUT", "/v1/bootstrap/prompts/AGENTS.md", "{\"content\":\"Agent bootstrap instructions\"}", "");
+    try std.testing.expectEqualStrings("200 OK", put.status);
+    try std.testing.expect(std.mem.indexOf(u8, put.body, "\"memory_key\":\"__bootstrap.prompt.AGENTS.md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, put.body, "Agent bootstrap instructions") != null);
+
+    const get = handleRequest(&ctx, "GET", "/v1/bootstrap/prompts/AGENTS.md", "", "");
+    try std.testing.expectEqualStrings("200 OK", get.status);
+    try std.testing.expect(std.mem.indexOf(u8, get.body, "\"prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get.body, "Agent bootstrap instructions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get.body, "\"truncated\":false") != null);
+
+    const exists = handleRequest(&ctx, "GET", "/v1/bootstrap/prompts/AGENTS.md/exists", "", "");
+    try std.testing.expectEqualStrings("200 OK", exists.status);
+    try std.testing.expect(std.mem.indexOf(u8, exists.body, "\"exists\":true") != null);
+
+    const excerpt = handleRequest(&ctx, "GET", "/v1/bootstrap/prompts/AGENTS.md?max_bytes=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", excerpt.status);
+    try std.testing.expect(std.mem.indexOf(u8, excerpt.body, "\"truncated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, excerpt.body, "Agent bootstrap instructions") == null);
+
+    const fingerprint = handleRequest(&ctx, "GET", "/v1/bootstrap/prompts/fingerprint", "", "");
+    try std.testing.expectEqualStrings("200 OK", fingerprint.status);
+    try std.testing.expect(std.mem.indexOf(u8, fingerprint.body, "\"present\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fingerprint.body, "\"total\":9") != null);
+
+    const adapter_get = handleRequest(&ctx, "GET", "/v1/agent/memories/__bootstrap.prompt.AGENTS.md", "", "");
+    try std.testing.expectEqualStrings("200 OK", adapter_get.status);
+    try std.testing.expect(std.mem.indexOf(u8, adapter_get.body, "\"entry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, adapter_get.body, "Agent bootstrap instructions") != null);
+
+    const missing = handleRequest(&ctx, "GET", "/v1/bootstrap/prompts/README.md", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", missing.status);
+}
+
+test "api bootstrap prompt import-directory hydrates workspace bootstrap files" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Context{ .allocator = alloc, .store = &store };
+
+    const tmp_path = "zig-cache/tmp/nullpantry-bootstrap-test";
+    std.Io.Dir.cwd().deleteTree(compat.io(), tmp_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.io(), tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.io(), tmp_path) catch {};
+    const agents_path = try std.fs.path.join(alloc, &.{ tmp_path, "AGENTS.md" });
+    const memory_path = try std.fs.path.join(alloc, &.{ tmp_path, "MEMORY.md" });
+    try std.Io.Dir.cwd().writeFile(compat.io(), .{ .sub_path = agents_path, .data = "Workspace agents prompt" });
+    try std.Io.Dir.cwd().writeFile(compat.io(), .{ .sub_path = memory_path, .data = "Workspace memory prompt" });
+
+    const import_body = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\",\"scope\":\"team:bootstrap\",\"permissions\":[\"team:bootstrap\"]}}", .{tmp_path});
+    const imported = handleRequest(&ctx, "POST", "/v1/bootstrap/prompts/import-directory", import_body, "");
+    try std.testing.expectEqualStrings("200 OK", imported.status);
+    try std.testing.expect(std.mem.indexOf(u8, imported.body, "\"imported_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, imported.body, "\"filename\":\"AGENTS.md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, imported.body, "\"filename\":\"MEMORY.md\"") != null);
+
+    const get_shared = handleRequest(&ctx, "GET", "/v1/bootstrap/prompts/MEMORY.md?scope=team:bootstrap", "", "");
+    try std.testing.expectEqualStrings("200 OK", get_shared.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_shared.body, "Workspace memory prompt") != null);
 }
 
 test "api native agent memory list paginates past native prefilter window" {
