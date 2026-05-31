@@ -3858,7 +3858,13 @@ fn patchMemoryAtom(ctx: *Context, id: []const u8, body: []const u8) HttpResponse
 fn statusAction(ctx: *Context, body: []const u8, status: []const u8, verified: bool, response_key: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
-    const id = json.stringField(parsed.value.object, "id") orelse json.stringField(parsed.value.object, "memory_atom_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing id");
+    const obj = parsed.value.object;
+    if (json.stringField(obj, "object_type")) |object_type| {
+        if (std.mem.eql(u8, object_type, "agent_memory")) {
+            return statusActionAgentMemory(ctx, obj, body, status, response_key);
+        }
+    }
+    const id = json.stringField(obj, "id") orelse json.stringField(obj, "memory_atom_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing id");
     if (!canChangeMemoryStatus(ctx, id, status)) return json.errorResponse(ctx.allocator, 404, "not_found", "Memory atom not found");
     const changed = ctx.store.patchMemoryAtomStatusActor(id, status, verified, ctx.actor_id) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -3866,6 +3872,62 @@ fn statusAction(ctx: *Context, body: []const u8, status: []const u8, verified: b
     json.appendString(&out, ctx.allocator, id) catch return serverError(ctx);
     out.append(ctx.allocator, '}') catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn statusActionAgentMemory(ctx: *Context, obj: std.json.ObjectMap, body: []const u8, status: []const u8, response_key: []const u8) HttpResponse {
+    const operation = agentMemoryLifecycleOperationForStatus(status);
+    const object_id = json.stringField(obj, "object_id") orelse json.stringField(obj, "key") orelse json.stringField(obj, "id");
+    const input = buildAppliedAgentMemoryLifecycleInput(ctx, operation, body, object_id, ctx.actor_id, .{}) catch |err| switch (err) {
+        error.Forbidden => return forbidden(ctx),
+        error.NotFound => return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory target not found"),
+        error.InternalAgentMemory => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be changed through lifecycle endpoints"),
+        error.MissingKey, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Agent memory lifecycle payload must include key/object_id"),
+        else => return serverError(ctx),
+    };
+    const changed = ctx.store.patchAgentMemoryStatusRouted(ctx.allocator, input.key, input.session_id, input.owner_actor_id, input.status, ctx.actor_id, input.route) catch return serverError(ctx);
+    if (!changed) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory target not found");
+
+    const payload_json = agentMemoryLifecyclePayloadJson(ctx, input) catch return serverError(ctx);
+    const event_type = std.fmt.allocPrint(ctx.allocator, "agent_memory.{s}", .{operation}) catch return serverError(ctx);
+    const event_id = applyOrAppendFeedEventRecord(ctx, obj, event_type, operation, "agent_memory", input.key, input.scope, input.permissions_json, ctx.actor_id, "{}", payload_json) catch |err| switch (err) {
+        error.FeedConflict => return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying"),
+        error.FeedDedupeMismatch => return feedDedupeConflict(ctx),
+        error.Forbidden => return forbidden(ctx),
+        else => return serverError(ctx),
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.print(ctx.allocator, "{{\"{s}\":true,\"object_type\":\"agent_memory\",\"key\":", .{response_key}) catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, input.key) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"status\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, input.status) catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"event_id\":{d}}}", .{event_id}) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn agentMemoryLifecycleOperationForStatus(status: []const u8) []const u8 {
+    if (std.mem.eql(u8, status, "verified")) return "verify";
+    if (std.mem.eql(u8, status, "stale")) return "mark_stale";
+    if (std.mem.eql(u8, status, "superseded")) return "supersede";
+    if (std.mem.eql(u8, status, "deprecated")) return "forget";
+    return "verify";
+}
+
+fn agentMemoryLifecyclePayloadJson(ctx: *Context, input: AgentMemoryLifecycleApplyInput) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    try out.append(ctx.allocator, '{');
+    try appendJsonStringField(ctx.allocator, &out, "key", input.key, true);
+    try out.appendSlice(ctx.allocator, ",\"session_id\":");
+    try json.appendNullableString(&out, ctx.allocator, input.session_id);
+    try appendJsonStringField(ctx.allocator, &out, "scope", input.scope, false);
+    try out.appendSlice(ctx.allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(&out, ctx.allocator, input.permissions_json, "[]");
+    try appendJsonStringField(ctx.allocator, &out, "owner_id", input.owner_actor_id, false);
+    try appendJsonStringField(ctx.allocator, &out, "status", input.status, false);
+    try storage_routes.appendExtractionJson(ctx.allocator, &out, input.route);
+    try out.append(ctx.allocator, '}');
+    return out.toOwnedSlice(ctx.allocator);
 }
 
 fn parseMemoryAtomInput(ctx: *Context, body: []const u8) !store_mod.MemoryAtomInput {
@@ -5815,7 +5877,8 @@ fn isAgentMemoryStatusLifecycleOperation(operation: []const u8) bool {
     return std.mem.eql(u8, operation, "verify") or
         std.mem.eql(u8, operation, "mark_stale") or
         std.mem.eql(u8, operation, "stale") or
-        std.mem.eql(u8, operation, "supersede");
+        std.mem.eql(u8, operation, "supersede") or
+        std.mem.eql(u8, operation, "forget");
 }
 
 fn applyAgentMemoryLifecycleMutation(ctx: *Context, obj: std.json.ObjectMap, event_type: []const u8, operation: []const u8, event_actor_id: []const u8, payload_json: []const u8, fallback_route: store_mod.AgentMemoryStorageRoute, causality_json: []const u8) HttpResponse {
@@ -14568,6 +14631,72 @@ test "api memory apply supports agent memory lifecycle reducers" {
     try std.testing.expectEqualStrings("404 Not Found", scratch_after.status);
     const scratch_deprecated_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Scratch lifecycle agent memory\",\"use_vector\":false,\"include_deprecated\":true}", "");
     try std.testing.expect(std.mem.indexOf(u8, scratch_deprecated_search.body, "\"status\":\"superseded\"") != null);
+}
+
+test "api lifecycle endpoints support routed agent memory" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory_stores = &.{.{ .name = "scratch", .config = .{ .backend = .memory_lru } }},
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_id = "agent:lifecycle-direct",
+        .actor_scopes_json = "[\"admin\"]",
+    };
+
+    const native_put = handleRequest(&ctx, "PUT", "/v1/agent-memory/direct.lifecycle.native", "{\"content\":\"Direct native lifecycle memory\",\"scope\":\"public\",\"storage\":\"native\"}", "");
+    try std.testing.expectEqualStrings("200 OK", native_put.status);
+    const native_stale = handleRequest(&ctx, "POST", "/v1/mark-stale", "{\"object_type\":\"agent_memory\",\"key\":\"direct.lifecycle.native\",\"scope\":\"public\",\"storage\":\"native\"}", "");
+    try std.testing.expectEqualStrings("200 OK", native_stale.status);
+    try std.testing.expect(std.mem.indexOf(u8, native_stale.body, "\"object_type\":\"agent_memory\"") != null);
+    const stale_direct = handleRequest(&ctx, "GET", "/v1/agent-memory/direct.lifecycle.native?scope=public&storage=native", "", "");
+    try std.testing.expectEqualStrings("200 OK", stale_direct.status);
+    try std.testing.expect(std.mem.indexOf(u8, stale_direct.body, "\"status\":\"stale\"") != null);
+
+    const native_verify = handleRequest(&ctx, "POST", "/v1/verify", "{\"object_type\":\"agent_memory\",\"key\":\"direct.lifecycle.native\",\"scope\":\"public\",\"storage\":\"native\"}", "");
+    try std.testing.expectEqualStrings("200 OK", native_verify.status);
+    const verified_direct = handleRequest(&ctx, "GET", "/v1/agent-memory/direct.lifecycle.native?scope=public&storage=native", "", "");
+    try std.testing.expectEqualStrings("200 OK", verified_direct.status);
+    try std.testing.expect(std.mem.indexOf(u8, verified_direct.body, "\"status\":\"verified\"") != null);
+
+    const scratch_put = handleRequest(&ctx, "PUT", "/v1/agent-memory/direct.lifecycle.scratch", "{\"content\":\"Direct scratch lifecycle memory\",\"scope\":\"public\",\"store\":\"scratch\"}", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_put.status);
+    const scratch_stale = handleRequest(&ctx, "POST", "/v1/mark-stale", "{\"object_type\":\"agent_memory\",\"key\":\"direct.lifecycle.scratch\",\"scope\":\"public\",\"store\":\"scratch\"}", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_stale.status);
+    const scratch_stale_direct = handleRequest(&ctx, "GET", "/v1/agent-memory/direct.lifecycle.scratch?scope=public&store=scratch", "", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_stale_direct.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_stale_direct.body, "\"status\":\"stale\"") != null);
+
+    const scratch_forget = handleRequest(&ctx, "POST", "/v1/forget", "{\"object_type\":\"agent_memory\",\"key\":\"direct.lifecycle.scratch\",\"scope\":\"public\",\"store\":\"scratch\"}", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_forget.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_forget.body, "\"status\":\"deprecated\"") != null);
+    const scratch_after = handleRequest(&ctx, "GET", "/v1/agent-memory/direct.lifecycle.scratch?scope=public&store=scratch", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", scratch_after.status);
+
+    const events = try store.listFeedEvents(alloc, .{ .scopes_json = "[\"admin\"]", .limit = 100 });
+    var saw_mark_stale = false;
+    var saw_verify = false;
+    var saw_forget = false;
+    for (events) |event| {
+        if (!std.mem.eql(u8, event.object_type, "agent_memory")) continue;
+        if (std.mem.eql(u8, event.object_id, "direct.lifecycle.native") and std.mem.eql(u8, event.operation, "mark_stale")) {
+            saw_mark_stale = true;
+            try std.testing.expect(std.mem.indexOf(u8, event.payload_json, "\"storage\":\"native\"") != null);
+        }
+        if (std.mem.eql(u8, event.object_id, "direct.lifecycle.native") and std.mem.eql(u8, event.operation, "verify")) saw_verify = true;
+        if (std.mem.eql(u8, event.object_id, "direct.lifecycle.scratch") and std.mem.eql(u8, event.operation, "forget")) {
+            saw_forget = true;
+            try std.testing.expect(std.mem.indexOf(u8, event.payload_json, "\"status\":\"deprecated\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, event.payload_json, "\"store\":\"scratch\"") != null);
+        }
+    }
+    try std.testing.expect(saw_mark_stale);
+    try std.testing.expect(saw_verify);
+    try std.testing.expect(saw_forget);
 }
 
 test "api lifecycle overlay hides source entity and context pack by default" {
