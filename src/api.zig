@@ -2881,6 +2881,7 @@ fn vectorSearch(ctx: *Context, body: []const u8) HttpResponse {
         .strict_external = json.boolField(obj, "strict_external") orelse json.boolField(obj, "strict_vector") orelse false,
         .actor_id = ctx.actor_id,
     }) catch return serverError(ctx);
+    defer vector_mod.freeMatches(ctx.allocator, matches);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"matches\":[") catch return serverError(ctx);
     for (matches, 0..) |match, i| {

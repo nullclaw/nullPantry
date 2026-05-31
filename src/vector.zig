@@ -37,6 +37,25 @@ pub const VectorMatch = struct {
     }
 };
 
+pub fn deinitMatch(allocator: std.mem.Allocator, match: *VectorMatch) void {
+    allocator.free(match.id);
+    allocator.free(match.object_id);
+    allocator.free(match.object_type);
+    allocator.free(match.text);
+    allocator.free(match.scope);
+    allocator.free(match.heading_path_json);
+    match.* = undefined;
+}
+
+pub fn deinitMatches(allocator: std.mem.Allocator, matches: []VectorMatch) void {
+    for (matches) |*match| deinitMatch(allocator, match);
+}
+
+pub fn freeMatches(allocator: std.mem.Allocator, matches: []VectorMatch) void {
+    deinitMatches(allocator, matches);
+    allocator.free(matches);
+}
+
 pub fn cosine(a: []const f32, b: []const f32) f32 {
     if (a.len == 0 or b.len == 0 or a.len != b.len) return 0;
     var dot: f64 = 0;
@@ -110,23 +129,37 @@ pub fn normalize(values: []f32) void {
 
 pub fn bruteForceSearch(allocator: std.mem.Allocator, query: []const f32, records: []const VectorRecord, limit: usize) ![]VectorMatch {
     var matches: std.ArrayListUnmanaged(VectorMatch) = .empty;
-    errdefer matches.deinit(allocator);
+    errdefer {
+        deinitMatches(allocator, matches.items);
+        matches.deinit(allocator);
+    }
     for (records) |record| {
         const score = cosine(query, record.embedding);
         if (score <= 0) continue;
-        try matches.append(allocator, .{
-            .id = record.id,
-            .object_id = record.object_id,
-            .object_type = record.object_type,
-            .text = record.text,
-            .scope = record.scope,
-            .heading_path_json = record.heading_path_json,
-            .score = score,
-        });
+        try matches.append(allocator, try matchFromRecord(allocator, record, score));
     }
     sortMatches(matches.items);
     if (matches.items.len > limit) matches.shrinkRetainingCapacity(limit);
     return matches.toOwnedSlice(allocator);
+}
+
+fn matchFromRecord(allocator: std.mem.Allocator, record: VectorRecord, score: f32) !VectorMatch {
+    var match = VectorMatch{
+        .id = try allocator.dupe(u8, record.id),
+        .object_id = "",
+        .object_type = "",
+        .text = "",
+        .scope = "",
+        .heading_path_json = "",
+        .score = score,
+    };
+    errdefer deinitMatch(allocator, &match);
+    match.object_id = try allocator.dupe(u8, record.object_id);
+    match.object_type = try allocator.dupe(u8, record.object_type);
+    match.text = try allocator.dupe(u8, record.text);
+    match.scope = try allocator.dupe(u8, record.scope);
+    match.heading_path_json = try allocator.dupe(u8, record.heading_path_json);
+    return match;
 }
 
 pub fn annSearch(allocator: std.mem.Allocator, query: []const f32, records: []const VectorRecord, candidate_limit: usize, limit: usize) ![]VectorMatch {
@@ -364,7 +397,7 @@ test "vector brute force search ranks by cosine" {
         .{ .id = "vec_b", .object_id = "b", .embedding = &[_]f32{ 0, 1 }, .text = "beta" },
     };
     const matches = try bruteForceSearch(alloc, &[_]f32{ 1, 0 }, &records, 10);
-    defer alloc.free(matches);
+    defer freeMatches(alloc, matches);
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqualStrings("a", matches[0].object_id);
 }
@@ -376,7 +409,7 @@ test "vector ANN prefilter falls back safely" {
         .{ .id = "vec_b", .object_id = "b", .embedding = &[_]f32{ 0, 1 }, .text = "beta" },
     };
     const matches = try annSearch(alloc, &[_]f32{ 1, 0 }, &records, 1, 1);
-    defer alloc.free(matches);
+    defer freeMatches(alloc, matches);
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqualStrings("a", matches[0].object_id);
 }
