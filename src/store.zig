@@ -4175,6 +4175,7 @@ pub const FeedEvent = struct {
     pub fn writeJson(self: FeedEvent, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
         try out.print(allocator, "{{\"id\":{d},\"event_type\":", .{self.id});
         try @import("json_util.zig").appendString(out, allocator, self.event_type);
+        try out.print(allocator, ",\"sequence\":{d},\"origin_instance_id\":\"nullpantry\",\"origin_sequence\":{d}", .{ self.id, self.id });
         try out.appendSlice(allocator, ",\"operation\":");
         try @import("json_util.zig").appendString(out, allocator, self.operation);
         try out.appendSlice(allocator, ",\"object_type\":");

@@ -3319,6 +3319,7 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !i64 {
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return error.InvalidPayload;
     const scope = feedEventScope(ctx, obj, object_type, payload_json, event_actor_id) catch return error.InvalidPayload;
     const permissions_json = feedEventPermissions(ctx, obj, object_type, payload_json, event_actor_id) catch return error.InvalidPayload;
+    const dedupe_key = feedEventDedupeKey(ctx, obj) catch return error.InvalidPayload;
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         if (try feedAgentMemoryPayloadIsInternal(ctx, payload_json)) return error.InternalAgentMemory;
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
@@ -3330,8 +3331,8 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !i64 {
     } else if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
     const causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return error.InvalidPayload;
 
-    if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| {
-        if (try ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key)) |event| {
+    if (dedupe_key) |key| {
+        if (try ctx.store.getFeedEventByDedupeKey(ctx.allocator, key)) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return error.Forbidden;
             if (!feedDedupeMatches(event, event_type, operation, object_type, object_id, scope, permissions_json, event_actor_id, causality_json, payload_json)) return error.FeedDedupeMismatch;
             return event.id;
@@ -3346,7 +3347,7 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !i64 {
         .scope = scope,
         .permissions_json = permissions_json,
         .actor_id = event_actor_id,
-        .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+        .dedupe_key = dedupe_key,
         .causality_json = causality_json,
         .payload_json = payload_json,
         .status = "pending",
@@ -3365,6 +3366,7 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
     const scope = feedEventScope(ctx, obj, object_type, payload_json, ctx.actor_id) catch return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid feed payload");
     const permissions_json = feedEventPermissions(ctx, obj, object_type, payload_json, ctx.actor_id) catch return serverError(ctx);
+    const dedupe_key = feedEventDedupeKey(ctx, obj) catch return serverError(ctx);
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         const internal_payload = feedAgentMemoryPayloadIsInternal(ctx, payload_json) catch return serverError(ctx);
         if (internal_payload) return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be queued through the feed");
@@ -3377,8 +3379,8 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
         if (!canProposeAgentSessionEvent(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
     } else if (!canProposeRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     const event_object_id = json.stringField(obj, "object_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing object_id");
-    if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| {
-        if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key) catch return serverError(ctx)) |event| {
+    if (dedupe_key) |key| {
+        if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, key) catch return serverError(ctx)) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return forbidden(ctx);
             if (!feedDedupeMatches(event, event_type, json.stringField(obj, "operation") orelse "put", object_type, event_object_id, scope, permissions_json, ctx.actor_id, rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx), payload_json)) {
                 return feedDedupeConflict(ctx);
@@ -3395,7 +3397,7 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
         .scope = scope,
         .permissions_json = permissions_json,
         .actor_id = ctx.actor_id,
-        .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+        .dedupe_key = dedupe_key,
         .causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx),
         .payload_json = payload_json,
         .status = "pending",
@@ -3423,6 +3425,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     if (!canApplyAsActor(ctx, event_actor_id)) return forbidden(ctx);
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
     const causality_json = rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx);
+    const event_dedupe_key = feedEventDedupeKey(ctx, obj) catch return serverError(ctx);
     if (isLifecycleFeedOperation(operation) and !std.mem.eql(u8, object_type, "agent_memory") and !isAgentSessionFeedObject(object_type)) {
         return applyFeedLifecycleMutation(ctx, obj, event_type, operation, object_type, event_actor_id, payload_json, causality_json);
     }
@@ -3485,7 +3488,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
         };
     }
     var reserved_event_id: ?i64 = null;
-    if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| {
+    if (event_dedupe_key) |dedupe_key| {
         if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key) catch return serverError(ctx)) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return forbidden(ctx);
             if (!std.mem.eql(u8, event.status, "applied")) {
@@ -3545,7 +3548,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
                 .scope = scope,
                 .permissions_json = event_permissions_json,
                 .actor_id = event_actor_id,
-                .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+                .dedupe_key = event_dedupe_key,
                 .causality_json = causality_json,
                 .payload_json = payload_json,
                 .status = "applied",
@@ -3574,7 +3577,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
                 .scope = scope,
                 .permissions_json = event_permissions_json,
                 .actor_id = event_actor_id,
-                .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+                .dedupe_key = event_dedupe_key,
                 .causality_json = causality_json,
                 .payload_json = payload_json,
                 .status = "applied",
@@ -3605,7 +3608,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
                 .scope = scope,
                 .permissions_json = event_permissions_json,
                 .actor_id = event_actor_id,
-                .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+                .dedupe_key = event_dedupe_key,
                 .causality_json = causality_json,
                 .payload_json = payload_json,
                 .status = "applied",
@@ -3674,7 +3677,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
             .scope = scope,
             .permissions_json = event_permissions_json,
             .actor_id = event_actor_id,
-            .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+            .dedupe_key = event_dedupe_key,
             .causality_json = causality_json,
             .payload_json = payload_json,
             .status = "applied",
@@ -3713,7 +3716,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
             .scope = scope,
             .permissions_json = event_permissions_json,
             .actor_id = event_actor_id,
-            .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+            .dedupe_key = event_dedupe_key,
             .causality_json = causality_json,
             .payload_json = payload_json,
             .status = "applied",
@@ -3740,7 +3743,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
             .scope = scope,
             .permissions_json = event_permissions_json,
             .actor_id = event_actor_id,
-            .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+            .dedupe_key = event_dedupe_key,
             .causality_json = causality_json,
             .payload_json = payload_json,
             .status = "applied",
@@ -3762,7 +3765,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
         .scope = scope,
         .permissions_json = event_permissions_json,
         .actor_id = event_actor_id,
-        .dedupe_key = json.nullableStringField(obj, "dedupe_key"),
+        .dedupe_key = event_dedupe_key,
         .causality_json = causality_json,
         .payload_json = payload_json,
         .status = "applied",
@@ -7095,6 +7098,7 @@ fn appendFeedEventForActor(ctx: *Context, out: *std.ArrayListUnmanaged(u8), even
     const payload_json = try feedPayloadForActor(ctx, event);
     try out.print(ctx.allocator, "{{\"id\":{d},\"event_type\":", .{event.id});
     try json.appendString(out, ctx.allocator, event.event_type);
+    try out.print(ctx.allocator, ",\"sequence\":{d},\"origin_instance_id\":\"nullpantry\",\"origin_sequence\":{d}", .{ event.id, event.id });
     try out.appendSlice(ctx.allocator, ",\"operation\":");
     try json.appendString(out, ctx.allocator, event.operation);
     try out.appendSlice(ctx.allocator, ",\"object_type\":");
@@ -7267,12 +7271,29 @@ fn feedDedupeConflict(ctx: *Context) HttpResponse {
     return json.errorResponse(ctx.allocator, 409, "conflict", "Feed dedupe key already belongs to a different event payload");
 }
 
+fn feedEventDedupeKey(ctx: *Context, obj: std.json.ObjectMap) !?[]const u8 {
+    if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| return dedupe_key;
+    const origin_instance_id = json.stringField(obj, "origin_instance_id") orelse
+        json.stringField(obj, "source_instance_id") orelse
+        json.stringField(obj, "instance_id") orelse
+        return null;
+    const origin_sequence = json.intField(obj, "origin_sequence") orelse
+        json.intField(obj, "sequence") orelse
+        json.intField(obj, "id") orelse
+        return null;
+    const key: []const u8 = try std.fmt.allocPrint(ctx.allocator, "origin:{s}:{d}", .{ origin_instance_id, origin_sequence });
+    return key;
+}
+
 fn feedDedupeMatches(event: store_mod.FeedEvent, event_type: []const u8, operation: []const u8, object_type: []const u8, object_id: ?[]const u8, scope: []const u8, permissions_json: []const u8, actor_id: []const u8, causality_json: []const u8, payload_json: []const u8) bool {
     if (!std.mem.eql(u8, event.event_type, event_type)) return false;
     if (!std.mem.eql(u8, event.operation, operation)) return false;
     if (!std.mem.eql(u8, event.object_type, object_type)) return false;
-    if (object_id) |expected_object_id| {
-        if (!std.mem.eql(u8, event.object_id, expected_object_id)) return false;
+    const origin_replay = if (event.dedupe_key) |key| std.mem.startsWith(u8, key, "origin:") else false;
+    if (!origin_replay) {
+        if (object_id) |expected_object_id| {
+            if (!std.mem.eql(u8, event.object_id, expected_object_id)) return false;
+        }
     }
     if (!std.mem.eql(u8, event.scope, scope)) return false;
     if (!std.mem.eql(u8, event.permissions_json, permissions_json)) return false;
@@ -7409,8 +7430,9 @@ fn feedLifecycleMutationAllowed(ctx: *Context, operation: []const u8, scope: []c
 }
 
 fn applyOrAppendFeedEventRecord(ctx: *Context, obj: std.json.ObjectMap, event_type: []const u8, operation: []const u8, object_type: []const u8, object_id: []const u8, scope: []const u8, permissions_json: []const u8, event_actor_id: []const u8, causality_json: []const u8, payload_json: []const u8) !i64 {
-    if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| {
-        if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key) catch return error.StoreFailure) |event| {
+    const dedupe_key = try feedEventDedupeKey(ctx, obj);
+    if (dedupe_key) |key| {
+        if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, key) catch return error.StoreFailure) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return error.Forbidden;
             if (std.mem.eql(u8, event.status, "applied")) {
                 if (!feedDedupeMatches(event, event_type, operation, object_type, object_id, scope, permissions_json, event_actor_id, causality_json, payload_json)) return error.FeedDedupeMismatch;
@@ -7427,7 +7449,7 @@ fn applyOrAppendFeedEventRecord(ctx: *Context, obj: std.json.ObjectMap, event_ty
             .scope = scope,
             .permissions_json = permissions_json,
             .actor_id = event_actor_id,
-            .dedupe_key = dedupe_key,
+            .dedupe_key = key,
             .causality_json = causality_json,
             .payload_json = payload_json,
             .status = "applying",
@@ -7443,7 +7465,7 @@ fn applyOrAppendFeedEventRecord(ctx: *Context, obj: std.json.ObjectMap, event_ty
         .scope = scope,
         .permissions_json = permissions_json,
         .actor_id = event_actor_id,
-        .dedupe_key = null,
+        .dedupe_key = dedupe_key,
         .causality_json = causality_json,
         .payload_json = payload_json,
         .status = "applied",
@@ -10363,6 +10385,37 @@ test "api memory checkpoint restore preserves compacted cursor floor" {
     try std.testing.expectEqualStrings("200 OK", recovery_checkpoint.status);
     try std.testing.expect(std.mem.indexOf(u8, recovery_checkpoint.body, "restore_floor_one") != null);
     try std.testing.expect(std.mem.indexOf(u8, recovery_checkpoint.body, "restore_floor_two") != null);
+}
+
+test "api memory checkpoint restore is idempotent without explicit dedupe keys" {
+    var source_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer source_store.deinit();
+    var target_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer target_store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var source_ctx = Context{ .allocator = alloc, .store = &source_store, .actor_id = "agent:origin" };
+    const source_put = handleRequest(&source_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"origin.pref\",\"content\":\"origin replay value\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", source_put.status);
+    const checkpoint = handleRequest(&source_ctx, "GET", "/v1/memory/checkpoint?limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"origin_instance_id\":\"nullpantry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"origin_sequence\":") != null);
+
+    var target_ctx = Context{ .allocator = alloc, .store = &target_store, .actor_id = "agent:origin" };
+    const first_restore = handleRequest(&target_ctx, "POST", "/v1/memory/checkpoint", checkpoint.body, "");
+    try std.testing.expectEqualStrings("200 OK", first_restore.status);
+    const second_restore = handleRequest(&target_ctx, "POST", "/v1/memory/checkpoint", checkpoint.body, "");
+    try std.testing.expectEqualStrings("200 OK", second_restore.status);
+
+    const restored = (try target_store.agentMemoryGet(alloc, "origin.pref", null, "agent:origin")).?;
+    try std.testing.expectEqualStrings("origin replay value", restored.content);
+    const events = try target_store.listFeedEvents(alloc, .{ .scopes_json = "[\"admin\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0].dedupe_key != null);
+    try std.testing.expect(std.mem.startsWith(u8, events[0].dedupe_key.?, "origin:nullpantry:"));
 }
 
 test "api memory checkpoint restore does not compact unrelated target feed history" {
