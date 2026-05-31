@@ -4173,9 +4173,15 @@ pub const FeedEvent = struct {
     compacted_at_ms: ?i64,
 
     pub fn writeJson(self: FeedEvent, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+        return self.writeJsonWithInstance(allocator, out, "nullpantry");
+    }
+
+    pub fn writeJsonWithInstance(self: FeedEvent, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), instance_id: []const u8) !void {
         try out.print(allocator, "{{\"id\":{d},\"event_type\":", .{self.id});
         try @import("json_util.zig").appendString(out, allocator, self.event_type);
-        try out.print(allocator, ",\"sequence\":{d},\"origin_instance_id\":\"nullpantry\",\"origin_sequence\":{d}", .{ self.id, self.id });
+        try out.print(allocator, ",\"sequence\":{d},\"origin_instance_id\":", .{self.id});
+        try @import("json_util.zig").appendString(out, allocator, instance_id);
+        try out.print(allocator, ",\"origin_sequence\":{d}", .{self.id});
         try out.appendSlice(allocator, ",\"operation\":");
         try @import("json_util.zig").appendString(out, allocator, self.operation);
         try out.appendSlice(allocator, ",\"object_type\":");
@@ -4213,9 +4219,15 @@ pub const FeedStatus = struct {
     applied_events: usize,
 
     pub fn writeJson(self: FeedStatus, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+        return self.writeJsonWithInstance(allocator, out, "nullpantry");
+    }
+
+    pub fn writeJsonWithInstance(self: FeedStatus, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), instance_id: []const u8) !void {
+        try out.appendSlice(allocator, "{\"instance_id\":");
+        try @import("json_util.zig").appendString(out, allocator, instance_id);
         try out.print(
             allocator,
-            "{{\"instance_id\":\"nullpantry\",\"storage_kind\":\"native\",\"supports_compaction\":true,\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"oldest_available_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"next_local_origin_sequence\":{d},\"visible_events\":{d},\"pending_events\":{d},\"applying_events\":{d},\"applied_events\":{d}}}",
+            ",\"storage_kind\":\"native\",\"supports_compaction\":true,\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"oldest_available_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"next_local_origin_sequence\":{d},\"visible_events\":{d},\"pending_events\":{d},\"applying_events\":{d},\"applied_events\":{d}}}",
             .{ self.cursor_floor, self.cursor_floor, self.cursor_floor + 1, self.max_event_id, self.max_event_id, self.max_event_id + 1, self.visible_events, self.pending_events, self.applying_events, self.applied_events },
         );
     }

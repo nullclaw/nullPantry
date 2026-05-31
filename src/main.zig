@@ -24,6 +24,7 @@ const max_active_connections: usize = 128;
 const RuntimeConfig = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = default_port,
+    instance_id: []const u8 = "nullpantry",
     db_path: [:0]const u8 = ".nullpantry/nullpantry.db",
     backend: store_mod.BackendKind = .sqlite,
     postgres_url: ?[]const u8 = null,
@@ -101,6 +102,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("nullpantry v{s}\n", .{build_options.version});
     std.debug.print("listening on http://{s}:{d}\n", .{ cfg.host, cfg.port });
+    std.debug.print("instance id: {s}\n", .{cfg.instance_id});
     std.debug.print("storage backend: {s}\n", .{@tagName(cfg.backend)});
     std.debug.print("agent memory backend: {s}\n", .{cfg.agent_memory_backend.name()});
     std.debug.print("named agent memory stores: {d}\n", .{cfg.agent_memory_store_configs.len});
@@ -170,6 +172,7 @@ fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
     var ctx = api.Context{
         .allocator = req_alloc,
         .store = state.store,
+        .feed_instance_id = state.cfg.instance_id,
         .required_token = state.cfg.token,
         .token_principals_json = state.cfg.token_principals_json,
         .actor_scopes_json = state.cfg.actor_scopes_json,
@@ -253,6 +256,12 @@ fn setSocketTimeouts(conn: *std.Io.net.Stream) void {
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeConfig {
     var cfg = RuntimeConfig{};
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_INSTANCE_ID")) |instance_id| {
+        cfg.instance_id = instance_id;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_FEED_INSTANCE_ID")) |instance_id| {
+        cfg.instance_id = instance_id;
+    } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_TOKEN")) |token| {
         cfg.token = token;
         cfg.actor_scopes_json = "[\"public\"]";
@@ -547,6 +556,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--port") and i + 1 < args.len) {
             i += 1;
             cfg.port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--instance-id") and i + 1 < args.len) {
+            i += 1;
+            cfg.instance_id = args[i];
         } else if (std.mem.eql(u8, arg, "--db") and i + 1 < args.len) {
             i += 1;
             cfg.db_path = args[i];
@@ -938,7 +950,7 @@ fn parseBool(raw: []const u8) bool {
 
 fn printUsage() void {
     std.debug.print(
-        \\Usage: nullpantry [--host HOST] [--port PORT] [--db PATH] [--token TOKEN] [--token-principals JSON] [--actor-scopes JSON] [--actor-capabilities JSON] [--worker-scopes JSON] [--worker-capabilities JSON] [--trust-actor-headers]
+        \\Usage: nullpantry [--host HOST] [--port PORT] [--instance-id ID] [--db PATH] [--token TOKEN] [--token-principals JSON] [--actor-scopes JSON] [--actor-capabilities JSON] [--worker-scopes JSON] [--worker-capabilities JSON] [--trust-actor-headers]
         \\       nullpantry --backend postgres --postgres-url URL [--token TOKEN|--token-principals JSON]
         \\       nullpantry --agent-memory-backend redis --redis-url redis://:pass@host:6379/0
         \\       nullpantry --agent-memory-backend api --agent-memory-api-url https://pantry.internal --agent-memory-api-token TOKEN
@@ -948,6 +960,8 @@ fn printUsage() void {
         \\       nullpantry --lucid-enabled --lucid-workspace /path/to/workspace
         \\
         \\Environment:
+        \\  NULLPANTRY_INSTANCE_ID
+        \\  NULLPANTRY_FEED_INSTANCE_ID
         \\  NULLPANTRY_TOKEN
         \\  NULLPANTRY_TOKEN_PRINCIPALS
         \\  NULLPANTRY_DATABASE_URL
@@ -1064,6 +1078,12 @@ test "worker principal can be narrowed explicitly" {
 
     try std.testing.expectEqualStrings("[\"project:nullpantry\"]", cfg.worker_scopes_json);
     try std.testing.expectEqualStrings("[\"read\",\"write\",\"verify\"]", cfg.worker_capabilities_json);
+}
+
+test "instance id can be configured for feed origin identity" {
+    const args = [_][:0]const u8{ "nullpantry", "--instance-id", "pantry-test-a" };
+    const cfg = try parseArgs(std.testing.allocator, &args);
+    try std.testing.expectEqualStrings("pantry-test-a", cfg.instance_id);
 }
 
 test "provider insecure http opt-in is explicit for embeddings fallbacks and llm" {

@@ -2114,15 +2114,45 @@ fn agentMemoryApplyPayload(allocator: std.mem.Allocator, input: Input, actor_id:
         },
         .merge_string_set => {
             try out.appendSlice(allocator, ",\"values\":");
-            try json.appendRawJsonOr(&out, allocator, input.content, "[]");
+            try appendStringSetMergePayload(&out, allocator, input.content);
         },
         .merge_object => {
             try out.appendSlice(allocator, ",\"object\":");
-            try json.appendRawJsonOr(&out, allocator, input.content, "{}");
+            try appendObjectMergePayload(&out, allocator, input.content);
         },
     }
     try out.appendSlice(allocator, "}}");
     return out.toOwnedSlice(allocator);
+}
+
+fn appendStringSetMergePayload(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, content: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
+        try json.appendString(out, allocator, content);
+        return;
+    };
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .string => |value| try json.appendString(out, allocator, value),
+        .array => |array| {
+            for (array.items) |item| {
+                if (item != .string) return error.InvalidPayload;
+            }
+            const value_json = try json.jsonFromValue(allocator, parsed.value);
+            defer allocator.free(value_json);
+            try out.appendSlice(allocator, value_json);
+        },
+        else => return error.InvalidPayload,
+    }
+}
+
+fn appendObjectMergePayload(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, content: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return error.InvalidPayload;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const value_json = try json.jsonFromValue(allocator, parsed.value);
+    defer allocator.free(value_json);
+    try out.appendSlice(allocator, value_json);
 }
 
 fn agentMemoryDeleteAllApplyPayload(allocator: std.mem.Allocator, key: []const u8, owner_actor_id: []const u8, writer_actor_id: []const u8) ![]u8 {
@@ -2837,6 +2867,37 @@ test "agent memory api backend builds urls and parses memory responses" {
     try std.testing.expect(std.mem.indexOf(u8, apply_payload, "\"scope\":\"team:alpha\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, apply_payload, "\"permissions\":[\"team:secret\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, apply_payload, "\"values\":[\"zig\"]") != null);
+
+    const string_set_payload = try agentMemoryApplyPayload(std.testing.allocator, .{
+        .key = "traits.tags",
+        .content = "friendly",
+        .actor_id = "agent:a",
+        .operation = .merge_string_set,
+    }, "agent:a");
+    defer std.testing.allocator.free(string_set_payload);
+    try std.testing.expect(std.mem.indexOf(u8, string_set_payload, "\"values\":\"friendly\"") != null);
+
+    try std.testing.expectError(error.InvalidPayload, agentMemoryApplyPayload(std.testing.allocator, .{
+        .key = "traits.tags",
+        .content = "{\"not\":\"a set\"}",
+        .actor_id = "agent:a",
+        .operation = .merge_string_set,
+    }, "agent:a"));
+
+    const object_payload = try agentMemoryApplyPayload(std.testing.allocator, .{
+        .key = "profile.behavior",
+        .content = "{\"tone\":\"formal\"}",
+        .actor_id = "agent:a",
+        .operation = .merge_object,
+    }, "agent:a");
+    defer std.testing.allocator.free(object_payload);
+    try std.testing.expect(std.mem.indexOf(u8, object_payload, "\"object\":{\"tone\":\"formal\"}") != null);
+    try std.testing.expectError(error.InvalidPayload, agentMemoryApplyPayload(std.testing.allocator, .{
+        .key = "profile.behavior",
+        .content = "not-json",
+        .actor_id = "agent:a",
+        .operation = .merge_object,
+    }, "agent:a"));
 
     const exact_query = try agentMemoryExactQuery(std.testing.allocator, null, "team:alpha");
     defer std.testing.allocator.free(exact_query);

@@ -32,6 +32,7 @@ pub const Context = struct {
     required_token: ?[]const u8 = null,
     token_principals_json: ?[]const u8 = null,
     actor_id: []const u8 = "local",
+    feed_instance_id: []const u8 = "nullpantry",
     actor_scopes_json: []const u8 = "[\"admin\"]",
     actor_capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
     embedding_base_url: ?[]const u8 = null,
@@ -3162,7 +3163,7 @@ fn memoryFeedStatus(ctx: *Context) HttpResponse {
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
     const status = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    status.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+    status.writeJsonWithInstance(ctx.allocator, &out, ctx.feed_instance_id) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
@@ -3194,7 +3195,9 @@ fn memoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
         else => return serverError(ctx),
     };
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    out.print(ctx.allocator, "{{\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"events\":[", .{ status.cursor_floor, status.cursor_floor, status.max_event_id, status.max_event_id }) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "{\"instance_id\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.feed_instance_id) catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"events\":[", .{ status.cursor_floor, status.cursor_floor, status.max_event_id, status.max_event_id }) catch return serverError(ctx);
     _ = appendFeedEventsForActor(ctx, &out, events) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, "]}") catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
@@ -7098,7 +7101,9 @@ fn appendFeedEventForActor(ctx: *Context, out: *std.ArrayListUnmanaged(u8), even
     const payload_json = try feedPayloadForActor(ctx, event);
     try out.print(ctx.allocator, "{{\"id\":{d},\"event_type\":", .{event.id});
     try json.appendString(out, ctx.allocator, event.event_type);
-    try out.print(ctx.allocator, ",\"sequence\":{d},\"origin_instance_id\":\"nullpantry\",\"origin_sequence\":{d}", .{ event.id, event.id });
+    try out.print(ctx.allocator, ",\"sequence\":{d},\"origin_instance_id\":", .{event.id});
+    try json.appendString(out, ctx.allocator, ctx.feed_instance_id);
+    try out.print(ctx.allocator, ",\"origin_sequence\":{d}", .{event.id});
     try out.appendSlice(ctx.allocator, ",\"operation\":");
     try json.appendString(out, ctx.allocator, event.operation);
     try out.appendSlice(ctx.allocator, ",\"object_type\":");
@@ -10416,6 +10421,50 @@ test "api memory checkpoint restore is idempotent without explicit dedupe keys" 
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expect(events[0].dedupe_key != null);
     try std.testing.expect(std.mem.startsWith(u8, events[0].dedupe_key.?, "origin:nullpantry:"));
+}
+
+test "api memory checkpoint origin identity is instance specific" {
+    var source_a_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer source_a_store.deinit();
+    var source_b_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer source_b_store.deinit();
+    var target_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer target_store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var source_a_ctx = Context{ .allocator = alloc, .store = &source_a_store, .actor_id = "agent:origin", .feed_instance_id = "pantry-a" };
+    var source_b_ctx = Context{ .allocator = alloc, .store = &source_b_store, .actor_id = "agent:origin", .feed_instance_id = "pantry-b" };
+    const put_a = handleRequest(&source_a_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"origin.a\",\"content\":\"from a\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", put_a.status);
+    const put_b = handleRequest(&source_b_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"origin.b\",\"content\":\"from b\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", put_b.status);
+
+    const checkpoint_a = handleRequest(&source_a_ctx, "GET", "/v1/memory/checkpoint?limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint_a.body, "\"instance_id\":\"pantry-a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint_a.body, "\"origin_instance_id\":\"pantry-a\"") != null);
+    const checkpoint_b = handleRequest(&source_b_ctx, "GET", "/v1/memory/checkpoint?limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint_b.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint_b.body, "\"instance_id\":\"pantry-b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint_b.body, "\"origin_instance_id\":\"pantry-b\"") != null);
+
+    var target_ctx = Context{ .allocator = alloc, .store = &target_store, .actor_id = "agent:origin", .feed_instance_id = "pantry-target" };
+    const restore_a = handleRequest(&target_ctx, "POST", "/v1/memory/checkpoint", checkpoint_a.body, "");
+    try std.testing.expectEqualStrings("200 OK", restore_a.status);
+    const restore_b = handleRequest(&target_ctx, "POST", "/v1/memory/checkpoint", checkpoint_b.body, "");
+    try std.testing.expectEqualStrings("200 OK", restore_b.status);
+
+    const restored_a = (try target_store.agentMemoryGet(alloc, "origin.a", null, "agent:origin")).?;
+    try std.testing.expectEqualStrings("from a", restored_a.content);
+    const restored_b = (try target_store.agentMemoryGet(alloc, "origin.b", null, "agent:origin")).?;
+    try std.testing.expectEqualStrings("from b", restored_b.content);
+    const events = try target_store.listFeedEvents(alloc, .{ .scopes_json = "[\"admin\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+    try std.testing.expect(events[0].dedupe_key != null);
+    try std.testing.expect(events[1].dedupe_key != null);
+    try std.testing.expect(!std.mem.eql(u8, events[0].dedupe_key.?, events[1].dedupe_key.?));
 }
 
 test "api memory checkpoint restore does not compact unrelated target feed history" {
