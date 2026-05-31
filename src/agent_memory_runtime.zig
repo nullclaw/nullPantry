@@ -8,6 +8,7 @@ const compat = @import("compat.zig");
 const net_security = @import("net_security.zig");
 const redis = @import("redis.zig");
 const agent_memory_reducer = @import("agent_memory_reducer.zig");
+const retrieval_mod = @import("retrieval.zig");
 
 pub const BackendKind = enum {
     none,
@@ -2458,13 +2459,7 @@ fn messagesFromResp(allocator: std.mem.Allocator, resp: redis.RespValue) ![]Mess
 }
 
 fn scoreText(query: []const u8, text: []const u8) f64 {
-    if (query.len == 0) return 1.0;
-    var score: f64 = 0.0;
-    var it = std.mem.tokenizeAny(u8, query, " \t\r\n.,;:/\\-_*\"'()[]{}<>!?");
-    while (it.next()) |token| {
-        if (token.len > 0 and std.ascii.indexOfIgnoreCase(text, token) != null) score += 1.0;
-    }
-    return score;
+    return retrieval_mod.lexicalScore(query, text);
 }
 
 fn sortAgentMemory(items: []domain.AgentMemory) void {
@@ -2751,6 +2746,11 @@ test "memory_lru and none agent memory runtimes match agent memory contract" {
         var copy = shared;
         freeAgentMemory(std.testing.allocator, &copy);
     }
+    const stopword_only = try runtime.store(std.testing.allocator, .{ .key = "stopword.pref", .content = "the and or only", .actor_id = "agent:a" });
+    defer {
+        var copy = stopword_only;
+        freeAgentMemory(std.testing.allocator, &copy);
+    }
 
     const a = (try runtime.get(std.testing.allocator, "pref.lang", null, "agent:a")).?;
     defer {
@@ -2769,6 +2769,13 @@ test "memory_lru and none agent memory runtimes match agent memory contract" {
     }
     try std.testing.expectEqualStrings("team shared", shared_visible.content);
     try std.testing.expect((try runtime.getVisible(std.testing.allocator, "team.pref", null, "agent:c", "[\"public\"]")) == null);
+
+    const stopword_search = try runtime.search(std.testing.allocator, "??? OR AND the", 10, null, "[]", "agent:a");
+    defer {
+        for (stopword_search) |*entry| freeAgentMemory(std.testing.allocator, entry);
+        std.testing.allocator.free(stopword_search);
+    }
+    try std.testing.expectEqual(@as(usize, 0), stopword_search.len);
 
     try runtime.saveMessage("sess", "user", "hello from a", "agent:a");
     try runtime.saveMessage("sess", "user", "hello from b", "agent:b");
