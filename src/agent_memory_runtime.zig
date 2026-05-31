@@ -628,8 +628,7 @@ pub const MemoryAgentMemory = struct {
             const message = self.messages.items[i];
             const same_actor = std.mem.eql(u8, message.actor_id, actor);
             const same_session = if (session_id) |sid| std.mem.eql(u8, message.session_id, sid) else true;
-            const autosave = std.mem.eql(u8, message.role, "autosave_user") or std.mem.eql(u8, message.role, "autosave_assistant");
-            if (same_actor and same_session and autosave) {
+            if (same_actor and same_session and domain.isAutosaveSessionRole(message.role)) {
                 var removed = self.messages.orderedRemove(i);
                 freeMemorySessionMessage(self.allocator, &removed);
                 continue;
@@ -1187,20 +1186,41 @@ pub const RedisAgentMemory = struct {
     }
 
     pub fn clearAutoSaved(self: *RedisAgentMemory, session_id: ?[]const u8, actor_id: ?[]const u8) !void {
+        const actor = actor_id orelse return;
         if (session_id) |sid| {
-            const loaded = try self.loadMessages(self.allocator, sid, actor_id);
-            defer {
-                for (loaded) |message| {
-                    self.allocator.free(message.role);
-                    self.allocator.free(message.content);
-                }
-                self.allocator.free(loaded);
-            }
-            try self.clearMessages(sid, actor_id);
+            return self.clearAutoSavedSession(sid, actor);
+        }
+        const session_ids = try self.listRawSessionIds(self.allocator, actor);
+        defer {
+            for (session_ids) |sid| self.allocator.free(sid);
+            self.allocator.free(session_ids);
+        }
+        for (session_ids) |sid| {
+            try self.clearAutoSavedSession(sid, actor);
+        }
+    }
+
+    fn clearAutoSavedSession(self: *RedisAgentMemory, session_id: []const u8, actor: []const u8) !void {
+        const loaded = try self.loadMessages(self.allocator, session_id, actor);
+        defer {
             for (loaded) |message| {
-                if (std.mem.eql(u8, message.role, "autosave_user") or std.mem.eql(u8, message.role, "autosave_assistant")) continue;
-                try self.saveMessage(sid, message.role, message.content, actor_id);
+                self.allocator.free(message.role);
+                self.allocator.free(message.content);
             }
+            self.allocator.free(loaded);
+        }
+        var saw_autosave = false;
+        for (loaded) |message| {
+            if (domain.isAutosaveSessionRole(message.role)) {
+                saw_autosave = true;
+                break;
+            }
+        }
+        if (!saw_autosave) return;
+        try self.clearMessages(session_id, actor);
+        for (loaded) |message| {
+            if (domain.isAutosaveSessionRole(message.role)) continue;
+            try self.saveMessageAt(session_id, message.role, message.content, message.created_at_ms, actor);
         }
     }
 
@@ -1531,6 +1551,27 @@ pub const RedisAgentMemory = struct {
             .first_message_at = first,
             .last_message_at = last,
         };
+    }
+
+    fn listRawSessionIds(self: *RedisAgentMemory, allocator: std.mem.Allocator, actor: []const u8) ![][]u8 {
+        const index_key = try self.sessionsIndexKey(allocator, actor);
+        defer allocator.free(index_key);
+        var resp = try self.client.command(&.{ "SMEMBERS", index_key });
+        defer resp.deinit(self.allocator);
+        const values = switch (resp) {
+            .array => |maybe_items| maybe_items orelse return allocator.alloc([]u8, 0),
+            else => return allocator.alloc([]u8, 0),
+        };
+        var out: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (out.items) |sid| allocator.free(sid);
+            out.deinit(allocator);
+        }
+        for (values) |value| {
+            const sid = value.asString() orelse continue;
+            try out.append(allocator, try allocator.dupe(u8, sid));
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     fn globalIndexKey(self: *RedisAgentMemory, allocator: std.mem.Allocator) ![]u8 {
@@ -2820,6 +2861,45 @@ test "memory_lru expires entries messages and usage by ttl" {
     try std.testing.expectEqual(@as(?u64, null), try runtime.loadUsage("session", "agent:ttl"));
 }
 
+test "memory_lru clears all autosaves for one actor and preserves kept timestamps" {
+    var runtime = try Runtime.init(std.testing.allocator, .{ .backend = .memory_lru });
+    defer runtime.deinit();
+
+    try runtime.saveMessageAt("sess-a", "user", "kept a", 101, "agent:a");
+    try runtime.saveMessageAt("sess-a", "autosave_user", "draft a", 102, "agent:a");
+    try runtime.saveMessageAt("sess-b", "autosave_assistant", "draft b", 201, "agent:a");
+    try runtime.saveMessageAt("sess-b", "assistant", "kept b", 202, "agent:a");
+    try runtime.saveMessageAt("sess-b", "autosave_user", "other actor draft", 301, "agent:b");
+
+    try runtime.clearAutoSaved(null, "agent:a");
+
+    const a_messages = try runtime.loadMessages(std.testing.allocator, "sess-a", "agent:a");
+    defer {
+        for (a_messages) |*message| freeMessage(std.testing.allocator, message);
+        std.testing.allocator.free(a_messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), a_messages.len);
+    try std.testing.expectEqualStrings("kept a", a_messages[0].content);
+    try std.testing.expectEqual(@as(i64, 101), a_messages[0].created_at_ms);
+
+    const b_messages = try runtime.loadMessages(std.testing.allocator, "sess-b", "agent:a");
+    defer {
+        for (b_messages) |*message| freeMessage(std.testing.allocator, message);
+        std.testing.allocator.free(b_messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), b_messages.len);
+    try std.testing.expectEqualStrings("kept b", b_messages[0].content);
+    try std.testing.expectEqual(@as(i64, 202), b_messages[0].created_at_ms);
+
+    const other_actor_messages = try runtime.loadMessages(std.testing.allocator, "sess-b", "agent:b");
+    defer {
+        for (other_actor_messages) |*message| freeMessage(std.testing.allocator, message);
+        std.testing.allocator.free(other_actor_messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), other_actor_messages.len);
+    try std.testing.expectEqualStrings("other actor draft", other_actor_messages[0].content);
+}
+
 test "redis agent memory contract when configured" {
     const url = compat.process.getEnvVarOwned(std.testing.allocator, "NULLPANTRY_TEST_REDIS_URL") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => {
@@ -2941,6 +3021,8 @@ test "redis agent memory contract when configured" {
     try std.testing.expectEqual(@as(u64, 2), history.total);
     try std.testing.expectEqualStrings("hello from a", history.messages[0].content);
     try std.testing.expectEqualStrings("kept", history.messages[1].content);
+    try std.testing.expect(history.messages[1].created_at_ms >= history.messages[0].created_at_ms);
+
     const sessions = try runtime.listSessions(std.testing.allocator, 10, 0, "agent:a");
     defer {
         for (sessions.sessions) |session| std.testing.allocator.free(session.session_id);
@@ -2948,6 +3030,40 @@ test "redis agent memory contract when configured" {
     }
     try std.testing.expectEqual(@as(u64, 1), sessions.total);
     try std.testing.expectEqual(@as(u64, 2), sessions.sessions[0].message_count);
+
+    try runtime.saveMessageAt("autosave-a", "user", "redis kept a", 101, "agent:a");
+    try runtime.saveMessageAt("autosave-a", "autosave_user", "redis draft a", 102, "agent:a");
+    try runtime.saveMessageAt("autosave-b", "autosave_assistant", "redis draft b", 201, "agent:a");
+    try runtime.saveMessageAt("autosave-b", "assistant", "redis kept b", 202, "agent:a");
+    try runtime.saveMessageAt("autosave-b", "autosave_user", "redis other actor draft", 301, "agent:b");
+    try runtime.clearAutoSaved(null, "agent:a");
+
+    const redis_a_messages = try runtime.loadMessages(std.testing.allocator, "autosave-a", "agent:a");
+    defer {
+        for (redis_a_messages) |*message| freeMessage(std.testing.allocator, message);
+        std.testing.allocator.free(redis_a_messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), redis_a_messages.len);
+    try std.testing.expectEqualStrings("redis kept a", redis_a_messages[0].content);
+    try std.testing.expectEqual(@as(i64, 101), redis_a_messages[0].created_at_ms);
+
+    const redis_b_messages = try runtime.loadMessages(std.testing.allocator, "autosave-b", "agent:a");
+    defer {
+        for (redis_b_messages) |*message| freeMessage(std.testing.allocator, message);
+        std.testing.allocator.free(redis_b_messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), redis_b_messages.len);
+    try std.testing.expectEqualStrings("redis kept b", redis_b_messages[0].content);
+    try std.testing.expectEqual(@as(i64, 202), redis_b_messages[0].created_at_ms);
+
+    const redis_other_messages = try runtime.loadMessages(std.testing.allocator, "autosave-b", "agent:b");
+    defer {
+        for (redis_other_messages) |*message| freeMessage(std.testing.allocator, message);
+        std.testing.allocator.free(redis_other_messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), redis_other_messages.len);
+    try std.testing.expectEqualStrings("redis other actor draft", redis_other_messages[0].content);
+
     try runtime.saveUsage("sess", 128, "agent:a");
     try std.testing.expectEqual(@as(?u64, 128), try runtime.loadUsage("sess", "agent:a"));
     try std.testing.expect(try runtime.deleteUsage("sess", "agent:a"));

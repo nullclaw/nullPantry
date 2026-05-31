@@ -11,6 +11,10 @@ pub fn sessionMessageVisibleInHistory(role: []const u8) bool {
     return !isRuntimeCommandRole(role);
 }
 
+pub fn isAutosaveSessionRole(role: []const u8) bool {
+    return std.mem.eql(u8, role, "autosave_user") or std.mem.eql(u8, role, "autosave_assistant");
+}
+
 pub const Source = struct {
     id: []const u8,
     source_type: []const u8,
