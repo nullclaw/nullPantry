@@ -15,11 +15,45 @@ pub const MmrCandidate = struct {
     embedding: []const f32,
 };
 
+pub const RetrievalStrategy = enum {
+    keyword_only,
+    vector_only,
+    hybrid,
+
+    pub fn name(self: RetrievalStrategy) []const u8 {
+        return switch (self) {
+            .keyword_only => "keyword_only",
+            .vector_only => "vector_only",
+            .hybrid => "hybrid",
+        };
+    }
+};
+
+pub const AdaptiveConfig = struct {
+    enabled: bool = true,
+    keyword_max_tokens: u32 = 3,
+    vector_min_tokens: u32 = 6,
+};
+
+pub const QueryAnalysis = struct {
+    token_count: u32,
+    has_special_chars: bool,
+    is_question: bool,
+    avg_token_length: f32,
+    recommended_strategy: RetrievalStrategy,
+};
+
 pub const RetrievalPlan = struct {
     use_keyword: bool,
     use_vector: bool,
     use_graph: bool,
     use_reranker: bool,
+    adaptive_enabled: bool,
+    strategy: RetrievalStrategy,
+    token_count: u32,
+    has_special_chars: bool,
+    is_question: bool,
+    avg_token_length: f32,
     expanded_query: []const u8,
     keyword_query: []const u8,
     websearch_query: []const u8,
@@ -154,13 +188,33 @@ pub fn expandQuery(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
 }
 
 pub fn buildPlan(allocator: std.mem.Allocator, query: []const u8, has_vector_index: bool, allow_reranker: bool) !RetrievalPlan {
+    return buildPlanWithAdaptive(allocator, query, has_vector_index, allow_reranker, .{});
+}
+
+pub fn buildPlanWithAdaptive(allocator: std.mem.Allocator, query: []const u8, has_vector_index: bool, allow_reranker: bool, adaptive: AdaptiveConfig) !RetrievalPlan {
     var expansion = try expandQueryDetailed(allocator, query);
     errdefer expansion.deinit(allocator);
+    const analysis = analyzeQuery(query, adaptive);
+    const vector_available = has_vectorIndexWorthy(query) and has_vector_index;
+    const use_vector = switch (analysis.recommended_strategy) {
+        .keyword_only => false,
+        .vector_only, .hybrid => vector_available,
+    };
+    const use_keyword = switch (analysis.recommended_strategy) {
+        .vector_only => !use_vector,
+        .keyword_only, .hybrid => true,
+    };
     return .{
-        .use_keyword = true,
-        .use_vector = has_vectorIndexWorthy(query) and has_vector_index,
+        .use_keyword = use_keyword,
+        .use_vector = use_vector,
         .use_graph = hasEntityHint(query),
         .use_reranker = allow_reranker,
+        .adaptive_enabled = adaptive.enabled,
+        .strategy = analysis.recommended_strategy,
+        .token_count = analysis.token_count,
+        .has_special_chars = analysis.has_special_chars,
+        .is_question = analysis.is_question,
+        .avg_token_length = analysis.avg_token_length,
         .expanded_query = expansion.expanded_query,
         .keyword_query = expansion.keyword_query,
         .websearch_query = expansion.websearch_query,
@@ -169,6 +223,79 @@ pub fn buildPlan(allocator: std.mem.Allocator, query: []const u8, has_vector_ind
         .intent_hints_json = expansion.intents_json,
         .query_expanded = expansion.changed,
     };
+}
+
+pub fn analyzeQuery(query: []const u8, config: AdaptiveConfig) QueryAnalysis {
+    if (!config.enabled) {
+        return .{
+            .token_count = 0,
+            .has_special_chars = false,
+            .is_question = false,
+            .avg_token_length = 0,
+            .recommended_strategy = .hybrid,
+        };
+    }
+
+    var token_count: u32 = 0;
+    var total_char_len: u32 = 0;
+    var has_special_chars = false;
+    var it = std.mem.tokenizeAny(u8, query, " \t\r\n");
+    while (it.next()) |token| {
+        token_count += 1;
+        total_char_len += @intCast(token.len);
+        if (!has_special_chars) {
+            for (token) |ch| {
+                if (ch == '_' or ch == '.' or ch == '/' or ch == '\\' or ch == ':' or ch == '-') {
+                    has_special_chars = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (token_count == 0) {
+        return .{
+            .token_count = 0,
+            .has_special_chars = false,
+            .is_question = false,
+            .avg_token_length = 0,
+            .recommended_strategy = .keyword_only,
+        };
+    }
+
+    const avg_token_length = @as(f32, @floatFromInt(total_char_len)) / @as(f32, @floatFromInt(token_count));
+    const is_question = isQuestionQuery(query);
+    const strategy: RetrievalStrategy = if (has_special_chars)
+        .keyword_only
+    else if (token_count <= config.keyword_max_tokens)
+        .keyword_only
+    else if (is_question and token_count >= config.vector_min_tokens)
+        .vector_only
+    else
+        .hybrid;
+
+    return .{
+        .token_count = token_count,
+        .has_special_chars = has_special_chars,
+        .is_question = is_question,
+        .avg_token_length = avg_token_length,
+        .recommended_strategy = strategy,
+    };
+}
+
+fn isQuestionQuery(query: []const u8) bool {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    const prefixes = [_][]const u8{
+        "what ", "how ", "why ", "when ", "where ", "who ", "which ", "can ", "could ", "does ", "do ", "is ", "are ",
+    };
+    for (prefixes) |prefix| {
+        if (startsWithAsciiIgnoreCase(trimmed, prefix)) return true;
+    }
+    return std.mem.startsWith(u8, trimmed, "почему ") or
+        std.mem.startsWith(u8, trimmed, "как ") or
+        std.mem.startsWith(u8, trimmed, "что ") or
+        std.mem.startsWith(u8, trimmed, "когда ") or
+        std.mem.startsWith(u8, trimmed, "где ");
 }
 
 fn expandQueryDetailed(allocator: std.mem.Allocator, query: []const u8) !QueryExpansion {
@@ -455,6 +582,14 @@ fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn startsWithAsciiIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
+    if (prefix.len > haystack.len) return false;
+    for (prefix, 0..) |ch, i| {
+        if (std.ascii.toLower(haystack[i]) != std.ascii.toLower(ch)) return false;
+    }
+    return true;
+}
+
 fn ticketLike(token: []const u8) bool {
     const dash = std.mem.indexOfScalar(u8, token, '-') orelse return false;
     if (dash == 0 or dash + 1 >= token.len) return false;
@@ -525,9 +660,12 @@ test "retrieval query expansion and plan expose stages" {
     var plan = try buildPlan(std.testing.allocator, "NullPantry decision", true, true);
     defer plan.deinit(std.testing.allocator);
     try std.testing.expect(plan.use_keyword);
-    try std.testing.expect(plan.use_vector);
+    try std.testing.expect(!plan.use_vector);
     try std.testing.expect(plan.use_graph);
     try std.testing.expect(plan.use_reranker);
+    try std.testing.expect(plan.adaptive_enabled);
+    try std.testing.expectEqual(RetrievalStrategy.keyword_only, plan.strategy);
+    try std.testing.expectEqual(@as(u32, 2), plan.token_count);
     try std.testing.expect(std.mem.indexOf(u8, plan.expanded_query, "adr") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.keyword_query, "rationale") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.websearch_query, " OR adr") != null);
@@ -535,6 +673,26 @@ test "retrieval query expansion and plan expose stages" {
     try std.testing.expect(std.mem.indexOf(u8, plan.expansion_reasons_json, "\"reason\":\"decision\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.intent_hints_json, "\"decision\"") != null);
     try std.testing.expect(plan.query_expanded);
+}
+
+test "retrieval adaptive strategy selects keyword vector and hybrid modes" {
+    const key = analyzeQuery("src/memory/root.zig", .{});
+    try std.testing.expectEqual(RetrievalStrategy.keyword_only, key.recommended_strategy);
+    try std.testing.expect(key.has_special_chars);
+
+    const question = analyzeQuery("how does the central memory retrieval system select context", .{});
+    try std.testing.expectEqual(RetrievalStrategy.vector_only, question.recommended_strategy);
+    try std.testing.expect(question.is_question);
+
+    var vector_plan = try buildPlan(std.testing.allocator, "how does the central memory retrieval system select context", true, false);
+    defer vector_plan.deinit(std.testing.allocator);
+    try std.testing.expect(!vector_plan.use_keyword);
+    try std.testing.expect(vector_plan.use_vector);
+
+    var no_vector_plan = try buildPlan(std.testing.allocator, "how does the central memory retrieval system select context", false, false);
+    defer no_vector_plan.deinit(std.testing.allocator);
+    try std.testing.expect(no_vector_plan.use_keyword);
+    try std.testing.expect(!no_vector_plan.use_vector);
 }
 
 test "retrieval plan enables graph for tickets repos and service-like names" {

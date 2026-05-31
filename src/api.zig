@@ -2789,6 +2789,16 @@ fn appendRetrievalPlanFields(ctx: *Context, out: *std.ArrayListUnmanaged(u8), pl
     try out.appendSlice(ctx.allocator, if (plan.use_graph) "true" else "false");
     try out.appendSlice(ctx.allocator, ",\"use_reranker\":");
     try out.appendSlice(ctx.allocator, if (plan.use_reranker) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"adaptive_enabled\":");
+    try out.appendSlice(ctx.allocator, if (plan.adaptive_enabled) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"strategy\":");
+    try json.appendString(out, ctx.allocator, plan.strategy.name());
+    try out.print(ctx.allocator, ",\"token_count\":{d}", .{plan.token_count});
+    try out.appendSlice(ctx.allocator, ",\"has_special_chars\":");
+    try out.appendSlice(ctx.allocator, if (plan.has_special_chars) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"is_question\":");
+    try out.appendSlice(ctx.allocator, if (plan.is_question) "true" else "false");
+    try out.print(ctx.allocator, ",\"avg_token_length\":{d:.3}", .{plan.avg_token_length});
     try out.appendSlice(ctx.allocator, ",\"query_expanded\":");
     try out.appendSlice(ctx.allocator, if (plan.query_expanded) "true" else "false");
     try out.appendSlice(ctx.allocator, ",\"expanded_query\":");
@@ -4223,6 +4233,7 @@ fn contextPack(ctx: *Context, body: []const u8) HttpResponse {
         .retrieval_limit = search_input.limit,
         .include_deprecated = search_input.include_deprecated,
         .use_vector = search_input.use_vector,
+        .adaptive_retrieval = search_input.adaptive_retrieval,
         .use_temporal_decay = search_input.use_temporal_decay,
         .use_mmr = search_input.use_mmr,
         .allow_reranker = search_input.allow_reranker,
@@ -5426,6 +5437,11 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
     var query_embedding_json: ?[]const u8 = null;
     var query_embedding_provider: []const u8 = "none";
     var embedding_dimensions: usize = @max(@as(usize, 1), @min(ctx.embedding_dimensions, @as(usize, 4096)));
+    const analysis = retrieval.analyzeQuery(query, .{});
+    if (!strict_vector and analysis.recommended_strategy == .keyword_only) {
+        use_vector = false;
+        query_embedding_provider = "adaptive_keyword_only";
+    }
     if (use_vector and query.len > 0) {
         const embedding_result = providers.embedText(ctx.allocator, .{
             .provider = ctx.embedding_provider,
@@ -5448,6 +5464,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
                 .include_sessions = json.boolField(obj, "include_sessions") orelse include_sessions_default,
                 .session_id = json.nullableStringField(obj, "session_id"),
                 .use_vector = false,
+                .adaptive_retrieval = true,
                 .strict_vector = false,
                 .use_temporal_decay = json.boolField(obj, "use_temporal_decay") orelse true,
                 .use_mmr = json.boolField(obj, "use_mmr") orelse true,
@@ -5472,6 +5489,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
         .include_sessions = json.boolField(obj, "include_sessions") orelse include_sessions_default,
         .session_id = json.nullableStringField(obj, "session_id"),
         .use_vector = use_vector,
+        .adaptive_retrieval = true,
         .strict_vector = strict_vector,
         .use_temporal_decay = json.boolField(obj, "use_temporal_decay") orelse true,
         .use_mmr = json.boolField(obj, "use_mmr") orelse true,
@@ -6823,6 +6841,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const providers_resp = handleRequest(&ctx, "GET", "/v1/providers", "", "");
     try std.testing.expectEqualStrings("200 OK", providers_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, providers_resp.body, "openai-compatible-embeddings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, providers_resp.body, "embedding-fallback-chain") != null);
     try std.testing.expect(std.mem.indexOf(u8, providers_resp.body, "ollama") != null);
     const invalid_decision = handleRequest(&ctx, "POST", "/v1/artifacts", "{\"type\":\"decision\",\"title\":\"ADR\",\"status\":\"verified\",\"body\":\"x\"}", "");
     try std.testing.expectEqualStrings("400 Bad Request", invalid_decision.status);
@@ -6831,6 +6850,8 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expectEqualStrings("200 OK", plan_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"use_vector\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"use_graph\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"strategy\":\"keyword_only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"token_count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"use_reranker\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"query_expanded\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"expansion_terms\"") != null);
@@ -6855,7 +6876,12 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const vector_id = try extractJsonString(arena.allocator(), upsert_resp.body, "\"id\":\"");
     const indexed_plan_resp = handleRequest(&ctx, "POST", "/v1/retrieval/plan", "{\"query\":\"NullPantry decision\",\"allow_reranker\":true}", "");
     try std.testing.expectEqualStrings("200 OK", indexed_plan_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, indexed_plan_resp.body, "\"use_vector\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, indexed_plan_resp.body, "\"use_vector\":false") != null);
+    const vector_plan_resp = handleRequest(&ctx, "POST", "/v1/retrieval/plan", "{\"query\":\"how does the central memory retrieval system select context\",\"allow_reranker\":true}", "");
+    try std.testing.expectEqualStrings("200 OK", vector_plan_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, vector_plan_resp.body, "\"strategy\":\"vector_only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vector_plan_resp.body, "\"use_keyword\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vector_plan_resp.body, "\"use_vector\":true") != null);
     const orphan_upsert = handleRequest(&ctx, "POST", "/v1/vector/upsert", "{\"object_id\":\"mem_missing\",\"text\":\"orphan\",\"scope\":\"public\",\"embedding\":[1,0],\"dimensions\":2}", "");
     try std.testing.expectEqualStrings("404 Not Found", orphan_upsert.status);
     const vector_resp = handleRequest(&ctx, "POST", "/v1/vector/search", "{\"embedding\":[1,0],\"scopes\":[\"public\"],\"limit\":5}", "");
@@ -6957,7 +6983,8 @@ test "api retrieval search fuses keyword and vector results" {
     const keyword_atom = try store.createMemoryAtom(alloc, .{ .text = "hybrid keyword decision", .scope = "public", .created_by = "human" });
     _ = keyword_atom;
     const vector_atom = try store.createMemoryAtom(alloc, .{ .text = "semantic only context", .scope = "public", .created_by = "human" });
-    const embedding = try vector_mod.deterministicEmbedding(alloc, "hybrid vector", 64);
+    const hybrid_query = "hybrid vector context retrieval pipeline";
+    const embedding = try vector_mod.deterministicEmbedding(alloc, hybrid_query, 64);
     const embedding_json = try vector_mod.embeddingToJson(alloc, embedding);
     _ = try store.upsertVectorChunk(alloc, .{
         .object_id = vector_atom.id,
@@ -6967,8 +6994,10 @@ test "api retrieval search fuses keyword and vector results" {
         .dimensions = 64,
     });
 
-    const resp = handleRequest(&ctx, "POST", "/v1/retrieval/search", "{\"query\":\"hybrid vector\",\"scopes\":[\"public\"],\"limit\":5}", "");
+    const resp_body = try std.fmt.allocPrint(alloc, "{{\"query\":\"{s}\",\"scopes\":[\"public\"],\"limit\":5}}", .{hybrid_query});
+    const resp = handleRequest(&ctx, "POST", "/v1/retrieval/search", resp_body, "");
     try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"strategy\":\"hybrid\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"vector_ann\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"rrf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"citation_assembly\"") != null);

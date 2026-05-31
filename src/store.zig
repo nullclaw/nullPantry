@@ -1042,7 +1042,7 @@ pub const Store = struct {
         for (primary) |result| try results.append(allocator, result);
 
         if (use_store_vector_path and input.use_vector and input.query.len > 0) {
-            var plan = try retrieval_mod.buildPlan(allocator, input.query, input.use_vector, input.allow_reranker);
+            var plan = try retrieval_mod.buildPlanWithAdaptive(allocator, input.query, input.use_vector, input.allow_reranker, .{ .enabled = input.adaptive_retrieval });
             defer plan.deinit(allocator);
             if (plan.use_vector or input.strict_vector) {
                 try self.appendVectorSearchResults(allocator, input, plan.expanded_query, results);
@@ -1656,6 +1656,7 @@ pub const Store = struct {
             .include_sessions = input.include_sessions,
             .session_id = input.session_id,
             .use_vector = input.use_vector,
+            .adaptive_retrieval = input.adaptive_retrieval,
             .use_temporal_decay = input.use_temporal_decay,
             .use_mmr = input.use_mmr,
             .allow_reranker = input.allow_reranker,
@@ -3026,6 +3027,7 @@ pub const SearchInput = struct {
     include_sessions: bool = false,
     session_id: ?[]const u8 = null,
     use_vector: bool = true,
+    adaptive_retrieval: bool = false,
     strict_vector: bool = false,
     use_temporal_decay: bool = true,
     use_mmr: bool = true,
@@ -3462,6 +3464,7 @@ pub const ContextPackInput = struct {
     retrieval_limit: usize = 40,
     include_deprecated: bool = false,
     use_vector: bool = true,
+    adaptive_retrieval: bool = false,
     use_temporal_decay: bool = true,
     use_mmr: bool = true,
     allow_reranker: bool = false,
@@ -5422,7 +5425,7 @@ pub const SQLiteStore = struct {
 
     pub fn search(self: *Self, allocator: std.mem.Allocator, input: SearchInput) ![]domain.SearchResult {
         const limit = @max(@as(usize, 1), @min(input.limit, 100));
-        var plan = try retrieval_mod.buildPlan(allocator, input.query, input.use_vector, input.allow_reranker);
+        var plan = try retrieval_mod.buildPlanWithAdaptive(allocator, input.query, input.use_vector, input.allow_reranker, .{ .enabled = input.adaptive_retrieval });
         defer plan.deinit(allocator);
         var keyword_input = input;
         keyword_input.query = plan.keyword_query;
@@ -5435,31 +5438,33 @@ pub const SQLiteStore = struct {
         var keyword_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         errdefer keyword_results.deinit(allocator);
 
-        try self.searchMemoryAtoms(allocator, keyword_input, fts_query, use_fts, &keyword_results);
-        try self.searchSpaces(allocator, input, original_fts_query, use_original_fts, &keyword_results);
-        try self.searchPolicyScopes(allocator, input, original_fts_query, use_original_fts, &keyword_results);
-        try self.searchSources(allocator, keyword_input, fts_query, use_fts, &keyword_results);
-        try self.searchArtifacts(allocator, keyword_input, fts_query, use_fts, &keyword_results);
-        try self.searchEntities(allocator, input, original_fts_query, use_original_fts, &keyword_results);
-        try self.searchRelations(allocator, input, original_fts_query, use_original_fts, &keyword_results);
-        try self.searchContextPacks(allocator, keyword_input, fts_query, use_fts, &keyword_results);
-        try self.searchFeedEvents(allocator, keyword_input, fts_query, use_fts, &keyword_results);
-        try self.searchAgentMemories(allocator, keyword_input, fts_query, use_fts, &keyword_results);
-        if (input.include_sessions) {
-            try self.searchSessionMessages(allocator, keyword_input, fts_query, use_fts, &keyword_results);
-        }
-        if (keyword_results.items.len == 0 and use_fts) {
-            try self.searchMemoryAtoms(allocator, keyword_input, "", false, &keyword_results);
-            try self.searchSpaces(allocator, input, "", false, &keyword_results);
-            try self.searchPolicyScopes(allocator, input, "", false, &keyword_results);
-            try self.searchSources(allocator, keyword_input, "", false, &keyword_results);
-            try self.searchArtifacts(allocator, keyword_input, "", false, &keyword_results);
-            try self.searchEntities(allocator, input, "", false, &keyword_results);
-            try self.searchRelations(allocator, input, "", false, &keyword_results);
-            try self.searchContextPacks(allocator, keyword_input, "", false, &keyword_results);
-            try self.searchFeedEvents(allocator, keyword_input, "", false, &keyword_results);
-            try self.searchAgentMemories(allocator, keyword_input, "", false, &keyword_results);
-            if (input.include_sessions) try self.searchSessionMessages(allocator, keyword_input, "", false, &keyword_results);
+        if (plan.use_keyword) {
+            try self.searchMemoryAtoms(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+            try self.searchSpaces(allocator, input, original_fts_query, use_original_fts, &keyword_results);
+            try self.searchPolicyScopes(allocator, input, original_fts_query, use_original_fts, &keyword_results);
+            try self.searchSources(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+            try self.searchArtifacts(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+            try self.searchEntities(allocator, input, original_fts_query, use_original_fts, &keyword_results);
+            try self.searchRelations(allocator, input, original_fts_query, use_original_fts, &keyword_results);
+            try self.searchContextPacks(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+            try self.searchFeedEvents(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+            try self.searchAgentMemories(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+            if (input.include_sessions) {
+                try self.searchSessionMessages(allocator, keyword_input, fts_query, use_fts, &keyword_results);
+            }
+            if (keyword_results.items.len == 0 and use_fts) {
+                try self.searchMemoryAtoms(allocator, keyword_input, "", false, &keyword_results);
+                try self.searchSpaces(allocator, input, "", false, &keyword_results);
+                try self.searchPolicyScopes(allocator, input, "", false, &keyword_results);
+                try self.searchSources(allocator, keyword_input, "", false, &keyword_results);
+                try self.searchArtifacts(allocator, keyword_input, "", false, &keyword_results);
+                try self.searchEntities(allocator, input, "", false, &keyword_results);
+                try self.searchRelations(allocator, input, "", false, &keyword_results);
+                try self.searchContextPacks(allocator, keyword_input, "", false, &keyword_results);
+                try self.searchFeedEvents(allocator, keyword_input, "", false, &keyword_results);
+                try self.searchAgentMemories(allocator, keyword_input, "", false, &keyword_results);
+                if (input.include_sessions) try self.searchSessionMessages(allocator, keyword_input, "", false, &keyword_results);
+            }
         }
 
         sortSearchResults(keyword_results.items);
@@ -9362,14 +9367,14 @@ pub const PostgresStore = struct {
 
     pub fn search(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput) ![]domain.SearchResult {
         const limit = @max(@as(usize, 1), @min(input.limit, 100));
-        var plan = try retrieval_mod.buildPlan(allocator, input.query, input.use_vector, input.allow_reranker);
+        var plan = try retrieval_mod.buildPlanWithAdaptive(allocator, input.query, input.use_vector, input.allow_reranker, .{ .enabled = input.adaptive_retrieval });
         defer plan.deinit(allocator);
         var semantic_input = input;
         semantic_input.query = plan.websearch_query;
         var keyword_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         errdefer keyword_results.deinit(allocator);
 
-        try self.searchPgKeywordCandidates(allocator, input, semantic_input, &keyword_results);
+        if (plan.use_keyword) try self.searchPgKeywordCandidates(allocator, input, semantic_input, &keyword_results);
         pgSortSearchResults(keyword_results.items);
 
         var vector_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
