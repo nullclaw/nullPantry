@@ -10554,11 +10554,19 @@ pub const PostgresStore = struct {
         defer arena.deinit();
         const allocator = arena.allocator();
         _ = try self.deleteVectorChunksForObject(allocator, "memory_atom", id_text, null);
-        const sql = try std.fmt.allocPrint(allocator, "WITH agent_deleted AS (DELETE FROM agent_memory_items WHERE memory_atom_id = {s} RETURNING 1), deleted AS (DELETE FROM memory_atoms WHERE id = {s} RETURNING 1) SELECT count(*)::text FROM deleted", .{ try sqlString(allocator, id_text), try sqlString(allocator, id_text) });
-        const text = try self.queryText(allocator, sql);
-        const changed = (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
-        if (changed) try self.insertAudit(self.allocator, "memory_atom.purged", null, "memory_atom", id_text);
-        return changed;
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH agent_deleted AS (" ++
+                "DELETE FROM agent_memory_items WHERE memory_atom_id = $1 RETURNING 1" ++
+                "), deleted AS (" ++
+                "DELETE FROM memory_atoms WHERE id = $1 RETURNING id" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) " ++
+                "SELECT 'memory_atom.purged',NULL,'memory_atom',id,'{}'::jsonb,(extract(epoch from clock_timestamp()) * 1000)::bigint FROM deleted RETURNING 1" ++
+                ") SELECT count(*)::text FROM deleted",
+            &.{id_text},
+        );
+        return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
     fn insertContextPackRecord(
