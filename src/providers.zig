@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
+const ids = @import("ids.zig");
 const json = @import("json_util.zig");
 const vector = @import("vector.zig");
 
@@ -69,6 +70,7 @@ pub const EmbeddingConfig = struct {
     dimensions: usize = 64,
     timeout_secs: u32 = 30,
     fallbacks: []const EmbeddingEndpointConfig = &.{},
+    runtime: ?*ProviderRuntime = null,
 
     pub fn enabled(self: EmbeddingConfig) bool {
         return self.primaryEndpoint().enabled();
@@ -91,9 +93,181 @@ pub const CompletionConfig = struct {
     api_key: ?[]const u8 = null,
     model: ?[]const u8 = null,
     timeout_secs: u32 = 45,
+    runtime: ?*ProviderRuntime = null,
 
     pub fn enabled(self: CompletionConfig) bool {
         return self.base_url != null and self.model != null;
+    }
+};
+
+pub const CircuitState = enum {
+    closed,
+    open,
+    half_open,
+
+    pub fn name(self: CircuitState) []const u8 {
+        return switch (self) {
+            .closed => "closed",
+            .open => "open",
+            .half_open => "half_open",
+        };
+    }
+};
+
+pub const CircuitOptions = struct {
+    failure_threshold: u32 = 3,
+    cooldown_ms: i64 = 30_000,
+};
+
+pub const ProviderCircuit = struct {
+    provider: []const u8,
+    state: CircuitState = .closed,
+    failure_count: u32 = 0,
+    failure_threshold: u32 = 3,
+    cooldown_ms: i64 = 30_000,
+    last_failure_ms: i64 = 0,
+    half_open_probe_sent: bool = false,
+    attempts: u64 = 0,
+    successes: u64 = 0,
+    failures: u64 = 0,
+    skipped: u64 = 0,
+
+    pub fn init(provider: []const u8, options: CircuitOptions) ProviderCircuit {
+        return .{
+            .provider = provider,
+            .failure_threshold = options.failure_threshold,
+            .cooldown_ms = options.cooldown_ms,
+        };
+    }
+
+    pub fn allow(self: *ProviderCircuit, now_ms: i64) bool {
+        switch (self.state) {
+            .closed => {
+                self.attempts += 1;
+                return true;
+            },
+            .open => {
+                if (self.cooldown_ms <= 0 or now_ms - self.last_failure_ms >= self.cooldown_ms) {
+                    self.state = .half_open;
+                    self.half_open_probe_sent = true;
+                    self.attempts += 1;
+                    return true;
+                }
+                self.skipped += 1;
+                return false;
+            },
+            .half_open => {
+                if (!self.half_open_probe_sent) {
+                    self.half_open_probe_sent = true;
+                    self.attempts += 1;
+                    return true;
+                }
+                self.skipped += 1;
+                return false;
+            },
+        }
+    }
+
+    pub fn recordSuccess(self: *ProviderCircuit) void {
+        self.state = .closed;
+        self.failure_count = 0;
+        self.half_open_probe_sent = false;
+        self.successes += 1;
+    }
+
+    pub fn recordFailure(self: *ProviderCircuit, now_ms: i64) void {
+        self.failure_count +|= 1;
+        self.failures += 1;
+        self.last_failure_ms = now_ms;
+        if (self.state == .half_open or self.failure_count >= self.failure_threshold) {
+            self.state = .open;
+            self.half_open_probe_sent = false;
+        }
+    }
+
+    pub fn appendJson(self: ProviderCircuit, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+        try out.appendSlice(allocator, "{\"provider\":");
+        try json.appendString(out, allocator, self.provider);
+        try out.appendSlice(allocator, ",\"state\":");
+        try json.appendString(out, allocator, self.state.name());
+        try out.print(
+            allocator,
+            ",\"failure_count\":{d},\"failure_threshold\":{d},\"cooldown_ms\":{d},\"last_failure_ms\":{d},\"attempts\":{d},\"successes\":{d},\"failures\":{d},\"skipped\":{d}}}",
+            .{ self.failure_count, self.failure_threshold, self.cooldown_ms, self.last_failure_ms, self.attempts, self.successes, self.failures, self.skipped },
+        );
+    }
+};
+
+pub const ProviderTarget = union(enum) {
+    embedding_primary,
+    embedding_fallback: usize,
+    completion,
+};
+
+pub const ProviderRuntime = struct {
+    mutex: std.Io.Mutex = .init,
+    embedding_primary: ProviderCircuit,
+    embedding_fallbacks: []ProviderCircuit,
+    completion: ProviderCircuit,
+
+    pub fn init(allocator: std.mem.Allocator, embedding: EmbeddingConfig, completion: CompletionConfig, options: CircuitOptions) !ProviderRuntime {
+        var fallbacks = try allocator.alloc(ProviderCircuit, embedding.fallbacks.len);
+        errdefer allocator.free(fallbacks);
+        for (embedding.fallbacks, 0..) |fallback, i| {
+            fallbacks[i] = ProviderCircuit.init(fallback.provider.name(), options);
+        }
+        return .{
+            .embedding_primary = ProviderCircuit.init(embedding.provider.name(), options),
+            .embedding_fallbacks = fallbacks,
+            .completion = ProviderCircuit.init(if (completion.model != null) "openai-compatible-chat" else "none", options),
+        };
+    }
+
+    pub fn deinit(self: *ProviderRuntime, allocator: std.mem.Allocator) void {
+        allocator.free(self.embedding_fallbacks);
+        self.embedding_fallbacks = &.{};
+    }
+
+    pub fn allow(self: *ProviderRuntime, target: ProviderTarget) bool {
+        self.mutex.lockUncancelable(compat.io());
+        defer self.mutex.unlock(compat.io());
+        const circuit = self.circuitFor(target) orelse return true;
+        return circuit.allow(ids.nowMs());
+    }
+
+    pub fn recordSuccess(self: *ProviderRuntime, target: ProviderTarget) void {
+        self.mutex.lockUncancelable(compat.io());
+        defer self.mutex.unlock(compat.io());
+        if (self.circuitFor(target)) |circuit| circuit.recordSuccess();
+    }
+
+    pub fn recordFailure(self: *ProviderRuntime, target: ProviderTarget) void {
+        self.mutex.lockUncancelable(compat.io());
+        defer self.mutex.unlock(compat.io());
+        if (self.circuitFor(target)) |circuit| circuit.recordFailure(ids.nowMs());
+    }
+
+    pub fn appendStatusJson(self: *ProviderRuntime, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+        self.mutex.lockUncancelable(compat.io());
+        defer self.mutex.unlock(compat.io());
+        try out.appendSlice(allocator, "{\"embedding\":{\"primary\":");
+        try self.embedding_primary.appendJson(allocator, out);
+        try out.appendSlice(allocator, ",\"fallbacks\":[");
+        for (self.embedding_fallbacks, 0..) |fallback, i| {
+            if (i > 0) try out.append(allocator, ',');
+            try fallback.appendJson(allocator, out);
+        }
+        try out.appendSlice(allocator, "]},\"completion\":");
+        try self.completion.appendJson(allocator, out);
+        try out.append(allocator, '}');
+    }
+
+    fn circuitFor(self: *ProviderRuntime, target: ProviderTarget) ?*ProviderCircuit {
+        return switch (target) {
+            .embedding_primary => &self.embedding_primary,
+            .embedding_fallback => |i| if (i < self.embedding_fallbacks.len) &self.embedding_fallbacks[i] else null,
+            .completion => &self.completion,
+        };
     }
 };
 
@@ -123,6 +297,7 @@ pub const provider_descriptors = [_]ProviderDescriptor{
     .{ .name = "gemini", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /v1beta/models/{model}:embedContent", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "voyage", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /v1/embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "embedding-fallback-chain", .role = "server-side embedding failover between configured providers", .status = "built_in", .protocol = "NULLPANTRY_EMBEDDING_FALLBACKS string or JSON", .env_prefix = "NULLPANTRY_EMBEDDING_" },
+    .{ .name = "provider-circuit-breaker", .role = "shared runtime provider health, cooldown, and half-open probing", .status = "built_in", .protocol = "diagnostics.providers", .env_prefix = "NULLPANTRY_PROVIDER_" },
     .{ .name = "openai-compatible-chat", .role = "ask synthesis, structured extraction, and optional reranking", .status = "built_in", .protocol = "POST /chat/completions", .env_prefix = "NULLPANTRY_LLM_" },
     .{ .name = "ollama", .role = "local provider via OpenAI-compatible endpoint", .status = "compatible", .protocol = "configure Ollama OpenAI compatibility base URL", .env_prefix = "NULLPANTRY_EMBEDDING_|NULLPANTRY_LLM_" },
 };
@@ -149,20 +324,39 @@ pub fn appendProvidersJson(allocator: std.mem.Allocator, out: *std.ArrayListUnma
 pub fn embedText(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []const u8, fallback_dimensions: usize) !EmbeddingResult {
     const primary = cfg.primaryEndpoint();
     var first_err: ?anyerror = null;
+    var skipped_by_circuit = false;
     if (primary.enabled() or primary.provider == .local_deterministic) {
-        if (embedWithEndpoint(allocator, primary, text, fallback_dimensions)) |result| return result else |primary_err| {
-            first_err = primary_err;
+        if (providerAllowed(cfg.runtime, .embedding_primary)) {
+            if (embedWithEndpoint(allocator, primary, text, fallback_dimensions)) |result| {
+                providerSucceeded(cfg.runtime, .embedding_primary);
+                return result;
+            } else |primary_err| {
+                providerFailed(cfg.runtime, .embedding_primary);
+                first_err = primary_err;
+            }
+        } else {
+            skipped_by_circuit = true;
         }
     }
-    for (cfg.fallbacks) |fallback| {
+    for (cfg.fallbacks, 0..) |fallback, i| {
         if (!fallback.enabled() and fallback.provider != .local_deterministic) continue;
-        if (embedWithEndpoint(allocator, fallback, text, fallback_dimensions)) |result| return result else |fallback_err| {
+        const target = ProviderTarget{ .embedding_fallback = i };
+        if (!providerAllowed(cfg.runtime, target)) {
+            skipped_by_circuit = true;
+            continue;
+        }
+        if (embedWithEndpoint(allocator, fallback, text, fallback_dimensions)) |result| {
+            providerSucceeded(cfg.runtime, target);
+            return result;
+        } else |fallback_err| {
+            providerFailed(cfg.runtime, target);
             if (first_err == null) first_err = fallback_err;
             continue;
         }
     }
     if (primary.enabled() or cfg.fallbacks.len > 0) {
         if (first_err) |err| return err;
+        if (skipped_by_circuit) return error.ProviderCircuitOpen;
     }
 
     return .{
@@ -271,11 +465,30 @@ pub fn completeAnswer(allocator: std.mem.Allocator, cfg: CompletionConfig, promp
 
 pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: CompletionConfig, system_prompt: []const u8, prompt: []const u8) !CompletionResult {
     if (!cfg.enabled()) return error.ProviderUnavailable;
+    if (!providerAllowed(cfg.runtime, .completion)) return error.ProviderCircuitOpen;
+    const content = callOpenAICompatibleChat(allocator, cfg, system_prompt, prompt) catch |err| {
+        providerFailed(cfg.runtime, .completion);
+        return err;
+    };
+    providerSucceeded(cfg.runtime, .completion);
     return .{
         .provider = "openai-compatible",
         .model = cfg.model orelse "unknown",
-        .content = try callOpenAICompatibleChat(allocator, cfg, system_prompt, prompt),
+        .content = content,
     };
+}
+
+fn providerAllowed(runtime: ?*ProviderRuntime, target: ProviderTarget) bool {
+    if (runtime) |rt| return rt.allow(target);
+    return true;
+}
+
+fn providerSucceeded(runtime: ?*ProviderRuntime, target: ProviderTarget) void {
+    if (runtime) |rt| rt.recordSuccess(target);
+}
+
+fn providerFailed(runtime: ?*ProviderRuntime, target: ProviderTarget) void {
+    if (runtime) |rt| rt.recordFailure(target);
 }
 
 fn callOpenAICompatibleEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfig, text: []const u8) ![]f32 {
@@ -612,6 +825,45 @@ test "embedding fallback chain can recover to deterministic local embeddings" {
     try std.testing.expectEqual(@as(usize, 3), result.embedding.len);
 }
 
+test "provider runtime opens failed primary and skips it during cooldown" {
+    const fallbacks = [_]EmbeddingEndpointConfig{.{ .provider = .local_deterministic, .dimensions = 3 }};
+    var runtime = try ProviderRuntime.init(std.testing.allocator, .{
+        .provider = .openai_compatible,
+        .base_url = "://bad-provider-url",
+        .model = "broken",
+        .dimensions = 3,
+        .timeout_secs = 1,
+        .fallbacks = &fallbacks,
+    }, .{}, .{ .failure_threshold = 1, .cooldown_ms = 60_000 });
+    defer runtime.deinit(std.testing.allocator);
+
+    const first = try embedText(std.testing.allocator, .{
+        .provider = .openai_compatible,
+        .base_url = "://bad-provider-url",
+        .model = "broken",
+        .dimensions = 3,
+        .timeout_secs = 1,
+        .fallbacks = &fallbacks,
+        .runtime = &runtime,
+    }, "fallback memory", 3);
+    defer std.testing.allocator.free(first.embedding);
+    try std.testing.expectEqualStrings("local-deterministic", first.provider);
+    try std.testing.expectEqual(CircuitState.open, runtime.embedding_primary.state);
+
+    const second = try embedText(std.testing.allocator, .{
+        .provider = .openai_compatible,
+        .base_url = "://bad-provider-url",
+        .model = "broken",
+        .dimensions = 3,
+        .timeout_secs = 1,
+        .fallbacks = &fallbacks,
+        .runtime = &runtime,
+    }, "fallback memory again", 3);
+    defer std.testing.allocator.free(second.embedding);
+    try std.testing.expectEqualStrings("local-deterministic", second.provider);
+    try std.testing.expectEqual(@as(u64, 1), runtime.embedding_primary.skipped);
+}
+
 test "providers parse openai-compatible chat response" {
     const body = "{\"choices\":[{\"message\":{\"content\":\"answer\"}}]}";
     const content = try parseChatResponse(std.testing.allocator, body);
@@ -635,6 +887,7 @@ test "providers manifest includes concrete and compatible providers" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "openai-compatible-embeddings") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"name\":\"gemini\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"name\":\"voyage\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "provider-circuit-breaker") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ollama") != null);
 }
 

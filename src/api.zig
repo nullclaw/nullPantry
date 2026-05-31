@@ -43,6 +43,7 @@ pub const Context = struct {
     llm_api_key: ?[]const u8 = null,
     llm_model: ?[]const u8 = null,
     provider_timeout_secs: u32 = 30,
+    provider_runtime: ?*providers.ProviderRuntime = null,
     trust_actor_headers: bool = false,
 };
 
@@ -2092,6 +2093,7 @@ fn runExtraction(ctx: *Context, source: domain.Source, options: ExtractionOption
                     .api_key = ctx.llm_api_key,
                     .model = ctx.llm_model,
                     .timeout_secs = ctx.provider_timeout_secs,
+                    .runtime = ctx.provider_runtime,
                 }, "Return only valid JSON for the requested NullPantry extraction schema. Do not include markdown fences unless the model cannot avoid them. Extract only source-grounded memory atoms and relations.", prompt) catch |err| {
                     if (options.strict_llm_extraction) return err;
                     extraction_fallback = true;
@@ -2253,6 +2255,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
                 .dimensions = ctx.embedding_dimensions,
                 .timeout_secs = ctx.provider_timeout_secs,
                 .fallbacks = ctx.embedding_fallbacks,
+                .runtime = ctx.provider_runtime,
             }, chunk_text, ctx.embedding_dimensions) catch return count;
             const embedding_json = try vector_mod.embeddingToJson(ctx.allocator, embedding_result.embedding);
             _ = try ctx.store.upsertVectorChunk(ctx.allocator, .{
@@ -2589,6 +2592,7 @@ fn vectorEmbed(ctx: *Context, body: []const u8) HttpResponse {
         .dimensions = @min(dimensions, 4096),
         .timeout_secs = ctx.provider_timeout_secs,
         .fallbacks = ctx.embedding_fallbacks,
+        .runtime = ctx.provider_runtime,
     };
     const result = providers.embedText(ctx.allocator, cfg, text, @min(dimensions, 4096)) catch return serverError(ctx);
     const embedding_json = @import("vector.zig").embeddingToJson(ctx.allocator, result.embedding) catch return serverError(ctx);
@@ -3442,6 +3446,14 @@ fn lifecycleDiagnostics(ctx: *Context) HttpResponse {
         "{{\"diagnostics\":{{\"health\":\"{s}\",\"total_memory_atoms\":{d},\"stale_memory_atoms\":{d},\"vector_outbox_pending\":{d},\"lucid_projection_pending\":{d},\"lucid_projection_failed\":{d},\"cache_entries\":{d},\"queued_jobs\":{d},\"running_jobs\":{d},\"failed_jobs\":{d},\"pending_feed_events\":{d},\"open_conflicts\":{d},\"agent_memories\":{d},\"sessions\":{d}}}}}",
         .{ diagnostics.health(), diagnostics.total_memory_atoms, diagnostics.stale_memory_atoms, diagnostics.vector_outbox_pending, diagnostics.lucid_projection_pending, diagnostics.lucid_projection_failed, diagnostics.cache_entries, diagnostics.queued_jobs, diagnostics.running_jobs, diagnostics.failed_jobs, diagnostics.pending_feed_events, diagnostics.open_conflicts, diagnostics.agent_memories, diagnostics.sessions },
     ) catch return serverError(ctx);
+    if (ctx.provider_runtime) |runtime| {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        out.appendSlice(ctx.allocator, body[0 .. body.len - 2]) catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, ",\"providers\":") catch return serverError(ctx);
+        runtime.appendStatusJson(ctx.allocator, &out) catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
+        return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+    }
     return .{ .status = "200 OK", .body = body };
 }
 
@@ -3893,6 +3905,7 @@ fn lifecycleSummarize(ctx: *Context, body: []const u8) HttpResponse {
             .api_key = ctx.llm_api_key,
             .model = ctx.llm_model,
             .timeout_secs = ctx.provider_timeout_secs,
+            .runtime = ctx.provider_runtime,
         }, system, prompt)) |completion| {
             const trimmed = summarizer.trimUtf8WithSuffix(ctx.allocator, completion.content, max_chars) catch return serverError(ctx);
             summary_text = trimmed.text;
@@ -4001,6 +4014,7 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
                 .api_key = ctx.llm_api_key,
                 .model = ctx.llm_model,
                 .timeout_secs = ctx.provider_timeout_secs,
+                .runtime = ctx.provider_runtime,
             }, prompt)) |completion| {
                 if (answerCitationsValid(ctx, completion.content, results) catch false) {
                     answer_provider = completion.provider;
@@ -4085,6 +4099,7 @@ fn maybeLlmRerankResults(ctx: *Context, query: []const u8, results: []domain.Sea
         .api_key = ctx.llm_api_key,
         .model = ctx.llm_model,
         .timeout_secs = ctx.provider_timeout_secs,
+        .runtime = ctx.provider_runtime,
     }, prompt) catch return results;
     return parseRerankOrder(ctx.allocator, completion.content, results) catch results;
 }
@@ -5491,6 +5506,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
             .dimensions = embedding_dimensions,
             .timeout_secs = ctx.provider_timeout_secs,
             .fallbacks = ctx.embedding_fallbacks,
+            .runtime = ctx.provider_runtime,
         }, query, embedding_dimensions) catch |err| {
             if (strict_vector) return err;
             use_vector = false;
@@ -7095,6 +7111,44 @@ test "api vector embed uses configured embedding fallback chain and rejects prov
 
     const override = handleRequest(&ctx, "POST", "/v1/vector/embed", "{\"text\":\"x\",\"provider\":\"gemini\"}", "");
     try std.testing.expectEqualStrings("400 Bad Request", override.status);
+}
+
+test "api diagnostics expose provider circuit breaker state" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const fallbacks = [_]providers.EmbeddingEndpointConfig{.{ .provider = .local_deterministic, .dimensions = 4 }};
+    var runtime = try providers.ProviderRuntime.init(std.testing.allocator, .{
+        .provider = .openai_compatible,
+        .base_url = "://bad-provider-url",
+        .model = "bad-model",
+        .dimensions = 4,
+        .timeout_secs = 1,
+        .fallbacks = &fallbacks,
+    }, .{}, .{ .failure_threshold = 1, .cooldown_ms = 60_000 });
+    defer runtime.deinit(std.testing.allocator);
+
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .embedding_base_url = "://bad-provider-url",
+        .embedding_model = "bad-model",
+        .embedding_dimensions = 4,
+        .embedding_fallbacks = &fallbacks,
+        .provider_timeout_secs = 1,
+        .provider_runtime = &runtime,
+    };
+
+    const embed_resp = handleRequest(&ctx, "POST", "/v1/vector/embed", "{\"text\":\"provider circuit vector\"}", "");
+    try std.testing.expectEqualStrings("200 OK", embed_resp.status);
+    const diagnostics = handleRequest(&ctx, "GET", "/v1/lifecycle/diagnostics", "", "");
+    try std.testing.expectEqualStrings("200 OK", diagnostics.status);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"providers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"state\":\"open\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"provider\":\"openai-compatible\"") != null);
 }
 
 test "api search and ask do not return unrelated fallback evidence on zero hit" {

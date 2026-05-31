@@ -24,6 +24,7 @@ pub const RunOptions = struct {
     llm_api_key: ?[]const u8 = null,
     llm_model: ?[]const u8 = null,
     provider_timeout_secs: u32 = 30,
+    provider_runtime: ?*providers.ProviderRuntime = null,
     actor_id: []const u8 = "system:worker",
 };
 
@@ -247,6 +248,7 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
                     .api_key = options.llm_api_key,
                     .model = options.llm_model,
                     .timeout_secs = options.provider_timeout_secs,
+                    .runtime = options.provider_runtime,
                 }, "Return only valid JSON for the requested NullPantry extraction schema. Do not include markdown fences unless the model cannot avoid them. Extract only source-grounded memory atoms and relations.", prompt) catch |err| {
                     if (job_options.strict_llm_extraction) return err;
                     counts.extraction_fallback = true;
@@ -410,6 +412,7 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
                 .dimensions = options.embedding_dimensions,
                 .timeout_secs = options.provider_timeout_secs,
                 .fallbacks = options.embedding_fallbacks,
+                .runtime = options.provider_runtime,
             }, chunk_text, options.embedding_dimensions) catch return count;
             const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
             _ = try store.upsertVectorChunk(allocator, .{
@@ -466,6 +469,7 @@ fn processEmbeddingOutboxEntry(allocator: std.mem.Allocator, store: *store_mod.S
         .dimensions = dimensions,
         .timeout_secs = options.provider_timeout_secs,
         .fallbacks = options.embedding_fallbacks,
+        .runtime = options.provider_runtime,
     }, text, dimensions);
     const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
     _ = try store.upsertVectorChunk(allocator, .{

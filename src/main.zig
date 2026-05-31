@@ -43,6 +43,8 @@ const RuntimeConfig = struct {
     llm_api_key: ?[]const u8 = null,
     llm_model: ?[]const u8 = null,
     provider_timeout_secs: u32 = 30,
+    provider_circuit_failure_threshold: u32 = 3,
+    provider_circuit_cooldown_ms: i64 = 30_000,
     worker_interval_ms: u64 = 5000,
     trust_actor_headers: bool = false,
     agent_memory_backend: agent_memory_runtime.BackendKind = .native,
@@ -59,6 +61,7 @@ const ServerState = struct {
     allocator: std.mem.Allocator,
     store: *store_mod.Store,
     cfg: RuntimeConfig,
+    provider_runtime: *providers.ProviderRuntime,
     active_connections: std.atomic.Value(usize) = .init(0),
 };
 
@@ -103,7 +106,13 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("analytics backend: {s}\n", .{cfg.analytics_backend.backend.name()});
     std.debug.print("lucid projection: {s}\n", .{if (cfg.lucid_projection.isEnabled()) "enabled" else "disabled"});
 
-    var state = ServerState{ .allocator = allocator, .store = &store, .cfg = cfg };
+    var provider_runtime = try providers.ProviderRuntime.init(allocator, embeddingConfigFromRuntime(cfg), completionConfigFromRuntime(cfg), .{
+        .failure_threshold = cfg.provider_circuit_failure_threshold,
+        .cooldown_ms = cfg.provider_circuit_cooldown_ms,
+    });
+    defer provider_runtime.deinit(allocator);
+
+    var state = ServerState{ .allocator = allocator, .store = &store, .cfg = cfg, .provider_runtime = &provider_runtime };
     if (cfg.worker_interval_ms > 0) {
         const worker_thread = try std.Thread.spawn(.{}, workerLoop, .{&state});
         worker_thread.detach();
@@ -173,6 +182,7 @@ fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
         .llm_api_key = state.cfg.llm_api_key,
         .llm_model = state.cfg.llm_model,
         .provider_timeout_secs = state.cfg.provider_timeout_secs,
+        .provider_runtime = state.provider_runtime,
         .trust_actor_headers = state.cfg.trust_actor_headers,
     };
     const response = api.handleRequest(&ctx, method, target, body, raw);
@@ -211,6 +221,7 @@ fn workerLoop(state: *ServerState) void {
             .llm_api_key = state.cfg.llm_api_key,
             .llm_model = state.cfg.llm_model,
             .provider_timeout_secs = state.cfg.provider_timeout_secs,
+            .provider_runtime = state.provider_runtime,
         }) catch |err| {
             arena.deinit();
             std.debug.print("event=worker_error error={}\n", .{err});
@@ -287,6 +298,14 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_PROVIDER_TIMEOUT_SECS")) |secs| {
         cfg.provider_timeout_secs = std.fmt.parseInt(u32, secs, 10) catch cfg.provider_timeout_secs;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_PROVIDER_CIRCUIT_FAILURE_THRESHOLD")) |threshold| {
+        defer allocator.free(threshold);
+        cfg.provider_circuit_failure_threshold = std.fmt.parseInt(u32, threshold, 10) catch cfg.provider_circuit_failure_threshold;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_PROVIDER_CIRCUIT_COOLDOWN_MS")) |cooldown| {
+        defer allocator.free(cooldown);
+        cfg.provider_circuit_cooldown_ms = std.fmt.parseInt(i64, cooldown, 10) catch cfg.provider_circuit_cooldown_ms;
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_FALLBACKS")) |fallbacks| {
         defer allocator.free(fallbacks);
@@ -531,6 +550,12 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--provider-timeout-secs") and i + 1 < args.len) {
             i += 1;
             cfg.provider_timeout_secs = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--provider-circuit-failure-threshold") and i + 1 < args.len) {
+            i += 1;
+            cfg.provider_circuit_failure_threshold = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--provider-circuit-cooldown-ms") and i + 1 < args.len) {
+            i += 1;
+            cfg.provider_circuit_cooldown_ms = try std.fmt.parseInt(i64, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--worker-interval-ms") and i + 1 < args.len) {
             i += 1;
             cfg.worker_interval_ms = try std.fmt.parseInt(u64, args[i], 10);
@@ -671,6 +696,15 @@ fn embeddingConfigFromRuntime(cfg: RuntimeConfig) providers.EmbeddingConfig {
         .dimensions = cfg.embedding_dimensions,
         .timeout_secs = cfg.provider_timeout_secs,
         .fallbacks = cfg.embedding_fallbacks,
+    };
+}
+
+fn completionConfigFromRuntime(cfg: RuntimeConfig) providers.CompletionConfig {
+    return .{
+        .base_url = cfg.llm_base_url,
+        .api_key = cfg.llm_api_key,
+        .model = cfg.llm_model,
+        .timeout_secs = cfg.provider_timeout_secs,
     };
 }
 
