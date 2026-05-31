@@ -11348,6 +11348,10 @@ test "api memory feed endpoints honor named runtime route selection" {
     const queued_source_retry = handleRequest(&ctx, "POST", "/v1/memory/events?store=scratch", queued_source_body, "");
     try std.testing.expectEqualStrings("200 OK", queued_source_retry.status);
 
+    const nested_route_keyword_source_body = "{\"event_type\":\"source.put\",\"operation\":\"put\",\"object_type\":\"source\",\"object_id\":\"src_nested_route_keyword\",\"origin_instance_id\":\"route-test\",\"origin_sequence\":3,\"scope\":\"public\",\"payload\":{\"title\":\"Scratch nested route keyword source\",\"content\":\"Scratch nested route keyword body\",\"scope\":\"public\",\"metadata\":{\"store\":\"payload-metadata\"}}}";
+    const nested_route_keyword_source = handleRequest(&ctx, "POST", "/v1/memory/events?store=scratch", nested_route_keyword_source_body, "");
+    try std.testing.expectEqualStrings("200 OK", nested_route_keyword_source.status);
+
     const pending_restore = handleRequest(&ctx, "POST", "/v1/memory/checkpoint?store=scratch", "{\"events\":[{\"event_type\":\"source.put\",\"operation\":\"put\",\"object_type\":\"source\",\"object_id\":\"src_restored_pending_route\",\"status\":\"pending\",\"scope\":\"public\",\"payload\":{\"title\":\"Scratch restored pending source feed\",\"content\":\"Scratch restored pending source body\",\"scope\":\"public\"}}]}", "");
     try std.testing.expectEqualStrings("200 OK", pending_restore.status);
 
@@ -11375,6 +11379,7 @@ test "api memory feed endpoints honor named runtime route selection" {
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed atom feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed source feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch queued source feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch nested route keyword source") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch restored pending source feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "Scratch routed session feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_feed.body, "\"total_tokens\":123") != null);
@@ -11388,6 +11393,7 @@ test "api memory feed endpoints honor named runtime route selection" {
     try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch routed feed apply") == null);
     try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch routed source feed") == null);
     try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch queued source feed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch nested route keyword source") == null);
     try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch restored pending source feed") == null);
     try std.testing.expect(std.mem.indexOf(u8, native_feed.body, "Scratch routed session feed") == null);
 
@@ -11398,6 +11404,7 @@ test "api memory feed endpoints honor named runtime route selection" {
     try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch routed atom feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch routed source feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch queued source feed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch nested route keyword source") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch restored pending source feed") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_checkpoint.body, "Scratch routed session feed") != null);
 

@@ -295,10 +295,7 @@ pub fn payloadWithStorageRouteJson(allocator: std.mem.Allocator, payload_json: [
     if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') {
         return allocator.dupe(u8, payload_json);
     }
-    if (std.mem.indexOf(u8, trimmed, "\"store\"") != null or
-        std.mem.indexOf(u8, trimmed, "\"storage\"") != null or
-        std.mem.indexOf(u8, trimmed, "\"stores\"") != null)
-    {
+    if (try payloadHasTopLevelStorageRoute(allocator, trimmed)) {
         return allocator.dupe(u8, payload_json);
     }
 
@@ -330,6 +327,17 @@ pub fn payloadWithStorageRouteJson(allocator: std.mem.Allocator, payload_json: [
     }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
+}
+
+fn payloadHasTopLevelStorageRoute(allocator: std.mem.Allocator, payload_json: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const obj = parsed.value.object;
+    return obj.get("store") != null or obj.get("storage") != null or obj.get("stores") != null;
 }
 
 fn storageRouteDedupePart(allocator: std.mem.Allocator, route: AgentMemoryStorageRoute) ![]const u8 {
@@ -549,6 +557,26 @@ fn firstScopeOrDefault(allocator: std.mem.Allocator, scopes_json: []const u8, fa
         }
     }
     return allocator.dupe(u8, fallback);
+}
+
+test "payloadWithStorageRouteJson ignores nested route-like keys" {
+    const allocator = std.testing.allocator;
+    const payload = "{\"title\":\"route\",\"metadata\":{\"store\":\"embedded\"},\"content\":\"{\\\"storage\\\":\\\"inside\\\"}\"}";
+    const routed = try payloadWithStorageRouteJson(allocator, payload, .{ .target = .named, .name = "scratch" });
+    defer allocator.free(routed);
+
+    try std.testing.expect(std.mem.indexOf(u8, routed, "\"store\":\"scratch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routed, "\"metadata\":{\"store\":\"embedded\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routed, "\"content\":\"{\\\"storage\\\":\\\"inside\\\"}\"") != null);
+}
+
+test "payloadWithStorageRouteJson preserves explicit top-level route selectors" {
+    const allocator = std.testing.allocator;
+    const payload = "{\"store\":\"archive\",\"title\":\"explicit\"}";
+    const routed = try payloadWithStorageRouteJson(allocator, payload, .{ .target = .named, .name = "scratch" });
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings(payload, routed);
 }
 
 fn hygieneCanVerify(input: HygieneRunInput, scope: []const u8, permissions_json: []const u8) bool {
