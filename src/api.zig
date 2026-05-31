@@ -3196,6 +3196,7 @@ fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8) HttpResponse {
             restorePendingCheckpointEvent(ctx, event_obj) catch |err| switch (err) {
                 error.Forbidden => return forbidden(ctx),
                 error.UnsupportedObjectType => return json.errorResponse(ctx.allocator, 400, "bad_request", "Unsupported feed object_type"),
+                error.InternalAgentMemory => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be restored through the feed"),
                 error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid checkpoint event"),
                 else => return serverError(ctx),
             };
@@ -3235,6 +3236,7 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap) !void {
     const scope = feedEventScope(ctx, obj, object_type, payload_json, event_actor_id) catch return error.InvalidPayload;
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return error.InvalidPayload;
     if (std.mem.eql(u8, object_type, "agent_memory")) {
+        if (try feedAgentMemoryPayloadIsInternal(ctx, payload_json)) return error.InternalAgentMemory;
         if (!canApplyAgentMemoryScope(ctx, event_actor_id, scope, permissions_json)) return error.Forbidden;
     } else if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
 
@@ -3317,6 +3319,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         const prepared = buildAppliedAgentMemoryInput(ctx, operation, payload_json, event_object_id, event_actor_id) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
+            error.InternalAgentMemory => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be applied through the feed"),
             error.MissingKey, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Agent memory apply payload must include key/object_id and valid merge content"),
             else => return serverError(ctx),
         };
@@ -3603,6 +3606,7 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
     if (payload.value != .object) return error.InvalidPayload;
     const obj = payload.value.object;
     const key = json.stringField(obj, "key") orelse object_id orelse return error.MissingKey;
+    if (domain.isInternalMemoryKey(key)) return error.InternalAgentMemory;
     const session_id = json.nullableStringField(obj, "session_id");
     if (session_id) |sid| {
         if (!agentSessionWriteAllowed(ctx, sid)) return error.Forbidden;
@@ -3629,6 +3633,7 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
         .merge_string_set => try agent_memory_reducer.stringSetPatchFromObject(ctx.allocator, obj),
         .merge_object => try agent_memory_reducer.objectPatchFromObject(ctx.allocator, obj),
     };
+    if (domain.isInternalMemoryEntryKeyOrContent(key, content)) return error.InternalAgentMemory;
 
     return .{ .input = .{
         .key = key,
@@ -5266,7 +5271,9 @@ fn feedAgentMemoryPayloadIsInternal(ctx: *Context, payload_json: []const u8) !bo
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const key = json.stringField(parsed.value.object, "key") orelse "";
-    const content = json.stringField(parsed.value.object, "content") orelse "";
+    const content = json.stringField(parsed.value.object, "content") orelse
+        json.stringField(parsed.value.object, "text") orelse
+        json.stringField(parsed.value.object, "value") orelse "";
     return domain.isInternalMemoryEntryKeyOrContent(key, content);
 }
 
@@ -8161,6 +8168,49 @@ test "api memory feed does not expose internal agent autosave payloads" {
     try std.testing.expectEqualStrings("200 OK", redacted.status);
     try std.testing.expect(std.mem.indexOf(u8, redacted.body, "manual internal autosave payload") == null);
     try std.testing.expect(std.mem.indexOf(u8, redacted.body, "autosave_user_1") == null);
+}
+
+test "api memory feed apply rejects internal agent memory payloads" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var admin_ctx = Context{ .allocator = alloc, .store = &store };
+
+    const direct_apply = handleRequest(&admin_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"operation\":\"put\",\"object_type\":\"agent_memory\",\"actor_id\":\"agent:sync\",\"payload\":{\"key\":\"autosave_user_1\",\"content\":\"internal autosave should not replay\"}}", "");
+    try std.testing.expectEqualStrings("400 Bad Request", direct_apply.status);
+    try std.testing.expect(std.mem.indexOf(u8, direct_apply.body, "Internal agent memory") != null);
+    try std.testing.expect((try store.agentMemoryGet(alloc, "autosave_user_1", null, "agent:sync")) == null);
+
+    const markdown_apply = handleRequest(&admin_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"operation\":\"put\",\"object_type\":\"agent_memory\",\"actor_id\":\"agent:sync\",\"payload\":{\"key\":\"normal.key\",\"content\":\"**autosave_assistant_1**: internal markdown replay\"}}", "");
+    try std.testing.expectEqualStrings("400 Bad Request", markdown_apply.status);
+    try std.testing.expect((try store.agentMemoryGet(alloc, "normal.key", null, "agent:sync")) == null);
+
+    const merge_apply = handleRequest(&admin_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.merge_string_set\",\"operation\":\"merge_string_set\",\"object_type\":\"agent_memory\",\"actor_id\":\"agent:sync\",\"payload\":{\"key\":\"__bootstrap.prompt.system\",\"values\":[\"leak\"]}}", "");
+    try std.testing.expectEqualStrings("400 Bad Request", merge_apply.status);
+    try std.testing.expect((try store.agentMemoryGet(alloc, "__bootstrap.prompt.system", null, "agent:sync")) == null);
+
+    const applied_checkpoint =
+        \\{"events":[
+        \\{"event_type":"agent_memory.put","operation":"put","object_type":"agent_memory","actor_id":"agent:sync","status":"applied","dedupe_key":"internal-applied","payload":{"key":"autosave_assistant_2","content":"applied checkpoint internal"}}
+        \\]}
+    ;
+    const applied_restore = handleRequest(&admin_ctx, "POST", "/v1/memory/checkpoint", applied_checkpoint, "");
+    try std.testing.expectEqualStrings("400 Bad Request", applied_restore.status);
+    try std.testing.expect((try store.agentMemoryGet(alloc, "autosave_assistant_2", null, "agent:sync")) == null);
+
+    const pending_checkpoint =
+        \\{"events":[
+        \\{"event_type":"agent_memory.put","operation":"put","object_type":"agent_memory","object_id":"ami_pending_internal","scope":"agent:sync","permissions":["actor:agent:sync"],"actor_id":"agent:sync","status":"pending","dedupe_key":"internal-pending","payload":{"key":"autosave_user_3","content":"pending checkpoint internal","scope":"agent:sync"}}
+        \\]}
+    ;
+    const pending_restore = handleRequest(&admin_ctx, "POST", "/v1/memory/checkpoint", pending_checkpoint, "");
+    try std.testing.expectEqualStrings("400 Bad Request", pending_restore.status);
+    const feed = handleRequest(&admin_ctx, "GET", "/v1/memory/events?limit=50", "", "");
+    try std.testing.expectEqualStrings("200 OK", feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "internal-pending") == null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "autosave_user_3") == null);
 }
 
 test "api memory apply supports deterministic agent memory merge reducers" {
