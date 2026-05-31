@@ -6,7 +6,46 @@ const vector = @import("vector.zig");
 
 pub const max_provider_response_bytes: usize = 8 * 1024 * 1024;
 
+pub const EmbeddingProviderKind = enum {
+    local_deterministic,
+    openai_compatible,
+    gemini,
+    voyage,
+
+    pub fn parse(raw: []const u8) EmbeddingProviderKind {
+        if (std.ascii.eqlIgnoreCase(raw, "local") or
+            std.ascii.eqlIgnoreCase(raw, "deterministic") or
+            std.ascii.eqlIgnoreCase(raw, "local-deterministic"))
+        {
+            return .local_deterministic;
+        }
+        if (std.ascii.eqlIgnoreCase(raw, "gemini") or
+            std.ascii.eqlIgnoreCase(raw, "google") or
+            std.ascii.eqlIgnoreCase(raw, "google-gemini"))
+        {
+            return .gemini;
+        }
+        if (std.ascii.eqlIgnoreCase(raw, "voyage") or
+            std.ascii.eqlIgnoreCase(raw, "voyageai") or
+            std.ascii.eqlIgnoreCase(raw, "voyage-ai"))
+        {
+            return .voyage;
+        }
+        return .openai_compatible;
+    }
+
+    pub fn name(self: EmbeddingProviderKind) []const u8 {
+        return switch (self) {
+            .local_deterministic => "local-deterministic",
+            .openai_compatible => "openai-compatible",
+            .gemini => "gemini",
+            .voyage => "voyage",
+        };
+    }
+};
+
 pub const EmbeddingConfig = struct {
+    provider: EmbeddingProviderKind = .openai_compatible,
     base_url: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     model: ?[]const u8 = null,
@@ -14,7 +53,11 @@ pub const EmbeddingConfig = struct {
     timeout_secs: u32 = 30,
 
     pub fn enabled(self: EmbeddingConfig) bool {
-        return self.base_url != null and self.model != null;
+        return switch (self.provider) {
+            .local_deterministic => false,
+            .openai_compatible => self.base_url != null and self.model != null,
+            .gemini, .voyage => self.api_key != null,
+        };
     }
 };
 
@@ -52,10 +95,10 @@ pub const ProviderDescriptor = struct {
 pub const provider_descriptors = [_]ProviderDescriptor{
     .{ .name = "local-deterministic", .role = "offline deterministic embeddings and fallback retrieval", .status = "built_in", .protocol = "none", .env_prefix = "" },
     .{ .name = "openai-compatible-embeddings", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
+    .{ .name = "gemini", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /v1beta/models/{model}:embedContent", .env_prefix = "NULLPANTRY_EMBEDDING_" },
+    .{ .name = "voyage", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /v1/embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "openai-compatible-chat", .role = "ask synthesis, structured extraction, and optional reranking", .status = "built_in", .protocol = "POST /chat/completions", .env_prefix = "NULLPANTRY_LLM_" },
     .{ .name = "ollama", .role = "local provider via OpenAI-compatible endpoint", .status = "compatible", .protocol = "configure Ollama OpenAI compatibility base URL", .env_prefix = "NULLPANTRY_EMBEDDING_|NULLPANTRY_LLM_" },
-    .{ .name = "voyage", .role = "embedding provider via OpenAI-compatible response shape", .status = "compatible", .protocol = "POST /embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
-    .{ .name = "gemini", .role = "external model provider adapter target", .status = "contract", .protocol = "provider adapter", .env_prefix = "NULLPANTRY_PROVIDER_" },
 };
 
 pub fn appendProvidersJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
@@ -79,10 +122,15 @@ pub fn appendProvidersJson(allocator: std.mem.Allocator, out: *std.ArrayListUnma
 
 pub fn embedText(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []const u8, fallback_dimensions: usize) !EmbeddingResult {
     if (cfg.enabled()) {
-        const embedding = try callOpenAICompatibleEmbedding(allocator, cfg, text);
+        const embedding = switch (cfg.provider) {
+            .local_deterministic => unreachable,
+            .openai_compatible => try callOpenAICompatibleEmbedding(allocator, cfg, text),
+            .gemini => try callGeminiEmbedding(allocator, cfg, text),
+            .voyage => try callVoyageEmbedding(allocator, cfg, text),
+        };
         return .{
-            .provider = "openai-compatible",
-            .model = cfg.model orelse "unknown",
+            .provider = cfg.provider.name(),
+            .model = embeddingModel(cfg),
             .embedding = embedding,
         };
     }
@@ -91,6 +139,15 @@ pub fn embedText(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []con
         .provider = "local-deterministic",
         .model = "local-deterministic",
         .embedding = try vector.deterministicEmbedding(allocator, text, fallback_dimensions),
+    };
+}
+
+fn embeddingModel(cfg: EmbeddingConfig) []const u8 {
+    return cfg.model orelse switch (cfg.provider) {
+        .local_deterministic => "local-deterministic",
+        .openai_compatible => "unknown",
+        .gemini => "text-embedding-004",
+        .voyage => "voyage-3-lite",
     };
 }
 
@@ -127,6 +184,63 @@ fn callOpenAICompatibleEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingCon
     const response = try postJson(allocator, url, cfg.api_key, cfg.timeout_secs, body);
     defer allocator.free(response);
     return parseEmbeddingResponse(allocator, response);
+}
+
+fn callGeminiEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []const u8) ![]f32 {
+    if (text.len == 0) return allocator.alloc(f32, 0);
+    const base_url = cfg.base_url orelse "https://generativelanguage.googleapis.com";
+    const model = cfg.model orelse "text-embedding-004";
+    const key = cfg.api_key orelse return error.ProviderUnavailable;
+    const suffix = try std.fmt.allocPrint(allocator, "/v1beta/models/{s}:embedContent?key={s}", .{ model, key });
+    defer allocator.free(suffix);
+    const url = try providerUrl(allocator, base_url, suffix);
+    defer allocator.free(url);
+
+    const body = try geminiEmbeddingPayload(allocator, model, text);
+    defer allocator.free(body);
+    const response = try postJson(allocator, url, null, cfg.timeout_secs, body);
+    defer allocator.free(response);
+    return parseGeminiEmbeddingResponse(allocator, response);
+}
+
+fn callVoyageEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []const u8) ![]f32 {
+    if (text.len == 0) return allocator.alloc(f32, 0);
+    const base_url = cfg.base_url orelse "https://api.voyageai.com";
+    const model = cfg.model orelse "voyage-3-lite";
+    const url = try providerUrl(allocator, base_url, "/v1/embeddings");
+    defer allocator.free(url);
+
+    const body = try voyageEmbeddingPayload(allocator, model, text, "query");
+    defer allocator.free(body);
+    const response = try postJson(allocator, url, cfg.api_key, cfg.timeout_secs, body);
+    defer allocator.free(response);
+    return parseEmbeddingResponse(allocator, response);
+}
+
+fn geminiEmbeddingPayload(allocator: std.mem.Allocator, model: []const u8, text: []const u8) ![]u8 {
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer payload.deinit(allocator);
+    const model_ref = try std.fmt.allocPrint(allocator, "models/{s}", .{model});
+    defer allocator.free(model_ref);
+    try payload.appendSlice(allocator, "{\"model\":");
+    try json.appendString(&payload, allocator, model_ref);
+    try payload.appendSlice(allocator, ",\"content\":{\"parts\":[{\"text\":");
+    try json.appendString(&payload, allocator, text);
+    try payload.appendSlice(allocator, "}]}}");
+    return payload.toOwnedSlice(allocator);
+}
+
+fn voyageEmbeddingPayload(allocator: std.mem.Allocator, model: []const u8, text: []const u8, input_type: []const u8) ![]u8 {
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer payload.deinit(allocator);
+    try payload.appendSlice(allocator, "{\"model\":");
+    try json.appendString(&payload, allocator, model);
+    try payload.appendSlice(allocator, ",\"input\":[");
+    try json.appendString(&payload, allocator, text);
+    try payload.appendSlice(allocator, "],\"input_type\":");
+    try json.appendString(&payload, allocator, input_type);
+    try payload.append(allocator, '}');
+    return payload.toOwnedSlice(allocator);
 }
 
 fn callOpenAICompatibleChat(allocator: std.mem.Allocator, cfg: CompletionConfig, system_prompt: []const u8, prompt: []const u8) ![]const u8 {
@@ -270,6 +384,20 @@ fn embeddingFromValue(allocator: std.mem.Allocator, value: std.json.Value) ![]f3
     return out;
 }
 
+fn parseGeminiEmbeddingResponse(allocator: std.mem.Allocator, body: []const u8) ![]f32 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.ProviderInvalidResponse;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.ProviderInvalidResponse,
+    };
+    const embedding = switch (root.get("embedding") orelse return error.ProviderInvalidResponse) {
+        .object => |o| o,
+        else => return error.ProviderInvalidResponse,
+    };
+    return embeddingFromValue(allocator, embedding.get("values") orelse return error.ProviderInvalidResponse);
+}
+
 fn parseChatResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.ProviderInvalidResponse;
     defer parsed.deinit();
@@ -302,6 +430,37 @@ test "providers parse openai-compatible embedding response" {
     try std.testing.expectApproxEqAbs(@as(f32, 1), embedding[0], 0.0001);
 }
 
+test "providers parse gemini embedding response" {
+    const body = "{\"embedding\":{\"values\":[0,3,4]}}";
+    const embedding = try parseGeminiEmbeddingResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(embedding);
+    try std.testing.expectEqual(@as(usize, 3), embedding.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), embedding[1], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), embedding[2], 0.0001);
+}
+
+test "providers build native embedding payloads" {
+    const gemini = try geminiEmbeddingPayload(std.testing.allocator, "text-embedding-004", "hello \"world\"");
+    defer std.testing.allocator.free(gemini);
+    try std.testing.expect(std.mem.indexOf(u8, gemini, "\"model\":\"models/text-embedding-004\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gemini, "hello \\\"world\\\"") != null);
+
+    const voyage = try voyageEmbeddingPayload(std.testing.allocator, "voyage-3-lite", "document text", "document");
+    defer std.testing.allocator.free(voyage);
+    try std.testing.expect(std.mem.indexOf(u8, voyage, "\"model\":\"voyage-3-lite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, voyage, "\"input_type\":\"document\"") != null);
+}
+
+test "embedding provider kind parsing and defaults" {
+    try std.testing.expectEqual(EmbeddingProviderKind.gemini, EmbeddingProviderKind.parse("google-gemini"));
+    try std.testing.expectEqual(EmbeddingProviderKind.voyage, EmbeddingProviderKind.parse("voyage-ai"));
+    try std.testing.expectEqual(EmbeddingProviderKind.local_deterministic, EmbeddingProviderKind.parse("deterministic"));
+    try std.testing.expectEqual(EmbeddingProviderKind.openai_compatible, EmbeddingProviderKind.parse("unknown"));
+    try std.testing.expect((EmbeddingConfig{ .provider = .gemini, .api_key = "key" }).enabled());
+    try std.testing.expect((EmbeddingConfig{ .provider = .voyage, .api_key = "key" }).enabled());
+    try std.testing.expect(!(EmbeddingConfig{ .provider = .gemini }).enabled());
+}
+
 test "providers parse openai-compatible chat response" {
     const body = "{\"choices\":[{\"message\":{\"content\":\"answer\"}}]}";
     const content = try parseChatResponse(std.testing.allocator, body);
@@ -323,6 +482,8 @@ test "providers manifest includes concrete and compatible providers" {
     defer out.deinit(std.testing.allocator);
     try appendProvidersJson(std.testing.allocator, &out);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "openai-compatible-embeddings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"name\":\"gemini\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"name\":\"voyage\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ollama") != null);
 }
 

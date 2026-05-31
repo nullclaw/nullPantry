@@ -11,6 +11,7 @@ const redis_mod = @import("redis.zig");
 const vector_runtime = @import("vector_runtime.zig");
 const analytics_runtime = @import("analytics_runtime.zig");
 const lucid_runtime = @import("lucid_runtime.zig");
+const providers = @import("providers.zig");
 
 const default_port: u16 = 8765;
 const max_request_size: usize = 2 * 1024 * 1024;
@@ -35,6 +36,7 @@ const RuntimeConfig = struct {
     embedding_base_url: ?[]const u8 = null,
     embedding_api_key: ?[]const u8 = null,
     embedding_model: ?[]const u8 = null,
+    embedding_provider: providers.EmbeddingProviderKind = .openai_compatible,
     embedding_dimensions: usize = 64,
     llm_base_url: ?[]const u8 = null,
     llm_api_key: ?[]const u8 = null,
@@ -163,6 +165,7 @@ fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
         .embedding_base_url = state.cfg.embedding_base_url,
         .embedding_api_key = state.cfg.embedding_api_key,
         .embedding_model = state.cfg.embedding_model,
+        .embedding_provider = state.cfg.embedding_provider,
         .embedding_dimensions = state.cfg.embedding_dimensions,
         .llm_base_url = state.cfg.llm_base_url,
         .llm_api_key = state.cfg.llm_api_key,
@@ -199,6 +202,7 @@ fn workerLoop(state: *ServerState) void {
             .embedding_base_url = state.cfg.embedding_base_url,
             .embedding_api_key = state.cfg.embedding_api_key,
             .embedding_model = state.cfg.embedding_model,
+            .embedding_provider = state.cfg.embedding_provider,
             .embedding_dimensions = state.cfg.embedding_dimensions,
             .llm_base_url = state.cfg.llm_base_url,
             .llm_api_key = state.cfg.llm_api_key,
@@ -261,6 +265,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_MODEL")) |model| {
         cfg.embedding_model = model;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_PROVIDER")) |provider| {
+        defer allocator.free(provider);
+        cfg.embedding_provider = providers.EmbeddingProviderKind.parse(provider);
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_DIMENSIONS")) |dims| {
         cfg.embedding_dimensions = std.fmt.parseInt(usize, dims, 10) catch cfg.embedding_dimensions;
@@ -495,6 +503,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--embedding-model") and i + 1 < args.len) {
             i += 1;
             cfg.embedding_model = args[i];
+        } else if (std.mem.eql(u8, arg, "--embedding-provider") and i + 1 < args.len) {
+            i += 1;
+            cfg.embedding_provider = providers.EmbeddingProviderKind.parse(args[i]);
         } else if (std.mem.eql(u8, arg, "--embedding-dimensions") and i + 1 < args.len) {
             i += 1;
             cfg.embedding_dimensions = try std.fmt.parseInt(usize, args[i], 10);
@@ -798,6 +809,7 @@ fn printUsage() void {
         \\  NULLPANTRY_EMBEDDING_BASE_URL
         \\  NULLPANTRY_EMBEDDING_API_KEY
         \\  NULLPANTRY_EMBEDDING_MODEL
+        \\  NULLPANTRY_EMBEDDING_PROVIDER
         \\  NULLPANTRY_EMBEDDING_DIMENSIONS
         \\  NULLPANTRY_LLM_BASE_URL
         \\  NULLPANTRY_LLM_API_KEY

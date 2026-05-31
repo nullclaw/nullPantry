@@ -35,6 +35,7 @@ pub const Context = struct {
     embedding_base_url: ?[]const u8 = null,
     embedding_api_key: ?[]const u8 = null,
     embedding_model: ?[]const u8 = null,
+    embedding_provider: providers.EmbeddingProviderKind = .openai_compatible,
     embedding_dimensions: usize = 64,
     llm_base_url: ?[]const u8 = null,
     llm_api_key: ?[]const u8 = null,
@@ -1195,7 +1196,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -2243,6 +2244,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
             const payload = try store_mod.vectorEmbedPayloadJson(ctx.allocator, @intCast(count), chunk_text, scope, permissions_json, ctx.embedding_model, ctx.embedding_dimensions);
             const outbox_id = try ctx.store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
             const embedding_result = providers.embedText(ctx.allocator, .{
+                .provider = ctx.embedding_provider,
                 .base_url = ctx.embedding_base_url,
                 .api_key = ctx.embedding_api_key,
                 .model = ctx.embedding_model,
@@ -2353,6 +2355,7 @@ fn runJob(ctx: *Context, id: []const u8) HttpResponse {
         .embedding_base_url = ctx.embedding_base_url,
         .embedding_api_key = ctx.embedding_api_key,
         .embedding_model = ctx.embedding_model,
+        .embedding_provider = ctx.embedding_provider,
         .embedding_dimensions = ctx.embedding_dimensions,
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
@@ -2569,12 +2572,13 @@ fn vectorEmbed(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    if (obj.get("base_url") != null or obj.get("api_key") != null or obj.get("model") != null or obj.get("timeout_secs") != null) {
+    if (obj.get("base_url") != null or obj.get("api_key") != null or obj.get("model") != null or obj.get("provider") != null or obj.get("timeout_secs") != null) {
         return json.errorResponse(ctx.allocator, 400, "bad_request", "Provider overrides are not allowed; configure providers on the server");
     }
     const text = json.stringField(obj, "text") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing text");
     const dimensions: usize = @intCast(@max(json.intField(obj, "dimensions") orelse @as(i64, @intCast(ctx.embedding_dimensions)), 1));
     const cfg = providers.EmbeddingConfig{
+        .provider = ctx.embedding_provider,
         .base_url = ctx.embedding_base_url,
         .api_key = ctx.embedding_api_key,
         .model = ctx.embedding_model,
@@ -2738,6 +2742,7 @@ fn vectorOutboxRun(ctx: *Context, body: []const u8) HttpResponse {
         .embedding_base_url = ctx.embedding_base_url,
         .embedding_api_key = ctx.embedding_api_key,
         .embedding_model = ctx.embedding_model,
+        .embedding_provider = ctx.embedding_provider,
         .embedding_dimensions = ctx.embedding_dimensions,
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
@@ -2870,6 +2875,7 @@ fn workersRun(ctx: *Context, body: []const u8) HttpResponse {
         .embedding_base_url = ctx.embedding_base_url,
         .embedding_api_key = ctx.embedding_api_key,
         .embedding_model = ctx.embedding_model,
+        .embedding_provider = ctx.embedding_provider,
         .embedding_dimensions = ctx.embedding_dimensions,
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
@@ -5416,6 +5422,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
     var embedding_dimensions: usize = @max(@as(usize, 1), @min(ctx.embedding_dimensions, @as(usize, 4096)));
     if (use_vector and query.len > 0) {
         const embedding_result = providers.embedText(ctx.allocator, .{
+            .provider = ctx.embedding_provider,
             .base_url = ctx.embedding_base_url,
             .api_key = ctx.embedding_api_key,
             .model = ctx.embedding_model,

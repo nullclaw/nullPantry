@@ -17,6 +17,7 @@ pub const RunOptions = struct {
     embedding_base_url: ?[]const u8 = null,
     embedding_api_key: ?[]const u8 = null,
     embedding_model: ?[]const u8 = null,
+    embedding_provider: providers.EmbeddingProviderKind = .openai_compatible,
     embedding_dimensions: usize = 64,
     llm_base_url: ?[]const u8 = null,
     llm_api_key: ?[]const u8 = null,
@@ -401,6 +402,7 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
             const payload = try store_mod.vectorEmbedPayloadJson(allocator, @intCast(count), chunk_text, scope, permissions_json, options.embedding_model, options.embedding_dimensions);
             const outbox_id = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
             const embedding_result = providers.embedText(allocator, .{
+                .provider = options.embedding_provider,
                 .base_url = options.embedding_base_url,
                 .api_key = options.embedding_api_key,
                 .model = options.embedding_model,
@@ -455,6 +457,7 @@ fn processEmbeddingOutboxEntry(allocator: std.mem.Allocator, store: *store_mod.S
     const chunk_ordinal = json.intField(obj, "chunk_ordinal") orelse 0;
     const dimensions: usize = @intCast(@max(@as(i64, 1), json.intField(obj, "dimensions") orelse @as(i64, @intCast(options.embedding_dimensions))));
     const embedding_result = try providers.embedText(allocator, .{
+        .provider = options.embedding_provider,
         .base_url = options.embedding_base_url,
         .api_key = options.embedding_api_key,
         .model = options.embedding_model,
