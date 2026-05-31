@@ -1375,6 +1375,13 @@ pub const Store = struct {
         };
     }
 
+    pub fn countSourcesVisible(self: *Store, allocator: std.mem.Allocator, scopes_json: []const u8, actor_id: ?[]const u8) !usize {
+        return switch (self.backend) {
+            .sqlite => |*s| s.countSourcesVisible(allocator, scopes_json, actor_id),
+            .postgres => |*p| p.countSourcesVisible(allocator, scopes_json, actor_id),
+        };
+    }
+
     pub fn requeueVectorOutboxFailures(self: *Store) !usize {
         return switch (self.backend) {
             .sqlite => |*s| s.requeueVectorOutboxFailures(),
@@ -8213,6 +8220,27 @@ pub const SQLiteStore = struct {
         return @intCast(try self.countSql("SELECT COUNT(*) FROM vector_chunks"));
     }
 
+    pub fn countSourcesVisible(self: *Self, allocator: std.mem.Allocator, scopes_json: []const u8, actor_id: ?[]const u8) !usize {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const stmt = try self.prepare("SELECT id,scope,permissions_json,metadata_json FROM sources");
+        defer _ = c.sqlite3_finalize(stmt);
+        var count: usize = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id_text = try columnText(scratch, stmt, 0);
+            const scope = try columnText(scratch, stmt, 1);
+            const permissions = try columnText(scratch, stmt, 2);
+            const metadata = try columnText(scratch, stmt, 3);
+            if (isAgentMemorySourceMetadata(metadata)) continue;
+            const status = try self.primitiveLifecycleStatus(scratch, "source", id_text);
+            if (!domain.isDefaultVisibleStatus(status)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(scratch, scope, permissions, scopes_json, actor_id)) continue;
+            count += 1;
+        }
+        return count;
+    }
+
     pub fn requeueVectorOutboxFailures(self: *Self) !usize {
         const stmt = try self.prepare("UPDATE vector_outbox SET status = 'pending', locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?1 WHERE status IN ('failed_embedding','failed_external_index','failed_external_delete')");
         defer _ = c.sqlite3_finalize(stmt);
@@ -11621,6 +11649,20 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const text = try self.queryText(arena.allocator(), "SELECT count(*)::text FROM vector_chunks");
+        return std.fmt.parseInt(usize, text, 10) catch 0;
+    }
+
+    pub fn countSourcesVisible(self: *PostgresStore, allocator: std.mem.Allocator, scopes_json: []const u8, actor_id: ?[]const u8) !usize {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const visible_sql = try pgRecordVisibleSql(scratch, "s.scope", "s.permissions_json", scopes_json, actor_id);
+        const sql = try std.fmt.allocPrint(
+            scratch,
+            "SELECT count(*)::text FROM sources s LEFT JOIN primitive_lifecycle pl ON pl.object_type = 'source' AND pl.object_id = s.id WHERE ({s}) AND coalesce(pl.status, 'active') NOT IN ('rejected','deprecated','superseded') AND coalesce(s.metadata_json->>'native', '') NOT IN ('agent_memory','agent_memory_runtime')",
+            .{visible_sql},
+        );
+        const text = try self.queryText(scratch, sql);
         return std.fmt.parseInt(usize, text, 10) catch 0;
     }
 

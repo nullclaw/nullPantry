@@ -204,6 +204,12 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return appendMemoryFeed(ctx, body, parsed.query);
     } else if (eql(seg1, "memory") and eql(seg2, "status") and is_get) {
         return memoryFeedStatus(ctx, parsed.query);
+    } else if (eql(seg1, "memory") and eql(seg2, "stats") and is_get) {
+        return memoryStats(ctx);
+    } else if (eql(seg1, "memory") and eql(seg2, "reindex") and is_post) {
+        return memoryReindex(ctx, body);
+    } else if (eql(seg1, "memory") and eql(seg2, "drain-outbox") and is_post) {
+        return memoryDrainOutbox(ctx, body);
     } else if (eql(seg1, "memory") and eql(seg2, "compact") and is_post) {
         return memoryFeedCompact(ctx, body, parsed.query);
     } else if (eql(seg1, "memory") and eql(seg2, "checkpoint") and is_get) {
@@ -224,6 +230,8 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return lifecycleAnalyticsExport(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "diagnostics") and is_get) {
         return lifecycleDiagnostics(ctx);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "stats") and is_get) {
+        return memoryStats(ctx);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "migrate") and is_post) {
         return lifecycleMigrate(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "export-jsonl") and is_post) {
@@ -373,6 +381,9 @@ fn handleNullClawAgentAdapter(ctx: *Context, method: []const u8, query: []const 
     if (eql(seg2, "memory")) {
         if ((eql(seg3, "feed") or eql(seg3, "events")) and is_get and seg4 == null) return nullClawMemoryFeed(ctx, query);
         if (eql(seg3, "status") and is_get and seg4 == null) return nullClawMemoryFeedStatus(ctx, query);
+        if (eql(seg3, "stats") and is_get and seg4 == null) return memoryStats(ctx);
+        if (eql(seg3, "reindex") and is_post and seg4 == null) return memoryReindex(ctx, body);
+        if (eql(seg3, "drain-outbox") and is_post and seg4 == null) return memoryDrainOutbox(ctx, body);
         if (eql(seg3, "compact") and is_post and seg4 == null) return nullClawMemoryFeedCompact(ctx, body, query);
         if (eql(seg3, "checkpoint") and is_get and seg4 == null) return nullClawMemoryFeedCheckpoint(ctx, query);
         if (eql(seg3, "checkpoint") and is_post and seg4 == null) return nullClawMemoryFeedCheckpointRestore(ctx, body, query);
@@ -1982,6 +1993,9 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/memory/feed", .get = "listFeed", .post = "appendFeed" },
         .{ .path = "/memory/events", .get = "listFeedEvents", .post = "appendFeedEvent" },
         .{ .path = "/memory/status", .get = "feedStatus" },
+        .{ .path = "/memory/stats", .get = "memoryStats" },
+        .{ .path = "/memory/reindex", .post = "memoryReindex" },
+        .{ .path = "/memory/drain-outbox", .post = "memoryDrainOutbox" },
         .{ .path = "/memory/compact", .post = "compactFeed" },
         .{ .path = "/memory/checkpoint", .get = "exportFeedCheckpoint", .post = "restoreFeedCheckpoint" },
         .{ .path = "/memory/apply", .post = "applyFeedEvent" },
@@ -1999,6 +2013,7 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/conflicts", .get = "listConflicts" },
         .{ .path = "/conflicts/scan", .post = "scanConflicts" },
         .{ .path = "/lifecycle/diagnostics", .get = "diagnostics" },
+        .{ .path = "/lifecycle/stats", .get = "memoryStats" },
         .{ .path = "/lifecycle/migrate", .post = "migrateLifecycleStorage" },
         .{ .path = "/lifecycle/export-jsonl", .post = "exportJsonlDataset" },
         .{ .path = "/lifecycle/snapshot", .post = "createSnapshot" },
@@ -2057,7 +2072,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","nullclaw_api_memory_adapter","bootstrap_prompts","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","jsonl_export","hygiene_report","lifecycle_migrate","lifecycle_rollout","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","nullclaw_api_memory_adapter","bootstrap_prompts","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_stats","memory_reindex","memory_drain_outbox","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","jsonl_export","hygiene_report","lifecycle_migrate","lifecycle_rollout","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -2987,7 +3002,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_memory_events":"GET /v1/agent/memory/events","nullclaw_api_memory_status":"GET /v1/agent/memory/status","nullclaw_api_memory_compact":"POST /v1/agent/memory/compact","nullclaw_api_memory_checkpoint":"GET|POST /v1/agent/memory/checkpoint","nullclaw_api_memory_apply":"POST /v1/agent/memory/apply","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","lifecycle_rollout":"POST /v1/lifecycle/rollout","jsonl_export":"POST /v1/lifecycle/export-jsonl","hygiene_report":"POST /v1/lifecycle/hygiene-report","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_memory_events":"GET /v1/agent/memory/events","nullclaw_api_memory_status":"GET /v1/agent/memory/status","nullclaw_api_memory_stats":"GET /v1/agent/memory/stats","nullclaw_api_memory_reindex":"POST /v1/agent/memory/reindex","nullclaw_api_memory_drain_outbox":"POST /v1/agent/memory/drain-outbox","nullclaw_api_memory_compact":"POST /v1/agent/memory/compact","nullclaw_api_memory_checkpoint":"GET|POST /v1/agent/memory/checkpoint","nullclaw_api_memory_apply":"POST /v1/agent/memory/apply","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","memory_stats":"GET /v1/lifecycle/stats|GET /v1/memory/stats|GET /v1/agent/memory/stats","memory_reindex":"POST /v1/memory/reindex|POST /v1/agent/memory/reindex","memory_drain_outbox":"POST /v1/memory/drain-outbox|POST /v1/agent/memory/drain-outbox","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","lifecycle_rollout":"POST /v1/lifecycle/rollout","jsonl_export":"POST /v1/lifecycle/export-jsonl","hygiene_report":"POST /v1/lifecycle/hygiene-report","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -3754,6 +3769,20 @@ fn vectorRebuild(ctx: *Context, body: []const u8) HttpResponse {
     return vectorMaintenanceResponse(ctx, "vector_rebuild", result);
 }
 
+fn memoryReindex(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "write")) return forbidden(ctx);
+    const effective_body = optionalJsonObjectBody(body);
+    var parsed = parseBody(ctx, effective_body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const result = ctx.store.rebuildVectorIndex(ctx.allocator, .{
+        .limit = positiveLimit(json.intField(obj, "limit"), 1000),
+        .reset_external = json.boolField(obj, "reset_external") orelse false,
+        .retry_failed = json.boolField(obj, "retry_failed") orelse false,
+    }) catch return serverError(ctx);
+    return memoryReindexResponse(ctx, result);
+}
+
 fn vectorReconcile(ctx: *Context, body: []const u8) HttpResponse {
     if (!hasCapability(ctx, "write")) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
@@ -3772,6 +3801,25 @@ fn vectorMaintenanceResponse(ctx: *Context, key: []const u8, result: store_mod.V
         "{{\"{s}\":{{\"canonical_chunks\":{d},\"enqueued_upserts\":{d},\"requeued_failed\":{d},\"external_enabled\":{s},\"active_sink\":\"{s}\",\"local_engine\":\"{s}\",\"search_engine\":\"{s}\",\"external_sinks\":{s}}}}}",
         .{
             key,
+            result.canonical_chunks,
+            result.enqueued_upserts,
+            result.requeued_failed,
+            if (result.external_enabled) "true" else "false",
+            ctx.store.vectorBackendName(),
+            ctx.store.localVectorEngineName(),
+            ctx.store.effectiveVectorSearchEngineName(),
+            ctx.store.vectorExternalSinksJson(),
+        },
+    ) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = body };
+}
+
+fn memoryReindexResponse(ctx: *Context, result: store_mod.VectorMaintenanceResult) HttpResponse {
+    const body = std.fmt.allocPrint(
+        ctx.allocator,
+        "{{\"reindexed\":{d},\"skipped\":false,\"memory_reindex\":{{\"canonical_chunks\":{d},\"enqueued_upserts\":{d},\"requeued_failed\":{d},\"external_enabled\":{s},\"active_sink\":\"{s}\",\"local_engine\":\"{s}\",\"search_engine\":\"{s}\",\"external_sinks\":{s}}}}}",
+        .{
+            result.enqueued_upserts,
             result.canonical_chunks,
             result.enqueued_upserts,
             result.requeued_failed,
@@ -3830,6 +3878,43 @@ fn vectorOutboxRun(ctx: *Context, body: []const u8) HttpResponse {
     const indexed_external = ctx.store.countVectorOutbox("indexed_external") catch return serverError(ctx);
     const deleted_external = ctx.store.countVectorOutbox("deleted_external") catch return serverError(ctx);
     const response = std.fmt.allocPrint(ctx.allocator, "{{\"outbox_run\":{{\"processed\":{d},\"failed\":{d},\"pending\":{d},\"embedded\":{d},\"indexed_local\":{d},\"indexed_external\":{d},\"deleted_external\":{d},\"active_sink\":\"{s}\",\"local_engine\":\"{s}\",\"search_engine\":\"{s}\",\"external_sinks\":{s}}}}}", .{ result.processed, result.failed, pending, embedded, indexed_local, indexed_external, deleted_external, ctx.store.vectorBackendName(), ctx.store.localVectorEngineName(), ctx.store.effectiveVectorSearchEngineName(), ctx.store.vectorExternalSinksJson() }) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = response };
+}
+
+fn memoryDrainOutbox(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "write")) return forbidden(ctx);
+    const effective_body = optionalJsonObjectBody(body);
+    var parsed = parseBody(ctx, effective_body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const limit = positiveLimit(json.intField(parsed.value.object, "limit"), 100);
+    const result = worker.runVectorOutboxOnce(ctx.allocator, ctx.store, .{
+        .scopes_json = ctx.actor_scopes_json,
+        .capabilities_json = ctx.actor_capabilities_json,
+        .outbox_limit = limit,
+        .embedding_base_url = ctx.embedding_base_url,
+        .embedding_api_key = ctx.embedding_api_key,
+        .embedding_model = ctx.embedding_model,
+        .embedding_provider = ctx.embedding_provider,
+        .embedding_fallbacks = ctx.embedding_fallbacks,
+        .embedding_dimensions = ctx.embedding_dimensions,
+        .embedding_allow_insecure_http = ctx.embedding_allow_insecure_http,
+        .llm_base_url = ctx.llm_base_url,
+        .llm_api_key = ctx.llm_api_key,
+        .llm_model = ctx.llm_model,
+        .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
+        .provider_timeout_secs = ctx.provider_timeout_secs,
+        .actor_id = ctx.actor_id,
+    }) catch return serverError(ctx);
+    const pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
+    const embedded = ctx.store.countVectorOutbox("embedded") catch return serverError(ctx);
+    const indexed_local = ctx.store.countVectorOutbox("indexed_local") catch return serverError(ctx);
+    const indexed_external = ctx.store.countVectorOutbox("indexed_external") catch return serverError(ctx);
+    const deleted_external = ctx.store.countVectorOutbox("deleted_external") catch return serverError(ctx);
+    const response = std.fmt.allocPrint(
+        ctx.allocator,
+        "{{\"drained\":{d},\"failed\":{d},\"memory_outbox\":{{\"processed\":{d},\"pending\":{d},\"embedded\":{d},\"indexed_local\":{d},\"indexed_external\":{d},\"deleted_external\":{d},\"active_sink\":\"{s}\",\"local_engine\":\"{s}\",\"search_engine\":\"{s}\",\"external_sinks\":{s}}}}}",
+        .{ result.processed, result.failed, result.processed, pending, embedded, indexed_local, indexed_external, deleted_external, ctx.store.vectorBackendName(), ctx.store.localVectorEngineName(), ctx.store.effectiveVectorSearchEngineName(), ctx.store.vectorExternalSinksJson() },
+    ) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
 }
 
@@ -5526,6 +5611,60 @@ fn lifecycleDiagnostics(ctx: *Context) HttpResponse {
         out.appendSlice(ctx.allocator, ",\"providers\":") catch return serverError(ctx);
         runtime.appendStatusJson(ctx.allocator, &out) catch return serverError(ctx);
     }
+    out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn memoryStats(ctx: *Context) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const store_diag = ctx.store.lifecycleDiagnostics() catch return serverError(ctx);
+    const visible_sources = ctx.store.countSourcesVisible(ctx.allocator, ctx.actor_scopes_json, ctx.actor_id) catch return serverError(ctx);
+    const visible_entries = ctx.store.agentMemoryCount(ctx.actor_id, ctx.actor_scopes_json) catch return serverError(ctx);
+    const vector_entries = ctx.store.countVectorChunks() catch return serverError(ctx);
+    const outbox_pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
+    const embedding_name = if (embeddingProviderConfigured(ctx)) ctx.embedding_provider.name() else "local-deterministic";
+    const llm_rerank_configured = ctx.llm_base_url != null and ctx.llm_model != null;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"backend\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.store.agentMemoryBackendName()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"retrieval\":\"hybrid\",\"vector\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.store.effectiveVectorSearchEngineName()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"embedding\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, embedding_name) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"rollout\":\"policy\",\"sync\":\"central_feed\"") catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"sources\":{d},\"fallback\":\"permission_filtered_keyword_graph\",\"entries\":{d},\"vector_entries\":{d},\"outbox_pending\":{d},\"nullpantry\":{{\"record_backend\":", .{ visible_sources, visible_entries, vector_entries, outbox_pending }) catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.store.backendName()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"agent_memory_backend\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.store.agentMemoryBackendName()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"vector_backend\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.store.vectorBackendName()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"local_vector_engine\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.store.localVectorEngineName()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"search_engine\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.store.effectiveVectorSearchEngineName()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"embedding_provider\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.embedding_provider.name()) catch return serverError(ctx);
+    out.print(
+        ctx.allocator,
+        ",\"embedding_external_configured\":{s},\"llm_rerank_configured\":{s},\"visible_sources\":{d},\"visible_agent_memories\":{d},\"total_memory_atoms\":{d},\"stale_memory_atoms\":{d},\"native_agent_memories\":{d},\"sessions\":{d},\"cache_entries\":{d},\"queued_jobs\":{d},\"running_jobs\":{d},\"failed_jobs\":{d},\"pending_feed_events\":{d},\"open_conflicts\":{d}",
+        .{
+            if (embeddingProviderConfigured(ctx)) "true" else "false",
+            if (llm_rerank_configured) "true" else "false",
+            visible_sources,
+            visible_entries,
+            store_diag.total_memory_atoms,
+            store_diag.stale_memory_atoms,
+            store_diag.agent_memories,
+            store_diag.sessions,
+            store_diag.cache_entries,
+            store_diag.queued_jobs,
+            store_diag.running_jobs,
+            store_diag.failed_jobs,
+            store_diag.pending_feed_events,
+            store_diag.open_conflicts,
+        },
+    ) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
@@ -10173,6 +10312,10 @@ fn positiveLimit(value: ?i64, default_value: usize) usize {
     return @intCast(@min(raw, 500));
 }
 
+fn optionalJsonObjectBody(body: []const u8) []const u8 {
+    return if (std.mem.trim(u8, body, " \t\r\n").len == 0) "{}" else body;
+}
+
 fn parseLimit(value: ?[]const u8, default_value: usize) usize {
     const raw = value orelse return default_value;
     const parsed = std.fmt.parseInt(usize, raw, 10) catch return default_value;
@@ -12039,6 +12182,9 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"migrateLifecycleStorage\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"exportJsonlDataset\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"createHygieneReport\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"memoryStats\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"memoryReindex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"memoryDrainOutbox\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "created_by_actor_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"loadAgentSessionMessages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"min_relevance\"") != null);
@@ -12052,6 +12198,9 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_status\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"jsonl_export\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"hygiene_report\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"memory_stats\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"memory_reindex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"memory_drain_outbox\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"lifecycle_migrate\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"min_relevance\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"adaptive_retrieval\"") != null);
@@ -12147,6 +12296,20 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expectEqualStrings("200 OK", rebuild.status);
     try std.testing.expect(std.mem.indexOf(u8, rebuild.body, "\"canonical_chunks\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rebuild.body, "\"enqueued_upserts\":1") != null);
+    const memory_reindex = handleRequest(&ctx, "POST", "/v1/memory/reindex", "{\"limit\":10}", "");
+    try std.testing.expectEqualStrings("200 OK", memory_reindex.status);
+    try std.testing.expect(std.mem.indexOf(u8, memory_reindex.body, "\"reindexed\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory_reindex.body, "\"memory_reindex\"") != null);
+    const memory_drain = handleRequest(&ctx, "POST", "/v1/memory/drain-outbox", "{\"limit\":10}", "");
+    try std.testing.expectEqualStrings("200 OK", memory_drain.status);
+    try std.testing.expect(std.mem.indexOf(u8, memory_drain.body, "\"drained\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory_drain.body, "\"memory_outbox\"") != null);
+    const agent_memory_reindex = handleRequest(&ctx, "POST", "/v1/agent/memory/reindex", "", "");
+    try std.testing.expectEqualStrings("200 OK", agent_memory_reindex.status);
+    try std.testing.expect(std.mem.indexOf(u8, agent_memory_reindex.body, "\"reindexed\":") != null);
+    const agent_memory_drain = handleRequest(&ctx, "POST", "/v1/agent/memory/drain-outbox", "", "");
+    try std.testing.expectEqualStrings("200 OK", agent_memory_drain.status);
+    try std.testing.expect(std.mem.indexOf(u8, agent_memory_drain.body, "\"drained\":") != null);
 
     const diagnostics = handleRequest(&ctx, "GET", "/v1/lifecycle/diagnostics", "", "");
     try std.testing.expectEqualStrings("200 OK", diagnostics.status);
@@ -12174,6 +12337,49 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const snapshot = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot", "{\"type\":\"manual\",\"summary\":{\"memory_atoms\":1}}", "");
     try std.testing.expectEqualStrings("200 OK", snapshot.status);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.body, "\"snap_") != null);
+}
+
+test "api memory stats exposes nullclaw-compatible counters with pantry runtime detail" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createSource(alloc, .{
+        .title = "Stats visible source",
+        .content = "Source counted by compact memory stats",
+        .scope = "public",
+        .actor_id = "agent:stats",
+    });
+    _ = try store.agentMemoryStore(alloc, .{
+        .key = "stats.pref",
+        .content = "Stats agent memory entry",
+        .actor_id = "agent:stats",
+    });
+
+    var ctx = Context{ .allocator = alloc, .store = &store, .actor_id = "agent:stats", .actor_scopes_json = "[\"public\"]", .actor_capabilities_json = "[\"read\"]" };
+    const stats = handleRequest(&ctx, "GET", "/v1/lifecycle/stats", "", "");
+    try std.testing.expectEqualStrings("200 OK", stats.status);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"backend\":\"native\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"retrieval\":\"hybrid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"vector\":\"sqlite_local_vector\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"embedding\":\"local-deterministic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"rollout\":\"policy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"sync\":\"central_feed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"sources\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"entries\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"vector_entries\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"outbox_pending\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"nullpantry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"record_backend\":\"sqlite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"visible_sources\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"visible_agent_memories\":1") != null);
+
+    const alias = handleRequest(&ctx, "GET", "/v1/memory/stats", "", "");
+    try std.testing.expectEqualStrings("200 OK", alias.status);
+    try std.testing.expect(std.mem.indexOf(u8, alias.body, "\"sources\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alias.body, "\"entries\":1") != null);
 }
 
 test "api diagnostics expose agent memory runtime planes" {
@@ -14720,6 +14926,12 @@ test "api manifest and connector endpoints describe headless service contracts" 
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "GET /v1/agent-sessions") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/vector/rebuild") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/vector/reconcile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "nullclaw_api_memory_stats") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "nullclaw_api_memory_reindex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "nullclaw_api_memory_drain_outbox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "GET /v1/lifecycle/stats|GET /v1/memory/stats|GET /v1/agent/memory/stats") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/memory/reindex|POST /v1/agent/memory/reindex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/memory/drain-outbox|POST /v1/agent/memory/drain-outbox") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/lifecycle/migrate") != null);
 }
 
