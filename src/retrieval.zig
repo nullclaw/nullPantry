@@ -228,16 +228,6 @@ pub fn buildPlanWithAdaptive(allocator: std.mem.Allocator, query: []const u8, ha
 }
 
 pub fn analyzeQuery(query: []const u8, config: AdaptiveConfig) QueryAnalysis {
-    if (!config.enabled) {
-        return .{
-            .token_count = 0,
-            .has_special_chars = false,
-            .is_question = false,
-            .avg_token_length = 0,
-            .recommended_strategy = .hybrid,
-        };
-    }
-
     var token_count: u32 = 0;
     var total_char_len: u32 = 0;
     var has_special_chars = false;
@@ -267,7 +257,9 @@ pub fn analyzeQuery(query: []const u8, config: AdaptiveConfig) QueryAnalysis {
 
     const avg_token_length = @as(f32, @floatFromInt(total_char_len)) / @as(f32, @floatFromInt(token_count));
     const is_question = isQuestionQuery(query);
-    const strategy: RetrievalStrategy = if (has_special_chars)
+    const strategy: RetrievalStrategy = if (!config.enabled)
+        .hybrid
+    else if (has_special_chars)
         .keyword_only
     else if (token_count <= config.keyword_max_tokens)
         .keyword_only
@@ -685,6 +677,11 @@ test "retrieval adaptive strategy selects keyword vector and hybrid modes" {
     const question = analyzeQuery("how does the central memory retrieval system select context", .{});
     try std.testing.expectEqual(RetrievalStrategy.vector_only, question.recommended_strategy);
     try std.testing.expect(question.is_question);
+
+    const adaptive_off = analyzeQuery("src/memory/root.zig", .{ .enabled = false });
+    try std.testing.expectEqual(RetrievalStrategy.hybrid, adaptive_off.recommended_strategy);
+    try std.testing.expectEqual(@as(u32, 1), adaptive_off.token_count);
+    try std.testing.expect(adaptive_off.has_special_chars);
 
     var vector_plan = try buildPlan(std.testing.allocator, "how does the central memory retrieval system select context", true, false);
     defer vector_plan.deinit(std.testing.allocator);

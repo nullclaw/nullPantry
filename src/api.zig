@@ -1181,7 +1181,7 @@ fn openApiDocument(ctx: *Context) HttpResponse {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator,
-        \\{"openapi":"3.1.0","info":{"title":"NullPantry API","version":"v1","description":"Headless agent-native knowledge base and central memory service for the Null ecosystem."},"servers":[{"url":"/v1"}],"security":[{"bearerAuth":[]}],"components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}},"schemas":{"Error":{"type":"object","required":["error"],"properties":{"error":{"type":"string"},"message":{"type":"string"}}},"SourceCreate":{"type":"object","required":["title"],"properties":{"type":{"type":"string","default":"manual"},"title":{"type":"string"},"content":{"type":"string"},"scope":{"type":"string","default":"workspace"},"permissions":{"type":"array","items":{"type":"string"}},"metadata":{"type":"object"}}},"MemoryAtomCreate":{"type":"object","required":["text"],"properties":{"text":{"type":"string"},"scope":{"type":"string"},"confidence":{"type":"number"},"status":{"enum":["proposed","verified","rejected","stale","deprecated","superseded"]},"source_ids":{"type":"array","items":{"type":"string"}},"evidence_ranges":{"type":"array","items":{"type":"object"}}}},"AgentMemoryEntry":{"type":"object","required":["key","content","actor_id","owner_id","created_by_actor_id","scope"],"properties":{"key":{"type":"string"},"content":{"type":"string"},"category":{"type":"string"},"session_id":{"type":["string","null"]},"actor_id":{"type":"string","description":"Logical memory owner; shared scoped rows use shared:<scope>."},"owner_id":{"type":"string"},"created_by_actor_id":{"type":"string","description":"Actual actor that last wrote this memory row."},"scope":{"type":"string"},"permissions":{"type":"array","items":{"type":"string"}},"timestamp":{"type":"string"},"score":{"type":"number"}}},"SearchRequest":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"scopes":{"type":"array","items":{"type":"string"}},"include_deprecated":{"type":"boolean"},"use_vector":{"type":"boolean"},"allow_reranker":{"type":"boolean"},"min_relevance":{"type":"number","minimum":0},"min_score":{"type":"number","minimum":0}}},"ConnectorCursor":{"type":"object","required":["connector","scope","cursor"],"properties":{"connector":{"type":"string"},"scope":{"type":"string"},"cursor":{"type":"string"},"config":{"type":"object"},"permissions":{"type":"array","items":{"type":"string"}},"updated_at_ms":{"type":"integer"}}},"ConnectorIngestRequest":{"type":"object","properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/SourceCreate"}},"run_now":{"type":"boolean"},"scope":{"type":"string"},"permissions":{"type":"array","items":{"type":"string"}},"next_cursor":{"type":"string"},"cursor":{"type":"string"},"config":{"type":"object"}}}}},"paths":{
+        \\{"openapi":"3.1.0","info":{"title":"NullPantry API","version":"v1","description":"Headless agent-native knowledge base and central memory service for the Null ecosystem."},"servers":[{"url":"/v1"}],"security":[{"bearerAuth":[]}],"components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}},"schemas":{"Error":{"type":"object","required":["error"],"properties":{"error":{"type":"string"},"message":{"type":"string"}}},"SourceCreate":{"type":"object","required":["title"],"properties":{"type":{"type":"string","default":"manual"},"title":{"type":"string"},"content":{"type":"string"},"scope":{"type":"string","default":"workspace"},"permissions":{"type":"array","items":{"type":"string"}},"metadata":{"type":"object"}}},"MemoryAtomCreate":{"type":"object","required":["text"],"properties":{"text":{"type":"string"},"scope":{"type":"string"},"confidence":{"type":"number"},"status":{"enum":["proposed","verified","rejected","stale","deprecated","superseded"]},"source_ids":{"type":"array","items":{"type":"string"}},"evidence_ranges":{"type":"array","items":{"type":"object"}}}},"AgentMemoryEntry":{"type":"object","required":["key","content","actor_id","owner_id","created_by_actor_id","scope"],"properties":{"key":{"type":"string"},"content":{"type":"string"},"category":{"type":"string"},"session_id":{"type":["string","null"]},"actor_id":{"type":"string","description":"Logical memory owner; shared scoped rows use shared:<scope>."},"owner_id":{"type":"string"},"created_by_actor_id":{"type":"string","description":"Actual actor that last wrote this memory row."},"scope":{"type":"string"},"permissions":{"type":"array","items":{"type":"string"}},"timestamp":{"type":"string"},"score":{"type":"number"}}},"SearchRequest":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"scopes":{"type":"array","items":{"type":"string"}},"include_deprecated":{"type":"boolean"},"use_vector":{"type":"boolean"},"strict_vector":{"type":"boolean"},"adaptive_retrieval":{"type":"boolean","default":true},"use_temporal_decay":{"type":"boolean","default":true},"use_mmr":{"type":"boolean","default":true},"half_life_days":{"type":"number","minimum":0},"allow_reranker":{"type":"boolean"},"min_relevance":{"type":"number","minimum":0},"min_score":{"type":"number","minimum":0}}},"ConnectorCursor":{"type":"object","required":["connector","scope","cursor"],"properties":{"connector":{"type":"string"},"scope":{"type":"string"},"cursor":{"type":"string"},"config":{"type":"object"},"permissions":{"type":"array","items":{"type":"string"}},"updated_at_ms":{"type":"integer"}}},"ConnectorIngestRequest":{"type":"object","properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/SourceCreate"}},"run_now":{"type":"boolean"},"scope":{"type":"string"},"permissions":{"type":"array","items":{"type":"string"}},"next_cursor":{"type":"string"},"cursor":{"type":"string"},"config":{"type":"object"}}}}},"paths":{
     ) catch return serverError(ctx);
     for (paths, 0..) |path, i| {
         if (i > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
@@ -1215,7 +1215,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","lifecycle_migrate","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","lifecycle_migrate","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -3002,9 +3002,10 @@ fn retrievalPlan(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const query = json.stringField(obj, "query") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing query");
-    const has_vector_index = (ctx.store.countVectorChunks() catch 0) > 0;
+    const has_vector_index = (ctx.store.countVectorChunks() catch 0) > 0 and (json.boolField(obj, "use_vector") orelse true);
+    const adaptive_retrieval = adaptiveRetrievalFromObject(obj);
     const allow_reranker = (json.boolField(obj, "allow_reranker") orelse false) and ctx.llm_base_url != null and ctx.llm_model != null;
-    var plan = retrieval.buildPlan(ctx.allocator, query, has_vector_index, allow_reranker) catch return serverError(ctx);
+    var plan = retrieval.buildPlanWithAdaptive(ctx.allocator, query, has_vector_index, allow_reranker, .{ .enabled = adaptive_retrieval }) catch return serverError(ctx);
     plan.min_relevance = minRelevanceFromObject(obj);
     defer plan.deinit(ctx.allocator);
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -3094,7 +3095,7 @@ fn retrievalSearch(ctx: *Context, body: []const u8) HttpResponse {
     input.use_vector = input.use_vector and use_vector and has_vector_index;
     input.allow_reranker = allow_reranker;
     const llm_rerank_effective = allow_reranker and ctx.llm_base_url != null and ctx.llm_model != null;
-    var plan = retrieval.buildPlan(ctx.allocator, query, input.use_vector, llm_rerank_effective) catch return serverError(ctx);
+    var plan = retrieval.buildPlanWithAdaptive(ctx.allocator, query, input.use_vector, llm_rerank_effective, .{ .enabled = input.adaptive_retrieval }) catch return serverError(ctx);
     plan.min_relevance = input.min_relevance;
     defer plan.deinit(ctx.allocator);
     var results = ctx.store.search(ctx.allocator, input) catch |err| switch (err) {
@@ -4806,7 +4807,7 @@ fn appendRuntimeDiagnostics(ctx: *Context, out: *std.ArrayListUnmanaged(u8), sch
     try json.appendString(out, ctx.allocator, ctx.store.analyticsBackendName());
     try out.appendSlice(ctx.allocator, "},\"cache\":{\"response_cache_active\":true,\"semantic_cache_active\":true,\"entries\":");
     try out.print(ctx.allocator, "{d}", .{store_diag.cache_entries});
-    try out.appendSlice(ctx.allocator, "},\"retrieval\":{\"keyword\":true,\"vector\":true,\"graph\":true,\"query_expansion\":true,\"rrf\":true,\"min_relevance\":true,\"temporal_decay\":true,\"mmr\":true,\"llm_rerank_configured\":");
+    try out.appendSlice(ctx.allocator, "},\"retrieval\":{\"keyword\":true,\"vector\":true,\"adaptive_retrieval\":true,\"graph\":true,\"query_expansion\":true,\"rrf\":true,\"min_relevance\":true,\"temporal_decay\":true,\"mmr\":true,\"llm_rerank_configured\":");
     try out.appendSlice(ctx.allocator, if (ctx.llm_base_url != null and ctx.llm_model != null) "true" else "false");
     try out.appendSlice(ctx.allocator, ",\"summarizer\":true},\"embedding_provider\":{\"provider\":");
     try json.appendString(out, ctx.allocator, ctx.embedding_provider.name());
@@ -7504,6 +7505,7 @@ fn buildAppliedContextPackInput(ctx: *Context, obj: std.json.ObjectMap, event_ac
         .retrieval_limit = positiveLimit(json.intField(obj, "retrieval_limit"), 40),
         .include_deprecated = json.boolField(obj, "include_deprecated") orelse false,
         .use_vector = json.boolField(obj, "use_vector") orelse true,
+        .adaptive_retrieval = adaptiveRetrievalFromObject(obj),
         .use_temporal_decay = json.boolField(obj, "use_temporal_decay") orelse true,
         .use_mmr = json.boolField(obj, "use_mmr") orelse true,
         .allow_reranker = json.boolField(obj, "allow_reranker") orelse false,
@@ -7678,16 +7680,24 @@ fn minRelevanceFromObject(obj: std.json.ObjectMap) f64 {
     return raw;
 }
 
+fn adaptiveRetrievalFromObject(obj: std.json.ObjectMap) bool {
+    return json.boolField(obj, "adaptive_retrieval") orelse
+        json.boolField(obj, "use_adaptive_retrieval") orelse
+        json.boolField(obj, "adaptive") orelse
+        true;
+}
+
 fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, limit: usize, include_sessions_default: bool) !store_mod.SearchInput {
     var use_vector = json.boolField(obj, "use_vector") orelse true;
     const strict_vector = json.boolField(obj, "strict_vector") orelse false;
+    const adaptive_retrieval = adaptiveRetrievalFromObject(obj);
     const agent_memory_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
     const min_relevance = minRelevanceFromObject(obj);
     var query_embedding_json: ?[]const u8 = null;
     var query_embedding_provider: []const u8 = "none";
     var embedding_dimensions: usize = @max(@as(usize, 1), @min(ctx.embedding_dimensions, @as(usize, 4096)));
-    const analysis = retrieval.analyzeQuery(query, .{});
-    if (!strict_vector and analysis.recommended_strategy == .keyword_only) {
+    const analysis = retrieval.analyzeQuery(query, .{ .enabled = adaptive_retrieval });
+    if (adaptive_retrieval and !strict_vector and analysis.recommended_strategy == .keyword_only) {
         use_vector = false;
         query_embedding_provider = "adaptive_keyword_only";
     }
@@ -7715,7 +7725,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
                 .include_sessions = json.boolField(obj, "include_sessions") orelse include_sessions_default,
                 .session_id = json.nullableStringField(obj, "session_id"),
                 .use_vector = false,
-                .adaptive_retrieval = true,
+                .adaptive_retrieval = adaptive_retrieval,
                 .strict_vector = false,
                 .use_temporal_decay = json.boolField(obj, "use_temporal_decay") orelse true,
                 .use_mmr = json.boolField(obj, "use_mmr") orelse true,
@@ -7741,7 +7751,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
         .include_sessions = json.boolField(obj, "include_sessions") orelse include_sessions_default,
         .session_id = json.nullableStringField(obj, "session_id"),
         .use_vector = use_vector,
-        .adaptive_retrieval = true,
+        .adaptive_retrieval = adaptive_retrieval,
         .strict_vector = strict_vector,
         .use_temporal_decay = json.boolField(obj, "use_temporal_decay") orelse true,
         .use_mmr = json.boolField(obj, "use_mmr") orelse true,
@@ -9355,6 +9365,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "created_by_actor_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"loadAgentSessionMessages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"min_relevance\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"adaptive_retrieval\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "/nullclaw") == null);
 
     const capabilities_resp = handleRequest(&ctx, "GET", "/v1/capabilities", "", "");
@@ -9364,6 +9375,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_status\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"lifecycle_migrate\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"min_relevance\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"adaptive_retrieval\"") != null);
 
     const artifact_types = handleRequest(&ctx, "GET", "/v1/artifact-types", "", "");
     try std.testing.expectEqualStrings("200 OK", artifact_types.status);
@@ -9382,6 +9394,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"use_vector\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"use_graph\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"strategy\":\"keyword_only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"adaptive_enabled\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"token_count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"use_reranker\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_resp.body, "\"min_relevance\":0.250000") != null);
@@ -9409,6 +9422,11 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const indexed_plan_resp = handleRequest(&ctx, "POST", "/v1/retrieval/plan", "{\"query\":\"NullPantry decision\",\"allow_reranker\":true}", "");
     try std.testing.expectEqualStrings("200 OK", indexed_plan_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, indexed_plan_resp.body, "\"use_vector\":false") != null);
+    const adaptive_off_plan_resp = handleRequest(&ctx, "POST", "/v1/retrieval/plan", "{\"query\":\"NullPantry decision\",\"adaptive_retrieval\":false,\"allow_reranker\":true}", "");
+    try std.testing.expectEqualStrings("200 OK", adaptive_off_plan_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, adaptive_off_plan_resp.body, "\"adaptive_enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, adaptive_off_plan_resp.body, "\"strategy\":\"hybrid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, adaptive_off_plan_resp.body, "\"use_vector\":true") != null);
     const vector_plan_resp = handleRequest(&ctx, "POST", "/v1/retrieval/plan", "{\"query\":\"how does the central memory retrieval system select context\",\"allow_reranker\":true}", "");
     try std.testing.expectEqualStrings("200 OK", vector_plan_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, vector_plan_resp.body, "\"strategy\":\"vector_only\"") != null);
@@ -9461,7 +9479,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"schema_ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"agent_memory_backend\":\"native\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"vector\":{\"backend\":\"local\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"retrieval\":{\"keyword\":true,\"vector\":true,\"graph\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"retrieval\":{\"keyword\":true,\"vector\":true,\"adaptive_retrieval\":true,\"graph\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"embedding_provider\":{\"provider\":\"openai-compatible\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"completion_provider\":{\"configured\":false") != null);
     const analytics_status = handleRequest(&ctx, "GET", "/v1/lifecycle/analytics/status", "", "");
@@ -9639,6 +9657,12 @@ test "api retrieval search fuses keyword and vector results" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "semantic only context") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"groups\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, vector_atom.id) != null);
+
+    const adaptive_off_search = handleRequest(&ctx, "POST", "/v1/retrieval/search", "{\"query\":\"short lookup\",\"scopes\":[\"public\"],\"limit\":5,\"adaptive_retrieval\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", adaptive_off_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, adaptive_off_search.body, "\"adaptive_enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, adaptive_off_search.body, "\"strategy\":\"hybrid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, adaptive_off_search.body, "\"vector_ann\"") != null);
 
     const filtered_body = try std.fmt.allocPrint(alloc, "{{\"query\":\"{s}\",\"scopes\":[\"public\"],\"limit\":5,\"min_relevance\":999}}", .{hybrid_query});
     const filtered = handleRequest(&ctx, "POST", "/v1/retrieval/search", filtered_body, "");
