@@ -452,6 +452,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_ANALYTICS_TIMEOUT_SECS")) |secs| {
         cfg.analytics_backend.timeout_secs = std.fmt.parseInt(u32, secs, 10) catch cfg.analytics_backend.timeout_secs;
     } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_ANALYTICS_ALLOW_INSECURE_HTTP")) |value| {
+        defer allocator.free(value);
+        cfg.analytics_backend.allow_insecure_http = parseBool(value);
+    } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_CLICKHOUSE_URL")) |url| {
         cfg.analytics_backend.backend = .clickhouse;
         cfg.analytics_backend.base_url = url;
@@ -462,6 +466,11 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_CLICKHOUSE_TABLE")) |table| {
         cfg.analytics_backend.backend = .clickhouse;
         cfg.analytics_backend.table = table;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_CLICKHOUSE_ALLOW_INSECURE_HTTP")) |value| {
+        defer allocator.free(value);
+        cfg.analytics_backend.backend = .clickhouse;
+        cfg.analytics_backend.allow_insecure_http = parseBool(value);
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LUCID_ENABLED")) |value| {
         defer allocator.free(value);
@@ -678,6 +687,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--analytics-timeout-secs") and i + 1 < args.len) {
             i += 1;
             cfg.analytics_backend.timeout_secs = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--analytics-allow-insecure-http")) {
+            cfg.analytics_backend.allow_insecure_http = true;
         } else if (std.mem.eql(u8, arg, "--lucid-enabled")) {
             cfg.lucid_projection.enabled = true;
         } else if (std.mem.eql(u8, arg, "--lucid-command") and i + 1 < args.len) {
@@ -945,9 +956,11 @@ fn printUsage() void {
         \\  NULLPANTRY_ANALYTICS_API_KEY
         \\  NULLPANTRY_ANALYTICS_TABLE
         \\  NULLPANTRY_ANALYTICS_TIMEOUT_SECS
+        \\  NULLPANTRY_ANALYTICS_ALLOW_INSECURE_HTTP
         \\  NULLPANTRY_CLICKHOUSE_URL
         \\  NULLPANTRY_CLICKHOUSE_API_KEY
         \\  NULLPANTRY_CLICKHOUSE_TABLE
+        \\  NULLPANTRY_CLICKHOUSE_ALLOW_INSECURE_HTTP
         \\  NULLPANTRY_LUCID_ENABLED
         \\  NULLPANTRY_LUCID_COMMAND
         \\  NULLPANTRY_LUCID_WORKSPACE
@@ -1198,6 +1211,7 @@ test "clickhouse analytics backend can be configured from args" {
         "np_events",
         "--analytics-timeout-secs",
         "9",
+        "--analytics-allow-insecure-http",
     };
     const cfg = try parseArgs(std.testing.allocator, &args);
 
@@ -1205,6 +1219,7 @@ test "clickhouse analytics backend can be configured from args" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8123", cfg.analytics_backend.base_url.?);
     try std.testing.expectEqualStrings("np_events", cfg.analytics_backend.table);
     try std.testing.expectEqual(@as(u32, 9), cfg.analytics_backend.timeout_secs);
+    try std.testing.expect(cfg.analytics_backend.allow_insecure_http);
 }
 
 test "lucid projection can be configured from args" {

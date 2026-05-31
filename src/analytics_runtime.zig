@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const ids = @import("ids.zig");
 const json = @import("json_util.zig");
+const net_security = @import("net_security.zig");
 
 pub const max_analytics_response_bytes: usize = 8 * 1024 * 1024;
 
@@ -29,6 +30,7 @@ pub const Config = struct {
     api_key: ?[]const u8 = null,
     table: []const u8 = "nullpantry_events",
     timeout_secs: u32 = 30,
+    allow_insecure_http: bool = false,
 
     pub fn enabled(self: Config) bool {
         return self.backend == .clickhouse and self.base_url != null and self.table.len > 0;
@@ -150,7 +152,7 @@ fn clickhouseInsert(allocator: std.mem.Allocator, cfg: Config, events: []const E
 
     const query = try std.fmt.allocPrint(allocator, "INSERT INTO {s} FORMAT JSONEachRow", .{table});
     defer allocator.free(query);
-    const url = try clickhouseQueryUrl(allocator, cfg.base_url.?, query);
+    const url = try clickhouseQueryUrl(allocator, cfg, query);
     defer allocator.free(url);
     const body = try eventsJsonEachRow(allocator, missing.items);
     defer allocator.free(body);
@@ -170,7 +172,7 @@ fn clickhouseEnsureTable(allocator: std.mem.Allocator, cfg: Config, table: []con
         .{table},
     );
     defer allocator.free(query);
-    const url = try clickhouseQueryUrl(allocator, cfg.base_url.?, query);
+    const url = try clickhouseQueryUrl(allocator, cfg, query);
     defer allocator.free(url);
     const response = try post(allocator, url, cfg.api_key, cfg.timeout_secs, "text/plain", "");
     defer allocator.free(response);
@@ -178,7 +180,7 @@ fn clickhouseEnsureTable(allocator: std.mem.Allocator, cfg: Config, table: []con
 
 fn clickhouseQuery(allocator: std.mem.Allocator, cfg: Config, query: []const u8) ![]u8 {
     if (!cfg.enabled()) return error.AnalyticsBackendNotConfigured;
-    const url = try clickhouseQueryUrl(allocator, cfg.base_url.?, query);
+    const url = try clickhouseQueryUrl(allocator, cfg, query);
     defer allocator.free(url);
     return post(allocator, url, cfg.api_key, cfg.timeout_secs, "text/plain", "");
 }
@@ -351,7 +353,9 @@ fn joinUrl(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_url[0..end], suffix });
 }
 
-fn clickhouseQueryUrl(allocator: std.mem.Allocator, base_url: []const u8, query: []const u8) ![]u8 {
+fn clickhouseQueryUrl(allocator: std.mem.Allocator, cfg: Config, query: []const u8) ![]u8 {
+    const base_url = cfg.base_url orelse return error.AnalyticsBackendNotConfigured;
+    try net_security.validateHttpBaseUrl(base_url, cfg.allow_insecure_http);
     const encoded = try percentEncode(allocator, query);
     defer allocator.free(encoded);
     const suffix = try std.fmt.allocPrint(allocator, "?query={s}", .{encoded});
@@ -478,10 +482,22 @@ test "clickhouse analytics config gates runtime" {
     try std.testing.expect((Config{ .backend = .clickhouse, .base_url = "http://127.0.0.1:8123" }).enabled());
     try std.testing.expect(BackendKind.parse("clickhouse") == .clickhouse);
     try std.testing.expectError(error.InvalidAnalyticsTable, safeIdentifier(std.testing.allocator, "bad table"));
+    try std.testing.expectError(error.InsecureRuntimeUrl, clickhouseQueryUrl(std.testing.allocator, .{
+        .backend = .clickhouse,
+        .base_url = "http://clickhouse.internal:8123",
+    }, "SELECT 1"));
+
+    const url = try clickhouseQueryUrl(std.testing.allocator, .{
+        .backend = .clickhouse,
+        .base_url = "http://clickhouse.internal:8123",
+        .allow_insecure_http = true,
+    }, "SELECT 1");
+    defer std.testing.allocator.free(url);
+    try std.testing.expect(std.mem.startsWith(u8, url, "http://clickhouse.internal:8123/?query=SELECT%201"));
 }
 
 test "clickhouse query URL percent-encodes SQL" {
-    const url = try clickhouseQueryUrl(std.testing.allocator, "http://127.0.0.1:8123", "SELECT count() FROM np.events");
+    const url = try clickhouseQueryUrl(std.testing.allocator, .{ .backend = .clickhouse, .base_url = "http://127.0.0.1:8123" }, "SELECT count() FROM np.events");
     defer std.testing.allocator.free(url);
     try std.testing.expect(std.mem.indexOf(u8, url, "SELECT%20count%28%29%20FROM%20np.events") != null);
 }
