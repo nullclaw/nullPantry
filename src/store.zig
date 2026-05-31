@@ -18,6 +18,7 @@ const analytics_runtime = @import("analytics_runtime.zig");
 const lucid_runtime = @import("lucid_runtime.zig");
 const graph_mod = @import("graph.zig");
 const feed_contract = @import("feed_contract.zig");
+const storage_routes = @import("storage_route.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -288,42 +289,8 @@ pub const BackendKind = enum {
     }
 };
 
-pub const AgentMemoryStorageTarget = enum {
-    primary,
-    native,
-    runtime,
-    named,
-    subset,
-    all,
-};
-
-pub const AgentMemoryStorageRoute = struct {
-    target: AgentMemoryStorageTarget = .primary,
-    name: ?[]const u8 = null,
-    stores: []const []const u8 = &.{},
-
-    pub fn parse(raw: ?[]const u8) AgentMemoryStorageRoute {
-        const value = raw orelse return .{};
-        if (std.ascii.eqlIgnoreCase(value, "primary")) return .{ .target = .primary };
-        if (std.ascii.eqlIgnoreCase(value, "default")) return .{ .target = .primary };
-        if (std.ascii.eqlIgnoreCase(value, "native")) return .{ .target = .native };
-        if (std.ascii.eqlIgnoreCase(value, "canonical")) return .{ .target = .native };
-        if (std.ascii.eqlIgnoreCase(value, "sqlite")) return .{ .target = .native };
-        if (std.ascii.eqlIgnoreCase(value, "postgres")) return .{ .target = .native };
-        if (std.ascii.eqlIgnoreCase(value, "runtime")) return .{ .target = .runtime };
-        if (std.ascii.eqlIgnoreCase(value, "external")) return .{ .target = .runtime };
-        if (std.ascii.eqlIgnoreCase(value, "redis")) return .{ .target = .runtime };
-        if (std.ascii.eqlIgnoreCase(value, "all")) return .{ .target = .all };
-        if (std.ascii.eqlIgnoreCase(value, "federated")) return .{ .target = .all };
-        return .{ .target = .named, .name = value };
-    }
-
-    pub fn fromStores(stores: []const []const u8) AgentMemoryStorageRoute {
-        if (stores.len == 0) return .{};
-        if (stores.len == 1) return parse(stores[0]);
-        return .{ .target = .subset, .stores = stores };
-    }
-};
+pub const AgentMemoryStorageTarget = storage_routes.Target;
+pub const AgentMemoryStorageRoute = storage_routes.Route;
 
 const PrimitiveMirrorKind = enum {
     source,

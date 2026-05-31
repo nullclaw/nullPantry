@@ -27,6 +27,7 @@ const agent_memory_reducer = @import("agent_memory_reducer.zig");
 const agent_memory_runtime = @import("agent_memory_runtime.zig");
 const bootstrap_prompts = @import("bootstrap_prompts.zig");
 const feed_contract = @import("feed_contract.zig");
+const storage_routes = @import("storage_route.zig");
 
 const nullclaw_agent_memory_projection = "agent_memory";
 
@@ -276,7 +277,7 @@ fn handleAgentSessions(ctx: *Context, method: []const u8, query: []const u8, seg
         if (!allAgentSessionsReadAllowed(ctx)) return forbidden(ctx);
         const limit = parseLimit(json.queryParam(query, "limit"), 50);
         const offset = parseLimit(json.queryParam(query, "offset"), 0);
-        const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+        const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
         const result = ctx.store.listSessionsRouted(ctx.allocator, limit, offset, actorFilter(ctx), storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
@@ -291,7 +292,7 @@ fn handleAgentSessions(ctx: *Context, method: []const u8, query: []const u8, seg
         } else if (!allAgentSessionsWriteAllowed(ctx)) {
             return forbidden(ctx);
         }
-        const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+        const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
         ctx.store.clearAutoSavedRouted(session_id, actorFilter(ctx), storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
@@ -303,7 +304,7 @@ fn handleAgentSessions(ctx: *Context, method: []const u8, query: []const u8, seg
         if (!agentSessionReadAllowed(ctx, seg2.?)) return forbidden(ctx);
         const limit = parseLimit(json.queryParam(query, "limit"), 100);
         const offset = parseLimit(json.queryParam(query, "offset"), 0);
-        const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+        const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
         const result = ctx.store.historyRouted(ctx.allocator, seg2.?, limit, offset, actorFilter(ctx), storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
@@ -317,7 +318,7 @@ fn handleAgentSessions(ctx: *Context, method: []const u8, query: []const u8, seg
         if (is_post) return saveMessage(ctx, seg2.?, body, query);
         if (is_get) return loadMessages(ctx, seg2.?, query);
         if (is_delete) {
-            const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+            const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
             ctx.store.clearMessagesRouted(seg2.?, actorFilter(ctx), storage_target) catch |err| switch (err) {
                 error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
                 else => return serverError(ctx),
@@ -332,7 +333,7 @@ fn handleAgentSessions(ctx: *Context, method: []const u8, query: []const u8, seg
         if (is_put) return saveUsage(ctx, seg2.?, body, query);
         if (is_get) return loadUsage(ctx, seg2.?, query);
         if (is_delete) {
-            const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+            const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
             _ = ctx.store.deleteUsageRouted(seg2.?, actorFilter(ctx), storage_target) catch |err| switch (err) {
                 error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
                 else => return serverError(ctx),
@@ -389,7 +390,7 @@ fn handleNullClawAgentAdapter(ctx: *Context, method: []const u8, query: []const 
 
 fn nullClawAgentClearMessages(ctx: *Context, session_id: []const u8, query: []const u8) HttpResponse {
     if (!agentSessionWriteAllowed(ctx, session_id)) return forbidden(ctx);
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     ctx.store.clearMessagesRouted(session_id, actorFilter(ctx), storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -421,7 +422,7 @@ fn handleBootstrapPrompts(ctx: *Context, method: []const u8, query: []const u8, 
 fn bootstrapPromptsList(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"prefix\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, bootstrap_prompts.key_prefix) catch return serverError(ctx);
@@ -455,7 +456,7 @@ fn bootstrapPromptsList(ctx: *Context, query: []const u8) HttpResponse {
 fn bootstrapPromptsFingerprint(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     var entries = ctx.allocator.alloc(?[]const u8, bootstrap_prompts.docs.len) catch return serverError(ctx);
     @memset(entries, null);
     for (bootstrap_prompts.docs, 0..) |doc, i| {
@@ -476,7 +477,7 @@ fn bootstrapPromptGet(ctx: *Context, filename: []const u8, query: []const u8) Ht
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const key = bootstrap_prompts.memoryKey(filename) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Bootstrap prompt is not registered");
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const max_bytes = if (json.queryParam(query, "max_bytes")) |value| parseLimit(value, 0) else 0;
     const entry = loadAgentMemoryForRequest(ctx, key, null, requested_scope, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
@@ -490,7 +491,7 @@ fn bootstrapPromptExists(ctx: *Context, filename: []const u8, query: []const u8)
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const key = bootstrap_prompts.memoryKey(filename) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Bootstrap prompt is not registered");
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const entry = loadAgentMemoryForRequest(ctx, key, null, requested_scope, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -513,7 +514,7 @@ fn bootstrapPromptStore(ctx: *Context, filename: []const u8, body: []const u8) H
     const stored = agentMemoryStoreParsed(ctx, key, parsed.value.object);
     if (!std.mem.eql(u8, stored.status, "200 OK")) return stored;
     const requested_scope = json.nullableStringField(parsed.value.object, "scope");
-    const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, parsed.value.object) catch return serverError(ctx);
+    const storage_target = storage_routes.fromObject(ctx.allocator, parsed.value.object) catch return serverError(ctx);
     const entry = loadAgentMemoryForRequest(ctx, key, null, requested_scope, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -640,7 +641,7 @@ fn nullClawAgentMemoryStore(ctx: *Context, key: []const u8, body: []const u8) Ht
 
     const session_id = json.nullableStringField(obj, "session_id");
     const requested_scope = json.nullableStringField(obj, "scope");
-    const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     const entry = loadAgentMemoryForRequest(ctx, key, session_id, requested_scope, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -656,7 +657,7 @@ fn nullClawAgentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) Htt
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const entry = loadAgentMemoryForRequest(ctx, key, session_id, requested_scope, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -684,7 +685,7 @@ fn nullClawAgentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     const include_internal = queryBool(query, "include_internal", false);
     const limit = parseLimit(json.queryParam(query, "limit"), std.math.maxInt(usize));
     const offset = parseLimit(json.queryParam(query, "offset"), 0);
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const exact_owner = if (requested_scope) |scope| access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx) else null;
     defer if (exact_owner) |owner| ctx.allocator.free(owner);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
@@ -739,7 +740,7 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     if (graph_entries) |entries| {
         return nullClawAgentMemoryEntriesResponse(ctx, entries, include_internal, limit, 0);
     }
-    const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
     const primary = if (session_id == null)
         ctx.store.agentMemorySearchAnyVisibleRouted(ctx.allocator, query, limit, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
@@ -776,7 +777,7 @@ fn nullClawAgentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) 
     else
         ctx.actor_id;
     defer if (requested_scope != null) ctx.allocator.free(owner_actor_id);
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const deleted = ctx.store.agentMemoryDeleteAllRouted(key, owner_actor_id, ctx.actor_id, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -913,7 +914,7 @@ fn createSource(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const title = json.stringField(obj, "title") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing title");
-    const storage_route = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    const storage_route = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     const input = store_mod.SourceInput{
         .source_type = json.stringField(obj, "type") orelse "manual",
         .title = title,
@@ -956,7 +957,7 @@ fn createArtifact(ctx: *Context, body: []const u8) HttpResponse {
     const title = json.stringField(obj, "title") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing title");
     const scope = json.stringField(obj, "scope") orelse "workspace";
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
-    const storage_route = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    const storage_route = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     if (!canWriteRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     const artifact_type = json.stringField(obj, "type") orelse json.stringField(obj, "artifact_type") orelse "page";
     const status = json.stringField(obj, "status") orelse if (std.mem.eql(u8, artifact_type, "decision")) "proposed" else "draft";
@@ -1015,7 +1016,7 @@ fn resolveEntity(ctx: *Context, body: []const u8) HttpResponse {
     const name = json.stringField(obj, "name") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing name");
     const scope = json.stringField(obj, "scope") orelse "workspace";
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
-    const storage_route = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    const storage_route = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     if (!canWriteRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     const canonical_artifact_id = json.nullableStringField(obj, "canonical_artifact_id");
     if (!artifactCanBackRecord(ctx, canonical_artifact_id, scope, permissions_json)) return forbidden(ctx);
@@ -1050,7 +1051,7 @@ fn createRelation(ctx: *Context, body: []const u8) HttpResponse {
     const source_ids_json = rawField(ctx.allocator, obj, "source_ids", "[]") catch return serverError(ctx);
     const scope = json.stringField(obj, "scope") orelse "workspace";
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
-    const storage_route = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    const storage_route = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     if (!canWriteRecord(ctx, scope, permissions_json)) return forbidden(ctx);
     if (!sourceIdsCanBackRecord(ctx, source_ids_json, scope, permissions_json)) return forbidden(ctx);
     if (!entityCanBackRecord(ctx, from_entity_id, scope, permissions_json)) return forbidden(ctx);
@@ -2203,7 +2204,7 @@ fn qmdConnectorIngest(ctx: *Context, connector: []const u8, obj: std.json.Object
             .related_entities_json = rawField(ctx.allocator, obj, "related_entities", "[]") catch return serverError(ctx),
             .metadata_json = item.metadata_json,
             .actor_id = ctx.actor_id,
-            .storage_route = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx),
+            .storage_route = storage_routes.fromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx),
         }) catch return serverError(ctx);
 
         var source_atoms: usize = 0;
@@ -2243,7 +2244,7 @@ fn qmdSessionExport(ctx: *Context, body: []const u8) HttpResponse {
     const directory = json.stringField(obj, "directory") orelse json.stringField(obj, "path") orelse json.stringField(obj, "export_dir") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing directory");
     if (directory.len == 0) return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing directory");
 
-    const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx);
+    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx);
     const session_limit = positiveBounded(json.intField(obj, "session_limit") orelse json.intField(obj, "limit"), 100, 5000);
     const session_offset = positiveBounded(json.intField(obj, "offset"), 0, 1000000);
     const message_limit = positiveBounded(json.intField(obj, "message_limit") orelse json.intField(obj, "max_messages"), 10000, 50000);
@@ -2402,7 +2403,7 @@ fn connectorIngestOne(ctx: *Context, connector: []const u8, obj: std.json.Object
         .related_entities_json = rawField(ctx.allocator, obj, "related_entities", "[]") catch return error.InvalidPayload,
         .metadata_json = try connectorMetadataJson(ctx.allocator, connector, metadata_json),
         .actor_id = ctx.actor_id,
-        .storage_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        .storage_route = try storage_routes.fromObject(ctx.allocator, obj),
     });
 }
 
@@ -2450,7 +2451,7 @@ fn markdownImport(ctx: *Context, body: []const u8) HttpResponse {
 
     const run_now = json.boolField(obj, "run_now") orelse false;
     if (!run_now) {
-        const job_input = markdownExtractionJobInputJson(ctx.allocator, json.boolField(obj, "extract_memory") orelse true, json.boolField(obj, "use_llm_extraction") orelse json.boolField(obj, "structured_extraction") orelse false, json.boolField(obj, "strict_llm_extraction") orelse false, agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx)) catch return serverError(ctx);
+        const job_input = markdownExtractionJobInputJson(ctx.allocator, json.boolField(obj, "extract_memory") orelse true, json.boolField(obj, "use_llm_extraction") orelse json.boolField(obj, "structured_extraction") orelse false, json.boolField(obj, "strict_llm_extraction") orelse false, storage_routes.fromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx)) catch return serverError(ctx);
         const job = ctx.store.createJob(ctx.allocator, .{
             .job_type = "extract_memory",
             .scope = source.scope,
@@ -2675,7 +2676,7 @@ fn createMarkdownObjects(
     if (!canProposeRecord(ctx, imported.scope, imported.permissions_json)) return error.Forbidden;
     if (!markdownStatusCanBeProposed(imported.status) and !canWriteRecord(ctx, imported.scope, imported.permissions_json)) return error.Forbidden;
 
-    const storage_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    const storage_route = try storage_routes.fromObject(ctx.allocator, obj);
     const related_entities_json = if (jsonArrayIsEmpty(imported.related_entities_json))
         try extraction.extractEntityNamesJson(ctx.allocator, imported.body)
     else
@@ -2804,7 +2805,7 @@ fn queueMarkdownExtractionJob(ctx: *Context, obj: std.json.ObjectMap, source: do
         json.boolField(obj, "extract_memory") orelse true,
         json.boolField(obj, "use_llm_extraction") orelse json.boolField(obj, "structured_extraction") orelse false,
         json.boolField(obj, "strict_llm_extraction") orelse false,
-        try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        try storage_routes.fromObject(ctx.allocator, obj),
     );
     _ = try ctx.store.createJob(ctx.allocator, .{
         .job_type = "extract_memory",
@@ -2833,31 +2834,10 @@ fn markdownExtractionJobInputJson(allocator: std.mem.Allocator, extract_memory: 
     try out.appendSlice(allocator, ",\"strict_llm_extraction\":");
     try out.appendSlice(allocator, if (strict_llm_extraction) "true" else "false");
     if (route.target != .primary) {
-        try appendExtractionStorageRouteJson(allocator, &out, route);
+        try storage_routes.appendExtractionJson(allocator, &out, route);
     }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
-}
-
-fn appendExtractionStorageRouteJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), route: store_mod.AgentMemoryStorageRoute) !void {
-    switch (route.target) {
-        .primary => {},
-        .native => try out.appendSlice(allocator, ",\"storage\":\"native\""),
-        .runtime => try out.appendSlice(allocator, ",\"store\":\"runtime\""),
-        .named => {
-            try out.appendSlice(allocator, ",\"store\":");
-            try json.appendString(out, allocator, route.name orelse "runtime");
-        },
-        .all => try out.appendSlice(allocator, ",\"storage\":\"all\""),
-        .subset => {
-            try out.appendSlice(allocator, ",\"stores\":[");
-            for (route.stores, 0..) |store_name, i| {
-                if (i > 0) try out.append(allocator, ',');
-                try json.appendString(out, allocator, store_name);
-            }
-            try out.append(allocator, ']');
-        },
-    }
 }
 
 fn markdownImportQueuedResponse(ctx: *Context, job: store_mod.Job, source: domain.Source, artifact: domain.Artifact) HttpResponse {
@@ -3027,7 +3007,7 @@ fn extractionOptionsFromObject(ctx: *Context, obj: std.json.ObjectMap, create_ar
         .extract_memory = json.boolField(obj, "extract_memory") orelse extract_memory_default,
         .use_llm_extraction = json.boolField(obj, "use_llm_extraction") orelse json.boolField(obj, "structured_extraction") orelse false,
         .strict_llm_extraction = json.boolField(obj, "strict_llm_extraction") orelse false,
-        .storage_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        .storage_route = try storage_routes.fromObject(ctx.allocator, obj),
     };
 }
 
@@ -3554,7 +3534,7 @@ fn parseMemoryAtomInput(ctx: *Context, body: []const u8) !store_mod.MemoryAtomIn
         .owner = try dupOptional(ctx.allocator, json.nullableStringField(obj, "owner")),
         .permissions_json = try rawField(ctx.allocator, obj, "permissions", "[]"),
         .tags_json = try rawField(ctx.allocator, obj, "tags", "[]"),
-        .storage_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj),
+        .storage_route = try storage_routes.fromObject(ctx.allocator, obj),
     };
 }
 
@@ -4091,7 +4071,7 @@ fn nullClawMemoryFeedApply(ctx: *Context, body: []const u8, query: []const u8) H
 
 fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
-    const storage_route = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_route = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
         return runtimeMemoryFeed(ctx, runtime, query);
     }
@@ -4111,7 +4091,7 @@ fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
 
 fn memoryFeedStatus(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
-    const storage_route = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_route = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
         return runtimeMemoryFeedStatus(ctx, runtime);
     }
@@ -4129,7 +4109,7 @@ fn memoryFeedCompact(ctx: *Context, body: []const u8, query: []const u8) HttpRes
     if (!(hasCapability(ctx, "feed_apply") and (hasCapability(ctx, "export") or hasCapability(ctx, "delete")))) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
-    const storage_route = agentMemoryStorageTargetFromObjectOrQuery(ctx.allocator, parsed.value.object, query) catch return serverError(ctx);
+    const storage_route = storage_routes.fromObjectOrQuery(ctx.allocator, parsed.value.object, query) catch return serverError(ctx);
     const requested_before_id = feedCompactCursorFromObject(parsed.value.object);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
         return runtimeMemoryFeedCompact(ctx, runtime, requested_before_id);
@@ -4142,7 +4122,7 @@ fn memoryFeedCompact(ctx: *Context, body: []const u8, query: []const u8) HttpRes
         const result = ctx.store.compactFeedCursorProjection(projection_name, before_id, ctx.actor_id) catch return serverError(ctx);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         out.print(ctx.allocator, "{{\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"oldest_available_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"compacted_events\":{d},\"projection\":\"storage_route\",\"route\":", .{ result.cursor_floor, result.cursor_floor, result.cursor_floor + 1, result.max_event_id, result.max_event_id, result.compacted_events }) catch return serverError(ctx);
-        appendAgentMemoryStorageRouteJson(ctx.allocator, &out, storage_route) catch return serverError(ctx);
+        storage_routes.appendRouteJson(ctx.allocator, &out, storage_route) catch return serverError(ctx);
         out.append(ctx.allocator, '}') catch return serverError(ctx);
         return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
     }
@@ -4163,7 +4143,7 @@ fn feedCompactCursorFromObject(obj: std.json.ObjectMap) ?i64 {
 
 fn memoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
     if (!(hasCapability(ctx, "read") and hasCapability(ctx, "export"))) return forbidden(ctx);
-    const storage_route = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_route = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
         return runtimeMemoryFeedCheckpoint(ctx, runtime, query);
     }
@@ -4512,7 +4492,7 @@ fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8, query: []const u
 
 fn memoryFeedCheckpointRestoreInternal(ctx: *Context, body: []const u8, query: []const u8, projection_compaction: ?FeedProjectionCompaction) HttpResponse {
     if (!canApplyFeed(ctx)) return forbidden(ctx);
-    const storage_route = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_route = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     if (projection_compaction == null) {
         if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
             return runtimeMemoryFeedCheckpointRestore(ctx, runtime, body);
@@ -4819,7 +4799,7 @@ fn restorePendingCheckpointEvent(ctx: *Context, obj: std.json.ObjectMap, fallbac
     const event_actor_id = json.stringField(obj, "actor_id") orelse ctx.actor_id;
     if (!canApplyAsActor(ctx, event_actor_id)) return error.Forbidden;
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return error.InvalidPayload;
-    const explicit_or_fallback_route = agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route) catch return error.InvalidPayload;
+    const explicit_or_fallback_route = storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route) catch return error.InvalidPayload;
     const payload_route = feedObjectPayloadRoute(ctx, object_type, explicit_or_fallback_route);
     const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, payload_route) catch return error.InvalidPayload;
     defer ctx.allocator.free(event_payload_json);
@@ -4870,7 +4850,7 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8, query: []const u8) HttpResp
         return json.errorResponse(ctx.allocator, 400, "bad_request", "Unsupported feed object_type");
     }
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
-    const storage_route = agentMemoryStorageTargetFromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
+    const storage_route = storage_routes.fromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
     const payload_route = feedObjectPayloadRoute(ctx, object_type, storage_route);
     const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, payload_route) catch return serverError(ctx);
     defer ctx.allocator.free(event_payload_json);
@@ -4924,7 +4904,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    const storage_route = agentMemoryStorageTargetFromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
+    const storage_route = storage_routes.fromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
         return runtimeMemoryFeedApply(ctx, runtime, body);
     }
@@ -5333,7 +5313,7 @@ fn buildAppliedMemoryAtomInput(ctx: *Context, payload_json: []const u8, fallback
         .owner = json.nullableStringField(obj, "owner"),
         .permissions_json = permissions_json,
         .tags_json = rawField(ctx.allocator, obj, "tags", "[\"feed\"]") catch "[\"feed\"]",
-        .storage_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
+        .storage_route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
     if (!canCreateMemoryAtom(ctx, input)) return error.Forbidden;
@@ -5404,7 +5384,7 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
     if (session_id) |sid| {
         if (!agentSessionWriteAllowed(ctx, sid)) return error.Forbidden;
     }
-    const route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route);
+    const route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route);
     const scope = json.nullableStringField(obj, "scope");
     const computed_owner_id = try access.agentMemoryOwner(ctx.allocator, event_actor_id, scope);
     const owner_actor_id = json.stringField(obj, "owner_id") orelse computed_owner_id;
@@ -5458,7 +5438,7 @@ fn buildAppliedAgentSessionMessageInput(ctx: *Context, operation: []const u8, pa
     }
     const payload_actor = json.nullableStringField(obj, "actor_id") orelse event_actor_id;
     if (!std.mem.eql(u8, payload_actor, event_actor_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
-    const route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route);
+    const route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route);
     if (std.mem.eql(u8, operation, "delete_autosaved")) {
         return .{ .session_id = session_id, .actor_id = payload_actor, .delete_autosaved = true, .route = route };
     }
@@ -5488,7 +5468,7 @@ fn buildAppliedAgentSessionUsageInput(ctx: *Context, operation: []const u8, payl
     if (!agentSessionWriteAllowed(ctx, session_id)) return error.Forbidden;
     const payload_actor = json.nullableStringField(obj, "actor_id") orelse event_actor_id;
     if (!std.mem.eql(u8, payload_actor, event_actor_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
-    const route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route);
+    const route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route);
     if (std.mem.eql(u8, operation, "delete") or std.mem.eql(u8, operation, "forget")) {
         return .{ .session_id = session_id, .actor_id = payload_actor, .delete_usage = true, .route = route };
     }
@@ -5543,7 +5523,7 @@ fn lifecycleMigrate(ctx: *Context, body: []const u8) HttpResponse {
     const obj = parsed.value.object;
 
     const kind = json.stringField(obj, "object_type") orelse json.stringField(obj, "kind") orelse "agent_memory";
-    const source_route = (agentMemoryStorageTargetFromAliasedObject(ctx.allocator, obj, &.{
+    const source_route = (storage_routes.fromAliasedObject(ctx.allocator, obj, &.{
         "from",
         "source",
         "from_storage",
@@ -5553,7 +5533,7 @@ fn lifecycleMigrate(ctx: *Context, body: []const u8) HttpResponse {
         "from_stores",
         "source_stores",
     }) catch return serverError(ctx)) orelse store_mod.AgentMemoryStorageRoute{};
-    const target_route = (agentMemoryStorageTargetFromAliasedObject(ctx.allocator, obj, &.{
+    const target_route = (storage_routes.fromAliasedObject(ctx.allocator, obj, &.{
         "to",
         "target",
         "to_storage",
@@ -5728,9 +5708,9 @@ fn lifecycleMigrationResponse(ctx: *Context, input: AgentMemoryMigrationResponse
     out.appendSlice(ctx.allocator, ",\"delete_source\":") catch return serverError(ctx);
     out.appendSlice(ctx.allocator, if (input.delete_source) "true" else "false") catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"source_route\":") catch return serverError(ctx);
-    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.source_route) catch return serverError(ctx);
+    storage_routes.appendRouteJson(ctx.allocator, &out, input.source_route) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"target_route\":") catch return serverError(ctx);
-    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.target_route) catch return serverError(ctx);
+    storage_routes.appendRouteJson(ctx.allocator, &out, input.target_route) catch return serverError(ctx);
     out.print(ctx.allocator, ",\"matched\":{d},\"selected\":{d},\"migrated\":{d},\"skipped\":{d},\"limit\":{d},\"offset\":{d},\"entries\":[", .{
         input.matched,
         input.selected.len,
@@ -5766,24 +5746,6 @@ fn appendAgentMemoryMigrationEntryJson(allocator: std.mem.Allocator, out: *std.A
         try json.appendString(out, allocator, saved.id);
         try out.appendSlice(allocator, ",\"target_store\":");
         try json.appendString(out, allocator, if (saved.store.len > 0) saved.store else "primary");
-    }
-    try out.append(allocator, '}');
-}
-
-fn appendAgentMemoryStorageRouteJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), route: store_mod.AgentMemoryStorageRoute) !void {
-    try out.appendSlice(allocator, "{\"target\":");
-    try json.appendString(out, allocator, @tagName(route.target));
-    if (route.name) |name| {
-        try out.appendSlice(allocator, ",\"name\":");
-        try json.appendString(out, allocator, name);
-    }
-    if (route.stores.len > 0) {
-        try out.appendSlice(allocator, ",\"stores\":[");
-        for (route.stores, 0..) |store_name, i| {
-            if (i > 0) try out.append(allocator, ',');
-            try json.appendString(out, allocator, store_name);
-        }
-        try out.append(allocator, ']');
     }
     try out.append(allocator, '}');
 }
@@ -5875,9 +5837,9 @@ fn lifecycleAllMigrationResponse(ctx: *Context, input: LifecycleAllMigrationResp
     out.appendSlice(ctx.allocator, ",\"preflight\":") catch return serverError(ctx);
     out.appendSlice(ctx.allocator, if (input.preflight) "true" else "false") catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"source_route\":") catch return serverError(ctx);
-    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.source_route) catch return serverError(ctx);
+    storage_routes.appendRouteJson(ctx.allocator, &out, input.source_route) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"target_route\":") catch return serverError(ctx);
-    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.target_route) catch return serverError(ctx);
+    storage_routes.appendRouteJson(ctx.allocator, &out, input.target_route) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"results\":{\"agent_memory\":") catch return serverError(ctx);
     out.appendSlice(ctx.allocator, input.agent_memory) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"agent_sessions\":") catch return serverError(ctx);
@@ -6143,9 +6105,9 @@ fn lifecycleSessionMigrationResponse(ctx: *Context, input: AgentSessionMigration
     out.appendSlice(ctx.allocator, ",\"actor_id\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, input.actor_id) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"source_route\":") catch return serverError(ctx);
-    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.source_route) catch return serverError(ctx);
+    storage_routes.appendRouteJson(ctx.allocator, &out, input.source_route) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"target_route\":") catch return serverError(ctx);
-    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.target_route) catch return serverError(ctx);
+    storage_routes.appendRouteJson(ctx.allocator, &out, input.target_route) catch return serverError(ctx);
     out.print(ctx.allocator, ",\"matched\":{d},\"selected\":{d},\"migrated\":{d},\"messages_copied\":{d},\"usage_copied\":{d},\"skipped\":{d},\"limit\":{d},\"offset\":{d},\"message_limit\":{d},\"entries\":[", .{
         input.matched,
         input.entries.len,
@@ -7055,7 +7017,7 @@ fn snapshotHydrateAgentMemory(ctx: *Context, obj: std.json.ObjectMap, options: S
     }
     if (options.dry_run) return .{ .object_type = "agent_memory", .id = json.stringField(obj, "id") orelse key };
     const owner_actor_id = json.stringField(obj, "owner_id") orelse json.stringField(obj, "actor_id") orelse (try access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope));
-    const route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    const route = try storage_routes.fromObject(ctx.allocator, obj);
     if (try ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, route)) |existing| {
         if (std.mem.eql(u8, existing.content, content) and std.mem.eql(u8, existing.category, category)) {
             return .{ .object_type = "agent_memory", .id = existing.id, .created = false };
@@ -8029,7 +7991,7 @@ fn agentMemoryStoreParsed(ctx: *Context, key: []const u8, obj: std.json.ObjectMa
     } else if (!domain.permissionsAreOpen(permissions) and !domain.permissionsWritable(permissions, ctx.actor_scopes_json)) {
         return forbidden(ctx);
     }
-    const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     const owner_actor_id = access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx);
     const entry = ctx.store.agentMemoryStoreRouted(ctx.allocator, .{
         .key = key,
@@ -8057,7 +8019,7 @@ fn agentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) HttpRespons
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     var entry = if (requested_scope) |scope| blk: {
         const owner_actor_id = access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx);
         break :blk ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, storage_target) catch |err| switch (err) {
@@ -8092,7 +8054,7 @@ fn agentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     const include_internal = queryBool(query, "include_internal", false);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const offset = parseLimit(json.queryParam(query, "offset"), 0);
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const exact_owner = if (requested_scope) |scope| access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx) else null;
     defer if (exact_owner) |owner| ctx.allocator.free(owner);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
@@ -8148,7 +8110,7 @@ fn agentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     if (graph_entries) |entries| {
         return agentMemoryEntriesResponseFiltered(ctx, entries, include_internal, limit, 0);
     }
-    const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
+    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
     const primary = if (session_id == null and include_sessions)
         ctx.store.agentMemorySearchAnyVisibleRouted(ctx.allocator, query, limit, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
@@ -8183,7 +8145,7 @@ fn agentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResp
         access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx)
     else
         ctx.actor_id;
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const entry = ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -8201,7 +8163,7 @@ fn agentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResp
 
 fn agentMemoryCount(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const count = ctx.store.agentMemoryCountRouted(ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -8255,89 +8217,6 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
-}
-
-fn agentMemoryStorageTargetFromObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !store_mod.AgentMemoryStorageRoute {
-    if (json.stringField(obj, "storage")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
-    if (json.stringField(obj, "store")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
-    if (json.stringField(obj, "target_store")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
-    if (obj.get("stores")) |value| return agentMemoryStorageTargetFromValue(allocator, value);
-    return .{};
-}
-
-fn objectHasStorageTarget(obj: std.json.ObjectMap) bool {
-    return json.stringField(obj, "storage") != null or
-        json.stringField(obj, "store") != null or
-        json.stringField(obj, "target_store") != null or
-        obj.get("stores") != null;
-}
-
-fn agentMemoryStorageTargetFromObjectOrFallback(allocator: std.mem.Allocator, obj: std.json.ObjectMap, fallback: store_mod.AgentMemoryStorageRoute) !store_mod.AgentMemoryStorageRoute {
-    if (objectHasStorageTarget(obj)) return agentMemoryStorageTargetFromObject(allocator, obj);
-    return fallback;
-}
-
-fn agentMemoryStorageTargetFromObjectOrQuery(allocator: std.mem.Allocator, obj: std.json.ObjectMap, query: []const u8) !store_mod.AgentMemoryStorageRoute {
-    if (objectHasStorageTarget(obj)) {
-        return agentMemoryStorageTargetFromObject(allocator, obj);
-    }
-    return agentMemoryStorageTargetFromQuery(allocator, query);
-}
-
-fn agentMemoryStorageTargetFromQuery(allocator: std.mem.Allocator, query: []const u8) !store_mod.AgentMemoryStorageRoute {
-    if (json.queryParam(query, "storage")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
-    if (json.queryParam(query, "store")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
-    if (json.queryParam(query, "target_store")) |value| return store_mod.AgentMemoryStorageRoute.parse(value);
-    if (json.queryParam(query, "stores")) |value| return agentMemoryStorageTargetFromCsv(allocator, value);
-    return .{};
-}
-
-fn agentMemoryStorageTargetFromCsv(allocator: std.mem.Allocator, value: []const u8) !store_mod.AgentMemoryStorageRoute {
-    var count: usize = 1;
-    for (value) |ch| {
-        if (ch == ',') count += 1;
-    }
-    var stores = try allocator.alloc([]const u8, count);
-    var used: usize = 0;
-    var it = std.mem.splitScalar(u8, value, ',');
-    while (it.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t\r\n");
-        if (trimmed.len == 0) continue;
-        stores[used] = trimmed;
-        used += 1;
-    }
-    return store_mod.AgentMemoryStorageRoute.fromStores(stores[0..used]);
-}
-
-fn agentMemoryStorageTargetFromValue(allocator: std.mem.Allocator, value: std.json.Value) !store_mod.AgentMemoryStorageRoute {
-    return switch (value) {
-        .string => |s| store_mod.AgentMemoryStorageRoute.parse(s),
-        .array => |items| blk: {
-            var stores = try allocator.alloc([]const u8, items.items.len);
-            var count: usize = 0;
-            for (items.items) |item| {
-                if (item != .string) continue;
-                stores[count] = item.string;
-                count += 1;
-            }
-            break :blk store_mod.AgentMemoryStorageRoute.fromStores(stores[0..count]);
-        },
-        else => .{},
-    };
-}
-
-fn agentMemoryStorageTargetFromAliasedObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap, names: []const []const u8) !?store_mod.AgentMemoryStorageRoute {
-    for (names) |name| {
-        if (obj.get(name)) |value| return try agentMemoryStorageTargetFromRouteValue(allocator, value);
-    }
-    return null;
-}
-
-fn agentMemoryStorageTargetFromRouteValue(allocator: std.mem.Allocator, value: std.json.Value) !store_mod.AgentMemoryStorageRoute {
-    return switch (value) {
-        .object => |nested| agentMemoryStorageTargetFromObject(allocator, nested),
-        else => agentMemoryStorageTargetFromValue(allocator, value),
-    };
 }
 
 fn agentMemoryEntryVisible(ctx: *Context, entry: domain.AgentMemory) bool {
@@ -8394,7 +8273,7 @@ fn saveMessage(ctx: *Context, session_id: []const u8, body: []const u8, query: [
     const role = json.stringField(obj, "role") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing role");
     const content = json.stringField(obj, "content") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing content");
     const created_at_ms = json.intField(obj, "created_at_ms") orelse ids.nowMs();
-    const storage_target = agentMemoryStorageTargetFromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
     ctx.store.saveMessageRoutedAt(session_id, role, content, created_at_ms, ctx.actor_id, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -8403,7 +8282,7 @@ fn saveMessage(ctx: *Context, session_id: []const u8, body: []const u8, query: [
 }
 
 fn loadMessages(ctx: *Context, session_id: []const u8, query: []const u8) HttpResponse {
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const messages = ctx.store.loadMessagesRouted(ctx.allocator, session_id, actorFilter(ctx), storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -8423,7 +8302,7 @@ fn saveUsage(ctx: *Context, session_id: []const u8, body: []const u8, query: []c
     defer parsed.deinit();
     const obj = parsed.value.object;
     const total = json.intField(obj, "total_tokens") orelse 0;
-    const storage_target = agentMemoryStorageTargetFromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
     ctx.store.saveUsageRouted(session_id, @intCast(@max(total, 0)), ctx.actor_id, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -8432,7 +8311,7 @@ fn saveUsage(ctx: *Context, session_id: []const u8, body: []const u8, query: []c
 }
 
 fn loadUsage(ctx: *Context, session_id: []const u8, query: []const u8) HttpResponse {
-    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
     const total_opt = ctx.store.loadUsageRouted(session_id, actorFilter(ctx), storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -9219,7 +9098,7 @@ fn buildAppliedSourceInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scop
         .related_entities_json = rawField(ctx.allocator, obj, "related_entities", "[]") catch "[]",
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch "{}",
         .actor_id = event_actor_id,
-        .storage_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
+        .storage_route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
 }
@@ -9252,7 +9131,7 @@ fn buildAppliedArtifactInput(ctx: *Context, obj: std.json.ObjectMap, fallback_sc
         .summary = json.nullableStringField(obj, "summary"),
         .agent_summary = json.nullableStringField(obj, "agent_summary"),
         .actor_id = event_actor_id,
-        .storage_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
+        .storage_route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
 }
@@ -9274,7 +9153,7 @@ fn buildAppliedEntityInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scop
         .permissions_json = permissions_json,
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch "{}",
         .actor_id = event_actor_id,
-        .storage_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
+        .storage_route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
 }
@@ -9300,7 +9179,7 @@ fn buildAppliedRelationInput(ctx: *Context, obj: std.json.ObjectMap, fallback_sc
         .confidence = json.floatField(obj, "confidence") orelse 0.5,
         .status = json.stringField(obj, "status") orelse "proposed",
         .actor_id = event_actor_id,
-        .storage_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
+        .storage_route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
 }
@@ -9326,7 +9205,7 @@ fn buildAppliedContextPackInput(ctx: *Context, obj: std.json.ObjectMap, event_ac
         .allow_reranker = json.boolField(obj, "allow_reranker") orelse false,
         .min_relevance = minRelevanceFromObject(obj),
         .actor_id = event_actor_id,
-        .agent_memory_route = try agentMemoryStorageTargetFromObjectOrFallback(ctx.allocator, obj, fallback_route),
+        .agent_memory_route = try storage_routes.fromObjectOrFallback(ctx.allocator, obj, fallback_route),
         .suppress_feed = true,
     };
 }
@@ -9541,7 +9420,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
     var use_vector = json.boolField(obj, "use_vector") orelse true;
     const strict_vector = json.boolField(obj, "strict_vector") orelse false;
     const adaptive_retrieval = adaptiveRetrievalFromObject(obj);
-    const agent_memory_route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    const agent_memory_route = try storage_routes.fromObject(ctx.allocator, obj);
     const min_relevance = minRelevanceFromObject(obj);
     var query_embedding_json: ?[]const u8 = null;
     var query_embedding_provider: []const u8 = "none";
