@@ -8872,7 +8872,7 @@ pub const SQLiteStore = struct {
     pub fn claimJobAs(self: *Self, id: []const u8, worker_id: []const u8) !bool {
         const now = ids.nowMs();
         const claim_worker_id = effectiveWorkerId(worker_id, default_job_worker_id);
-        const stmt = try self.prepare("UPDATE jobs SET status = 'running', locked_until_ms = ?1, worker_id = ?2, updated_at_ms = ?3 WHERE id = ?4 AND (status = 'queued' OR (status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= ?5))");
+        const stmt = try self.prepare("UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until_ms = ?1, worker_id = ?2, updated_at_ms = ?3 WHERE id = ?4 AND (status = 'queued' OR (status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= ?5))");
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, now + default_job_lease_ms);
         bindText(stmt, 2, claim_worker_id);
@@ -8891,9 +8891,9 @@ pub const SQLiteStore = struct {
 
     pub fn finishJobAs(self: *Self, id: []const u8, status: []const u8, result_json: []const u8, error_text: ?[]const u8, worker_id: ?[]const u8) !bool {
         const stmt = if (worker_id != null)
-            try self.prepare("UPDATE jobs SET status = ?1, result_json = ?2, error_text = ?3, attempts = attempts + 1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?4 WHERE id = ?5 AND status = 'running' AND worker_id = ?6")
+            try self.prepare("UPDATE jobs SET status = ?1, result_json = ?2, error_text = ?3, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?4 WHERE id = ?5 AND status = 'running' AND worker_id = ?6")
         else
-            try self.prepare("UPDATE jobs SET status = ?1, result_json = ?2, error_text = ?3, attempts = attempts + 1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?4 WHERE id = ?5");
+            try self.prepare("UPDATE jobs SET status = ?1, result_json = ?2, error_text = ?3, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = ?4 WHERE id = ?5");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, status);
         bindText(stmt, 2, result_json);
@@ -11784,7 +11784,7 @@ pub const PostgresStore = struct {
         const claim_worker_id = effectiveWorkerId(worker_id, default_job_worker_id);
         const text = try self.queryParamsText(
             allocator,
-            "WITH updated AS (UPDATE jobs SET status = 'running', locked_until_ms = $1::bigint, worker_id = $2, updated_at_ms = $3::bigint WHERE id = $4 AND (status = 'queued' OR (status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= $5::bigint)) RETURNING 1) SELECT count(*)::text FROM updated",
+            "WITH updated AS (UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until_ms = $1::bigint, worker_id = $2, updated_at_ms = $3::bigint WHERE id = $4 AND (status = 'queued' OR (status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= $5::bigint)) RETURNING 1) SELECT count(*)::text FROM updated",
             &.{ locked_until, claim_worker_id, now_text, id, now_text },
         );
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
@@ -11802,13 +11802,13 @@ pub const PostgresStore = struct {
         const text = if (worker_id) |worker|
             try self.queryParamsText(
                 allocator,
-                "WITH updated AS (UPDATE jobs SET status = $1, result_json = $2::jsonb, error_text = $3, attempts = attempts + 1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $4::bigint WHERE id = $5 AND status = 'running' AND worker_id = $6 RETURNING 1) SELECT count(*)::text FROM updated",
+                "WITH updated AS (UPDATE jobs SET status = $1, result_json = $2::jsonb, error_text = $3, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $4::bigint WHERE id = $5 AND status = 'running' AND worker_id = $6 RETURNING 1) SELECT count(*)::text FROM updated",
                 &.{ status, result_json, error_text, now_text, id, worker },
             )
         else
             try self.queryParamsText(
                 allocator,
-                "WITH updated AS (UPDATE jobs SET status = $1, result_json = $2::jsonb, error_text = $3, attempts = attempts + 1, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $4::bigint WHERE id = $5 RETURNING 1) SELECT count(*)::text FROM updated",
+                "WITH updated AS (UPDATE jobs SET status = $1, result_json = $2::jsonb, error_text = $3, locked_until_ms = NULL, worker_id = NULL, updated_at_ms = $4::bigint WHERE id = $5 RETURNING 1) SELECT count(*)::text FROM updated",
                 &.{ status, result_json, error_text, now_text, id },
             );
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
@@ -15334,6 +15334,7 @@ test "sqlite jobs persist status transitions with scoped listing" {
     try std.testing.expect(!(try store.claimJob(job.id)));
     const claimed = (try store.getJob(alloc, job.id)).?;
     try std.testing.expectEqualStrings("running", claimed.status);
+    try std.testing.expectEqual(@as(i64, 1), claimed.attempts);
     try std.testing.expect(claimed.locked_until_ms != null);
     try std.testing.expectEqualStrings("worker:ingest-a", claimed.worker_id.?);
     try std.testing.expect(!try store.finishJobAs(job.id, "succeeded", "{\"ok\":false}", null, "worker:ingest-other"));
@@ -15358,8 +15359,12 @@ test "sqlite jobs persist status transitions with scoped listing" {
     try std.testing.expectEqualStrings("running", runnable[0].status);
 
     try std.testing.expect(try store.claimJobAs(expired.id, "worker:expired-b"));
+    const reclaimed = (try store.getJob(alloc, expired.id)).?;
+    try std.testing.expectEqual(@as(i64, 2), reclaimed.attempts);
     try std.testing.expect(!try store.finishJobAs(expired.id, "succeeded", "{\"stale\":true}", null, "worker:expired-a"));
     try std.testing.expect(try store.finishJobAs(expired.id, "succeeded", "{\"fresh\":true}", null, "worker:expired-b"));
+    const reclaimed_done = (try store.getJob(alloc, expired.id)).?;
+    try std.testing.expectEqual(@as(i64, 2), reclaimed_done.attempts);
 
     const visible = try store.listJobs(alloc, .{ .scopes_json = "[\"project:nullpantry\"]", .status = "succeeded" });
     try std.testing.expectEqual(@as(usize, 2), visible.len);
@@ -16162,6 +16167,8 @@ test "postgres storage contract covers primitives when configured" {
     });
     try std.testing.expect(try store.claimJob(job.id));
     try std.testing.expect(!(try store.claimJob(job.id)));
+    const claimed_pg_job = (try store.getJob(alloc, job.id)).?;
+    try std.testing.expectEqual(@as(i64, 1), claimed_pg_job.attempts);
     try std.testing.expect(try store.finishJob(job.id, "succeeded", "{\"done\":true}", null));
 
     const expired_job = try store.createJob(alloc, .{
@@ -16190,4 +16197,6 @@ test "postgres storage contract covers primitives when configured" {
     }
     try std.testing.expect(saw_expired);
     try std.testing.expect(try store.claimJob(expired_job.id));
+    const reclaimed_pg_job = (try store.getJob(alloc, expired_job.id)).?;
+    try std.testing.expectEqual(@as(i64, 2), reclaimed_pg_job.attempts);
 }
