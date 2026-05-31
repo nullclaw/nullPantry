@@ -703,6 +703,10 @@ test "feed operation inference and lifecycle status are centralized" {
     try std.testing.expectEqualStrings("delete_all", operationFromEventType("agent_memory.delete_all"));
     try std.testing.expectEqualStrings("delete_scoped", operationFromEventType("agent_memory_delete_scoped"));
     try std.testing.expectEqualStrings("delete", operationFromEventType("memory_atom.forget"));
+    try std.testing.expectEqualStrings("verify", operationFromEventType("agent_memory.verify"));
+    try std.testing.expectEqualStrings("mark_stale", operationFromEventType("agent_memory_mark_stale"));
+    try std.testing.expectEqualStrings("stale", operationFromEventType("agent_memory.stale"));
+    try std.testing.expectEqualStrings("supersede", operationFromEventType("agent_memory_supersede"));
     try std.testing.expectEqualStrings("delete_autosaved", operationFromEventType("session.clear_autosaved"));
     try std.testing.expectEqualStrings("merge_object", operationFromEventType("agent_memory.merge_object"));
     try std.testing.expectEqualStrings("merge_string_set", operationFromEventType("agent_memory_merge_string_set"));

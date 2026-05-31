@@ -5108,7 +5108,11 @@ fn nullClawMemoryOperationSupported(operation: []const u8) bool {
         std.mem.eql(u8, operation, "merge_string_set") or
         std.mem.eql(u8, operation, "delete_scoped") or
         std.mem.eql(u8, operation, "delete_all") or
-        std.mem.eql(u8, operation, "delete");
+        std.mem.eql(u8, operation, "delete") or
+        std.mem.eql(u8, operation, "verify") or
+        std.mem.eql(u8, operation, "mark_stale") or
+        std.mem.eql(u8, operation, "stale") or
+        std.mem.eql(u8, operation, "supersede");
 }
 
 fn appendNullClawEventPayload(ctx: *Context, out: *std.ArrayListUnmanaged(u8), obj: std.json.ObjectMap, operation: []const u8, key: []const u8) !void {
@@ -11923,6 +11927,41 @@ test "api nullclaw top-level feed apply deletes scoped and all session variants"
     try std.testing.expectEqualStrings("404 Not Found", global_after_delete_all.status);
     const session_after_delete_all = handleRequest(&ctx, "GET", "/v1/agent-memory/top.delete?session_id=s1", "", "");
     try std.testing.expectEqualStrings("404 Not Found", session_after_delete_all.status);
+}
+
+test "api nullclaw top-level feed apply accepts lifecycle reducers" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .store = &store,
+        .actor_id = "agent:nullclaw-life",
+        .actor_scopes_json = "[\"admin\"]",
+    };
+
+    const put = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-life\",\"origin_sequence\":1,\"operation\":\"put\",\"key\":\"top.lifecycle\",\"content\":\"Top lifecycle value\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", put.status);
+    const stale = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-life\",\"origin_sequence\":2,\"operation\":\"mark_stale\",\"key\":\"top.lifecycle\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", stale.status);
+    const stale_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Top lifecycle value\",\"use_vector\":false}", "");
+    try std.testing.expect(std.mem.indexOf(u8, stale_search.body, "\"status\":\"stale\"") != null);
+
+    const verify = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-life\",\"origin_sequence\":3,\"operation\":\"verify\",\"key\":\"top.lifecycle\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", verify.status);
+    const verified_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Top lifecycle value\",\"use_vector\":false}", "");
+    try std.testing.expect(std.mem.indexOf(u8, verified_search.body, "\"status\":\"verified\"") != null);
+
+    const supersede = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-life\",\"origin_sequence\":4,\"operation\":\"supersede\",\"key\":\"top.lifecycle\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", supersede.status);
+    const hidden = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Top lifecycle value\",\"use_vector\":false}", "");
+    try std.testing.expect(std.mem.indexOf(u8, hidden.body, "Top lifecycle value") == null);
+    const checkpoint = handleRequest(&ctx, "GET", "/v1/agent/memory/checkpoint?after=0&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"operation\":\"mark_stale\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"operation\":\"verify\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"operation\":\"supersede\"") != null);
 }
 
 test "api nullclaw memory apply uses configured primary runtime backend" {
