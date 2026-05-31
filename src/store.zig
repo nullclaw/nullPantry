@@ -2803,15 +2803,22 @@ pub const Store = struct {
         const start = @min(offset, total);
         const end = @min(start + limit, total);
         var page = try allocator.alloc(SessionInfo, end - start);
+        var page_initialized: usize = 0;
+        errdefer {
+            for (page[0..page_initialized]) |*session| freeSessionInfoOwned(allocator, session);
+            allocator.free(page);
+        }
         for (out.items, 0..) |*session, i| {
             if (i >= start and i < end) {
-                page[i - start] = session.*;
+                page[page_initialized] = session.*;
+                page_initialized += 1;
                 detachSessionInfoOwned(session);
             } else {
                 freeSessionInfoOwned(allocator, session);
             }
         }
         out.deinit(allocator);
+        try self.refreshSessionInfoPageFromRoute(allocator, page, actor_id, route);
         return .{ .total = @intCast(total), .sessions = page };
     }
 
@@ -3777,16 +3784,49 @@ pub const Store = struct {
         const start = @min(offset, total);
         const end = @min(start + limit, total);
         var page = try allocator.alloc(SessionInfo, end - start);
+        var page_initialized: usize = 0;
+        errdefer {
+            for (page[0..page_initialized]) |*session| freeSessionInfoOwned(allocator, session);
+            allocator.free(page);
+        }
         for (out.items, 0..) |*session, i| {
             if (i >= start and i < end) {
-                page[i - start] = session.*;
+                page[page_initialized] = session.*;
+                page_initialized += 1;
                 detachSessionInfoOwned(session);
             } else {
                 freeSessionInfoOwned(allocator, session);
             }
         }
         out.deinit(allocator);
+        try self.refreshSessionInfoPageFromRoute(allocator, page, actor_id, .{ .target = .all });
         return .{ .total = @intCast(total), .sessions = page };
+    }
+
+    fn refreshSessionInfoPageFromRoute(self: *Store, allocator: std.mem.Allocator, page: []SessionInfo, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        for (page) |*session| {
+            try self.refreshSessionInfoFromRoute(allocator, session, actor_id, route);
+        }
+    }
+
+    fn refreshSessionInfoFromRoute(self: *Store, allocator: std.mem.Allocator, session: *SessionInfo, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        const messages = try self.loadMessagesRouted(allocator, session.session_id, actor_id, route);
+        defer {
+            for (messages) |*message| freeMessageOwned(allocator, message);
+            allocator.free(messages);
+        }
+        var count: u64 = 0;
+        var first: i64 = 0;
+        var last: i64 = 0;
+        for (messages) |message| {
+            if (!domain.sessionMessageVisibleInHistory(message.role)) continue;
+            count += 1;
+            if (first == 0 or message.created_at_ms < first) first = message.created_at_ms;
+            if (message.created_at_ms > last) last = message.created_at_ms;
+        }
+        session.message_count = count;
+        session.first_message_at = first;
+        session.last_message_at = last;
     }
 
     pub fn history(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryShow {
@@ -16367,6 +16407,14 @@ test "sqlite federated session merge keeps repeated content with distinct timest
     try std.testing.expectEqual(@as(usize, 1), paged.messages.len);
     try std.testing.expectEqual(@as(i64, 202), paged.messages[0].created_at_ms);
     try std.testing.expectEqualStrings("same text", paged.messages[0].content);
+
+    const listed = try store.listSessionsRouted(alloc, 10, 0, "agent:merge", subset);
+    try std.testing.expectEqual(@as(u64, 1), listed.total);
+    try std.testing.expectEqual(@as(usize, 1), listed.sessions.len);
+    try std.testing.expectEqualStrings("merge-session", listed.sessions[0].session_id);
+    try std.testing.expectEqual(@as(u64, 3), listed.sessions[0].message_count);
+    try std.testing.expectEqual(@as(i64, 101), listed.sessions[0].first_message_at);
+    try std.testing.expectEqual(@as(i64, 303), listed.sessions[0].last_message_at);
 }
 
 test "sqlite context pack can include guarded session history when requested" {
