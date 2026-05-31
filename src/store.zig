@@ -5691,7 +5691,7 @@ pub const SQLiteStore = struct {
             const predicate = try columnText(allocator, stmt, 8);
             if (std.mem.eql(u8, predicate, "agent.memory")) continue;
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const relevance = if (use_fts) @max(0.0, 10.0 - c.sqlite3_column_double(stmt, 9)) else scoreText(input.query, text);
             if (!use_fts and relevance <= 0 and input.query.len > 0) continue;
             const citations = try self.sanitizeSourceIdsForActor(allocator, source_ids, input.scopes_json, input.actor_id);
@@ -5728,7 +5728,7 @@ pub const SQLiteStore = struct {
             const permissions = try columnText(allocator, stmt, 5);
             const metadata = try columnText(allocator, stmt, 6);
             const updated_at_ms = c.sqlite3_column_int64(stmt, 7);
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const text = if (description) |d| try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ name, title, d, metadata }) else try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ name, title, metadata });
             const relevance = if (use_fts) @max(0.0, 6.0 - c.sqlite3_column_double(stmt, 8)) else scoreText(input.query, text);
             if (!use_fts and input.query.len > 0 and relevance <= 0) continue;
@@ -5750,7 +5750,7 @@ pub const SQLiteStore = struct {
             const owner = try columnTextNullable(allocator, stmt, 3);
             const metadata = try columnText(allocator, stmt, 4);
             const updated_at_ms = c.sqlite3_column_int64(stmt, 5);
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const text = if (owner) |o| try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ scope, visibility, o, metadata }) else try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ scope, visibility, metadata });
             const relevance = if (use_fts) @max(0.0, 6.0 - c.sqlite3_column_double(stmt, 6)) else scoreText(input.query, text);
             if (!use_fts and input.query.len > 0 and relevance <= 0) continue;
@@ -5777,7 +5777,7 @@ pub const SQLiteStore = struct {
             if (std.mem.indexOf(u8, metadata, "\"native\":\"agent_memory_runtime\"") != null) continue;
             const status = try self.primitiveLifecycleStatus(allocator, "source", id_text);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const relevance = if (use_fts) @max(0.0, 9.0 - c.sqlite3_column_double(stmt, 7)) else scoreText(input.query, title) + scoreText(input.query, content);
             if (!use_fts and relevance <= 0 and input.query.len > 0) continue;
             const citations = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{id_text});
@@ -5803,7 +5803,7 @@ pub const SQLiteStore = struct {
             const updated_at_ms = c.sqlite3_column_int64(stmt, 7);
             const fields_json = try columnText(allocator, stmt, 8);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const text = try artifactTextWithFields(allocator, body, fields_json);
             const relevance = if (use_fts) @max(0.0, 9.0 - c.sqlite3_column_double(stmt, 9)) else scoreText(input.query, title) + scoreText(input.query, text);
             if (!use_fts and relevance <= 0 and input.query.len > 0) {
@@ -5833,7 +5833,7 @@ pub const SQLiteStore = struct {
             const updated_at_ms = c.sqlite3_column_int64(stmt, 7);
             const status = try self.primitiveLifecycleStatus(allocator, "entity", id_text);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const text = description orelse name;
             const relevance = if (use_fts) @max(0.0, 8.0 - c.sqlite3_column_double(stmt, 8)) else scoreText(input.query, name) + scoreText(input.query, aliases) + scoreText(input.query, text);
             if (!use_fts and relevance <= 0 and input.query.len > 0) continue;
@@ -5877,9 +5877,9 @@ pub const SQLiteStore = struct {
             const to_scope = try columnText(allocator, stmt, 12);
             const to_permissions = try columnText(allocator, stmt, 13);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, from_scope, from_permissions, input.scopes_json)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, to_scope, to_permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, from_scope, from_permissions, input.scopes_json, input.actor_id)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, to_scope, to_permissions, input.scopes_json, input.actor_id)) continue;
             const text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ from_name, relation_type, to_name });
             const relevance = if (use_fts) @max(0.0, 8.0 - c.sqlite3_column_double(stmt, 14)) else scoreText(input.query, text) + scoreText(input.query, relation_type);
             if (!use_fts and relevance <= 0 and input.query.len > 0) continue;
@@ -5928,7 +5928,7 @@ pub const SQLiteStore = struct {
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             const scope = try columnText(allocator, stmt, 2);
             const permissions = try columnText(allocator, stmt, 7);
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const source_ids = try columnText(allocator, stmt, 5);
             const confidence = c.sqlite3_column_double(stmt, 4);
             try results.append(allocator, .{
@@ -5957,7 +5957,7 @@ pub const SQLiteStore = struct {
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             const scope = try columnText(allocator, stmt, 4);
             const permissions = try columnText(allocator, stmt, 5);
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             try results.append(allocator, .{
                 .id = try columnText(allocator, stmt, 0),
                 .result_type = "artifact",
@@ -5985,7 +5985,7 @@ pub const SQLiteStore = struct {
             const id_text = try columnText(allocator, stmt, 0);
             const status = try self.primitiveLifecycleStatus(allocator, "source", id_text);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             try results.append(allocator, .{
                 .id = id_text,
                 .result_type = "source",
@@ -6022,9 +6022,9 @@ pub const SQLiteStore = struct {
             const from_permissions = try columnText(allocator, stmt, 11);
             const to_scope = try columnText(allocator, stmt, 12);
             const to_permissions = try columnText(allocator, stmt, 13);
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, from_scope, from_permissions, input.scopes_json)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, to_scope, to_permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, from_scope, from_permissions, input.scopes_json, input.actor_id)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, to_scope, to_permissions, input.scopes_json, input.actor_id)) continue;
             const relation_type = try columnText(allocator, stmt, 1);
             const confidence = c.sqlite3_column_double(stmt, 3);
             try results.append(allocator, .{
@@ -8973,6 +8973,15 @@ pub const PostgresStore = struct {
         try out.append(allocator, '(');
         try out.print(allocator, "({s} = 'public'", .{scope_expr});
         try appendPgVisibleScopes(allocator, &out, scopes.items, scope_expr);
+        if (actor_id) |actor| {
+            if (actor.len > 0) {
+                const actor_scope = try domain.defaultAgentMemoryScope(allocator, actor);
+                try out.print(allocator, " OR {s} = ", .{scope_expr});
+                try appendPgTextArrayItem(&out, allocator, actor);
+                try out.print(allocator, " OR {s} = ", .{scope_expr});
+                try appendPgTextArrayItem(&out, allocator, actor_scope);
+            }
+        }
         try out.append(allocator, ')');
         try out.append(allocator, ' ');
         try out.appendSlice(allocator, "AND ");
@@ -11228,7 +11237,7 @@ pub const PostgresStore = struct {
             const atom = try readPgMemoryAtom(allocator, item.object);
             if (std.mem.eql(u8, atom.predicate, "agent.memory")) continue;
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(atom.status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, atom.scope, atom.permissions_json, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, atom.scope, atom.permissions_json, input.scopes_json, input.actor_id)) continue;
             const relevance = pgScoreText(input.query, atom.text) + pgScoreText(input.query, atom.predicate) + pgScoreText(input.query, atom.object);
             if (relevance <= 0 and input.query.len > 0) continue;
             try results.append(allocator, .{ .id = atom.id, .result_type = "memory_atom", .title = atom.id, .text = atom.text, .scope = atom.scope, .status = atom.status, .score = relevance + atom.confidence, .source_ids_json = try self.sanitizeSourceIds(allocator, atom.source_ids_json, input.scopes_json), .required_scopes_json = try requiredAccessJsonGlobal(allocator, atom.scope, atom.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "memory_atom", atom.scope, atom.permissions_json, input.actor_id), .created_at_ms = atom.created_at_ms, .confidence = atom.confidence });
@@ -11247,7 +11256,7 @@ pub const PostgresStore = struct {
         for (parsed.value.array.items) |item| {
             if (item != .object) continue;
             const space = try readPgSpace(allocator, item.object);
-            if (!try self.recordVisibleWithPolicy(allocator, space.scope, space.permissions_json, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, space.scope, space.permissions_json, input.scopes_json, input.actor_id)) continue;
             const text = if (space.description) |d| try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ space.name, space.title, d }) else try std.fmt.allocPrint(allocator, "{s} {s}", .{ space.name, space.title });
             const relevance = pgScoreText(input.query, text);
             if (relevance <= 0 and input.query.len > 0) continue;
@@ -11267,7 +11276,7 @@ pub const PostgresStore = struct {
         for (parsed.value.array.items) |item| {
             if (item != .object) continue;
             const policy = try readPgPolicyScope(allocator, item.object);
-            if (!try self.recordVisibleWithPolicy(allocator, policy.scope, policy.permissions_json, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, policy.scope, policy.permissions_json, input.scopes_json, input.actor_id)) continue;
             const text = if (policy.owner) |o| try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ policy.scope, policy.visibility, o, policy.metadata_json }) else try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ policy.scope, policy.visibility, policy.metadata_json });
             const relevance = pgScoreText(input.query, text);
             if (relevance <= 0 and input.query.len > 0) continue;
@@ -11291,7 +11300,7 @@ pub const PostgresStore = struct {
             if (std.mem.indexOf(u8, source.metadata_json, "\"native\":\"agent_memory\"") != null) continue;
             const status = try self.primitiveLifecycleStatus(allocator, "source", source.id);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, source.scope, source.permissions_json, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, source.scope, source.permissions_json, input.scopes_json, input.actor_id)) continue;
             const relevance = pgScoreText(input.query, source.title) + pgScoreText(input.query, source.content);
             if (relevance <= 0 and input.query.len > 0) continue;
             try results.append(allocator, .{ .id = source.id, .result_type = "source", .title = source.title, .text = source.content, .scope = source.scope, .status = status, .score = relevance, .source_ids_json = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{source.id}), .required_scopes_json = try requiredAccessJsonGlobal(allocator, source.scope, source.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "source", source.scope, source.permissions_json, input.actor_id), .created_at_ms = source.imported_at_ms, .confidence = 0.7 });
@@ -11313,7 +11322,7 @@ pub const PostgresStore = struct {
             if (item != .object) continue;
             const artifact = try readPgArtifact(allocator, item.object);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(artifact.status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, artifact.scope, artifact.permissions_json, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, artifact.scope, artifact.permissions_json, input.scopes_json, input.actor_id)) continue;
             const text = try artifactTextWithFields(allocator, artifact.body, artifact.fields_json);
             const relevance = pgScoreText(input.query, artifact.title) + pgScoreText(input.query, text);
             if (relevance <= 0 and input.query.len > 0) {
@@ -11338,7 +11347,7 @@ pub const PostgresStore = struct {
             const entity = try readPgEntity(allocator, item.object);
             const status = try self.primitiveLifecycleStatus(allocator, "entity", entity.id);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, entity.scope, entity.permissions_json, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, entity.scope, entity.permissions_json, input.scopes_json, input.actor_id)) continue;
             const text = entity.description orelse entity.name;
             const relevance = pgScoreText(input.query, entity.name) + pgScoreText(input.query, entity.aliases_json) + pgScoreText(input.query, text);
             if (relevance <= 0 and input.query.len > 0) continue;
@@ -11365,9 +11374,9 @@ pub const PostgresStore = struct {
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             const scope = try dupStringField(allocator, obj, "scope", "workspace");
             const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, json.stringField(obj, "from_scope") orelse "", try rawJsonField(allocator, obj, "from_permissions_json", "[]"), input.scopes_json)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, json.stringField(obj, "to_scope") orelse "", try rawJsonField(allocator, obj, "to_permissions_json", "[]"), input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, json.stringField(obj, "from_scope") orelse "", try rawJsonField(allocator, obj, "from_permissions_json", "[]"), input.scopes_json, input.actor_id)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, json.stringField(obj, "to_scope") orelse "", try rawJsonField(allocator, obj, "to_permissions_json", "[]"), input.scopes_json, input.actor_id)) continue;
             const relation_type = try dupStringField(allocator, obj, "relation_type", "");
             const text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ json.stringField(obj, "from_name") orelse "", relation_type, json.stringField(obj, "to_name") orelse "" });
             const relevance = pgScoreText(input.query, text) + pgScoreText(input.query, relation_type);
@@ -11429,8 +11438,11 @@ pub const PostgresStore = struct {
     }
 
     fn expandPgEntityMemoryAtoms(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,text,scope,status,confidence,source_ids_json,created_at_ms,permissions_json FROM memory_atoms WHERE subject_entity_id = {s} ORDER BY created_at_ms DESC", .{try sqlString(allocator, entity_id)});
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT id,text,scope,status,confidence,source_ids_json,created_at_ms,permissions_json FROM memory_atoms WHERE subject_entity_id = $1 ORDER BY created_at_ms DESC",
+            &.{entity_id},
+        );
         defer parsed.deinit();
         if (parsed.value != .array) return;
         for (parsed.value.array.items) |item| {
@@ -11440,16 +11452,19 @@ pub const PostgresStore = struct {
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             const scope = try dupStringField(allocator, obj, "scope", "workspace");
             const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const confidence = json.floatField(obj, "confidence") orelse 0.5;
             try results.append(allocator, .{ .id = try dupStringField(allocator, obj, "id", ""), .result_type = "memory_atom", .title = entity_id, .text = try dupStringField(allocator, obj, "text", ""), .scope = scope, .status = status, .score = 0.7 + confidence, .source_ids_json = try self.sanitizeSourceIds(allocator, try rawJsonField(allocator, obj, "source_ids_json", "[]"), input.scopes_json), .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "memory_atom", scope, permissions, input.actor_id), .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .confidence = confidence });
         }
     }
 
     fn expandPgEntityArtifacts(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const entity_json = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{entity_id});
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,title,body,status,scope,permissions_json,source_ids_json,updated_at_ms,fields_json FROM artifacts WHERE related_entities_json @> {s} ORDER BY updated_at_ms DESC", .{try sqlJsonb(allocator, entity_json)});
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const entity_json = try singleJsonString(allocator, entity_id);
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT id,title,body,status,scope,permissions_json,source_ids_json,updated_at_ms,fields_json FROM artifacts WHERE related_entities_json @> $1::jsonb ORDER BY updated_at_ms DESC",
+            &.{entity_json},
+        );
         defer parsed.deinit();
         if (parsed.value != .array) return;
         for (parsed.value.array.items) |item| {
@@ -11459,15 +11474,18 @@ pub const PostgresStore = struct {
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             const scope = try dupStringField(allocator, obj, "scope", "workspace");
             const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             try results.append(allocator, .{ .id = try dupStringField(allocator, obj, "id", ""), .result_type = "artifact", .title = try dupStringField(allocator, obj, "title", ""), .text = try artifactTextWithFields(allocator, try dupStringField(allocator, obj, "body", ""), try rawJsonField(allocator, obj, "fields_json", "{}")), .scope = scope, .status = status, .score = 0.75, .source_ids_json = try self.sanitizeSourceIds(allocator, try rawJsonField(allocator, obj, "source_ids_json", "[]"), input.scopes_json), .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "artifact", scope, permissions, input.actor_id), .created_at_ms = json.intField(obj, "updated_at_ms") orelse 0, .confidence = 0.7 });
         }
     }
 
     fn expandPgEntitySources(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const entity_json = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{entity_id});
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,title,content,scope,permissions_json,imported_at_ms FROM sources WHERE related_entities_json @> {s} ORDER BY imported_at_ms DESC", .{try sqlJsonb(allocator, entity_json)});
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const entity_json = try singleJsonString(allocator, entity_id);
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT id,title,content,scope,permissions_json,imported_at_ms FROM sources WHERE related_entities_json @> $1::jsonb ORDER BY imported_at_ms DESC",
+            &.{entity_json},
+        );
         defer parsed.deinit();
         if (parsed.value != .array) return;
         for (parsed.value.array.items) |item| {
@@ -11478,15 +11496,17 @@ pub const PostgresStore = struct {
             const id_text = try dupStringField(allocator, obj, "id", "");
             const status = try self.primitiveLifecycleStatus(allocator, "source", id_text);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
             try results.append(allocator, .{ .id = id_text, .result_type = "source", .title = try dupStringField(allocator, obj, "title", ""), .text = try dupStringField(allocator, obj, "content", ""), .scope = scope, .status = status, .score = 0.65, .source_ids_json = try singleJsonString(allocator, id_text), .required_scopes_json = try requiredAccessJsonGlobal(allocator, scope, permissions, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "source", scope, permissions, input.actor_id), .created_at_ms = json.intField(obj, "imported_at_ms") orelse 0, .confidence = 0.65 });
         }
     }
 
     fn expandPgEntityRelations(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, entity_id: []const u8, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        const entity_sql = try sqlString(allocator, entity_id);
-        const inner = try std.fmt.allocPrint(allocator, "SELECT r.id,r.from_entity_id,r.relation_type,r.to_entity_id,r.source_ids_json,r.scope,r.permissions_json,r.confidence,r.status,r.created_at_ms,coalesce(fe.name,'') AS from_name,coalesce(te.name,'') AS to_name,coalesce(fe.scope,'') AS from_scope,coalesce(fe.permissions_json,'[]'::jsonb) AS from_permissions_json,coalesce(te.scope,'') AS to_scope,coalesce(te.permissions_json,'[]'::jsonb) AS to_permissions_json FROM relations r LEFT JOIN entities fe ON fe.id = r.from_entity_id LEFT JOIN entities te ON te.id = r.to_entity_id WHERE r.from_entity_id = {s} OR r.to_entity_id = {s} ORDER BY r.created_at_ms DESC", .{ entity_sql, entity_sql });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT r.id,r.from_entity_id,r.relation_type,r.to_entity_id,r.source_ids_json,r.scope,r.permissions_json,r.confidence,r.status,r.created_at_ms,coalesce(fe.name,'') AS from_name,coalesce(te.name,'') AS to_name,coalesce(fe.scope,'') AS from_scope,coalesce(fe.permissions_json,'[]'::jsonb) AS from_permissions_json,coalesce(te.scope,'') AS to_scope,coalesce(te.permissions_json,'[]'::jsonb) AS to_permissions_json FROM relations r LEFT JOIN entities fe ON fe.id = r.from_entity_id LEFT JOIN entities te ON te.id = r.to_entity_id WHERE r.from_entity_id = $1 OR r.to_entity_id = $1 ORDER BY r.created_at_ms DESC",
+            &.{entity_id},
+        );
         defer parsed.deinit();
         if (parsed.value != .array) return;
         for (parsed.value.array.items) |item| {
@@ -11496,9 +11516,9 @@ pub const PostgresStore = struct {
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) continue;
             const scope = try dupStringField(allocator, obj, "scope", "workspace");
             const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
-            if (!try self.recordVisibleWithPolicy(allocator, scope, permissions, input.scopes_json)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, json.stringField(obj, "from_scope") orelse "", try rawJsonField(allocator, obj, "from_permissions_json", "[]"), input.scopes_json)) continue;
-            if (!try self.recordVisibleWithPolicy(allocator, json.stringField(obj, "to_scope") orelse "", try rawJsonField(allocator, obj, "to_permissions_json", "[]"), input.scopes_json)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, json.stringField(obj, "from_scope") orelse "", try rawJsonField(allocator, obj, "from_permissions_json", "[]"), input.scopes_json, input.actor_id)) continue;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, json.stringField(obj, "to_scope") orelse "", try rawJsonField(allocator, obj, "to_permissions_json", "[]"), input.scopes_json, input.actor_id)) continue;
             const relation_type = try dupStringField(allocator, obj, "relation_type", "");
             const confidence = json.floatField(obj, "confidence") orelse 0.5;
             const text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ json.stringField(obj, "from_name") orelse "", relation_type, json.stringField(obj, "to_name") orelse "" });
@@ -13681,6 +13701,55 @@ test "sqlite graph expansion pulls entity context without bypassing acl" {
         if (std.mem.indexOf(u8, result.text, "include this verified service decision") != null) saw_atom = true;
     }
     try std.testing.expect(saw_atom);
+}
+
+test "sqlite search and graph expansion honor actor-owned primitive grants" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const actor = "agent:graph-owner";
+    const other_actor = "agent:graph-other";
+    const actor_scope = try domain.defaultAgentMemoryScope(alloc, actor);
+    const actor_permissions = try domain.actorGrantJson(alloc, actor);
+    const entity = try store.resolveEntity(alloc, .{ .entity_type = "service", .name = "ActorGraphService", .scope = "public" });
+    const related_entities = try singleJsonString(alloc, entity.id);
+    const source = try store.createSource(alloc, .{
+        .title = "Actor-owned graph note",
+        .content = "private actor graph payload",
+        .scope = actor_scope,
+        .permissions_json = actor_permissions,
+        .related_entities_json = related_entities,
+        .actor_id = actor,
+    });
+
+    const direct = try store.search(alloc, .{ .query = "private actor graph payload", .scopes_json = "[]", .actor_id = actor, .limit = 20, .use_vector = false });
+    var saw_direct = false;
+    for (direct) |result| {
+        if (std.mem.eql(u8, result.id, source.id)) saw_direct = true;
+    }
+    try std.testing.expect(saw_direct);
+
+    const hidden_direct = try store.search(alloc, .{ .query = "private actor graph payload", .scopes_json = "[]", .actor_id = other_actor, .limit = 20, .use_vector = false });
+    for (hidden_direct) |result| {
+        try std.testing.expect(!std.mem.eql(u8, result.id, source.id));
+        try std.testing.expect(std.mem.indexOf(u8, result.text, "private actor graph payload") == null);
+    }
+
+    const expanded = try store.search(alloc, .{ .query = "ActorGraphService", .scopes_json = "[]", .actor_id = actor, .limit = 20, .use_vector = false });
+    var saw_expanded = false;
+    for (expanded) |result| {
+        if (std.mem.eql(u8, result.id, source.id)) saw_expanded = true;
+    }
+    try std.testing.expect(saw_expanded);
+
+    const hidden_expanded = try store.search(alloc, .{ .query = "ActorGraphService", .scopes_json = "[]", .actor_id = other_actor, .limit = 20, .use_vector = false });
+    for (hidden_expanded) |result| {
+        try std.testing.expect(!std.mem.eql(u8, result.id, source.id));
+        try std.testing.expect(std.mem.indexOf(u8, result.text, "private actor graph payload") == null);
+    }
 }
 
 test "sqlite graph expansion matches related entity ids exactly" {
