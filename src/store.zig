@@ -9309,9 +9309,8 @@ pub const PostgresStore = struct {
     }
 
     pub fn importMemoryAtomsAtomic(self: *PostgresStore, allocator: std.mem.Allocator, inputs: []const PreparedMemoryImport) ![]domain.MemoryAtom {
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer sql.deinit(allocator);
-        try sql.appendSlice(allocator, "BEGIN;\n");
+        try self.runSql("BEGIN");
+        errdefer self.runSql("ROLLBACK") catch {};
 
         var out: std.ArrayListUnmanaged(domain.MemoryAtom) = .empty;
         errdefer out.deinit(allocator);
@@ -9319,53 +9318,16 @@ pub const PostgresStore = struct {
         for (inputs) |prepared| {
             var atom_input = prepared.atom;
             if (prepared.generated_source) |source_input| {
-                const source_id = try ids.make(allocator, "src_");
-                const source_now = ids.nowMs();
-                const source_ids = try singleJsonString(allocator, source_id);
-                const evidence = try evidenceRangeJson(allocator, source_id, atom_input.text.len, "snapshot_import");
-                atom_input.source_ids_json = source_ids;
-                atom_input.evidence_ranges_json = evidence;
-                try sql.print(
-                    allocator,
-                    "INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{d},{s},{s},{s},{s});\n",
-                    .{ try sqlString(allocator, source_id), try sqlString(allocator, source_input.source_type), try sqlString(allocator, source_input.title), try sqlNullableString(allocator, source_input.raw_content_uri), try sqlString(allocator, source_input.content), try sqlNullableString(allocator, source_input.author), try sqlJsonb(allocator, source_input.participants_json), try sqlJsonb(allocator, source_input.permissions_json), try sqlString(allocator, source_input.scope), source_now, source_now, try sqlNullableString(allocator, source_input.checksum), try sqlNullableString(allocator, source_input.language), try sqlJsonb(allocator, source_input.related_entities_json), try sqlJsonb(allocator, source_input.metadata_json) },
-                );
-                try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('source.created',{s},'source',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, source_input.actor_id), try sqlString(allocator, source_id), source_now });
+                const source = try self.createSource(allocator, source_input);
+                atom_input.source_ids_json = try singleJsonString(allocator, source.id);
+                atom_input.evidence_ranges_json = try evidenceRangeJson(allocator, source.id, atom_input.text.len, "snapshot_import");
             }
 
-            const atom_id = try ids.make(allocator, "mem_");
-            const atom_now = ids.nowMs();
-            const status = atom_input.status orelse domain.defaultMemoryStatus(atom_input.created_by, atom_input.scope);
-            try sql.print(
-                allocator,
-                "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) VALUES ({s},{s},{s},{s},{s},{s},{d},{s},{s},{s},{s},{d},{s},{s},NULL,{s},{s},{s});\n",
-                .{ try sqlString(allocator, atom_id), try sqlNullableString(allocator, atom_input.subject_entity_id), try sqlString(allocator, atom_input.predicate), try sqlString(allocator, atom_input.object), try sqlString(allocator, atom_input.text), try sqlString(allocator, atom_input.scope), atom_input.confidence, try sqlString(allocator, status), try sqlJsonb(allocator, atom_input.source_ids_json), try sqlJsonb(allocator, atom_input.evidence_ranges_json), try sqlString(allocator, atom_input.created_by), atom_now, try sqlNullableInt(allocator, atom_input.valid_from_ms), try sqlNullableInt(allocator, atom_input.valid_until_ms), try sqlNullableString(allocator, atom_input.owner), try sqlJsonb(allocator, atom_input.permissions_json), try sqlJsonb(allocator, atom_input.tags_json) },
-            );
-            try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_atom.created',{s},'memory_atom',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, atom_input.actor_id), try sqlString(allocator, atom_id), atom_now });
-            try out.append(allocator, .{
-                .id = atom_id,
-                .subject_entity_id = atom_input.subject_entity_id,
-                .predicate = atom_input.predicate,
-                .object = atom_input.object,
-                .text = atom_input.text,
-                .scope = atom_input.scope,
-                .confidence = atom_input.confidence,
-                .status = status,
-                .source_ids_json = atom_input.source_ids_json,
-                .evidence_ranges_json = atom_input.evidence_ranges_json,
-                .created_by = atom_input.created_by,
-                .created_at_ms = atom_now,
-                .valid_from_ms = atom_input.valid_from_ms,
-                .valid_until_ms = atom_input.valid_until_ms,
-                .last_verified_at_ms = null,
-                .owner = atom_input.owner,
-                .permissions_json = atom_input.permissions_json,
-                .tags_json = atom_input.tags_json,
-            });
+            const atom = try self.createMemoryAtom(allocator, atom_input);
+            try out.append(allocator, atom);
         }
 
-        try sql.appendSlice(allocator, "COMMIT;\n");
-        try self.runSql(sql.items);
+        try self.runSql("COMMIT");
         return out.toOwnedSlice(allocator);
     }
 
