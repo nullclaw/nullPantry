@@ -213,6 +213,8 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return lifecycleAnalyticsExport(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "diagnostics") and is_get) {
         return lifecycleDiagnostics(ctx);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "migrate") and is_post) {
+        return lifecycleMigrate(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and eql(seg3, "export") and is_post) {
         return lifecycleSnapshotExport(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and eql(seg3, "import") and is_post) {
@@ -1157,6 +1159,7 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/conflicts", .get = "listConflicts" },
         .{ .path = "/conflicts/scan", .post = "scanConflicts" },
         .{ .path = "/lifecycle/diagnostics", .get = "diagnostics" },
+        .{ .path = "/lifecycle/migrate", .post = "migrateAgentMemory" },
         .{ .path = "/lifecycle/snapshot", .post = "createSnapshot" },
         .{ .path = "/lifecycle/snapshot/export", .post = "exportSnapshot" },
         .{ .path = "/lifecycle/snapshot/import", .post = "importSnapshot" },
@@ -1212,7 +1215,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","lifecycle_migrate","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -2157,7 +2160,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -3715,6 +3718,240 @@ fn lifecycleDiagnostics(ctx: *Context) HttpResponse {
     }
     out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn lifecycleMigrate(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read") or !hasCapability(ctx, "write")) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    const kind = json.stringField(obj, "object_type") orelse json.stringField(obj, "kind") orelse "agent_memory";
+    if (!std.mem.eql(u8, kind, "agent_memory")) {
+        return json.errorResponse(ctx.allocator, 400, "unsupported_migration_kind", "Only agent_memory migration is currently supported");
+    }
+
+    const source_route = (agentMemoryStorageTargetFromAliasedObject(ctx.allocator, obj, &.{
+        "from",
+        "source",
+        "from_storage",
+        "source_storage",
+        "from_store",
+        "source_store",
+        "from_stores",
+        "source_stores",
+    }) catch return serverError(ctx)) orelse store_mod.AgentMemoryStorageRoute{};
+    const target_route = (agentMemoryStorageTargetFromAliasedObject(ctx.allocator, obj, &.{
+        "to",
+        "target",
+        "to_storage",
+        "target_storage",
+        "to_store",
+        "target_store",
+        "to_stores",
+        "target_stores",
+    }) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 400, "missing_target_storage", "Migration target storage is required");
+
+    const execute = json.boolField(obj, "execute") orelse false;
+    const dry_run = json.boolField(obj, "dry_run") orelse !execute;
+    const delete_source = json.boolField(obj, "delete_source") orelse false;
+    if (delete_source and !hasCapability(ctx, "delete")) return forbidden(ctx);
+
+    const session_id = json.nullableStringField(obj, "session_id");
+    if (session_id) |sid| {
+        if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
+        if (!dry_run and !agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+    }
+    const category = json.nullableStringField(obj, "category");
+    const query = std.mem.trim(u8, json.stringField(obj, "query") orelse json.stringField(obj, "q") orelse "", " \t\r\n");
+    const scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx);
+    const limit = positiveLimit(json.intField(obj, "limit"), 100);
+    const offset = positiveLimit(json.intField(obj, "offset"), 0);
+    const include_global = json.boolField(obj, "include_global") orelse false;
+    const include_internal = json.boolField(obj, "include_internal") orelse false;
+    const suppress_feed = json.boolField(obj, "suppress_feed") orelse false;
+
+    var candidates: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+    const fetch_limit = @min(limit + offset, 500);
+    if (query.len > 0) {
+        const primary = ctx.store.agentMemorySearchRouted(ctx.allocator, query, fetch_limit, session_id, scopes_json, ctx.actor_id, source_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        appendAgentMemoryEntries(ctx.allocator, &candidates, primary) catch return serverError(ctx);
+        if (include_global and session_id != null) {
+            const global = ctx.store.agentMemorySearchRouted(ctx.allocator, query, fetch_limit, null, scopes_json, ctx.actor_id, source_route) catch |err| switch (err) {
+                error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                else => return serverError(ctx),
+            };
+            appendMissingAgentMemoryEntries(ctx.allocator, &candidates, global) catch return serverError(ctx);
+        }
+    } else {
+        const primary = ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, session_id, ctx.actor_id, scopes_json, source_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        appendAgentMemoryEntries(ctx.allocator, &candidates, primary) catch return serverError(ctx);
+        if (include_global and session_id != null) {
+            const global = ctx.store.agentMemoryListVisibleRouted(ctx.allocator, category, null, ctx.actor_id, scopes_json, source_route) catch |err| switch (err) {
+                error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                else => return serverError(ctx),
+            };
+            appendMissingAgentMemoryEntries(ctx.allocator, &candidates, global) catch return serverError(ctx);
+        }
+    }
+    dedupeAgentMemoryEntries(ctx.allocator, &candidates);
+
+    var selected: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+    var skipped: usize = 0;
+    var visible_seen: usize = 0;
+    for (candidates.items) |entry| {
+        if (!agentMemoryEntryVisible(ctx, entry)) {
+            skipped += 1;
+            continue;
+        }
+        if (!include_internal and domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) {
+            skipped += 1;
+            continue;
+        }
+        if (visible_seen < offset) {
+            visible_seen += 1;
+            skipped += 1;
+            continue;
+        }
+        if (selected.items.len >= limit) {
+            skipped += 1;
+            continue;
+        }
+        visible_seen += 1;
+        if (!agentMemoryEntryMigratable(ctx, entry)) return forbidden(ctx);
+        if (delete_source and !agentMemoryEntryDeletable(ctx, entry)) return forbidden(ctx);
+        selected.append(ctx.allocator, entry) catch return serverError(ctx);
+    }
+
+    var migrated: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+    if (!dry_run) {
+        for (selected.items) |entry| {
+            const saved = ctx.store.agentMemoryStoreRouted(ctx.allocator, .{
+                .key = entry.key,
+                .content = entry.content,
+                .category = entry.category,
+                .session_id = entry.session_id,
+                .scope = entry.scope,
+                .permissions_json = entry.permissions_json,
+                .actor_id = entry.actor_id,
+                .writer_actor_id = ctx.actor_id,
+                .suppress_feed = suppress_feed,
+            }, target_route) catch |err| switch (err) {
+                error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                else => return serverError(ctx),
+            };
+            migrated.append(ctx.allocator, saved) catch return serverError(ctx);
+            if (delete_source) {
+                _ = ctx.store.agentMemoryDeleteRouted(entry.key, entry.session_id, entry.actor_id, ctx.actor_id, source_route) catch |err| switch (err) {
+                    error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                    else => return serverError(ctx),
+                };
+            }
+        }
+    }
+
+    return lifecycleMigrationResponse(ctx, .{
+        .kind = kind,
+        .dry_run = dry_run,
+        .delete_source = delete_source,
+        .source_route = source_route,
+        .target_route = target_route,
+        .matched = candidates.items.len,
+        .selected = selected.items,
+        .migrated = migrated.items,
+        .skipped = skipped,
+        .limit = limit,
+        .offset = offset,
+    });
+}
+
+const AgentMemoryMigrationResponseInput = struct {
+    kind: []const u8,
+    dry_run: bool,
+    delete_source: bool,
+    source_route: store_mod.AgentMemoryStorageRoute,
+    target_route: store_mod.AgentMemoryStorageRoute,
+    matched: usize,
+    selected: []const domain.AgentMemory,
+    migrated: []const domain.AgentMemory,
+    skipped: usize,
+    limit: usize,
+    offset: usize,
+};
+
+fn lifecycleMigrationResponse(ctx: *Context, input: AgentMemoryMigrationResponseInput) HttpResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"ok\":true,\"migration\":{\"kind\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, input.kind) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"dry_run\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (input.dry_run) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"delete_source\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (input.delete_source) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"source_route\":") catch return serverError(ctx);
+    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.source_route) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"target_route\":") catch return serverError(ctx);
+    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.target_route) catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"matched\":{d},\"selected\":{d},\"migrated\":{d},\"skipped\":{d},\"limit\":{d},\"offset\":{d},\"entries\":[", .{
+        input.matched,
+        input.selected.len,
+        input.migrated.len,
+        input.skipped,
+        input.limit,
+        input.offset,
+    }) catch return serverError(ctx);
+    for (input.selected, 0..) |entry, i| {
+        if (i > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
+        const saved: ?domain.AgentMemory = if (i < input.migrated.len) input.migrated[i] else null;
+        appendAgentMemoryMigrationEntryJson(ctx.allocator, &out, entry, saved) catch return serverError(ctx);
+    }
+    out.appendSlice(ctx.allocator, "]}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn appendAgentMemoryMigrationEntryJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: domain.AgentMemory, migrated: ?domain.AgentMemory) !void {
+    try out.appendSlice(allocator, "{\"key\":");
+    try json.appendString(out, allocator, entry.key);
+    try out.appendSlice(allocator, ",\"category\":");
+    try json.appendString(out, allocator, entry.category);
+    try out.appendSlice(allocator, ",\"session_id\":");
+    try json.appendNullableString(out, allocator, entry.session_id);
+    try out.appendSlice(allocator, ",\"actor_id\":");
+    try json.appendString(out, allocator, entry.actor_id);
+    try out.appendSlice(allocator, ",\"scope\":");
+    try json.appendString(out, allocator, entry.scope);
+    try out.appendSlice(allocator, ",\"source_store\":");
+    try json.appendString(out, allocator, if (entry.store.len > 0) entry.store else "primary");
+    if (migrated) |saved| {
+        try out.appendSlice(allocator, ",\"migrated_id\":");
+        try json.appendString(out, allocator, saved.id);
+        try out.appendSlice(allocator, ",\"target_store\":");
+        try json.appendString(out, allocator, if (saved.store.len > 0) saved.store else "primary");
+    }
+    try out.append(allocator, '}');
+}
+
+fn appendAgentMemoryStorageRouteJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), route: store_mod.AgentMemoryStorageRoute) !void {
+    try out.appendSlice(allocator, "{\"target\":");
+    try json.appendString(out, allocator, @tagName(route.target));
+    if (route.name) |name| {
+        try out.appendSlice(allocator, ",\"name\":");
+        try json.appendString(out, allocator, name);
+    }
+    if (route.stores.len > 0) {
+        try out.appendSlice(allocator, ",\"stores\":[");
+        for (route.stores, 0..) |store_name, i| {
+            if (i > 0) try out.append(allocator, ',');
+            try json.appendString(out, allocator, store_name);
+        }
+        try out.append(allocator, ']');
+    }
+    try out.append(allocator, '}');
 }
 
 fn appendRuntimeDiagnostics(ctx: *Context, out: *std.ArrayListUnmanaged(u8), schema_version: i64, schema_ok: bool, store_diag: store_mod.LifecycleDiagnostics) !void {
@@ -5506,6 +5743,20 @@ fn agentMemoryStorageTargetFromValue(allocator: std.mem.Allocator, value: std.js
     };
 }
 
+fn agentMemoryStorageTargetFromAliasedObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap, names: []const []const u8) !?store_mod.AgentMemoryStorageRoute {
+    for (names) |name| {
+        if (obj.get(name)) |value| return try agentMemoryStorageTargetFromRouteValue(allocator, value);
+    }
+    return null;
+}
+
+fn agentMemoryStorageTargetFromRouteValue(allocator: std.mem.Allocator, value: std.json.Value) !store_mod.AgentMemoryStorageRoute {
+    return switch (value) {
+        .object => |nested| agentMemoryStorageTargetFromObject(allocator, nested),
+        else => agentMemoryStorageTargetFromValue(allocator, value),
+    };
+}
+
 fn agentMemoryEntryVisible(ctx: *Context, entry: domain.AgentMemory) bool {
     return access.agentMemoryVisible(ctx.allocator, .{
         .owner_actor_id = entry.actor_id,
@@ -5532,6 +5783,21 @@ fn agentMemoryEntryDeletable(ctx: *Context, entry: domain.AgentMemory) bool {
         }
     }
     return domain.scopeDeletable(entry.scope, ctx.actor_scopes_json) and domain.permissionsWritable(entry.permissions_json, ctx.actor_scopes_json);
+}
+
+fn agentMemoryEntryMigratable(ctx: *Context, entry: domain.AgentMemory) bool {
+    const actor_owned = std.mem.eql(u8, entry.actor_id, ctx.actor_id) and
+        domain.isActorOwnedAgentMemoryScope(entry.scope, ctx.actor_id) and
+        access.permissionsVisibleForActor(ctx.allocator, entry.permissions_json, ctx.actor_scopes_json, ctx.actor_id);
+    if (actor_owned) return true;
+    if (entry.session_id) |sid| {
+        const session_scope = std.fmt.allocPrint(ctx.allocator, "session:{s}", .{sid}) catch return false;
+        defer ctx.allocator.free(session_scope);
+        if (std.mem.eql(u8, entry.scope, session_scope) and access.permissionsVisibleForActor(ctx.allocator, entry.permissions_json, ctx.actor_scopes_json, ctx.actor_id)) {
+            return agentSessionWriteAllowed(ctx, sid);
+        }
+    }
+    return canWriteRecord(ctx, entry.scope, entry.permissions_json);
 }
 
 fn actorFilter(ctx: *Context) ?[]const u8 {
@@ -7346,6 +7612,51 @@ test "api agent memory supports named stores and federated runtime reads" {
     try std.testing.expect(std.mem.indexOf(u8, missing.body, "storage_unavailable") != null);
 }
 
+test "api lifecycle migrate moves agent memory between storage planes" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory = .{ .backend = .memory_lru },
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "archive", .config = .{ .backend = .memory_lru } },
+        },
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const principals =
+        \\{"agent-route":{"actor_id":"agent:route","scopes":["public","write:public","delete:public"],"capabilities":["read","write","delete"]}}
+    ;
+    var ctx = Context{ .allocator = alloc, .store = &store, .token_principals_json = principals };
+    const raw = "PUT /v1/agent-memory/migrate.key HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}";
+
+    const put = handleRequest(&ctx, "PUT", "/v1/agent-memory/migrate.key", "{\"content\":\"Migrate Scratch Unique\",\"scope\":\"public\",\"store\":\"scratch\"}", raw);
+    try std.testing.expectEqualStrings("200 OK", put.status);
+
+    const dry_run = handleRequest(&ctx, "POST", "/v1/lifecycle/migrate", "{\"from\":\"scratch\",\"to\":\"archive\",\"query\":\"Migrate Scratch Unique\",\"scopes\":[\"public\"],\"dry_run\":true,\"limit\":10}", "POST /v1/lifecycle/migrate HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", dry_run.status);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"dry_run\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"selected\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"migrated\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"source_store\":\"scratch\"") != null);
+
+    const archive_before = handleRequest(&ctx, "POST", "/v1/agent-memory/search", "{\"query\":\"Migrate Scratch Unique\",\"store\":\"archive\",\"limit\":10}", "POST /v1/agent-memory/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", archive_before.status);
+    try std.testing.expect(std.mem.indexOf(u8, archive_before.body, "Migrate Scratch Unique") == null);
+
+    const execute = handleRequest(&ctx, "POST", "/v1/lifecycle/migrate", "{\"from_store\":\"scratch\",\"to_store\":\"archive\",\"query\":\"Migrate Scratch Unique\",\"scopes\":[\"public\"],\"execute\":true,\"delete_source\":true}", "POST /v1/lifecycle/migrate HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", execute.status);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"dry_run\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"migrated\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"target_store\":\"archive\"") != null);
+
+    const archive_after = handleRequest(&ctx, "POST", "/v1/agent-memory/search", "{\"query\":\"Migrate Scratch Unique\",\"store\":\"archive\",\"limit\":10}", "POST /v1/agent-memory/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", archive_after.status);
+    try std.testing.expect(std.mem.indexOf(u8, archive_after.body, "Migrate Scratch Unique") != null);
+    const scratch_after = handleRequest(&ctx, "GET", "/v1/agent-memory/migrate.key?store=scratch&scope=public", "", "GET /v1/agent-memory/migrate.key?store=scratch&scope=public HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("404 Not Found", scratch_after.status);
+}
+
 test "api memory checkpoint restore preserves named runtime storage plane" {
     var source_store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
         .agent_memory_stores = &.{
@@ -8004,6 +8315,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"rebuildVectorIndex\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"reconcileVectorIndex\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"putAgentMemoryByKey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"migrateAgentMemory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "created_by_actor_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"loadAgentSessionMessages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"min_relevance\"") != null);
@@ -8014,6 +8326,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_rebuild\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_reconcile\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"lifecycle_migrate\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"min_relevance\"") != null);
 
     const artifact_types = handleRequest(&ctx, "GET", "/v1/artifact-types", "", "");
@@ -9911,6 +10224,7 @@ test "api manifest and connector endpoints describe headless service contracts" 
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "GET /v1/agent-sessions") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/vector/rebuild") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/vector/reconcile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.body, "POST /v1/lifecycle/migrate") != null);
 }
 
 test "api qmd connector canonicalizes search results before extraction and retrieval" {
