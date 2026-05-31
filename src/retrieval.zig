@@ -74,6 +74,9 @@ pub const RetrievalPlan = struct {
     }
 };
 
+const search_token_delimiters = " \t\r\n.,;:/\\-_*\"'()[]{}<>!?|&+=#@$%^`~";
+const max_backend_search_terms = 64;
+
 pub fn reciprocalRankFusion(allocator: std.mem.Allocator, lists: []const []const RankedItem, k: f64, limit: usize) ![]RankedItem {
     var fused: std.ArrayListUnmanaged(RankedItem) = .empty;
     errdefer fused.deinit(allocator);
@@ -189,39 +192,17 @@ pub fn expandQuery(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
 }
 
 pub fn buildFts5Query(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
+    var terms: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer freeOwnedSearchTerms(allocator, &terms);
+    try collectSearchTerms(allocator, query, &terms);
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    var token_count: usize = 0;
-    var seen = std.StringHashMap(void).init(allocator);
-    defer {
-        var it = seen.keyIterator();
-        while (it.next()) |key| allocator.free(key.*);
-        seen.deinit();
-    }
 
-    var it = std.mem.tokenizeAny(u8, query, " \t\r\n.,;:/\\-_*\"'()[]{}<>!?");
-    while (it.next()) |raw| {
-        var token: std.ArrayListUnmanaged(u8) = .empty;
-        defer token.deinit(allocator);
-        for (raw) |ch| {
-            if (ch < 0x80) {
-                if (std.ascii.isAlphanumeric(ch)) try token.append(allocator, std.ascii.toLower(ch));
-            } else {
-                try token.append(allocator, ch);
-            }
-        }
-        if (token.items.len == 0) continue;
-        if (isFtsStopword(token.items)) continue;
-        if (seen.contains(token.items)) continue;
-
-        const owned_seen = try allocator.dupe(u8, token.items);
-        errdefer allocator.free(owned_seen);
-        try seen.put(owned_seen, {});
-
-        if (token_count > 0) try out.appendSlice(allocator, " OR ");
-        try out.appendSlice(allocator, token.items);
+    for (terms.items, 0..) |term, i| {
+        if (i > 0) try out.appendSlice(allocator, " OR ");
+        try out.appendSlice(allocator, term);
         try out.append(allocator, '*');
-        token_count += 1;
     }
     return out.toOwnedSlice(allocator);
 }
@@ -534,16 +515,128 @@ fn buildExpandedQuery(allocator: std.mem.Allocator, query: []const u8, terms: []
 }
 
 fn buildWebsearchQuery(allocator: std.mem.Allocator, query: []const u8, terms: []const []const u8) ![]u8 {
-    if (terms.len == 0) return allocator.dupe(u8, query);
+    var clauses: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (clauses.items) |clause| allocator.free(clause);
+        clauses.deinit(allocator);
+    }
+
+    var query_terms: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer freeOwnedSearchTerms(allocator, &query_terms);
+    try collectSearchTerms(allocator, query, &query_terms);
+    if (query_terms.items.len > 0) {
+        const clause = try buildWebsearchClause(allocator, query_terms.items, false);
+        try appendUniqueClause(allocator, &clauses, clause);
+    }
+
+    for (terms) |term| {
+        var term_tokens: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer freeOwnedSearchTerms(allocator, &term_tokens);
+        try collectSearchTerms(allocator, term, &term_tokens);
+        if (term_tokens.items.len == 0) continue;
+        if (allSearchTermsPresent(query_terms.items, term_tokens.items)) continue;
+
+        const phrase = hasWhitespace(term) and term_tokens.items.len > 1;
+        const clause = try buildWebsearchClause(allocator, term_tokens.items, phrase);
+        try appendUniqueClause(allocator, &clauses, clause);
+    }
+
+    return joinWebsearchClauses(allocator, clauses.items);
+}
+
+fn collectSearchTerms(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
+    var it = std.mem.tokenizeAny(u8, text, search_token_delimiters);
+    while (it.next()) |raw| {
+        if (out.items.len >= max_backend_search_terms) return;
+        try appendSearchTerm(allocator, out, raw);
+    }
+}
+
+fn appendSearchTerm(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), raw: []const u8) !void {
+    var token: std.ArrayListUnmanaged(u8) = .empty;
+    defer token.deinit(allocator);
+
+    for (raw) |ch| {
+        if (ch < 0x80) {
+            if (std.ascii.isAlphanumeric(ch)) try token.append(allocator, std.ascii.toLower(ch));
+        } else {
+            try token.append(allocator, ch);
+        }
+    }
+
+    if (token.items.len == 0) return;
+    if (isFtsStopword(token.items)) return;
+    for (out.items) |existing| {
+        if (std.mem.eql(u8, existing, token.items)) return;
+    }
+
+    const owned = try token.toOwnedSlice(allocator);
+    errdefer allocator.free(owned);
+    try out.append(allocator, owned);
+}
+
+fn freeOwnedSearchTerms(allocator: std.mem.Allocator, terms: *std.ArrayListUnmanaged([]const u8)) void {
+    for (terms.items) |term| allocator.free(term);
+    terms.deinit(allocator);
+}
+
+fn allSearchTermsPresent(existing: []const []const u8, terms: []const []const u8) bool {
+    if (existing.len == 0 or terms.len == 0) return false;
+    for (terms) |term| {
+        var found = false;
+        for (existing) |candidate| {
+            if (std.mem.eql(u8, candidate, term)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn buildWebsearchClause(allocator: std.mem.Allocator, terms: []const []const u8, phrase: bool) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    if (query.len > 0) try out.appendSlice(allocator, query);
-    for (terms) |term| {
-        if (term.len == 0) continue;
-        if (out.items.len > 0) try out.appendSlice(allocator, " OR ");
+    if (phrase) try out.append(allocator, '"');
+    for (terms, 0..) |term, i| {
+        if (i > 0) try out.append(allocator, ' ');
         try out.appendSlice(allocator, term);
     }
+    if (phrase) try out.append(allocator, '"');
     return out.toOwnedSlice(allocator);
+}
+
+fn appendUniqueClause(allocator: std.mem.Allocator, clauses: *std.ArrayListUnmanaged([]const u8), owned_clause: []const u8) !void {
+    if (owned_clause.len == 0) {
+        allocator.free(owned_clause);
+        return;
+    }
+    for (clauses.items) |existing| {
+        if (std.mem.eql(u8, existing, owned_clause)) {
+            allocator.free(owned_clause);
+            return;
+        }
+    }
+    errdefer allocator.free(owned_clause);
+    try clauses.append(allocator, owned_clause);
+}
+
+fn joinWebsearchClauses(allocator: std.mem.Allocator, clauses: []const []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (clauses, 0..) |clause, i| {
+        if (i > 0) try out.appendSlice(allocator, " OR ");
+        try out.appendSlice(allocator, clause);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn hasWhitespace(text: []const u8) bool {
+    for (text) |ch| {
+        if (std.ascii.isWhitespace(ch)) return true;
+    }
+    return false;
 }
 
 fn buildStringArrayJson(allocator: std.mem.Allocator, values: []const []const u8) ![]u8 {
@@ -766,6 +859,20 @@ test "retrieval fts5 query builder preserves unicode terms and strips syntax" {
     try std.testing.expect(std.mem.indexOf(u8, fts, "устарело*") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, fts, ':') == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, fts, '/') == null);
+}
+
+test "retrieval websearch query builder sanitizes operators and expansion terms" {
+    const web = try buildWebsearchQuery(
+        std.testing.allocator,
+        "scope:project/NullPantry ??? OR OR decision",
+        &[_][]const u8{ "adr", "decision", "root cause", "action item" },
+    );
+    defer std.testing.allocator.free(web);
+
+    try std.testing.expectEqualStrings("scope project nullpantry decision OR adr OR \"root cause\" OR \"action item\"", web);
+    try std.testing.expect(std.mem.indexOf(u8, web, "???") == null);
+    try std.testing.expect(std.mem.indexOf(u8, web, " OR OR ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "decision OR decision") == null);
 }
 
 test "retrieval adaptive strategy selects keyword vector and hybrid modes" {
