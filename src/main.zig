@@ -342,6 +342,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         defer allocator.free(bytes);
         cfg.api_agent_memory_config.max_response_bytes = std.fmt.parseInt(usize, bytes, 10) catch cfg.api_agent_memory_config.max_response_bytes;
     } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_AGENT_MEMORY_API_ALLOW_INSECURE_HTTP")) |value| {
+        defer allocator.free(value);
+        cfg.api_agent_memory_config.allow_insecure_http = parseBool(value);
+    } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_MEMORY_LRU_MAX_ENTRIES")) |max_entries| {
         defer allocator.free(max_entries);
         cfg.memory_config.max_entries = std.fmt.parseInt(usize, max_entries, 10) catch cfg.memory_config.max_entries;
@@ -583,6 +587,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--agent-memory-api-max-response-bytes") and i + 1 < args.len) {
             i += 1;
             cfg.api_agent_memory_config.max_response_bytes = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--agent-memory-api-allow-insecure-http")) {
+            cfg.api_agent_memory_config.allow_insecure_http = true;
         } else if (std.mem.eql(u8, arg, "--memory-lru-max-entries") and i + 1 < args.len) {
             i += 1;
             cfg.memory_config.max_entries = try std.fmt.parseInt(usize, args[i], 10);
@@ -743,6 +749,9 @@ fn parseAgentMemoryStoreConfigsJson(allocator: std.mem.Allocator, raw: []const u
         if (jsonIntField(item.object, "api_max_response_bytes") orelse jsonIntField(item.object, "max_response_bytes")) |bytes| {
             if (config.backend == .api) config.api.max_response_bytes = @intCast(@max(bytes, 0));
         }
+        if (jsonBoolField(item.object, "api_allow_insecure_http") orelse jsonBoolField(item.object, "allow_insecure_http")) |allow| {
+            if (config.backend == .api) config.api.allow_insecure_http = allow;
+        }
         if (jsonStringField(item.object, "redis_key_prefix")) |prefix| {
             config.redis.key_prefix = try allocator.dupe(u8, prefix);
         } else if (jsonStringField(item.object, "key_prefix")) |prefix| {
@@ -835,6 +844,15 @@ fn jsonIntField(obj: std.json.ObjectMap, name: []const u8) ?i64 {
     };
 }
 
+fn jsonBoolField(obj: std.json.ObjectMap, name: []const u8) ?bool {
+    const value = obj.get(name) orelse return null;
+    return switch (value) {
+        .bool => |b| b,
+        .string => |s| parseBool(s),
+        else => null,
+    };
+}
+
 fn parseBool(raw: []const u8) bool {
     const value = std.mem.trim(u8, raw, " \t\r\n");
     return std.ascii.eqlIgnoreCase(value, "1") or
@@ -881,6 +899,7 @@ fn printUsage() void {
         \\  NULLPANTRY_AGENT_MEMORY_API_CAPABILITIES
         \\  NULLPANTRY_AGENT_MEMORY_API_TIMEOUT_SECS
         \\  NULLPANTRY_AGENT_MEMORY_API_MAX_RESPONSE_BYTES
+        \\  NULLPANTRY_AGENT_MEMORY_API_ALLOW_INSECURE_HTTP
         \\  NULLPANTRY_AGENT_MEMORY_STORES
         \\  NULLPANTRY_MEMORY_LRU_MAX_ENTRIES
         \\  NULLPANTRY_MEMORY_LRU_MAX_MESSAGES
@@ -1026,6 +1045,7 @@ test "agent memory api backend can be configured from args" {
         "9",
         "--agent-memory-api-max-response-bytes",
         "123456",
+        "--agent-memory-api-allow-insecure-http",
     };
     const cfg = try parseArgs(std.testing.allocator, &args);
 
@@ -1036,6 +1056,7 @@ test "agent memory api backend can be configured from args" {
     try std.testing.expectEqualStrings("[\"read\",\"write\"]", cfg.api_agent_memory_config.actor_capabilities_json);
     try std.testing.expectEqual(@as(u32, 9), cfg.api_agent_memory_config.timeout_secs);
     try std.testing.expectEqual(@as(usize, 123456), cfg.api_agent_memory_config.max_response_bytes);
+    try std.testing.expect(cfg.api_agent_memory_config.allow_insecure_http);
 }
 
 test "named agent memory stores can be configured from args and json" {
@@ -1070,7 +1091,7 @@ test "named agent memory stores can be configured from args and json" {
         \\[
         \\  {"name":"fast","backend":"memory_lru","max_entries":32,"max_messages":64,"max_usage_entries":8,"max_bytes":2048,"ttl_seconds":120},
         \\  {"name":"team","redis_url":"redis://127.0.0.1:6379/5","key_prefix":"team-memory","ttl_seconds":30},
-        \\  {"name":"remote","api_url":"https://pantry.example/v1","api_token":"gateway","api_timeout_secs":11,"api_max_response_bytes":65536}
+        \\  {"name":"remote","api_url":"https://pantry.example/v1","api_token":"gateway","api_timeout_secs":11,"api_max_response_bytes":65536,"api_allow_insecure_http":true}
         \\]
     );
     defer std.testing.allocator.free(parsed);
@@ -1097,6 +1118,7 @@ test "named agent memory stores can be configured from args and json" {
     try std.testing.expectEqualStrings("remote", parsed[2].name);
     try std.testing.expectEqual(agent_memory_runtime.BackendKind.api, parsed[2].config.backend);
     try std.testing.expectEqualStrings("https://pantry.example/v1", parsed[2].config.api.base_url.?);
+    try std.testing.expect(parsed[2].config.api.allow_insecure_http);
     try std.testing.expectEqualStrings("gateway", parsed[2].config.api.token.?);
     try std.testing.expectEqual(@as(u32, 11), parsed[2].config.api.timeout_secs);
     try std.testing.expectEqual(@as(usize, 65536), parsed[2].config.api.max_response_bytes);

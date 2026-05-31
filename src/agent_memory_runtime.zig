@@ -5,6 +5,7 @@ const json = @import("json_util.zig");
 const domain = @import("domain.zig");
 const access = @import("access.zig");
 const compat = @import("compat.zig");
+const net_security = @import("net_security.zig");
 const redis = @import("redis.zig");
 const agent_memory_reducer = @import("agent_memory_reducer.zig");
 
@@ -53,6 +54,7 @@ pub const ApiConfig = struct {
     actor_capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
     timeout_secs: u32 = 30,
     max_response_bytes: usize = 2 * 1024 * 1024,
+    allow_insecure_http: bool = false,
 };
 
 pub const Config = struct {
@@ -1591,7 +1593,9 @@ pub const ApiAgentMemory = struct {
     config: ApiConfig,
 
     pub fn init(allocator: std.mem.Allocator, config: ApiConfig) !ApiAgentMemory {
-        if (config.base_url == null or std.mem.trim(u8, config.base_url.?, " \t\r\n").len == 0) return error.MissingApiBackendUrl;
+        const base_url = config.base_url orelse return error.MissingApiBackendUrl;
+        if (std.mem.trim(u8, base_url, " \t\r\n").len == 0) return error.MissingApiBackendUrl;
+        try net_security.validateHttpBaseUrl(base_url, config.allow_insecure_http);
         return .{ .allocator = allocator, .config = config };
     }
 
@@ -2563,6 +2567,11 @@ test "agent memory runtime parses backend names" {
 }
 
 test "agent memory api backend builds urls and parses memory responses" {
+    _ = try ApiAgentMemory.init(std.testing.allocator, .{ .base_url = "https://pantry.example/v1" });
+    _ = try ApiAgentMemory.init(std.testing.allocator, .{ .base_url = "http://localhost:8765" });
+    try std.testing.expectError(error.InsecureRuntimeUrl, ApiAgentMemory.init(std.testing.allocator, .{ .base_url = "http://pantry.internal:8765" }));
+    _ = try ApiAgentMemory.init(std.testing.allocator, .{ .base_url = "http://pantry.internal:8765", .allow_insecure_http = true });
+
     const url_root = try apiBackendUrl(std.testing.allocator, "https://pantry.example", "/agent-memory/key", "limit=1");
     defer std.testing.allocator.free(url_root);
     try std.testing.expectEqualStrings("https://pantry.example/v1/agent-memory/key?limit=1", url_root);
