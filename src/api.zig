@@ -4009,10 +4009,22 @@ fn lifecycleMigrateAll(
         });
     }
 
-    const memory_execute = lifecycleMigrateAgentMemory(ctx, obj, "agent_memory", source_route, target_route, false, delete_source);
+    const memory_execute = lifecycleMigrateAgentMemory(ctx, obj, "agent_memory", source_route, target_route, false, false);
     if (!isOkResponse(memory_execute)) return memory_execute;
-    const session_execute = lifecycleMigrateAgentSessions(ctx, obj, "agent_sessions", source_route, target_route, false, delete_source);
+    const session_execute = lifecycleMigrateAgentSessions(ctx, obj, "agent_sessions", source_route, target_route, false, false);
     if (!isOkResponse(session_execute)) return session_execute;
+
+    const cleanup_memory = if (delete_source)
+        lifecycleMigrateAgentMemory(ctx, obj, "agent_memory", source_route, target_route, false, true)
+    else
+        nullResponse(ctx);
+    if (!isOkResponse(cleanup_memory)) return cleanup_memory;
+    const cleanup_sessions = if (delete_source)
+        lifecycleDeleteSourceAgentSessions(ctx, obj, source_route)
+    else
+        nullResponse(ctx);
+    if (!isOkResponse(cleanup_sessions)) return cleanup_sessions;
+
     return lifecycleAllMigrationResponse(ctx, .{
         .dry_run = false,
         .delete_source = delete_source,
@@ -4021,6 +4033,8 @@ fn lifecycleMigrateAll(
         .target_route = target_route,
         .agent_memory = memory_execute.body,
         .agent_sessions = session_execute.body,
+        .source_cleanup_memory = cleanup_memory.body,
+        .source_cleanup_sessions = cleanup_sessions.body,
     });
 }
 
@@ -4032,6 +4046,8 @@ const LifecycleAllMigrationResponseInput = struct {
     target_route: store_mod.AgentMemoryStorageRoute,
     agent_memory: []const u8,
     agent_sessions: []const u8,
+    source_cleanup_memory: []const u8 = "null",
+    source_cleanup_sessions: []const u8 = "null",
 };
 
 fn lifecycleAllMigrationResponse(ctx: *Context, input: LifecycleAllMigrationResponseInput) HttpResponse {
@@ -4050,12 +4066,20 @@ fn lifecycleAllMigrationResponse(ctx: *Context, input: LifecycleAllMigrationResp
     out.appendSlice(ctx.allocator, input.agent_memory) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"agent_sessions\":") catch return serverError(ctx);
     out.appendSlice(ctx.allocator, input.agent_sessions) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "},\"source_cleanup\":{\"agent_memory\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, input.source_cleanup_memory) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"agent_sessions\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, input.source_cleanup_sessions) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, "}}}") catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
 fn isOkResponse(response: HttpResponse) bool {
     return std.mem.eql(u8, response.status, "200 OK");
+}
+
+fn nullResponse(ctx: *Context) HttpResponse {
+    return .{ .status = "200 OK", .body = ctx.allocator.dupe(u8, "null") catch return serverError(ctx) };
 }
 
 fn positiveBoundedInt(value: ?i64, default_value: usize, max_value: usize) usize {
@@ -4322,6 +4346,101 @@ fn lifecycleSessionMigrationResponse(ctx: *Context, input: AgentSessionMigration
         appendAgentSessionMigrationEntryJson(ctx.allocator, &out, entry) catch return serverError(ctx);
     }
     out.appendSlice(ctx.allocator, "]}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn lifecycleDeleteSourceAgentSessions(ctx: *Context, obj: std.json.ObjectMap, source_route: store_mod.AgentMemoryStorageRoute) HttpResponse {
+    const migration_actor_id = json.stringField(obj, "actor_id") orelse ctx.actor_id;
+    if (!domain.hasActorScope(ctx.actor_scopes_json, "admin") and !std.mem.eql(u8, migration_actor_id, ctx.actor_id)) return forbidden(ctx);
+
+    const limit = positiveLimit(json.intField(obj, "limit"), 100);
+    const offset = positiveLimit(json.intField(obj, "offset"), 0);
+    const message_limit = positiveBoundedInt(json.intField(obj, "message_limit"), 10000, 100000);
+
+    var requested: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (json.stringField(obj, "session_id")) |sid| {
+        tryAppendUniqueSessionId(ctx.allocator, &requested, sid) catch return serverError(ctx);
+    }
+    if (obj.get("session_ids")) |value| {
+        if (value != .array) return json.errorResponse(ctx.allocator, 400, "bad_request", "session_ids must be an array");
+        for (value.array.items) |item| {
+            if (item != .string) return json.errorResponse(ctx.allocator, 400, "bad_request", "session_ids must contain strings");
+            tryAppendUniqueSessionId(ctx.allocator, &requested, item.string) catch return serverError(ctx);
+        }
+    }
+
+    var candidates: std.ArrayListUnmanaged([]const u8) = .empty;
+    var matched: usize = 0;
+    if (requested.items.len > 0) {
+        matched = requested.items.len;
+        const start = @min(offset, requested.items.len);
+        const end = @min(start + limit, requested.items.len);
+        for (requested.items[start..end]) |sid| {
+            if (!agentSessionReadAllowed(ctx, sid) or !agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+            candidates.append(ctx.allocator, sid) catch return serverError(ctx);
+        }
+    } else {
+        if (!allAgentSessionsReadAllowed(ctx) or !allAgentSessionsWriteAllowed(ctx)) return forbidden(ctx);
+        const listed = ctx.store.listSessionsRouted(ctx.allocator, limit, offset, migration_actor_id, source_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        matched = @intCast(listed.total);
+        for (listed.sessions) |session| {
+            candidates.append(ctx.allocator, session.session_id) catch return serverError(ctx);
+        }
+    }
+
+    const message_limit_u64: u64 = @intCast(message_limit);
+    var sessions_deleted: usize = 0;
+    var messages_deleted: usize = 0;
+    var usage_deleted: usize = 0;
+    var skipped: usize = if (requested.items.len > 0) @min(offset, requested.items.len) else offset;
+
+    for (candidates.items) |sid| {
+        if (!agentSessionReadAllowed(ctx, sid) or !agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+        const history = ctx.store.historyRouted(ctx.allocator, sid, message_limit, 0, migration_actor_id, source_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        if (history.total > message_limit_u64) {
+            return json.errorResponse(ctx.allocator, 400, "message_limit_exceeded", "Session has more messages than message_limit; raise message_limit before deleting migrated source sessions");
+        }
+        const usage = ctx.store.loadUsageRouted(sid, migration_actor_id, source_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        if (history.total == 0 and usage == null) {
+            skipped += 1;
+            continue;
+        }
+        if (usage != null) {
+            const deleted = ctx.store.deleteUsageRouted(sid, migration_actor_id, source_route) catch |err| switch (err) {
+                error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                else => return serverError(ctx),
+            };
+            if (deleted) usage_deleted += 1;
+        }
+        ctx.store.clearMessagesRouted(sid, migration_actor_id, source_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        sessions_deleted += 1;
+        messages_deleted += @intCast(history.total);
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.print(ctx.allocator, "{{\"ok\":true,\"cleanup\":{{\"kind\":\"agent_sessions\",\"matched\":{d},\"selected\":{d},\"sessions_deleted\":{d},\"messages_deleted\":{d},\"usage_deleted\":{d},\"skipped\":{d},\"limit\":{d},\"offset\":{d},\"message_limit\":{d}}}}}", .{
+        matched,
+        candidates.items.len,
+        sessions_deleted,
+        messages_deleted,
+        usage_deleted,
+        skipped,
+        limit,
+        offset,
+        message_limit,
+    }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
@@ -8143,6 +8262,9 @@ test "api lifecycle migrate all moves agent memory and sessions together" {
     try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"dry_run\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"messages_copied\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"migrated\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"source_cleanup\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"sessions_deleted\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"messages_deleted\":1") != null);
 
     const archive_memory = handleRequest(&ctx, "GET", "/v1/agent-memory/all.key?store=archive&scope=public", "", "GET /v1/agent-memory/all.key?store=archive&scope=public HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", archive_memory.status);
