@@ -10308,7 +10308,7 @@ pub const PostgresStore = struct {
         var keyword_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         errdefer keyword_results.deinit(allocator);
 
-        if (plan.use_keyword) try self.searchPgKeywordCandidates(allocator, input, semantic_input, &keyword_results);
+        if (plan.use_keyword) try self.searchPgKeywordCandidates(allocator, semantic_input, &keyword_results);
         pgSortSearchResults(keyword_results.items);
 
         var vector_results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
@@ -10323,18 +10323,18 @@ pub const PostgresStore = struct {
         return try self.fusePgSearchResults(allocator, input, keyword_results.items, vector_results.items, limit);
     }
 
-    fn searchPgKeywordCandidates(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, semantic_input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
-        try self.searchPgMemoryAtoms(allocator, semantic_input, results);
+    fn searchPgKeywordCandidates(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, results: *std.ArrayListUnmanaged(domain.SearchResult)) !void {
+        try self.searchPgMemoryAtoms(allocator, input, results);
         try self.searchPgSpaces(allocator, input, results);
         try self.searchPgPolicyScopes(allocator, input, results);
-        try self.searchPgSources(allocator, semantic_input, results);
-        try self.searchPgArtifacts(allocator, semantic_input, results);
+        try self.searchPgSources(allocator, input, results);
+        try self.searchPgArtifacts(allocator, input, results);
         try self.searchPgEntities(allocator, input, results);
         try self.searchPgRelations(allocator, input, results);
-        try self.searchPgContextPacks(allocator, semantic_input, results);
-        try self.searchPgFeedEvents(allocator, semantic_input, results);
-        try self.searchPgAgentMemories(allocator, semantic_input, results);
-        if (input.include_sessions) try self.searchPgSessions(allocator, semantic_input, results);
+        try self.searchPgContextPacks(allocator, input, results);
+        try self.searchPgFeedEvents(allocator, input, results);
+        try self.searchPgAgentMemories(allocator, input, results);
+        if (input.include_sessions) try self.searchPgSessions(allocator, input, results);
     }
 
     fn fusePgSearchResults(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, keyword_results: []const domain.SearchResult, vector_results: []const domain.SearchResult, limit: usize) ![]domain.SearchResult {
