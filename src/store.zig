@@ -9410,6 +9410,9 @@ pub const PostgresStore = struct {
             to_entity: domain.Entity,
         };
 
+        try self.runSql("BEGIN");
+        errdefer self.runSql("ROLLBACK") catch {};
+
         var entity_list: std.ArrayListUnmanaged(domain.Entity) = .empty;
         errdefer entity_list.deinit(allocator);
         const base_entities = try self.resolveExtractedEntitiesPg(allocator, input.entity_names_json, input.source.scope, input.source.permissions_json, input.actor_id);
@@ -9440,24 +9443,17 @@ pub const PostgresStore = struct {
         const entities = try entity_list.toOwnedSlice(allocator);
         const related_entity_ids_json = try entityIdsJson(allocator, entities);
 
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer sql.deinit(allocator);
-        try sql.appendSlice(allocator, "BEGIN;\n");
-        try sql.print(allocator, "UPDATE sources SET related_entities_json = {s} WHERE id = {s};\n", .{ try sqlJsonb(allocator, related_entity_ids_json), try sqlString(allocator, input.source.id) });
+        try self.runParams(
+            allocator,
+            "UPDATE sources SET related_entities_json = $1::jsonb WHERE id = $2",
+            &.{ related_entity_ids_json, input.source.id },
+        );
 
         var artifact: ?domain.Artifact = null;
         if (input.artifact) |base_artifact_input| {
             var artifact_input = base_artifact_input;
             artifact_input.related_entities_json = related_entity_ids_json;
-            const artifact_id = try ids.make(allocator, "art_");
-            const now = ids.nowMs();
-            try sql.print(
-                allocator,
-                "INSERT INTO artifacts (id,type,title,body,status,owner,space_id,version,created_at_ms,updated_at_ms,last_verified_at_ms,scope,source_ids_json,related_entities_json,permissions_json,fields_json,summary,agent_summary) VALUES ({s},{s},{s},{s},{s},{s},{s},1,{d},{d},NULL,{s},{s},{s},{s},{s},{s},{s});\n",
-                .{ try sqlString(allocator, artifact_id), try sqlString(allocator, artifact_input.artifact_type), try sqlString(allocator, artifact_input.title), try sqlString(allocator, artifact_input.body), try sqlString(allocator, artifact_input.status), try sqlNullableString(allocator, artifact_input.owner), try sqlNullableString(allocator, artifact_input.space_id), now, now, try sqlString(allocator, artifact_input.scope), try sqlJsonb(allocator, artifact_input.source_ids_json), try sqlJsonb(allocator, artifact_input.related_entities_json), try sqlJsonb(allocator, artifact_input.permissions_json), try sqlJsonb(allocator, artifact_input.fields_json), try sqlNullableString(allocator, artifact_input.summary), try sqlNullableString(allocator, artifact_input.agent_summary) },
-            );
-            try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('artifact.created',{s},'artifact',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, artifact_input.actor_id), try sqlString(allocator, artifact_id), now });
-            artifact = .{ .id = artifact_id, .artifact_type = artifact_input.artifact_type, .title = artifact_input.title, .body = artifact_input.body, .status = artifact_input.status, .owner = artifact_input.owner, .space_id = artifact_input.space_id, .version = 1, .created_at_ms = now, .updated_at_ms = now, .last_verified_at_ms = null, .scope = artifact_input.scope, .source_ids_json = artifact_input.source_ids_json, .related_entities_json = artifact_input.related_entities_json, .permissions_json = artifact_input.permissions_json, .fields_json = artifact_input.fields_json, .summary = artifact_input.summary, .agent_summary = artifact_input.agent_summary };
+            artifact = try self.createArtifact(allocator, artifact_input);
         }
 
         var atoms: std.ArrayListUnmanaged(domain.MemoryAtom) = .empty;
@@ -9466,36 +9462,26 @@ pub const PostgresStore = struct {
         for (input.atoms) |base_atom_input| {
             var atom_input = base_atom_input;
             if (atom_input.subject_entity_id == null) atom_input.subject_entity_id = subject_entity_id;
-
-            const atom_id = try ids.make(allocator, "mem_");
-            const now = ids.nowMs();
-            const status = atom_input.status orelse domain.defaultMemoryStatus(atom_input.created_by, atom_input.scope);
-            try sql.print(
-                allocator,
-                "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) VALUES ({s},{s},{s},{s},{s},{s},{d},{s},{s},{s},{s},{d},{s},{s},NULL,{s},{s},{s});\n",
-                .{ try sqlString(allocator, atom_id), try sqlNullableString(allocator, atom_input.subject_entity_id), try sqlString(allocator, atom_input.predicate), try sqlString(allocator, atom_input.object), try sqlString(allocator, atom_input.text), try sqlString(allocator, atom_input.scope), atom_input.confidence, try sqlString(allocator, status), try sqlJsonb(allocator, atom_input.source_ids_json), try sqlJsonb(allocator, atom_input.evidence_ranges_json), try sqlString(allocator, atom_input.created_by), now, try sqlNullableInt(allocator, atom_input.valid_from_ms), try sqlNullableInt(allocator, atom_input.valid_until_ms), try sqlNullableString(allocator, atom_input.owner), try sqlJsonb(allocator, atom_input.permissions_json), try sqlJsonb(allocator, atom_input.tags_json) },
-            );
-            try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_atom.created',{s},'memory_atom',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, atom_input.actor_id), try sqlString(allocator, atom_id), now });
-            try atoms.append(allocator, .{ .id = atom_id, .subject_entity_id = atom_input.subject_entity_id, .predicate = atom_input.predicate, .object = atom_input.object, .text = atom_input.text, .scope = atom_input.scope, .confidence = atom_input.confidence, .status = status, .source_ids_json = atom_input.source_ids_json, .evidence_ranges_json = atom_input.evidence_ranges_json, .created_by = atom_input.created_by, .created_at_ms = now, .valid_from_ms = atom_input.valid_from_ms, .valid_until_ms = atom_input.valid_until_ms, .last_verified_at_ms = null, .owner = atom_input.owner, .permissions_json = atom_input.permissions_json, .tags_json = atom_input.tags_json });
+            try atoms.append(allocator, try self.createMemoryAtom(allocator, atom_input));
         }
 
         var relations: std.ArrayListUnmanaged(domain.Relation) = .empty;
         errdefer relations.deinit(allocator);
         for (resolved_relations.items) |resolved| {
-            const relation_type = graph_mod.canonicalRelationType(resolved.input.relation_type);
-            const relation_id = try ids.make(allocator, "rel_");
-            const now = ids.nowMs();
-            try sql.print(
-                allocator,
-                "INSERT INTO relations (id,from_entity_id,relation_type,to_entity_id,source_ids_json,scope,permissions_json,confidence,status,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{d},{s},{d});\n",
-                .{ try sqlString(allocator, relation_id), try sqlString(allocator, resolved.from_entity.id), try sqlString(allocator, relation_type), try sqlString(allocator, resolved.to_entity.id), try sqlJsonb(allocator, resolved.input.source_ids_json), try sqlString(allocator, resolved.input.scope), try sqlJsonb(allocator, resolved.input.permissions_json), resolved.input.confidence, try sqlString(allocator, resolved.input.status), now },
-            );
-            try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('relation.created',{s},'relation',{s},'{{}}'::jsonb,{d});\n", .{ try sqlNullableString(allocator, resolved.input.actor_id), try sqlString(allocator, relation_id), now });
-            try relations.append(allocator, .{ .id = relation_id, .from_entity_id = resolved.from_entity.id, .relation_type = relation_type, .to_entity_id = resolved.to_entity.id, .source_ids_json = resolved.input.source_ids_json, .scope = resolved.input.scope, .permissions_json = resolved.input.permissions_json, .confidence = resolved.input.confidence, .status = resolved.input.status, .created_at_ms = now });
+            try relations.append(allocator, try self.createRelation(allocator, .{
+                .from_entity_id = resolved.from_entity.id,
+                .relation_type = resolved.input.relation_type,
+                .to_entity_id = resolved.to_entity.id,
+                .source_ids_json = resolved.input.source_ids_json,
+                .scope = resolved.input.scope,
+                .permissions_json = resolved.input.permissions_json,
+                .confidence = resolved.input.confidence,
+                .status = resolved.input.status,
+                .actor_id = resolved.input.actor_id,
+            }));
         }
 
-        try sql.appendSlice(allocator, "COMMIT;\n");
-        try self.runSql(sql.items);
+        try self.runSql("COMMIT");
         return .{ .artifact = artifact, .entities = entities, .relations = try relations.toOwnedSlice(allocator), .atoms = try atoms.toOwnedSlice(allocator) };
     }
 
