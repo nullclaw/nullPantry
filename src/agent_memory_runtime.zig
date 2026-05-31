@@ -241,6 +241,16 @@ pub const Runtime = union(BackendKind) {
         };
     }
 
+    pub fn getAnyVisible(self: *Runtime, allocator: std.mem.Allocator, key: []const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
+        return switch (self.*) {
+            .none => null,
+            .native => error.NativeAgentMemoryRuntime,
+            .memory_lru => |*engine| engine.getAnyVisible(allocator, key, actor_id, scopes_json),
+            .redis => |*engine| engine.getAnyVisible(allocator, key, actor_id, scopes_json),
+            .api => |*engine| engine.getAnyVisible(allocator, key, actor_id, scopes_json),
+        };
+    }
+
     pub fn list(self: *Runtime, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
         return switch (self.*) {
             .none => allocator.alloc(domain.AgentMemory, 0),
@@ -618,6 +628,25 @@ pub const MemoryAgentMemory = struct {
             }
         }
         return null;
+    }
+
+    pub fn getAnyVisible(self: *MemoryAgentMemory, allocator: std.mem.Allocator, key: []const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
+        self.purgeExpired();
+        var matches: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+        defer matches.deinit(allocator);
+        errdefer for (matches.items) |*entry| freeAgentMemory(allocator, entry);
+        for (self.entries.items) |wrapped| {
+            const entry = wrapped.entry;
+            if (!std.mem.eql(u8, entry.key, key)) continue;
+            if (!try entryVisible(allocator, entry, actor_id, scopes_json)) continue;
+            try matches.append(allocator, try cloneAgentMemory(allocator, entry));
+        }
+        sortAgentMemory(matches.items);
+        if (matches.items.len == 0) return null;
+        const result = matches.items[0];
+        for (matches.items[1..]) |*entry| freeAgentMemory(allocator, entry);
+        self.touchEntryById(result.id, ids.nowMs());
+        return result;
     }
 
     pub fn list(self: *MemoryAgentMemory, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
@@ -1188,6 +1217,41 @@ pub const RedisAgentMemory = struct {
         const index_key = try self.globalIndexKey(allocator);
         defer allocator.free(index_key);
         return self.listFromIndex(allocator, index_key, category, session_id, actor_id, scopes_json, true);
+    }
+
+    pub fn getAnyVisible(self: *RedisAgentMemory, allocator: std.mem.Allocator, key: []const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
+        const index_key = try self.globalIndexKey(allocator);
+        defer allocator.free(index_key);
+        var resp = try self.client.command(&.{ "SMEMBERS", index_key });
+        defer resp.deinit(self.allocator);
+        const members = switch (resp) {
+            .array => |maybe_items| maybe_items orelse return null,
+            else => return null,
+        };
+        var matches: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+        defer matches.deinit(allocator);
+        errdefer for (matches.items) |*entry| freeAgentMemory(allocator, entry);
+        for (members) |member| {
+            const redis_key = member.asString() orelse continue;
+            var hash = try self.client.command(&.{ "HGETALL", redis_key });
+            const maybe_entry = try self.agentMemoryFromHash(allocator, hash);
+            hash.deinit(self.allocator);
+            var entry = maybe_entry orelse {
+                try self.removeIndexMember(index_key, redis_key);
+                continue;
+            };
+            var entry_owned = true;
+            defer if (entry_owned) freeAgentMemory(allocator, &entry);
+            if (!std.mem.eql(u8, entry.key, key)) continue;
+            if (!try entryVisible(allocator, entry, actor_id, scopes_json)) continue;
+            try matches.append(allocator, entry);
+            entry_owned = false;
+        }
+        sortAgentMemory(matches.items);
+        if (matches.items.len == 0) return null;
+        const result = matches.items[0];
+        for (matches.items[1..]) |*entry| freeAgentMemory(allocator, entry);
+        return result;
     }
 
     pub fn search(self: *RedisAgentMemory, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
@@ -1954,6 +2018,20 @@ pub const ApiAgentMemory = struct {
         return self.listWithScopes(allocator, category, session_id, actor_id, scopes_json, null);
     }
 
+    pub fn getAnyVisible(self: *ApiAgentMemory, allocator: std.mem.Allocator, key: []const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
+        const encoded_key = try percentEncode(allocator, key);
+        defer allocator.free(encoded_key);
+        const path = try std.fmt.allocPrint(allocator, "/agent-memory/{s}", .{encoded_key});
+        defer allocator.free(path);
+        const query = try agentMemoryAnyVisibleQuery(allocator);
+        defer allocator.free(query);
+        const response = try self.request(allocator, .GET, path, query, actor_id, scopes_json, "");
+        defer allocator.free(response.body);
+        if (response.status == .not_found) return null;
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return try parseAgentMemoryWrapper(allocator, response.body, "memory");
+    }
+
     fn listWithScopes(self: *ApiAgentMemory, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, exact_scope: ?[]const u8) ![]domain.AgentMemory {
         var all: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
         errdefer {
@@ -2347,6 +2425,14 @@ fn agentMemoryListQuery(allocator: std.mem.Allocator, category: ?[]const u8, ses
     if (category) |value| try appendQueryString(allocator, &out, &first, "category", value);
     if (session_id) |value| try appendQueryString(allocator, &out, &first, "session_id", value);
     if (scope) |value| try appendQueryString(allocator, &out, &first, "scope", value);
+    return out.toOwnedSlice(allocator);
+}
+
+fn agentMemoryAnyVisibleQuery(allocator: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var first = true;
+    try appendQueryString(allocator, &out, &first, "include_sessions", "true");
     return out.toOwnedSlice(allocator);
 }
 

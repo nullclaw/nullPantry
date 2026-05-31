@@ -357,11 +357,12 @@ fn handleNullClawAgentAdapter(ctx: *Context, method: []const u8, query: []const 
         if (is_get and seg3 == null) return nullClawAgentMemoryList(ctx, query);
         if (is_get and eql(seg3, "count") and seg4 == null) return agentMemoryCount(ctx, query);
         if (is_get and seg3 != null and seg4 == null) return nullClawAgentMemoryGet(ctx, seg3.?, query);
-        if (is_delete and seg3 != null and seg4 == null) return agentMemoryDelete(ctx, seg3.?, query);
+        if (is_delete and seg3 != null and seg4 == null) return nullClawAgentMemoryDelete(ctx, seg3.?, query);
     }
 
     if (eql(seg2, "sessions")) {
         if (eql(seg3, "auto-saved") and seg4 == null) return handleAgentSessions(ctx, method, query, seg3, null, body);
+        if (is_delete and seg3 != null and eql(seg4, "messages")) return nullClawAgentClearMessages(ctx, seg3.?, query);
         if (seg3 != null and seg4 != null) return handleAgentSessions(ctx, method, query, seg3, seg4, body);
         if (seg3 == null and is_get) return handleAgentSessions(ctx, method, query, null, null, body);
     }
@@ -372,6 +373,20 @@ fn handleNullClawAgentAdapter(ctx: *Context, method: []const u8, query: []const 
     }
 
     return json.errorResponse(ctx.allocator, 404, "not_found", "Not found");
+}
+
+fn nullClawAgentClearMessages(ctx: *Context, session_id: []const u8, query: []const u8) HttpResponse {
+    if (!agentSessionWriteAllowed(ctx, session_id)) return forbidden(ctx);
+    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    ctx.store.clearMessagesRouted(session_id, actorFilter(ctx), storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    _ = ctx.store.deleteUsageRouted(session_id, actorFilter(ctx), storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    return ok(ctx, "{\"ok\":true}");
 }
 
 fn handleBootstrapPrompts(ctx: *Context, method: []const u8, query: []const u8, seg3: ?[]u8, seg4: ?[]u8, body: []const u8) HttpResponse {
@@ -634,8 +649,15 @@ fn nullClawAgentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) Htt
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
-    if (entry == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
-    return nullClawAgentMemoryEntryResponse(ctx, entry.?);
+    const effective_entry = if (entry == null and session_id == null and requested_scope == null)
+        ctx.store.agentMemoryGetAnyVisibleRouted(ctx.allocator, key, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        }
+    else
+        entry;
+    if (effective_entry == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
+    return nullClawAgentMemoryEntryResponse(ctx, effective_entry.?);
 }
 
 fn nullClawAgentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
@@ -706,6 +728,28 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     }
     dedupeAgentMemoryEntries(ctx.allocator, &entries);
     return nullClawAgentMemoryEntriesResponse(ctx, entries.items, include_internal, limit, 0);
+}
+
+fn nullClawAgentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "delete")) return forbidden(ctx);
+    const session_id = json.queryParamDecoded(ctx.allocator, query, "session_id") catch return serverError(ctx);
+    if (session_id != null) return agentMemoryDelete(ctx, key, query);
+    const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
+    if (requested_scope) |scope| {
+        if (!domain.scopeDeletable(scope, ctx.actor_scopes_json)) return forbidden(ctx);
+    }
+    const owner_actor_id = if (requested_scope) |scope|
+        access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx)
+    else
+        ctx.actor_id;
+    defer if (requested_scope != null) ctx.allocator.free(owner_actor_id);
+    const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
+    const deleted = ctx.store.agentMemoryDeleteAllRouted(key, owner_actor_id, ctx.actor_id, storage_target) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+    if (!deleted) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
+    return ok(ctx, "{\"ok\":true}");
 }
 
 fn loadAgentMemoryForRequest(ctx: *Context, key: []const u8, session_id: ?[]const u8, requested_scope: ?[]const u8, storage_target: store_mod.AgentMemoryStorageRoute) !?domain.AgentMemory {
@@ -6994,7 +7038,7 @@ fn agentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) HttpRespons
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
     const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
-    const entry = if (requested_scope) |scope| blk: {
+    var entry = if (requested_scope) |scope| blk: {
         const owner_actor_id = access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx);
         break :blk ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
@@ -7004,6 +7048,12 @@ fn agentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) HttpRespons
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
+    if (entry == null and session_id == null and requested_scope == null and queryBool(query, "include_sessions", false)) {
+        entry = ctx.store.agentMemoryGetAnyVisibleRouted(ctx.allocator, key, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+    }
     if (entry == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
     if (!agentMemoryEntryVisible(ctx, entry.?)) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
     return agentMemoryEntryResponse(ctx, "memory", entry.?);
@@ -9032,6 +9082,22 @@ test "api nullclaw agent adapter matches current nullclaw memory engine contract
     try std.testing.expectEqualStrings("200 OK", count_a.status);
     try std.testing.expect(std.mem.indexOf(u8, count_a.body, "\"count\":1") != null);
 
+    const put_session_a = handleRequest(&ctx, "PUT", "/v1/agent/memories/pref.session", "{\"content\":\"Agent A session adapter value\",\"category\":\"core\",\"session_id\":\"sid-1\"}", "PUT /v1/agent/memories/pref.session HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", put_session_a.status);
+    const put_session_b = handleRequest(&ctx, "PUT", "/v1/agent/memories/pref.session", "{\"content\":\"Agent B session adapter value\",\"category\":\"core\",\"session_id\":\"sid-1\"}", "PUT /v1/agent/memories/pref.session HTTP/1.1\r\nAuthorization: Bearer agent-b\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", put_session_b.status);
+    const get_session_a_without_sid = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.session", "", "GET /v1/agent/memories/pref.session HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", get_session_a_without_sid.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_session_a_without_sid.body, "Agent A session adapter value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_session_a_without_sid.body, "Agent B session adapter value") == null);
+    const delete_session_a = handleRequest(&ctx, "DELETE", "/v1/agent/memories/pref.session", "", "DELETE /v1/agent/memories/pref.session HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", delete_session_a.status);
+    const missing_session_a = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.session?session_id=sid-1", "", "GET /v1/agent/memories/pref.session?session_id=sid-1 HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("404 Not Found", missing_session_a.status);
+    const still_session_b = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.session?session_id=sid-1", "", "GET /v1/agent/memories/pref.session?session_id=sid-1 HTTP/1.1\r\nAuthorization: Bearer agent-b\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", still_session_b.status);
+    try std.testing.expect(std.mem.indexOf(u8, still_session_b.body, "Agent B session adapter value") != null);
+
     const deleted = handleRequest(&ctx, "DELETE", "/v1/agent/memories/pref.lang", "", "DELETE /v1/agent/memories/pref.lang HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", deleted.status);
     const missing = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.lang", "", "GET /v1/agent/memories/pref.lang HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
@@ -9079,6 +9145,8 @@ test "api nullclaw agent adapter matches current nullclaw session engine contrac
 
     const clear_messages = handleRequest(&ctx, "DELETE", "/v1/agent/sessions/sid-1/messages", "", "DELETE /v1/agent/sessions/sid-1/messages HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", clear_messages.status);
+    const usage_after_clear_messages = handleRequest(&ctx, "GET", "/v1/agent/sessions/sid-1/usage", "", "GET /v1/agent/sessions/sid-1/usage HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("404 Not Found", usage_after_clear_messages.status);
     const clear_usage = handleRequest(&ctx, "DELETE", "/v1/agent/sessions/sid-1/usage", "", "DELETE /v1/agent/sessions/sid-1/usage HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", clear_usage.status);
 }
