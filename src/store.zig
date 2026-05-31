@@ -1101,13 +1101,15 @@ pub const Store = struct {
 
     pub fn createSource(self: *Store, allocator: std.mem.Allocator, input: SourceInput) !domain.Source {
         try self.ensureKnowledgePrimitiveMirrorRoute(input.storage_route);
+        var routed_input = input;
+        routed_input.related_entities_json = try self.canonicalizeRelatedEntitiesJson(allocator, input.related_entities_json, input.scope, input.permissions_json, input.actor_id, input.storage_route);
         const source = try switch (self.backend) {
-            .sqlite => |*s| s.createSource(allocator, input),
-            .postgres => |*p| p.createSource(allocator, input),
+            .sqlite => |*s| s.createSource(allocator, routed_input),
+            .postgres => |*p| p.createSource(allocator, routed_input),
         };
-        if (!input.suppress_feed) try self.appendSourcePutFeedEvent(allocator, source, input.actor_id, input.storage_route);
-        try self.mirrorKnowledgePrimitive(allocator, .source, source.id, source.title, source.content, source.scope, source.permissions_json, input.actor_id, input.storage_route);
-        try self.enqueueLucidProjectionPut(allocator, "source", source.id, source.title, source.content, source.scope, source.permissions_json, input.actor_id);
+        if (!routed_input.suppress_feed) try self.appendSourcePutFeedEvent(allocator, source, routed_input.actor_id, routed_input.storage_route);
+        try self.mirrorKnowledgePrimitive(allocator, .source, source.id, source.title, source.content, source.scope, source.permissions_json, routed_input.actor_id, routed_input.storage_route);
+        try self.enqueueLucidProjectionPut(allocator, "source", source.id, source.title, source.content, source.scope, source.permissions_json, routed_input.actor_id);
         return source;
     }
 
@@ -1127,14 +1129,72 @@ pub const Store = struct {
 
     pub fn createArtifact(self: *Store, allocator: std.mem.Allocator, input: ArtifactInput) !domain.Artifact {
         try self.ensureKnowledgePrimitiveMirrorRoute(input.storage_route);
+        var routed_input = input;
+        if (input.space_id) |space_id| {
+            const space = (try self.getSpace(allocator, space_id)) orelse return error.SpaceNotFound;
+            if (!aclCoversTarget(allocator, space.scope, space.permissions_json, input.scope, input.permissions_json)) {
+                return error.ArtifactAclBroaderThanSpace;
+            }
+            routed_input.space_id = space.id;
+        }
+        routed_input.related_entities_json = try self.canonicalizeRelatedEntitiesJson(allocator, input.related_entities_json, input.scope, input.permissions_json, input.actor_id, input.storage_route);
         const artifact = try switch (self.backend) {
-            .sqlite => |*s| s.createArtifact(allocator, input),
-            .postgres => |*p| p.createArtifact(allocator, input),
+            .sqlite => |*s| s.createArtifact(allocator, routed_input),
+            .postgres => |*p| p.createArtifact(allocator, routed_input),
         };
-        if (!input.suppress_feed) try self.appendArtifactPutFeedEvent(allocator, artifact, input.actor_id, input.storage_route);
-        try self.mirrorKnowledgePrimitive(allocator, .artifact, artifact.id, artifact.title, artifact.body, artifact.scope, artifact.permissions_json, input.actor_id, input.storage_route);
-        try self.enqueueLucidProjectionPut(allocator, "artifact", artifact.id, artifact.artifact_type, artifact.body, artifact.scope, artifact.permissions_json, input.actor_id);
+        if (!routed_input.suppress_feed) try self.appendArtifactPutFeedEvent(allocator, artifact, routed_input.actor_id, routed_input.storage_route);
+        try self.mirrorKnowledgePrimitive(allocator, .artifact, artifact.id, artifact.title, artifact.body, artifact.scope, artifact.permissions_json, routed_input.actor_id, routed_input.storage_route);
+        try self.enqueueLucidProjectionPut(allocator, "artifact", artifact.id, artifact.artifact_type, artifact.body, artifact.scope, artifact.permissions_json, routed_input.actor_id);
         return artifact;
+    }
+
+    fn canonicalizeRelatedEntitiesJson(self: *Store, allocator: std.mem.Allocator, related_entities_json: []const u8, target_scope: []const u8, target_permissions_json: []const u8, actor_id: ?[]const u8, storage_route: AgentMemoryStorageRoute) ![]const u8 {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, related_entities_json, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.InvalidPayload;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.append(allocator, '[');
+        var count: usize = 0;
+        for (parsed.value.array.items) |item| {
+            const entity = try self.relatedEntityFromJsonValue(allocator, item, target_scope, target_permissions_json, actor_id, storage_route);
+            if (!aclCoversTarget(allocator, entity.scope, entity.permissions_json, target_scope, target_permissions_json)) return error.RecordAclBroaderThanRelatedEntity;
+            try appendUniqueJsonStringGlobal(allocator, &out, &count, entity.id);
+        }
+        try out.append(allocator, ']');
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn relatedEntityFromJsonValue(self: *Store, allocator: std.mem.Allocator, value: std.json.Value, target_scope: []const u8, target_permissions_json: []const u8, actor_id: ?[]const u8, storage_route: AgentMemoryStorageRoute) !domain.Entity {
+        switch (value) {
+            .string => |text| {
+                if (try self.getEntity(allocator, text)) |entity| return entity;
+                if (std.mem.startsWith(u8, text, "ent_")) return error.RelatedEntityNotFound;
+                return self.resolveEntity(allocator, .{
+                    .entity_type = "project",
+                    .name = text,
+                    .scope = target_scope,
+                    .permissions_json = target_permissions_json,
+                    .actor_id = actor_id,
+                    .storage_route = storage_route,
+                });
+            },
+            .object => |obj| {
+                if (json.stringField(obj, "id") orelse json.stringField(obj, "entity_id")) |id| {
+                    return (try self.getEntity(allocator, id)) orelse error.RelatedEntityNotFound;
+                }
+                const name = json.stringField(obj, "name") orelse return error.InvalidPayload;
+                return self.resolveEntity(allocator, .{
+                    .entity_type = json.stringField(obj, "type") orelse json.stringField(obj, "entity_type") orelse "project",
+                    .name = name,
+                    .scope = target_scope,
+                    .permissions_json = target_permissions_json,
+                    .actor_id = actor_id,
+                    .storage_route = storage_route,
+                });
+            },
+            else => return error.InvalidPayload,
+        }
     }
 
     pub fn getArtifact(self: *Store, allocator: std.mem.Allocator, id: []const u8) !?domain.Artifact {
@@ -1146,13 +1206,21 @@ pub const Store = struct {
 
     pub fn resolveEntity(self: *Store, allocator: std.mem.Allocator, input: EntityInput) !domain.Entity {
         try self.ensureKnowledgePrimitiveMirrorRoute(input.storage_route);
+        var routed_input = input;
+        if (input.canonical_artifact_id) |artifact_id| {
+            const artifact = (try self.getArtifact(allocator, artifact_id)) orelse return error.CanonicalArtifactNotFound;
+            if (!aclCoversTarget(allocator, artifact.scope, artifact.permissions_json, input.scope, input.permissions_json)) {
+                return error.EntityAclBroaderThanCanonicalArtifact;
+            }
+            routed_input.canonical_artifact_id = artifact.id;
+        }
         const entity = try switch (self.backend) {
-            .sqlite => |*s| s.resolveEntity(allocator, input),
-            .postgres => |*p| p.resolveEntity(allocator, input),
+            .sqlite => |*s| s.resolveEntity(allocator, routed_input),
+            .postgres => |*p| p.resolveEntity(allocator, routed_input),
         };
-        if (!input.suppress_feed) try self.appendEntityPutFeedEvent(allocator, entity, input.actor_id, input.storage_route);
-        try self.mirrorKnowledgePrimitive(allocator, .entity, entity.id, entity.name, entity.description orelse entity.name, entity.scope, entity.permissions_json, input.actor_id, input.storage_route);
-        try self.enqueueLucidProjectionPut(allocator, "entity", entity.id, entity.name, entity.description orelse entity.name, entity.scope, entity.permissions_json, input.actor_id);
+        if (!routed_input.suppress_feed) try self.appendEntityPutFeedEvent(allocator, entity, routed_input.actor_id, routed_input.storage_route);
+        try self.mirrorKnowledgePrimitive(allocator, .entity, entity.id, entity.name, entity.description orelse entity.name, entity.scope, entity.permissions_json, routed_input.actor_id, routed_input.storage_route);
+        try self.enqueueLucidProjectionPut(allocator, "entity", entity.id, entity.name, entity.description orelse entity.name, entity.scope, entity.permissions_json, routed_input.actor_id);
         return entity;
     }
 
@@ -2056,6 +2124,7 @@ pub const Store = struct {
 
     pub fn importContextPackSnapshot(self: *Store, allocator: std.mem.Allocator, input: ContextPackSnapshotInput) !ContextPackResult {
         try self.ensureKnowledgePrimitiveMirrorRoute(.{});
+        try self.validateContextPackSnapshotRefs(allocator, input);
         const pack = try switch (self.backend) {
             .sqlite => |*s| s.importContextPackSnapshot(allocator, input),
             .postgres => |*p| p.importContextPackSnapshot(allocator, input),
@@ -2070,6 +2139,52 @@ pub const Store = struct {
             try self.enqueueLucidProjectionPut(allocator, "context_pack", pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id);
         }
         return pack;
+    }
+
+    fn validateContextPackSnapshotRefs(self: *Store, allocator: std.mem.Allocator, input: ContextPackSnapshotInput) !void {
+        const effective_required = if (input.actor_isolated) blk: {
+            const actor = input.actor_id orelse return error.InvalidPayload;
+            break :blk try domain.actorGrantJson(allocator, actor);
+        } else input.required_scopes_json;
+        defer if (input.actor_isolated) allocator.free(effective_required);
+
+        try self.validateContextPackSourceRefs(allocator, input.included_sources_json, effective_required, input.actor_id);
+        try self.validateContextPackArtifactRefs(allocator, input.included_artifacts_json, effective_required, input.actor_id);
+        try self.validateContextPackMemoryAtomRefs(allocator, input.included_memory_atoms_json, effective_required, input.actor_id);
+        try validateContextPackResultRefs(allocator, input.included_result_refs_json, effective_required, input.actor_isolated);
+    }
+
+    fn validateContextPackSourceRefs(self: *Store, allocator: std.mem.Allocator, ids_json: []const u8, required_scopes_json: []const u8, actor_id: ?[]const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, ids_json, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.InvalidPayload;
+        for (parsed.value.array.items) |item| {
+            if (item != .string) return error.InvalidPayload;
+            const source = (try self.getSource(allocator, item.string)) orelse return error.ContextPackReferenceNotFound;
+            if (!try contextPackRequiredScopesCoverRecord(allocator, required_scopes_json, source.scope, source.permissions_json, actor_id)) return error.ContextPackAclBroaderThanRefs;
+        }
+    }
+
+    fn validateContextPackArtifactRefs(self: *Store, allocator: std.mem.Allocator, ids_json: []const u8, required_scopes_json: []const u8, actor_id: ?[]const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, ids_json, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.InvalidPayload;
+        for (parsed.value.array.items) |item| {
+            if (item != .string) return error.InvalidPayload;
+            const artifact = (try self.getArtifact(allocator, item.string)) orelse return error.ContextPackReferenceNotFound;
+            if (!try contextPackRequiredScopesCoverRecord(allocator, required_scopes_json, artifact.scope, artifact.permissions_json, actor_id)) return error.ContextPackAclBroaderThanRefs;
+        }
+    }
+
+    fn validateContextPackMemoryAtomRefs(self: *Store, allocator: std.mem.Allocator, ids_json: []const u8, required_scopes_json: []const u8, actor_id: ?[]const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, ids_json, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.InvalidPayload;
+        for (parsed.value.array.items) |item| {
+            if (item != .string) return error.InvalidPayload;
+            const atom = (try self.getMemoryAtom(allocator, item.string)) orelse return error.ContextPackReferenceNotFound;
+            if (!try contextPackRequiredScopesCoverRecord(allocator, required_scopes_json, atom.scope, atom.permissions_json, actor_id)) return error.ContextPackAclBroaderThanRefs;
+        }
     }
 
     pub fn importMemoryAtomsAtomic(self: *Store, allocator: std.mem.Allocator, inputs: []const PreparedMemoryImport) ![]domain.MemoryAtom {
@@ -14180,6 +14295,38 @@ fn contextPackHasEvidence(pack: ContextPackResult) bool {
         jsonArrayTextHasItems(pack.included_memory_atoms_json);
 }
 
+fn contextPackRequiredScopesCoverRecord(allocator: std.mem.Allocator, required_scopes_json: []const u8, scope: []const u8, permissions_json: []const u8, actor_id: ?[]const u8) !bool {
+    const record_required = try requiredAccessJsonGlobal(allocator, scope, permissions_json, actor_id);
+    defer allocator.free(record_required);
+    return requiredScopeSetCovers(allocator, required_scopes_json, record_required);
+}
+
+fn validateContextPackResultRefs(allocator: std.mem.Allocator, refs_json: []const u8, required_scopes_json: []const u8, actor_isolated: bool) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, refs_json, .{}) catch return error.InvalidPayload;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidPayload;
+    for (parsed.value.array.items) |item| {
+        if (item != .object) return error.InvalidPayload;
+        const obj = item.object;
+        if ((json.boolField(obj, "actor_isolated") orelse false) and !actor_isolated) return error.ContextPackAclBroaderThanRefs;
+        const ref_required = try rawJsonField(allocator, obj, "required_scopes", "[]");
+        if (!requiredScopeSetCovers(allocator, required_scopes_json, ref_required)) return error.ContextPackAclBroaderThanRefs;
+    }
+}
+
+fn requiredScopeSetCovers(allocator: std.mem.Allocator, covering_json: []const u8, required_json: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, required_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .array) return false;
+    for (parsed.value.array.items) |item| {
+        if (item != .string) return false;
+        const required = item.string;
+        if (std.mem.eql(u8, required, "public")) continue;
+        if (!domain.hasJsonString(covering_json, required)) return false;
+    }
+    return true;
+}
+
 fn jsonArrayTextHasItems(value: []const u8) bool {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     return trimmed.len > 2 and !std.mem.eql(u8, trimmed, "[]");
@@ -15738,6 +15885,155 @@ test "sqlite relation acl cannot be broader than endpoint entities" {
     });
 }
 
+test "store artifact acl cannot be broader than containing space" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const space = try store.createSpace(alloc, .{
+        .name = "secret-shelf",
+        .title = "Secret Shelf",
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+    });
+
+    try std.testing.expectError(error.SpaceNotFound, store.createArtifact(alloc, .{
+        .title = "Missing shelf artifact",
+        .body = "missing shelf body",
+        .space_id = "missing-shelf",
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+    }));
+
+    try std.testing.expectError(error.ArtifactAclBroaderThanSpace, store.createArtifact(alloc, .{
+        .title = "Broad shelf artifact",
+        .body = "broad shelf body",
+        .space_id = space.id,
+        .scope = "project:secret",
+        .permissions_json = "[]",
+    }));
+
+    const artifact = try store.createArtifact(alloc, .{
+        .title = "Secret shelf artifact",
+        .body = "secret shelf body",
+        .space_id = space.name,
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+    });
+    try std.testing.expectEqualStrings(space.id, artifact.space_id.?);
+}
+
+test "store entity canonical artifact must exist and cover entity acl" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const artifact = try store.createArtifact(alloc, .{
+        .title = "Secret canonical artifact",
+        .body = "secret canonical artifact body",
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+    });
+
+    try std.testing.expectError(error.CanonicalArtifactNotFound, store.resolveEntity(alloc, .{
+        .entity_type = "project",
+        .name = "Missing Canonical Project",
+        .canonical_artifact_id = "art_missing",
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+    }));
+
+    try std.testing.expectError(error.EntityAclBroaderThanCanonicalArtifact, store.resolveEntity(alloc, .{
+        .entity_type = "project",
+        .name = "Broad Canonical Project",
+        .canonical_artifact_id = artifact.id,
+        .scope = "project:secret",
+        .permissions_json = "[]",
+    }));
+
+    const entity = try store.resolveEntity(alloc, .{
+        .entity_type = "project",
+        .name = "Secret Canonical Project",
+        .canonical_artifact_id = artifact.id,
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+    });
+    try std.testing.expectEqualStrings(artifact.id, entity.canonical_artifact_id.?);
+}
+
+test "store source and artifact canonicalize related entities and enforce related acl" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = try store.createSource(alloc, .{
+        .title = "Canonical related source",
+        .content = "source related to canonical entities",
+        .scope = "project:canon",
+        .permissions_json = "[\"team:canon\"]",
+        .related_entities_json = "[\"Canonical Project\",{\"name\":\"Canonical Service\",\"type\":\"service\"},\"Canonical Project\"]",
+        .actor_id = "agent:canon",
+    });
+    const project = try store.resolveEntity(alloc, .{
+        .entity_type = "project",
+        .name = "Canonical Project",
+        .scope = "project:canon",
+        .permissions_json = "[\"team:canon\"]",
+        .actor_id = "agent:canon",
+    });
+    const service = try store.resolveEntity(alloc, .{
+        .entity_type = "service",
+        .name = "Canonical Service",
+        .scope = "project:canon",
+        .permissions_json = "[\"team:canon\"]",
+        .actor_id = "agent:canon",
+    });
+    try std.testing.expect(domain.hasJsonString(source.related_entities_json, project.id));
+    try std.testing.expect(domain.hasJsonString(source.related_entities_json, service.id));
+    try std.testing.expect(std.mem.indexOf(u8, source.related_entities_json, "Canonical Project") == null);
+
+    const artifact_related = try std.fmt.allocPrint(alloc, "[{{\"entity_id\":\"{s}\"}}]", .{service.id});
+    const artifact = try store.createArtifact(alloc, .{
+        .title = "Canonical related artifact",
+        .body = "artifact related to canonical service",
+        .scope = "project:canon",
+        .permissions_json = "[\"team:canon\"]",
+        .related_entities_json = artifact_related,
+        .actor_id = "agent:canon",
+    });
+    try std.testing.expect(domain.hasJsonString(artifact.related_entities_json, service.id));
+    try std.testing.expect(std.mem.indexOf(u8, artifact.related_entities_json, "entity_id") == null);
+
+    try std.testing.expectError(error.RelatedEntityNotFound, store.createSource(alloc, .{
+        .title = "Missing related entity source",
+        .content = "missing related entity source",
+        .scope = "project:canon",
+        .permissions_json = "[\"team:canon\"]",
+        .related_entities_json = "[\"ent_missing_related\"]",
+    }));
+
+    const secret = try store.resolveEntity(alloc, .{
+        .entity_type = "service",
+        .name = "Secret Related Service",
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+    });
+    const secret_related = try singleJsonString(alloc, secret.id);
+    try std.testing.expectError(error.RecordAclBroaderThanRelatedEntity, store.createArtifact(alloc, .{
+        .title = "Broad related artifact",
+        .body = "broad related artifact",
+        .scope = "public",
+        .permissions_json = "[]",
+        .related_entities_json = secret_related,
+    }));
+}
+
 test "sqlite graph expansion pulls entity context without bypassing acl" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -17029,6 +17325,53 @@ test "sqlite persisted context packs preserve actor isolation from included agen
         }
     }
     try std.testing.expect(saw_pack);
+}
+
+test "context pack snapshot imports cannot publish refs wider than required scopes" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const secret_source = try store.createSource(alloc, .{
+        .title = "Secret source",
+        .content = "secret source content",
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+    });
+
+    const public_required = "[\"public\"]";
+    const secret_required = "[\"project:secret\",\"team:secret\"]";
+    const included_sources = try std.fmt.allocPrint(alloc, "[\"{s}\"]", .{secret_source.id});
+
+    try std.testing.expectError(error.ContextPackAclBroaderThanRefs, store.importContextPackSnapshot(alloc, .{
+        .id = "ctx_bad_secret_ref",
+        .query = "bad secret ref",
+        .generated_summary = "bad summary",
+        .included_sources_json = included_sources,
+        .required_scopes_json = public_required,
+    }));
+
+    const imported = try store.importContextPackSnapshot(alloc, .{
+        .id = "ctx_good_secret_ref",
+        .query = "good secret ref",
+        .generated_summary = "good summary",
+        .included_sources_json = included_sources,
+        .required_scopes_json = secret_required,
+    });
+    try std.testing.expectEqualStrings("ctx_good_secret_ref", imported.id);
+
+    const actor_grant = try domain.actorGrantJson(alloc, "agent:a");
+    const actor_ref = try std.fmt.allocPrint(alloc, "[{{\"id\":\"mem_actor\",\"type\":\"agent_memory\",\"required_scopes\":{s},\"actor_isolated\":true}}]", .{actor_grant});
+    try std.testing.expectError(error.ContextPackAclBroaderThanRefs, store.importContextPackSnapshot(alloc, .{
+        .id = "ctx_bad_actor_ref",
+        .query = "bad actor ref",
+        .generated_summary = "bad actor summary",
+        .included_result_refs_json = actor_ref,
+        .required_scopes_json = actor_grant,
+        .actor_isolated = false,
+    }));
 }
 
 test "sqlite public context packs remain visible with empty required scopes" {

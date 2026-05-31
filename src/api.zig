@@ -931,6 +931,8 @@ fn createSource(ctx: *Context, body: []const u8) HttpResponse {
     };
     if (!canWriteRecord(ctx, input.scope, input.permissions_json)) return forbidden(ctx);
     const source = ctx.store.createSource(ctx.allocator, input) catch |err| switch (err) {
+        error.InvalidPayload => return badJson(ctx),
+        error.RelatedEntityNotFound, error.RecordAclBroaderThanRelatedEntity => return forbidden(ctx),
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
@@ -967,13 +969,15 @@ fn createArtifact(ctx: *Context, body: []const u8) HttpResponse {
     };
     const source_ids_json = rawField(ctx.allocator, obj, "source_ids", "[]") catch return serverError(ctx);
     if (!sourceIdsCanBackRecord(ctx, source_ids_json, scope, permissions_json)) return forbidden(ctx);
+    const space_id = json.nullableStringField(obj, "space_id");
+    if (!spaceCanContainRecord(ctx, space_id, scope, permissions_json)) return forbidden(ctx);
     const artifact = ctx.store.createArtifact(ctx.allocator, .{
         .artifact_type = artifact_type,
         .title = title,
         .body = json.stringField(obj, "body") orelse "",
         .status = status,
         .owner = json.nullableStringField(obj, "owner"),
-        .space_id = json.nullableStringField(obj, "space_id"),
+        .space_id = space_id,
         .scope = scope,
         .source_ids_json = source_ids_json,
         .related_entities_json = rawField(ctx.allocator, obj, "related_entities", "[]") catch return serverError(ctx),
@@ -984,6 +988,9 @@ fn createArtifact(ctx: *Context, body: []const u8) HttpResponse {
         .actor_id = ctx.actor_id,
         .storage_route = storage_route,
     }) catch |err| switch (err) {
+        error.SpaceNotFound, error.ArtifactAclBroaderThanSpace => return forbidden(ctx),
+        error.InvalidPayload => return badJson(ctx),
+        error.RelatedEntityNotFound, error.RecordAclBroaderThanRelatedEntity => return forbidden(ctx),
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
@@ -1009,18 +1016,21 @@ fn resolveEntity(ctx: *Context, body: []const u8) HttpResponse {
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return serverError(ctx);
     const storage_route = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
     if (!canWriteRecord(ctx, scope, permissions_json)) return forbidden(ctx);
+    const canonical_artifact_id = json.nullableStringField(obj, "canonical_artifact_id");
+    if (!artifactCanBackRecord(ctx, canonical_artifact_id, scope, permissions_json)) return forbidden(ctx);
     const entity = ctx.store.resolveEntity(ctx.allocator, .{
         .entity_type = json.stringField(obj, "type") orelse "concept",
         .name = name,
         .aliases_json = rawField(ctx.allocator, obj, "aliases", "[]") catch return serverError(ctx),
         .description = json.nullableStringField(obj, "description"),
-        .canonical_artifact_id = json.nullableStringField(obj, "canonical_artifact_id"),
+        .canonical_artifact_id = canonical_artifact_id,
         .scope = scope,
         .permissions_json = permissions_json,
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch return serverError(ctx),
         .actor_id = ctx.actor_id,
         .storage_route = storage_route,
     }) catch |err| switch (err) {
+        error.CanonicalArtifactNotFound, error.EntityAclBroaderThanCanonicalArtifact => return forbidden(ctx),
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
@@ -2428,6 +2438,8 @@ fn markdownImport(ctx: *Context, body: []const u8) HttpResponse {
     defer imported.deinit(ctx.allocator);
     const created = createMarkdownObjects(ctx, obj, imported, content, imported.path, firstNonNullString(json.nullableStringField(obj, "checksum"), imported.checksum)) catch |err| switch (err) {
         error.InvalidArtifactStatus => return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid artifact status for this artifact type"),
+        error.InvalidPayload => return badJson(ctx),
+        error.RelatedEntityNotFound, error.RecordAclBroaderThanRelatedEntity => return forbidden(ctx),
         error.Forbidden => return forbidden(ctx),
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -2545,6 +2557,8 @@ fn markdownImportDirectory(ctx: *Context, body: []const u8) HttpResponse {
 
         const created = createMarkdownObjects(ctx, obj, imported, file.content, file.path, file.checksum) catch |err| switch (err) {
             error.InvalidArtifactStatus => return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid artifact status for this artifact type"),
+            error.InvalidPayload => return badJson(ctx),
+            error.RelatedEntityNotFound, error.RecordAclBroaderThanRelatedEntity => return forbidden(ctx),
             error.Forbidden => return forbidden(ctx),
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
@@ -2668,6 +2682,8 @@ fn createMarkdownObjects(
     const source_checksum = firstNonNullString(checksum, imported.checksum);
     const source_path = firstNonNullString(file_path, imported.path);
     const metadata_json = try markdownImportMetadataJson(ctx.allocator, imported.metadata_json, source_path, source_checksum);
+    const artifact_space_id = firstNonNullString(imported.space_id, json.nullableStringField(obj, "space_id"));
+    if (!spaceCanContainRecord(ctx, artifact_space_id, imported.scope, imported.permissions_json)) return error.Forbidden;
 
     const source = try ctx.store.createSource(ctx.allocator, .{
         .source_type = imported.source_type,
@@ -2693,7 +2709,7 @@ fn createMarkdownObjects(
         .body = imported.body,
         .status = imported.status,
         .owner = firstNonNullString(imported.owner, firstNonNullString(imported.author, firstNonNullString(json.nullableStringField(obj, "owner"), json.nullableStringField(obj, "author")))),
-        .space_id = firstNonNullString(imported.space_id, json.nullableStringField(obj, "space_id")),
+        .space_id = artifact_space_id,
         .scope = imported.scope,
         .source_ids_json = actual_source_ids_json,
         .related_entities_json = related_entities_json,
@@ -5225,7 +5241,14 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     }
     if (!std.mem.eql(u8, object_type, "memory_atom") and !std.mem.eql(u8, object_type, "agent_memory")) {
         const object_id = applyFeedObjectPut(ctx, object_type, event_payload_json, scope, event_permissions_json, event_actor_id, event_object_id, event_payload_route) catch |err| switch (err) {
-            error.Forbidden => return forbidden(ctx),
+            error.Forbidden,
+            error.RelatedEntityNotFound,
+            error.RecordAclBroaderThanRelatedEntity,
+            error.SpaceNotFound,
+            error.ArtifactAclBroaderThanSpace,
+            error.CanonicalArtifactNotFound,
+            error.EntityAclBroaderThanCanonicalArtifact,
+            => return forbidden(ctx),
             error.InvalidPayload, error.MissingRequiredField => return json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid feed payload for object_type"),
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
@@ -6691,7 +6714,17 @@ fn lifecycleSnapshotImportStructured(ctx: *Context, items: []const std.json.Valu
             if (!std.mem.eql(u8, kind, phase)) continue;
             validated += 1;
             const hydrated = snapshotHydrateStructuredObject(ctx, kind, record, options) catch |err| switch (err) {
-                error.Forbidden => return forbidden(ctx),
+                error.Forbidden,
+                error.RelatedEntityNotFound,
+                error.RecordAclBroaderThanRelatedEntity,
+                error.SpaceNotFound,
+                error.ArtifactAclBroaderThanSpace,
+                error.CanonicalArtifactNotFound,
+                error.EntityAclBroaderThanCanonicalArtifact,
+                error.ContextPackReferenceNotFound,
+                error.ContextPackAclBroaderThanRefs,
+                => return forbidden(ctx),
+                error.InvalidPayload => return badJson(ctx),
                 error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
                 error.Skipped => {
                     skipped += 1;
@@ -6917,6 +6950,8 @@ fn snapshotHydrateArtifact(ctx: *Context, obj: std.json.ObjectMap, options: Snap
     }
     var source_ids = try rawField(ctx.allocator, obj, "source_ids", try rawField(ctx.allocator, obj, "citations", "[]"));
     if (!sourceIdsCanBackRecord(ctx, source_ids, scope, permissions)) source_ids = "[]";
+    const space_id = json.nullableStringField(obj, "space_id");
+    if (!spaceCanContainRecord(ctx, space_id, scope, permissions)) return error.Forbidden;
     const artifact_type = json.stringField(obj, "artifact_type") orelse blk: {
         const raw_type = json.stringField(obj, "type") orelse "page";
         break :blk if (std.mem.eql(u8, raw_type, "artifact")) "page" else raw_type;
@@ -6928,7 +6963,7 @@ fn snapshotHydrateArtifact(ctx: *Context, obj: std.json.ObjectMap, options: Snap
         .body = json.stringField(obj, "body") orelse json.stringField(obj, "text") orelse "",
         .status = status,
         .owner = json.nullableStringField(obj, "owner"),
-        .space_id = json.nullableStringField(obj, "space_id"),
+        .space_id = space_id,
         .scope = scope,
         .source_ids_json = source_ids,
         .related_entities_json = try rawField(ctx.allocator, obj, "related_entities", try rawField(ctx.allocator, obj, "related_entities_json", "[]")),
@@ -6957,13 +6992,15 @@ fn snapshotHydrateEntity(ctx: *Context, obj: std.json.ObjectMap, options: Snapsh
             }
         }
     }
+    const canonical_artifact_id = json.nullableStringField(obj, "canonical_artifact_id");
+    if (!artifactCanBackRecord(ctx, canonical_artifact_id, scope, permissions)) return error.Forbidden;
     const entity = try ctx.store.resolveEntity(ctx.allocator, .{
         .id = if (options.preserve_ids) json.nullableStringField(obj, "id") else null,
         .entity_type = entity_type,
         .name = name,
         .aliases_json = try rawField(ctx.allocator, obj, "aliases", try rawField(ctx.allocator, obj, "aliases_json", "[]")),
         .description = json.nullableStringField(obj, "description") orelse json.nullableStringField(obj, "text"),
-        .canonical_artifact_id = json.nullableStringField(obj, "canonical_artifact_id"),
+        .canonical_artifact_id = canonical_artifact_id,
         .scope = scope,
         .permissions_json = permissions,
         .metadata_json = try rawField(ctx.allocator, obj, "metadata", try rawField(ctx.allocator, obj, "metadata_json", "{}")),
@@ -9454,6 +9491,8 @@ fn buildAppliedArtifactInput(ctx: *Context, obj: std.json.ObjectMap, fallback_sc
     if (!artifacts.validStatus(artifact_type, status)) return error.InvalidPayload;
     const fields_json = try normalizeArtifactFieldsJson(ctx, obj, artifact_type);
     if (!sourceIdsCanBackRecord(ctx, source_ids_json, scope, permissions_json)) return error.Forbidden;
+    const space_id = json.nullableStringField(obj, "space_id");
+    if (!spaceCanContainRecord(ctx, space_id, scope, permissions_json)) return error.Forbidden;
     return .{
         .id = try feedIdOverride(obj, event_object_id, "art_"),
         .artifact_type = artifact_type,
@@ -9461,7 +9500,7 @@ fn buildAppliedArtifactInput(ctx: *Context, obj: std.json.ObjectMap, fallback_sc
         .body = json.stringField(obj, "body") orelse json.stringField(obj, "content") orelse "",
         .status = status,
         .owner = json.nullableStringField(obj, "owner"),
-        .space_id = json.nullableStringField(obj, "space_id"),
+        .space_id = space_id,
         .scope = scope,
         .source_ids_json = source_ids_json,
         .related_entities_json = rawField(ctx.allocator, obj, "related_entities", "[]") catch "[]",
@@ -9479,13 +9518,15 @@ fn buildAppliedEntityInput(ctx: *Context, obj: std.json.ObjectMap, fallback_scop
     const scope = payloadScope(obj, fallback_scope);
     const permissions_json = try payloadPermissions(ctx, obj, fallback_permissions_json);
     if (!canWriteRecord(ctx, scope, permissions_json)) return error.Forbidden;
+    const canonical_artifact_id = json.nullableStringField(obj, "canonical_artifact_id");
+    if (!artifactCanBackRecord(ctx, canonical_artifact_id, scope, permissions_json)) return error.Forbidden;
     return .{
         .id = try feedIdOverride(obj, event_object_id, "ent_"),
         .entity_type = json.stringField(obj, "type") orelse json.stringField(obj, "entity_type") orelse "concept",
         .name = json.stringField(obj, "name") orelse return error.MissingRequiredField,
         .aliases_json = rawField(ctx.allocator, obj, "aliases", "[]") catch "[]",
         .description = json.nullableStringField(obj, "description"),
-        .canonical_artifact_id = json.nullableStringField(obj, "canonical_artifact_id"),
+        .canonical_artifact_id = canonical_artifact_id,
         .scope = scope,
         .permissions_json = permissions_json,
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch "{}",
@@ -9989,6 +10030,20 @@ fn entityCanBackRecord(ctx: *Context, entity_id: []const u8, target_scope: []con
     const entity = (ctx.store.getEntity(ctx.allocator, entity_id) catch return false) orelse return false;
     if (!recordVisibleToActor(ctx, entity.scope, entity.permissions_json)) return false;
     return sourceAclCoversTarget(ctx.allocator, entity.scope, entity.permissions_json, target_scope, target_permissions_json);
+}
+
+fn spaceCanContainRecord(ctx: *Context, space_id: ?[]const u8, target_scope: []const u8, target_permissions_json: []const u8) bool {
+    const id = space_id orelse return true;
+    const space = (ctx.store.getSpace(ctx.allocator, id) catch return false) orelse return false;
+    if (!recordVisibleToActor(ctx, space.scope, space.permissions_json)) return false;
+    return sourceAclCoversTarget(ctx.allocator, space.scope, space.permissions_json, target_scope, target_permissions_json);
+}
+
+fn artifactCanBackRecord(ctx: *Context, artifact_id: ?[]const u8, target_scope: []const u8, target_permissions_json: []const u8) bool {
+    const id = artifact_id orelse return true;
+    const artifact = (ctx.store.getArtifact(ctx.allocator, id) catch return false) orelse return false;
+    if (!recordVisibleToActor(ctx, artifact.scope, artifact.permissions_json)) return false;
+    return sourceAclCoversTarget(ctx.allocator, artifact.scope, artifact.permissions_json, target_scope, target_permissions_json);
 }
 
 const sourceAclCoversTarget = access.aclCoversTarget;
@@ -13271,7 +13326,7 @@ test "api memory checkpoint restore preserves primitive ids and links" {
         \\{"event_type":"source.put","operation":"put","object_type":"source","object_id":"src_restore_fixed","scope":"public","permissions":["public"],"payload":{"id":"src_restore_fixed","type":"transcript","title":"Fixed Restore Source","content":"restore stable source content","scope":"public","permissions":["public"]}},
         \\{"event_type":"space.put","operation":"put","object_type":"space","object_id":"spc_restore_fixed","scope":"public","permissions":["public"],"payload":{"id":"spc_restore_fixed","name":"restore-space","title":"Restore Space","description":"restore stable shelf","scope":"public","permissions":["public"],"metadata":{"topic":"restore"}}},
         \\{"event_type":"policy_scope.put","operation":"put","object_type":"policy_scope","object_id":"project:restore","scope":"project:restore","permissions":["project:restore"],"payload":{"scope":"project:restore","visibility":"project","permissions":["project:restore"],"owner":"agent:restore","ttl_ms":1000,"review_after_ms":2000,"metadata":{"topic":"restore policy"}}},
-        \\{"event_type":"artifact.put","operation":"put","object_type":"artifact","object_id":"art_restore_fixed","scope":"public","permissions":["public"],"payload":{"id":"art_restore_fixed","type":"decision","title":"Fixed Restore Decision","body":"restore stable decision body","status":"proposed","scope":"public","permissions":["public"],"source_ids":["src_restore_fixed"],"fields":{"context":"restore context","decision":"restore stable decision","alternatives":"none","consequences":"stable ids","owner":"NullPantry","review_date":"2026-06-30"}}},
+        \\{"event_type":"artifact.put","operation":"put","object_type":"artifact","object_id":"art_restore_fixed","scope":"public","permissions":["public"],"payload":{"id":"art_restore_fixed","type":"decision","title":"Fixed Restore Decision","body":"restore stable decision body","status":"proposed","space_id":"spc_restore_fixed","scope":"public","permissions":["public"],"source_ids":["src_restore_fixed"],"fields":{"context":"restore context","decision":"restore stable decision","alternatives":"none","consequences":"stable ids","owner":"NullPantry","review_date":"2026-06-30"}}},
         \\{"event_type":"entity.put","operation":"put","object_type":"entity","object_id":"ent_restore_a","scope":"public","permissions":["public"],"payload":{"id":"ent_restore_a","type":"project","name":"Restore Project","scope":"public","permissions":["public"]}},
         \\{"event_type":"entity.put","operation":"put","object_type":"entity","object_id":"ent_restore_b","scope":"public","permissions":["public"],"payload":{"id":"ent_restore_b","type":"service","name":"Restore Service","scope":"public","permissions":["public"]}},
         \\{"event_type":"relation.put","operation":"put","object_type":"relation","object_id":"rel_restore_fixed","scope":"public","permissions":["public"],"payload":{"id":"rel_restore_fixed","from_entity_id":"ent_restore_a","relation_type":"restore_links_to","to_entity_id":"ent_restore_b","scope":"public","permissions":["public"],"source_ids":["src_restore_fixed"]}},
@@ -13290,6 +13345,7 @@ test "api memory checkpoint restore preserves primitive ids and links" {
     const policy = (try store.getPolicyScope(alloc, "project:restore")).?;
     try std.testing.expectEqualStrings("agent:restore", policy.owner.?);
     const artifact = (try store.getArtifact(alloc, "art_restore_fixed")).?;
+    try std.testing.expectEqualStrings("spc_restore_fixed", artifact.space_id.?);
     try std.testing.expect(std.mem.indexOf(u8, artifact.source_ids_json, "src_restore_fixed") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact.fields_json, "\"decision\":\"restore stable decision\"") != null);
     const entity = (try store.getEntity(alloc, "ent_restore_a")).?;
@@ -13373,6 +13429,18 @@ test "api memory apply covers pantry primitives and lifecycle reducers" {
     try std.testing.expectEqualStrings("200 OK", space_apply.status);
     const applied_space = (try store.getSpace(alloc, "spc_primitive_space")).?;
     try std.testing.expectEqualStrings("Primitive Space", applied_space.title);
+
+    const space_artifact_body = try std.fmt.allocPrint(alloc, "{{\"event_type\":\"artifact.put\",\"object_type\":\"artifact\",\"scope\":\"public\",\"dedupe_key\":\"primitive-space-artifact-1\",\"payload\":{{\"type\":\"decision\",\"title\":\"Primitive shelf decision\",\"body\":\"space-backed decision body\",\"status\":\"proposed\",\"space_id\":\"spc_primitive_space\",\"source_ids\":[\"{s}\"],\"fields\":{{\"context\":\"primitive shelf context\",\"decision\":\"space-backed decision body\",\"alternatives\":\"none\",\"consequences\":\"space ACL enforced\",\"owner\":\"NullPantry\",\"review_date\":\"2026-07-31\"}}}}}}", .{source_id});
+    const space_artifact_apply = handleRequest(&ctx, "POST", "/v1/memory/apply", space_artifact_body, "");
+    try std.testing.expectEqualStrings("200 OK", space_artifact_apply.status);
+    var space_artifact_parsed = try std.json.parseFromSlice(std.json.Value, alloc, space_artifact_apply.body, .{});
+    defer space_artifact_parsed.deinit();
+    const space_artifact_id = json.stringField(space_artifact_parsed.value.object, "object_id").?;
+    const space_artifact = (try store.getArtifact(alloc, space_artifact_id)).?;
+    try std.testing.expectEqualStrings("spc_primitive_space", space_artifact.space_id.?);
+
+    const missing_space_artifact = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"artifact.put\",\"object_type\":\"artifact\",\"scope\":\"public\",\"payload\":{\"type\":\"page\",\"title\":\"Missing space artifact\",\"body\":\"should not attach\",\"space_id\":\"spc_missing\"}}", "");
+    try std.testing.expectEqualStrings("403 Forbidden", missing_space_artifact.status);
 
     const policy_apply = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"policy_scope.put\",\"object_type\":\"policy_scope\",\"object_id\":\"public\",\"scope\":\"public\",\"dedupe_key\":\"primitive-policy-1\",\"payload\":{\"scope\":\"public\",\"visibility\":\"workspace\",\"permissions\":[\"public\"],\"owner\":\"agent:primitive\"}}", "");
     try std.testing.expectEqualStrings("200 OK", policy_apply.status);
@@ -13942,14 +14010,30 @@ test "api markdown import creates source artifact and extracted memory" {
         .actor_scopes_json = "[\"project:nullpantry\",\"write:project:nullpantry\"]",
         .actor_capabilities_json = "[\"read\",\"write\",\"propose\",\"export\"]",
     };
+    const space_resp = handleRequest(&ctx, "POST", "/v1/spaces", "{\"name\":\"docs\",\"title\":\"Docs\",\"scope\":\"project:nullpantry\",\"permissions\":[\"project:nullpantry\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", space_resp.status);
+    const docs_space = (try store.getSpace(alloc, "docs")).?;
 
     const body =
-        "{\"content\":\"---\\ntitle: NullPantry ADR\\nartifact_type: decision\\nstatus: accepted\\nscope: project:nullpantry\\npermissions: [\\\"project:nullpantry\\\"]\\nfields: {\\\"context\\\":\\\"Need shared memory\\\",\\\"decision\\\":\\\"Use NullPantry\\\"}\\n---\\n\\n# Body\\n\\nDecision: centralize complex agent memory in NullPantry.\\n\",\"run_now\":true}";
+        "{\"content\":\"---\\ntitle: NullPantry ADR\\nartifact_type: decision\\nstatus: accepted\\nspace_id: docs\\nscope: project:nullpantry\\npermissions: [\\\"project:nullpantry\\\"]\\nfields: {\\\"context\\\":\\\"Need shared memory\\\",\\\"decision\\\":\\\"Use NullPantry\\\"}\\n---\\n\\n# Body\\n\\nDecision: centralize complex agent memory in NullPantry.\\n\",\"run_now\":true}";
     const resp = handleRequest(&ctx, "POST", "/v1/markdown/import", body, "");
     try std.testing.expectEqualStrings("200 OK", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"type\":\"decision\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"accepted\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"predicate\":\"decision\"") != null);
+    var imported_parsed = try std.json.parseFromSlice(std.json.Value, alloc, resp.body, .{});
+    defer imported_parsed.deinit();
+    const imported_artifact_id = json.stringField(imported_parsed.value.object.get("artifact").?.object, "id").?;
+    const imported_artifact = (try store.getArtifact(alloc, imported_artifact_id)).?;
+    try std.testing.expectEqualStrings(docs_space.id, imported_artifact.space_id.?);
+
+    const missing_space_body =
+        "{\"content\":\"---\\ntitle: Bad ADR\\nartifact_type: decision\\nstatus: proposed\\nspace_id: missing-docs\\nscope: project:nullpantry\\npermissions: [\\\"project:nullpantry\\\"]\\nfields: {\\\"context\\\":\\\"Missing space\\\",\\\"decision\\\":\\\"Reject\\\"}\\n---\\n\\n# Bad\\n\",\"run_now\":false}";
+    const source_count_before = (try store.search(alloc, .{ .query = "Bad ADR", .scopes_json = "[\"project:nullpantry\"]", .use_vector = false })).len;
+    const missing_space_resp = handleRequest(&ctx, "POST", "/v1/markdown/import", missing_space_body, "");
+    try std.testing.expectEqualStrings("403 Forbidden", missing_space_resp.status);
+    const source_count_after = (try store.search(alloc, .{ .query = "Bad ADR", .scopes_json = "[\"project:nullpantry\"]", .use_vector = false })).len;
+    try std.testing.expectEqual(source_count_before, source_count_after);
 }
 
 test "api markdown export emits permission-aware artifact markdown" {
@@ -14673,6 +14757,7 @@ test "api spaces and policy scopes are first-class permission-filtered records" 
     const alloc = arena.allocator();
     var project_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"project:nullpantry\",\"write:project:nullpantry\"]", .actor_capabilities_json = "[\"read\",\"write\"]" };
     var public_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\"]", .actor_capabilities_json = "[\"read\"]" };
+    var public_writer_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\",\"write:public\"]", .actor_capabilities_json = "[\"read\",\"write\"]" };
 
     const create_space_resp = handleRequest(&project_ctx, "POST", "/v1/spaces", "{\"name\":\"nullpantry\",\"title\":\"NullPantry\",\"scope\":\"project:nullpantry\",\"permissions\":[\"project:nullpantry\"],\"metadata\":{\"kind\":\"shelf\"}}", "");
     try std.testing.expectEqualStrings("200 OK", create_space_resp.status);
@@ -14686,6 +14771,40 @@ test "api spaces and policy scopes are first-class permission-filtered records" 
     const visible_spaces = handleRequest(&project_ctx, "GET", "/v1/spaces", "", "");
     try std.testing.expectEqualStrings("200 OK", visible_spaces.status);
     try std.testing.expect(std.mem.indexOf(u8, visible_spaces.body, "\"name\":\"nullpantry\"") != null);
+
+    const project_space = (try store.getSpace(alloc, "nullpantry")).?;
+    const scoped_artifact = handleRequest(&project_ctx, "POST", "/v1/artifacts", "{\"title\":\"Project shelf page\",\"body\":\"space scoped body\",\"scope\":\"project:nullpantry\",\"permissions\":[\"project:nullpantry\"],\"space_id\":\"nullpantry\"}", "");
+    try std.testing.expectEqualStrings("200 OK", scoped_artifact.status);
+    var scoped_artifact_parsed = try std.json.parseFromSlice(std.json.Value, alloc, scoped_artifact.body, .{});
+    defer scoped_artifact_parsed.deinit();
+    const scoped_artifact_id = json.stringField(scoped_artifact_parsed.value.object.get("artifact").?.object, "id").?;
+    const project_shelf_page = (try store.getArtifact(alloc, scoped_artifact_id)).?;
+    try std.testing.expectEqualStrings(project_space.id, project_shelf_page.space_id.?);
+
+    const canonical_entity_body = try std.fmt.allocPrint(alloc, "{{\"type\":\"project\",\"name\":\"NullPantry Canonical\",\"scope\":\"project:nullpantry\",\"permissions\":[\"project:nullpantry\"],\"canonical_artifact_id\":\"{s}\"}}", .{project_shelf_page.id});
+    const canonical_entity = handleRequest(&project_ctx, "POST", "/v1/entities/resolve", canonical_entity_body, "");
+    try std.testing.expectEqualStrings("200 OK", canonical_entity.status);
+    try std.testing.expect(std.mem.indexOf(u8, canonical_entity.body, project_shelf_page.id) != null);
+
+    const broad_entity_body = try std.fmt.allocPrint(alloc, "{{\"type\":\"project\",\"name\":\"Too Broad Canonical\",\"scope\":\"project:nullpantry\",\"permissions\":[],\"canonical_artifact_id\":\"{s}\"}}", .{project_shelf_page.id});
+    const broad_entity = handleRequest(&project_ctx, "POST", "/v1/entities/resolve", broad_entity_body, "");
+    try std.testing.expectEqualStrings("403 Forbidden", broad_entity.status);
+
+    const missing_canonical_entity = handleRequest(&project_ctx, "POST", "/v1/entities/resolve", "{\"type\":\"project\",\"name\":\"Missing Canonical\",\"scope\":\"project:nullpantry\",\"permissions\":[\"project:nullpantry\"],\"canonical_artifact_id\":\"art_missing\"}", "");
+    try std.testing.expectEqualStrings("403 Forbidden", missing_canonical_entity.status);
+
+    const hidden_canonical_body = try std.fmt.allocPrint(alloc, "{{\"type\":\"project\",\"name\":\"Hidden Canonical\",\"scope\":\"public\",\"permissions\":[],\"canonical_artifact_id\":\"{s}\"}}", .{project_shelf_page.id});
+    const hidden_canonical_entity = handleRequest(&public_writer_ctx, "POST", "/v1/entities/resolve", hidden_canonical_body, "");
+    try std.testing.expectEqualStrings("403 Forbidden", hidden_canonical_entity.status);
+
+    const broader_artifact = handleRequest(&project_ctx, "POST", "/v1/artifacts", "{\"title\":\"Too broad shelf page\",\"body\":\"would publish wider than shelf\",\"scope\":\"project:nullpantry\",\"permissions\":[],\"space_id\":\"nullpantry\"}", "");
+    try std.testing.expectEqualStrings("403 Forbidden", broader_artifact.status);
+
+    const missing_space_artifact = handleRequest(&project_ctx, "POST", "/v1/artifacts", "{\"title\":\"Missing shelf page\",\"body\":\"missing shelf\",\"scope\":\"project:nullpantry\",\"permissions\":[\"project:nullpantry\"],\"space_id\":\"missing-shelf\"}", "");
+    try std.testing.expectEqualStrings("403 Forbidden", missing_space_artifact.status);
+
+    const hidden_space_artifact = handleRequest(&public_writer_ctx, "POST", "/v1/artifacts", "{\"title\":\"Hidden shelf page\",\"body\":\"hidden shelf\",\"scope\":\"public\",\"permissions\":[],\"space_id\":\"nullpantry\"}", "");
+    try std.testing.expectEqualStrings("403 Forbidden", hidden_space_artifact.status);
 
     const policy_resp = handleRequest(&project_ctx, "POST", "/v1/policy-scopes", "{\"scope\":\"project:nullpantry\",\"visibility\":\"project\",\"permissions\":[\"project:nullpantry\"],\"owner\":\"agent:nullpantry\",\"ttl_ms\":86400000,\"review_after_ms\":604800000}", "");
     try std.testing.expectEqualStrings("200 OK", policy_resp.status);
