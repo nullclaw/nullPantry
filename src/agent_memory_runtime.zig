@@ -1632,14 +1632,16 @@ pub const ApiAgentMemory = struct {
 
     fn applyAgentMemoryReducer(self: *ApiAgentMemory, allocator: std.mem.Allocator, input: Input) !domain.AgentMemory {
         const actor = try access.requiredActorId(input.writer_actor_id orelse input.actor_id);
-        const owner_actor = try access.agentMemoryOwner(allocator, actor, input.scope);
-        defer allocator.free(owner_actor);
         const body = try agentMemoryApplyPayload(allocator, input, actor);
         defer allocator.free(body);
         const response = try self.request(allocator, .POST, "/memory/apply", "", actor, null, body);
         defer allocator.free(response.body);
         if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
-        return (try self.get(allocator, input.key, input.session_id, owner_actor)) orelse error.AgentMemoryStorageUnavailable;
+        return (try self.getAppliedMemory(allocator, input, actor)) orelse error.AgentMemoryStorageUnavailable;
+    }
+
+    fn getAppliedMemory(self: *ApiAgentMemory, allocator: std.mem.Allocator, input: Input, actor: []const u8) !?domain.AgentMemory {
+        return self.getWithScopes(allocator, input.key, input.session_id, actor, self.config.actor_scopes_json, input.scope);
     }
 
     pub fn get(self: *ApiAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
@@ -2597,6 +2599,27 @@ test "agent memory api backend builds urls and parses memory responses" {
     try std.testing.expectEqualStrings("agent:a", parsed.actor_id);
     try std.testing.expectEqualStrings("agent:b", parsed.writer_actor_id);
     try std.testing.expectEqualStrings("[\"agent:a\"]", parsed.permissions_json);
+
+    const apply_payload = try agentMemoryApplyPayload(std.testing.allocator, .{
+        .key = "team.tools",
+        .content = "[\"zig\"]",
+        .category = "prefs",
+        .scope = "team:alpha",
+        .permissions_json = "[\"team:secret\"]",
+        .metadata_json = "{\"store\":\"remote\"}",
+        .actor_id = "agent:a",
+        .operation = .merge_string_set,
+    }, "agent:a");
+    defer std.testing.allocator.free(apply_payload);
+    try std.testing.expect(std.mem.indexOf(u8, apply_payload, "\"event_type\":\"agent_memory.merge_string_set\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply_payload, "\"actor_id\":\"agent:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply_payload, "\"scope\":\"team:alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply_payload, "\"permissions\":[\"team:secret\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply_payload, "\"values\":[\"zig\"]") != null);
+
+    const exact_query = try agentMemoryExactQuery(std.testing.allocator, null, "team:alpha");
+    defer std.testing.allocator.free(exact_query);
+    try std.testing.expectEqualStrings("scope=team%3Aalpha", exact_query);
 }
 
 test "named runtime registry rejects reserved duplicate and native stores" {
