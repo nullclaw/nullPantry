@@ -8107,11 +8107,22 @@ test "api memory feed redacts payload references hidden from actor" {
     try std.testing.expect(std.mem.indexOf(u8, public_feed.body, "classified summary") == null);
     try std.testing.expect(std.mem.indexOf(u8, public_feed.body, secret_source.id) == null);
 
+    const public_search = handleRequest(&public_ctx, "POST", "/v1/search", "{\"query\":\"classified summary\",\"use_vector\":false,\"limit\":20}", "");
+    try std.testing.expectEqualStrings("200 OK", public_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, public_search.body, "classified summary") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public_search.body, secret_source.id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, public_search.body, "art_pending") == null);
+
     var secret_ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\",\"project:secret\",\"team:secret\"]" };
     const secret_feed = handleRequest(&secret_ctx, "GET", "/v1/memory/events", "", "");
     try std.testing.expectEqualStrings("200 OK", secret_feed.status);
     try std.testing.expect(std.mem.indexOf(u8, secret_feed.body, "classified summary") != null);
     try std.testing.expect(std.mem.indexOf(u8, secret_feed.body, secret_source.id) != null);
+
+    const secret_search = handleRequest(&secret_ctx, "POST", "/v1/search", "{\"query\":\"classified summary\",\"use_vector\":false,\"limit\":20}", "");
+    try std.testing.expectEqualStrings("200 OK", secret_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, secret_search.body, "classified summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, secret_search.body, secret_source.id) != null);
 }
 
 test "api memory apply supports deterministic agent memory merge reducers" {
