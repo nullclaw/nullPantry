@@ -360,6 +360,15 @@ fn handleNullClawAgentAdapter(ctx: *Context, method: []const u8, query: []const 
         if (is_delete and seg3 != null and seg4 == null) return nullClawAgentMemoryDelete(ctx, seg3.?, query);
     }
 
+    if (eql(seg2, "memory")) {
+        if ((eql(seg3, "feed") or eql(seg3, "events")) and is_get and seg4 == null) return nullClawMemoryFeed(ctx, query);
+        if (eql(seg3, "status") and is_get and seg4 == null) return nullClawMemoryFeedStatus(ctx, query);
+        if (eql(seg3, "compact") and is_post and seg4 == null) return memoryFeedCompact(ctx, body, query);
+        if (eql(seg3, "checkpoint") and is_get and seg4 == null) return nullClawMemoryFeedCheckpoint(ctx, query);
+        if (eql(seg3, "checkpoint") and is_post and seg4 == null) return nullClawMemoryFeedCheckpointRestore(ctx, body, query);
+        if (eql(seg3, "apply") and is_post and seg4 == null) return nullClawMemoryFeedApply(ctx, body, query);
+    }
+
     if (eql(seg2, "sessions")) {
         if (eql(seg3, "auto-saved") and seg4 == null) return handleAgentSessions(ctx, method, query, seg3, null, body);
         if (is_delete and seg3 != null and eql(seg4, "messages")) return nullClawAgentClearMessages(ctx, seg3.?, query);
@@ -720,6 +729,13 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     const limit = positiveLimit(json.intField(obj, "limit"), 10);
     const include_global = json.boolField(obj, "include_global") orelse false;
     const include_internal = json.boolField(obj, "include_internal") orelse false;
+    const graph_entries = graphCommandAgentMemoryEntriesFromObject(ctx, obj, query, limit) catch |err| switch (err) {
+        error.InvalidGraphCommand, error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
+        else => return serverError(ctx),
+    };
+    if (graph_entries) |entries| {
+        return nullClawAgentMemoryEntriesResponse(ctx, entries, include_internal, limit, 0);
+    }
     const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
     const primary = if (session_id == null)
@@ -1132,7 +1148,7 @@ fn graphNeighbors(ctx: *Context, body: []const u8) HttpResponse {
     const depth = graphDepth(json.intField(obj, "depth"));
     const limit = positiveLimit(json.intField(obj, "limit"), 50);
     const root = (ctx.store.getEntity(ctx.allocator, entity_id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
-    const root_visible = visibleGraphEntity(ctx, root, options.include_deprecated) catch return serverError(ctx);
+    const root_visible = visibleGraphEntityWithOptions(ctx, root, options) catch return serverError(ctx);
     if (!root_visible) return json.errorResponse(ctx.allocator, 404, "not_found", "Entity not found");
 
     var entities: std.ArrayListUnmanaged(domain.Entity) = .empty;
@@ -1147,7 +1163,7 @@ fn graphNeighbors(ctx: *Context, body: []const u8) HttpResponse {
         for (frontier.items) |current_entity_id| {
             const raw_relations = ctx.store.listEntityRelations(ctx.allocator, current_entity_id, limit) catch return serverError(ctx);
             for (raw_relations) |relation| {
-                const visible = visibleGraphRelation(ctx, relation, options.include_deprecated) catch return serverError(ctx);
+                const visible = visibleGraphRelationWithOptions(ctx, relation, options) catch return serverError(ctx);
                 if (visible == null) continue;
                 if (!graphRelationAllowed(visible.?.relation, options)) continue;
                 if (relationInList(relations.items, relation.id)) continue;
@@ -1226,7 +1242,7 @@ fn graphQueryFromRoots(ctx: *Context, root_ids: []const []const u8, options: Gra
     var frontier: std.ArrayListUnmanaged([]const u8) = .empty;
     for (root_ids) |entity_id| {
         const entity = (ctx.store.getEntity(ctx.allocator, entity_id) catch return serverError(ctx)) orelse continue;
-        const entity_visible = visibleGraphEntity(ctx, entity, options.include_deprecated) catch return serverError(ctx);
+        const entity_visible = visibleGraphEntityWithOptions(ctx, entity, options) catch return serverError(ctx);
         if (!entity_visible) continue;
         if (!graph_mod.entityMatchesTypeFilter(entity.entity_type, options.entity_types)) continue;
         if (!entityInList(entities.items, entity.id)) entities.append(ctx.allocator, entity) catch return serverError(ctx);
@@ -1241,7 +1257,7 @@ fn graphQueryFromRoots(ctx: *Context, root_ids: []const []const u8, options: Gra
         for (frontier.items) |current_entity_id| {
             const raw_relations = ctx.store.listEntityRelations(ctx.allocator, current_entity_id, limit) catch return serverError(ctx);
             for (raw_relations) |relation| {
-                const visible = visibleGraphRelation(ctx, relation, options.include_deprecated) catch return serverError(ctx);
+                const visible = visibleGraphRelationWithOptions(ctx, relation, options) catch return serverError(ctx);
                 if (visible == null) continue;
                 if (!graphRelationAllowed(visible.?.relation, options)) continue;
                 if (relationInList(relations.items, relation.id)) continue;
@@ -1298,8 +1314,8 @@ fn graphPath(ctx: *Context, body: []const u8) HttpResponse {
 fn graphPathBetween(ctx: *Context, from_entity_id: []const u8, to_entity_id: []const u8, options: GraphTraversalOptions, max_depth: usize, limit: usize) HttpResponse {
     const from = (ctx.store.getEntity(ctx.allocator, from_entity_id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "From entity not found");
     const to = (ctx.store.getEntity(ctx.allocator, to_entity_id) catch return serverError(ctx)) orelse return json.errorResponse(ctx.allocator, 404, "not_found", "To entity not found");
-    const from_visible = visibleGraphEntity(ctx, from, options.include_deprecated) catch return serverError(ctx);
-    const to_visible = visibleGraphEntity(ctx, to, options.include_deprecated) catch return serverError(ctx);
+    const from_visible = visibleGraphEntityWithOptions(ctx, from, options) catch return serverError(ctx);
+    const to_visible = visibleGraphEntityWithOptions(ctx, to, options) catch return serverError(ctx);
     if (!from_visible) return json.errorResponse(ctx.allocator, 404, "not_found", "From entity not found");
     if (!to_visible) return json.errorResponse(ctx.allocator, 404, "not_found", "To entity not found");
     if (!graph_mod.entityMatchesTypeFilter(from.entity_type, options.entity_types) or !graph_mod.entityMatchesTypeFilter(to.entity_type, options.entity_types)) return graphPathNotFoundResponse(ctx, from.id, to.id, max_depth);
@@ -1316,7 +1332,7 @@ fn graphPathBetween(ctx: *Context, from_entity_id: []const u8, to_entity_id: []c
         for (frontier.items) |current_entity_id| {
             const raw_relations = ctx.store.listEntityRelations(ctx.allocator, current_entity_id, limit) catch return serverError(ctx);
             for (raw_relations) |relation| {
-                const visible = visibleGraphRelation(ctx, relation, options.include_deprecated) catch return serverError(ctx);
+                const visible = visibleGraphRelationWithOptions(ctx, relation, options) catch return serverError(ctx);
                 if (visible == null) continue;
                 if (!graphRelationAllowed(visible.?.relation, options)) continue;
                 const other = otherEntityForTraversal(visible.?, current_entity_id, options) orelse continue;
@@ -1353,6 +1369,7 @@ const GraphTraversalOptions = struct {
     direction: graph_mod.Direction = .both,
     relation_types: []const []const u8 = &[_][]const u8{},
     entity_types: []const []const u8 = &[_][]const u8{},
+    scopes_json: []const u8 = "",
     min_confidence: f64 = 0,
     include_deprecated: bool = false,
 };
@@ -1362,6 +1379,7 @@ fn graphTraversalOptions(ctx: *Context, obj: std.json.ObjectMap) !GraphTraversal
         .direction = try graph_mod.parseDirection(json.stringField(obj, "direction")),
         .relation_types = try graphStringListField(ctx.allocator, obj, "relation_types", "relation_type"),
         .entity_types = try graphStringListField(ctx.allocator, obj, "entity_types", "entity_type"),
+        .scopes_json = try effectiveScopes(ctx, obj),
         .min_confidence = json.floatField(obj, "min_confidence") orelse 0,
         .include_deprecated = json.boolField(obj, "include_deprecated") orelse false,
     };
@@ -1413,20 +1431,40 @@ fn graphRelationAllowed(relation: domain.Relation, options: GraphTraversalOption
 }
 
 fn visibleGraphEntity(ctx: *Context, entity: domain.Entity, include_deprecated: bool) !bool {
-    if (!recordVisibleToActor(ctx, entity.scope, entity.permissions_json)) return false;
+    return visibleGraphEntityInScopes(ctx, entity, include_deprecated, ctx.actor_scopes_json);
+}
+
+fn visibleGraphEntityWithOptions(ctx: *Context, entity: domain.Entity, options: GraphTraversalOptions) !bool {
+    return visibleGraphEntityInScopes(ctx, entity, options.include_deprecated, graphOptionScopes(ctx, options));
+}
+
+fn visibleGraphEntityInScopes(ctx: *Context, entity: domain.Entity, include_deprecated: bool, scopes_json: []const u8) !bool {
+    if (!recordVisibleToScopes(ctx, entity.scope, entity.permissions_json, scopes_json)) return false;
     if (include_deprecated) return true;
     const status = try ctx.store.primitiveLifecycleStatus(ctx.allocator, "entity", entity.id);
     return domain.isDefaultVisibleStatus(status);
 }
 
 fn visibleGraphRelation(ctx: *Context, relation: domain.Relation, include_deprecated: bool) !?VisibleGraphRelation {
+    return visibleGraphRelationInScopes(ctx, relation, include_deprecated, ctx.actor_scopes_json);
+}
+
+fn visibleGraphRelationWithOptions(ctx: *Context, relation: domain.Relation, options: GraphTraversalOptions) !?VisibleGraphRelation {
+    return visibleGraphRelationInScopes(ctx, relation, options.include_deprecated, graphOptionScopes(ctx, options));
+}
+
+fn visibleGraphRelationInScopes(ctx: *Context, relation: domain.Relation, include_deprecated: bool, scopes_json: []const u8) !?VisibleGraphRelation {
     if (!include_deprecated and !domain.isDefaultVisibleStatus(relation.status)) return null;
-    if (!recordVisibleToActor(ctx, relation.scope, relation.permissions_json)) return null;
+    if (!recordVisibleToScopes(ctx, relation.scope, relation.permissions_json, scopes_json)) return null;
     const from = (try ctx.store.getEntity(ctx.allocator, relation.from_entity_id)) orelse return null;
     const to = (try ctx.store.getEntity(ctx.allocator, relation.to_entity_id)) orelse return null;
-    if (!try visibleGraphEntity(ctx, from, include_deprecated)) return null;
-    if (!try visibleGraphEntity(ctx, to, include_deprecated)) return null;
+    if (!try visibleGraphEntityInScopes(ctx, from, include_deprecated, scopes_json)) return null;
+    if (!try visibleGraphEntityInScopes(ctx, to, include_deprecated, scopes_json)) return null;
     return .{ .relation = relation, .from = from, .to = to };
+}
+
+fn graphOptionScopes(ctx: *Context, options: GraphTraversalOptions) []const u8 {
+    return if (options.scopes_json.len > 0) options.scopes_json else ctx.actor_scopes_json;
 }
 
 fn otherEntityForTraversal(visible: VisibleGraphRelation, current_entity_id: []const u8, options: GraphTraversalOptions) ?domain.Entity {
@@ -1462,6 +1500,36 @@ fn graphCommandSearchResultsFromObject(ctx: *Context, obj: std.json.ObjectMap, q
     return try graphCommandSearchResults(ctx, command_opt.?, options, graphDepthFromSize(command_opt.?.max_depth), limit);
 }
 
+fn graphCommandAgentMemoryEntriesFromObject(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, limit: usize) !?[]domain.AgentMemory {
+    const results = (try graphCommandSearchResultsFromObject(ctx, obj, query, limit)) orelse return null;
+    var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+    errdefer {
+        for (entries.items) |*entry| agent_memory_runtime.freeAgentMemory(ctx.allocator, entry);
+        entries.deinit(ctx.allocator);
+    }
+    for (results) |result| {
+        try entries.append(ctx.allocator, try graphSearchResultToAgentMemory(ctx, result));
+    }
+    return try entries.toOwnedSlice(ctx.allocator);
+}
+
+fn graphSearchResultToAgentMemory(ctx: *Context, result: domain.SearchResult) !domain.AgentMemory {
+    return .{
+        .id = try std.fmt.allocPrint(ctx.allocator, "graph:{s}:{s}", .{ result.result_type, result.id }),
+        .key = try std.fmt.allocPrint(ctx.allocator, "graph.{s}.{s}", .{ result.result_type, result.id }),
+        .content = try ctx.allocator.dupe(u8, result.text),
+        .category = try std.fmt.allocPrint(ctx.allocator, "knowledge_graph:{s}", .{result.result_type}),
+        .timestamp = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.created_at_ms}),
+        .session_id = null,
+        .actor_id = try ctx.allocator.dupe(u8, ctx.actor_id),
+        .writer_actor_id = try ctx.allocator.dupe(u8, ctx.actor_id),
+        .scope = try ctx.allocator.dupe(u8, result.scope),
+        .permissions_json = try ctx.allocator.dupe(u8, "[]"),
+        .store = try ctx.allocator.dupe(u8, "graph"),
+        .score = result.score,
+    };
+}
+
 fn graphCommandSearchResults(ctx: *Context, command: graph_mod.Command, options: GraphTraversalOptions, depth: usize, limit: usize) ![]domain.SearchResult {
     return switch (command.kind) {
         .traverse => blk: {
@@ -1493,7 +1561,7 @@ fn graphSearchFromRoots(ctx: *Context, root_ids: []const []const u8, options: Gr
 
     for (root_ids) |entity_id| {
         const entity = (try ctx.store.getEntity(ctx.allocator, entity_id)) orelse continue;
-        if (!try visibleGraphEntity(ctx, entity, options.include_deprecated)) continue;
+        if (!try visibleGraphEntityWithOptions(ctx, entity, options)) continue;
         if (!graph_mod.entityMatchesTypeFilter(entity.entity_type, options.entity_types)) continue;
         try appendGraphEntitySearchResult(ctx, &results, entity, 1.0, limit);
         if (!stringInList(frontier.items, entity.id)) try frontier.append(ctx.allocator, entity.id);
@@ -1505,7 +1573,7 @@ fn graphSearchFromRoots(ctx: *Context, root_ids: []const []const u8, options: Gr
         for (frontier.items) |current_entity_id| {
             const raw_relations = try ctx.store.listEntityRelations(ctx.allocator, current_entity_id, limit);
             for (raw_relations) |relation| {
-                const visible = try visibleGraphRelation(ctx, relation, options.include_deprecated);
+                const visible = try visibleGraphRelationWithOptions(ctx, relation, options);
                 if (visible == null) continue;
                 if (!graphRelationAllowed(visible.?.relation, options)) continue;
                 const other = otherEntityForTraversal(visible.?, current_entity_id, options) orelse continue;
@@ -1531,8 +1599,8 @@ fn graphPathSearchResults(ctx: *Context, from_entity_id: []const u8, to_entity_i
 
     const from = (try ctx.store.getEntity(ctx.allocator, from_entity_id)) orelse return results.toOwnedSlice(ctx.allocator);
     const to = (try ctx.store.getEntity(ctx.allocator, to_entity_id)) orelse return results.toOwnedSlice(ctx.allocator);
-    if (!try visibleGraphEntity(ctx, from, options.include_deprecated)) return results.toOwnedSlice(ctx.allocator);
-    if (!try visibleGraphEntity(ctx, to, options.include_deprecated)) return results.toOwnedSlice(ctx.allocator);
+    if (!try visibleGraphEntityWithOptions(ctx, from, options)) return results.toOwnedSlice(ctx.allocator);
+    if (!try visibleGraphEntityWithOptions(ctx, to, options)) return results.toOwnedSlice(ctx.allocator);
     if (!graph_mod.entityMatchesTypeFilter(from.entity_type, options.entity_types) or !graph_mod.entityMatchesTypeFilter(to.entity_type, options.entity_types)) return results.toOwnedSlice(ctx.allocator);
 
     var parents: std.ArrayListUnmanaged(GraphParent) = .empty;
@@ -1547,7 +1615,7 @@ fn graphPathSearchResults(ctx: *Context, from_entity_id: []const u8, to_entity_i
         for (frontier.items) |current_entity_id| {
             const raw_relations = try ctx.store.listEntityRelations(ctx.allocator, current_entity_id, limit);
             for (raw_relations) |relation| {
-                const visible = try visibleGraphRelation(ctx, relation, options.include_deprecated);
+                const visible = try visibleGraphRelationWithOptions(ctx, relation, options);
                 if (visible == null) continue;
                 if (!graphRelationAllowed(visible.?.relation, options)) continue;
                 const other = otherEntityForTraversal(visible.?, current_entity_id, options) orelse continue;
@@ -1581,14 +1649,14 @@ fn graphPathSearchResults(ctx: *Context, from_entity_id: []const u8, to_entity_i
     while (i > 0 and results.items.len < limit) {
         i -= 1;
         const entity = (try ctx.store.getEntity(ctx.allocator, entity_ids_rev.items[i])) orelse continue;
-        if (!try visibleGraphEntity(ctx, entity, options.include_deprecated)) continue;
+        if (!try visibleGraphEntityWithOptions(ctx, entity, options)) continue;
         try appendGraphEntitySearchResult(ctx, &results, entity, 1.0, limit);
     }
     i = relation_ids_rev.items.len;
     while (i > 0 and results.items.len < limit) {
         i -= 1;
         const relation = (try ctx.store.getRelation(ctx.allocator, relation_ids_rev.items[i])) orelse continue;
-        const visible = try visibleGraphRelation(ctx, relation, options.include_deprecated);
+        const visible = try visibleGraphRelationWithOptions(ctx, relation, options);
         if (visible == null) continue;
         try appendGraphRelationSearchResult(ctx, &results, visible.?, 0.9, limit);
     }
@@ -2912,7 +2980,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_memory_events":"GET /v1/agent/memory/events","nullclaw_api_memory_status":"GET /v1/agent/memory/status","nullclaw_api_memory_compact":"POST /v1/agent/memory/compact","nullclaw_api_memory_checkpoint":"GET|POST /v1/agent/memory/checkpoint","nullclaw_api_memory_apply":"POST /v1/agent/memory/apply","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -3909,6 +3977,67 @@ fn workersRun(ctx: *Context, body: []const u8) HttpResponse {
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
+fn nullClawMemoryFeed(ctx: *Context, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const since_id = feedCursorFromQuery(query);
+    const limit = parseLimit(json.queryParam(query, "limit"), 100);
+    const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    const events = listCentralFeedEventsByObjectType(ctx, since_id, limit, feed_scopes, false, "agent_memory") catch |err| switch (err) {
+        error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor; request a checkpoint"),
+        else => return serverError(ctx),
+    };
+    return nullClawFeedEventsResponse(ctx, events);
+}
+
+fn nullClawMemoryFeedStatus(ctx: *Context, query: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    const status = centralFeedStatusByObjectType(ctx, feed_scopes, "agent_memory") catch return serverError(ctx);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    status.writeJsonWithInstance(ctx.allocator, &out, ctx.feed_instance_id) catch return serverError(ctx);
+    _ = query;
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn nullClawMemoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
+    if (!(hasCapability(ctx, "read") and hasCapability(ctx, "export"))) return forbidden(ctx);
+    const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    const status = centralFeedStatusByObjectType(ctx, feed_scopes, "agent_memory") catch return serverError(ctx);
+    const since_id = feedCursorFromQuery(query);
+    const limit = parseLimit(json.queryParam(query, "limit"), 500);
+    const events = listCentralFeedEventsByObjectType(ctx, since_id, limit, feed_scopes, true, "agent_memory") catch |err| switch (err) {
+        error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor"),
+        else => return serverError(ctx),
+    };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"instance_id\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.feed_instance_id) catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"events\":[", .{ status.cursor_floor, status.cursor_floor, status.max_event_id, status.max_event_id }) catch return serverError(ctx);
+    _ = appendFeedEventsForActorMode(ctx, &out, events, .nullclaw_agent_memory) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "]}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn nullClawMemoryFeedCheckpointRestore(ctx: *Context, body: []const u8, query: []const u8) HttpResponse {
+    const transformed = nullClawCheckpointToNativeFeedCheckpoint(ctx, body) catch |err| switch (err) {
+        error.NotNullClawCheckpoint => return memoryFeedCheckpointRestore(ctx, body, query),
+        else => return badJson(ctx),
+    };
+    return memoryFeedCheckpointRestore(ctx, transformed, query);
+}
+
+fn nullClawMemoryFeedApply(ctx: *Context, body: []const u8, query: []const u8) HttpResponse {
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    if (checkpointEventsValue(obj) != null) return nullClawMemoryFeedCheckpointRestore(ctx, body, query);
+    if (json.stringField(obj, "key") != null and json.stringField(obj, "object_type") == null) {
+        const transformed = nullClawEventToNativeFeedEvent(ctx, obj) catch return badJson(ctx);
+        return applyMemoryEvent(ctx, transformed, query);
+    }
+    return applyMemoryEvent(ctx, body, query);
+}
+
 fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const storage_route = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
@@ -4066,6 +4195,66 @@ fn centralFeedStatusForRoute(ctx: *Context, scopes_json: []const u8, route: stor
         for (batch) |event| {
             cursor = @max(cursor, event.id);
             if (!feedEventMatchesStorageRoute(ctx, event, route)) continue;
+            filtered.visible_events += 1;
+            if (std.mem.eql(u8, event.status, "pending")) {
+                filtered.pending_events += 1;
+            } else if (std.mem.eql(u8, event.status, "applying")) {
+                filtered.applying_events += 1;
+            } else if (std.mem.eql(u8, event.status, "applied")) {
+                filtered.applied_events += 1;
+            }
+        }
+        if (batch.len < 500) break;
+    }
+    return filtered;
+}
+
+fn listCentralFeedEventsByObjectType(ctx: *Context, since_id: i64, limit: usize, scopes_json: []const u8, ignore_cursor_floor: bool, object_type: []const u8) ![]store_mod.FeedEvent {
+    const target_limit = @max(@as(usize, 1), @min(limit, 500));
+    var cursor = since_id;
+    var out: std.ArrayListUnmanaged(store_mod.FeedEvent) = .empty;
+    while (out.items.len < target_limit) {
+        const batch = try ctx.store.listFeedEvents(ctx.allocator, .{
+            .since_id = cursor,
+            .limit = 500,
+            .scopes_json = scopes_json,
+            .ignore_cursor_floor = ignore_cursor_floor,
+            .actor_id = ctx.actor_id,
+        });
+        if (batch.len == 0) break;
+        for (batch) |event| {
+            cursor = @max(cursor, event.id);
+            if (!std.mem.eql(u8, event.object_type, object_type)) continue;
+            try out.append(ctx.allocator, event);
+            if (out.items.len >= target_limit) break;
+        }
+        if (batch.len < 500) break;
+    }
+    return out.toOwnedSlice(ctx.allocator);
+}
+
+fn centralFeedStatusByObjectType(ctx: *Context, scopes_json: []const u8, object_type: []const u8) !store_mod.FeedStatus {
+    const base = try ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = scopes_json, .actor_id = ctx.actor_id });
+    var filtered = store_mod.FeedStatus{
+        .cursor_floor = base.cursor_floor,
+        .max_event_id = base.max_event_id,
+        .visible_events = 0,
+        .pending_events = 0,
+        .applying_events = 0,
+        .applied_events = 0,
+    };
+    var cursor = base.cursor_floor;
+    while (true) {
+        const batch = try ctx.store.listFeedEvents(ctx.allocator, .{
+            .since_id = cursor,
+            .limit = 500,
+            .scopes_json = scopes_json,
+            .actor_id = ctx.actor_id,
+        });
+        if (batch.len == 0) break;
+        for (batch) |event| {
+            cursor = @max(cursor, event.id);
+            if (!std.mem.eql(u8, event.object_type, object_type)) continue;
             filtered.visible_events += 1;
             if (std.mem.eql(u8, event.status, "pending")) {
                 filtered.pending_events += 1;
@@ -4285,6 +4474,167 @@ fn checkpointEventSequence(obj: std.json.ObjectMap) ?i64 {
     return json.intField(obj, "id") orelse
         json.intField(obj, "sequence") orelse
         json.intField(obj, "event_id");
+}
+
+fn nullClawCheckpointToNativeFeedCheckpoint(ctx: *Context, body: []const u8) ![]const u8 {
+    var parsed = try parseBody(ctx, body);
+    defer parsed.deinit();
+    const events_value = checkpointEventsValue(parsed.value.object) orelse return error.NotNullClawCheckpoint;
+    if (events_value != .array) return error.InvalidPayload;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    const compacted_through = checkpointCompactedThrough(parsed.value.object);
+    try out.print(ctx.allocator, "{{\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"events\":[", .{ compacted_through, compacted_through });
+    var transformed_any = false;
+    for (events_value.array.items, 0..) |event_value, i| {
+        if (event_value != .object) return error.InvalidPayload;
+        if (i > 0) try out.append(ctx.allocator, ',');
+        if (isNullClawTopLevelMemoryEvent(event_value.object)) {
+            const native = try nullClawEventToNativeFeedEvent(ctx, event_value.object);
+            try out.appendSlice(ctx.allocator, native);
+            transformed_any = true;
+        } else {
+            const raw = try json.jsonFromValue(ctx.allocator, event_value);
+            try out.appendSlice(ctx.allocator, raw);
+        }
+    }
+    try out.appendSlice(ctx.allocator, "]}");
+    if (!transformed_any) return error.NotNullClawCheckpoint;
+    return out.toOwnedSlice(ctx.allocator);
+}
+
+fn isNullClawTopLevelMemoryEvent(obj: std.json.ObjectMap) bool {
+    return json.stringField(obj, "key") != null and obj.get("payload") == null and json.stringField(obj, "object_type") == null;
+}
+
+fn nullClawEventToNativeFeedEvent(ctx: *Context, obj: std.json.ObjectMap) ![]const u8 {
+    const key = json.stringField(obj, "key") orelse return error.InvalidPayload;
+    const operation = json.stringField(obj, "operation") orelse "put";
+    if (!nullClawMemoryOperationSupported(operation)) return error.InvalidPayload;
+    const event_type = try std.fmt.allocPrint(ctx.allocator, "agent_memory.{s}", .{operation});
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    try out.append(ctx.allocator, '{');
+    try appendJsonStringField(ctx.allocator, &out, "event_type", event_type, true);
+    try appendJsonStringField(ctx.allocator, &out, "operation", operation, false);
+    try appendJsonStringField(ctx.allocator, &out, "object_type", "agent_memory", false);
+    try appendJsonStringField(ctx.allocator, &out, "object_id", key, false);
+    try appendJsonStringField(ctx.allocator, &out, "actor_id", json.stringField(obj, "actor_id") orelse ctx.actor_id, false);
+    try appendOptionalStringField(ctx.allocator, &out, obj, "origin_instance_id");
+    try appendOptionalRawField(ctx.allocator, &out, obj, "origin_sequence");
+    try appendOptionalRawField(ctx.allocator, &out, obj, "sequence");
+    try appendOptionalRawField(ctx.allocator, &out, obj, "timestamp_ms");
+    try appendOptionalRawField(ctx.allocator, &out, obj, "scope");
+    try appendOptionalRawField(ctx.allocator, &out, obj, "permissions");
+    try appendOptionalRawField(ctx.allocator, &out, obj, "dedupe_key");
+    try appendOptionalRawField(ctx.allocator, &out, obj, "causality");
+    try out.appendSlice(ctx.allocator, ",\"payload\":{");
+    try appendNullClawEventPayload(ctx, &out, obj, operation, key);
+    try out.append(ctx.allocator, '}');
+    try out.append(ctx.allocator, '}');
+    return out.toOwnedSlice(ctx.allocator);
+}
+
+fn nullClawMemoryOperationSupported(operation: []const u8) bool {
+    return std.mem.eql(u8, operation, "put") or
+        std.mem.eql(u8, operation, "merge_object") or
+        std.mem.eql(u8, operation, "merge_string_set") or
+        std.mem.eql(u8, operation, "delete_scoped") or
+        std.mem.eql(u8, operation, "delete_all") or
+        std.mem.eql(u8, operation, "delete");
+}
+
+fn appendNullClawEventPayload(ctx: *Context, out: *std.ArrayListUnmanaged(u8), obj: std.json.ObjectMap, operation: []const u8, key: []const u8) !void {
+    try appendJsonStringField(ctx.allocator, out, "key", key, true);
+    if (json.stringField(obj, "category")) |category| try appendJsonStringField(ctx.allocator, out, "category", category, false);
+    if (json.nullableStringField(obj, "session_id")) |session_id| try appendJsonStringField(ctx.allocator, out, "session_id", session_id, false);
+    try appendOptionalRawField(ctx.allocator, out, obj, "scope");
+    try appendOptionalRawField(ctx.allocator, out, obj, "permissions");
+    try appendOptionalRawField(ctx.allocator, out, obj, "store");
+    try appendOptionalRawField(ctx.allocator, out, obj, "storage");
+    try appendOptionalRawField(ctx.allocator, out, obj, "stores");
+
+    if (std.mem.eql(u8, operation, "merge_string_set")) {
+        if (obj.get("values")) |values| {
+            try out.appendSlice(ctx.allocator, ",\"values\":");
+            try appendRawJsonValue(ctx.allocator, out, values);
+        } else if (json.stringField(obj, "content")) |content| {
+            try out.appendSlice(ctx.allocator, ",\"values\":");
+            try appendNullClawContentAsRawJsonOrString(ctx.allocator, out, content);
+        } else if (obj.get("value")) |value| {
+            try out.appendSlice(ctx.allocator, ",\"value\":");
+            try appendRawJsonValue(ctx.allocator, out, value);
+        } else {
+            return error.InvalidPayload;
+        }
+    } else if (std.mem.eql(u8, operation, "merge_object")) {
+        if (obj.get("object")) |object| {
+            if (object != .object) return error.InvalidPayload;
+            try out.appendSlice(ctx.allocator, ",\"object\":");
+            try appendRawJsonValue(ctx.allocator, out, object);
+        } else if (json.stringField(obj, "content")) |content| {
+            if (!jsonStringIsObject(ctx.allocator, content)) return error.InvalidPayload;
+            try out.appendSlice(ctx.allocator, ",\"object\":");
+            try out.appendSlice(ctx.allocator, content);
+        } else if (obj.get("value")) |value| {
+            if (value != .object) return error.InvalidPayload;
+            try out.appendSlice(ctx.allocator, ",\"object\":");
+            try appendRawJsonValue(ctx.allocator, out, value);
+        } else {
+            return error.InvalidPayload;
+        }
+    } else if (std.mem.eql(u8, operation, "put")) {
+        if (json.stringField(obj, "content")) |content| {
+            try appendJsonStringField(ctx.allocator, out, "content", content, false);
+        } else if (json.stringField(obj, "text")) |text| {
+            try appendJsonStringField(ctx.allocator, out, "content", text, false);
+        } else if (obj.get("value")) |value| {
+            try out.appendSlice(ctx.allocator, ",\"value\":");
+            try appendRawJsonValue(ctx.allocator, out, value);
+        } else {
+            return error.InvalidPayload;
+        }
+    }
+}
+
+fn appendJsonStringField(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: []const u8, first: bool) !void {
+    if (!first) try out.append(allocator, ',');
+    try json.appendString(out, allocator, name);
+    try out.append(allocator, ':');
+    try json.appendString(out, allocator, value);
+}
+
+fn appendOptionalStringField(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), obj: std.json.ObjectMap, name: []const u8) !void {
+    if (json.stringField(obj, name)) |value| try appendJsonStringField(allocator, out, name, value, false);
+}
+
+fn appendOptionalRawField(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), obj: std.json.ObjectMap, name: []const u8) !void {
+    const value = obj.get(name) orelse return;
+    try out.append(allocator, ',');
+    try json.appendString(out, allocator, name);
+    try out.append(allocator, ':');
+    try appendRawJsonValue(allocator, out, value);
+}
+
+fn appendRawJsonValue(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value) !void {
+    const raw = try json.jsonFromValue(allocator, value);
+    try out.appendSlice(allocator, raw);
+}
+
+fn appendNullClawContentAsRawJsonOrString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), content: []const u8) !void {
+    if (std.json.validate(allocator, content) catch false) {
+        try out.appendSlice(allocator, content);
+    } else {
+        try json.appendString(out, allocator, content);
+    }
+}
+
+fn jsonStringIsObject(allocator: std.mem.Allocator, content: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
 }
 
 fn responseEventId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
@@ -7559,6 +7909,13 @@ fn agentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     const include_global = json.boolField(obj, "include_global") orelse false;
     const include_sessions = json.boolField(obj, "include_sessions") orelse false;
     const include_internal = json.boolField(obj, "include_internal") orelse false;
+    const graph_entries = graphCommandAgentMemoryEntriesFromObject(ctx, obj, query, limit) catch |err| switch (err) {
+        error.InvalidGraphCommand, error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
+        else => return serverError(ctx),
+    };
+    if (graph_entries) |entries| {
+        return agentMemoryEntriesResponseFiltered(ctx, entries, include_internal, limit, 0);
+    }
     const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return serverError(ctx);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
     const primary = if (session_id == null and include_sessions)
@@ -8142,6 +8499,14 @@ fn feedEventsResponse(ctx: *Context, events: []store_mod.FeedEvent) HttpResponse
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
+fn nullClawFeedEventsResponse(ctx: *Context, events: []store_mod.FeedEvent) HttpResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"events\":[") catch return serverError(ctx);
+    _ = appendFeedEventsForActorMode(ctx, &out, events, .nullclaw_agent_memory) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "]}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
 fn runtimeFeedEventsResponse(ctx: *Context, events: []agent_memory_runtime.FeedEvent) HttpResponse {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"events\":[") catch return serverError(ctx);
@@ -8207,26 +8572,51 @@ fn appendRuntimeFeedStatusJson(allocator: std.mem.Allocator, out: *std.ArrayList
     });
 }
 
+const FeedWireMode = enum {
+    native,
+    nullclaw_agent_memory,
+};
+
 fn appendFeedEventsForActor(ctx: *Context, out: *std.ArrayListUnmanaged(u8), events: []store_mod.FeedEvent) !usize {
+    return appendFeedEventsForActorMode(ctx, out, events, .native);
+}
+
+fn appendFeedEventsForActorMode(ctx: *Context, out: *std.ArrayListUnmanaged(u8), events: []store_mod.FeedEvent, mode: FeedWireMode) !usize {
     var written: usize = 0;
     for (events) |event| {
         if (!feedRecordVisibleToActor(ctx, event.scope, event.permissions_json)) continue;
+        if (!try feedEventRenderableInMode(ctx, event, mode)) continue;
         if (written > 0) try out.append(ctx.allocator, ',');
-        try appendFeedEventForActor(ctx, out, event);
+        try appendFeedEventForActorMode(ctx, out, event, mode);
         written += 1;
     }
     return written;
 }
 
+fn feedEventRenderableInMode(ctx: *Context, event: store_mod.FeedEvent, mode: FeedWireMode) !bool {
+    if (mode != .nullclaw_agent_memory) return true;
+    if (!std.mem.eql(u8, event.object_type, "agent_memory")) return false;
+    const payload_json = try feedPayloadForActor(ctx, event);
+    if (feedPayloadIsRedacted(payload_json)) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
+
 fn appendFeedEventForActor(ctx: *Context, out: *std.ArrayListUnmanaged(u8), event: store_mod.FeedEvent) !void {
+    return appendFeedEventForActorMode(ctx, out, event, .native);
+}
+
+fn appendFeedEventForActorMode(ctx: *Context, out: *std.ArrayListUnmanaged(u8), event: store_mod.FeedEvent, mode: FeedWireMode) !void {
     const payload_json = try feedPayloadForActor(ctx, event);
     try out.print(ctx.allocator, "{{\"id\":{d},\"event_type\":", .{event.id});
     try json.appendString(out, ctx.allocator, event.event_type);
     try out.print(ctx.allocator, ",\"sequence\":{d},\"origin_instance_id\":", .{event.id});
     try json.appendString(out, ctx.allocator, ctx.feed_instance_id);
     try out.print(ctx.allocator, ",\"origin_sequence\":{d}", .{event.id});
+    try out.print(ctx.allocator, ",\"schema_version\":1,\"timestamp_ms\":{d}", .{event.created_at_ms});
     try out.appendSlice(ctx.allocator, ",\"operation\":");
-    try json.appendString(out, ctx.allocator, event.operation);
+    try json.appendString(out, ctx.allocator, feedWireOperation(event, mode));
     try out.appendSlice(ctx.allocator, ",\"object_type\":");
     try json.appendString(out, ctx.allocator, event.object_type);
     try out.appendSlice(ctx.allocator, ",\"object_id\":");
@@ -8243,6 +8633,7 @@ fn appendFeedEventForActor(ctx: *Context, out: *std.ArrayListUnmanaged(u8), even
     try json.appendRawJsonOr(out, ctx.allocator, event.causality_json, "{}");
     try out.appendSlice(ctx.allocator, ",\"payload\":");
     try json.appendRawJsonOr(out, ctx.allocator, payload_json, "{}");
+    try appendAgentMemoryFeedCompatFields(ctx, out, event, payload_json, mode);
     try out.appendSlice(ctx.allocator, ",\"status\":");
     try json.appendString(out, ctx.allocator, event.status);
     try out.print(ctx.allocator, ",\"created_at_ms\":{d},\"applied_at_ms\":", .{event.created_at_ms});
@@ -8250,6 +8641,75 @@ fn appendFeedEventForActor(ctx: *Context, out: *std.ArrayListUnmanaged(u8), even
     try out.appendSlice(ctx.allocator, ",\"compacted_at_ms\":");
     if (event.compacted_at_ms) |v| try out.print(ctx.allocator, "{d}", .{v}) else try out.appendSlice(ctx.allocator, "null");
     try out.append(ctx.allocator, '}');
+}
+
+fn feedWireOperation(event: store_mod.FeedEvent, mode: FeedWireMode) []const u8 {
+    if (mode == .nullclaw_agent_memory and std.mem.eql(u8, event.object_type, "agent_memory")) {
+        if (std.mem.eql(u8, event.operation, "delete") or std.mem.eql(u8, event.operation, "forget")) return "delete_scoped";
+    }
+    return event.operation;
+}
+
+fn appendAgentMemoryFeedCompatFields(ctx: *Context, out: *std.ArrayListUnmanaged(u8), event: store_mod.FeedEvent, payload_json: []const u8, mode: FeedWireMode) !void {
+    if (!std.mem.eql(u8, event.object_type, "agent_memory")) return;
+    if (feedPayloadIsRedacted(payload_json)) {
+        try out.appendSlice(ctx.allocator, ",\"key\":null,\"session_id\":null,\"category\":null,\"value_kind\":null,\"content\":null");
+        return;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{}) catch {
+        try out.appendSlice(ctx.allocator, ",\"key\":null,\"session_id\":null,\"category\":null,\"value_kind\":null,\"content\":null");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try out.appendSlice(ctx.allocator, ",\"key\":null,\"session_id\":null,\"category\":null,\"value_kind\":null,\"content\":null");
+        return;
+    }
+    const payload_obj = parsed.value.object;
+    try out.appendSlice(ctx.allocator, ",\"key\":");
+    if (json.stringField(payload_obj, "key")) |key| {
+        try json.appendString(out, ctx.allocator, key);
+    } else {
+        try json.appendString(out, ctx.allocator, event.object_id);
+    }
+    try out.appendSlice(ctx.allocator, ",\"session_id\":");
+    try json.appendNullableString(out, ctx.allocator, json.nullableStringField(payload_obj, "session_id"));
+    try out.appendSlice(ctx.allocator, ",\"category\":");
+    try json.appendNullableString(out, ctx.allocator, json.nullableStringField(payload_obj, "category"));
+    try out.appendSlice(ctx.allocator, ",\"value_kind\":");
+    try json.appendNullableString(out, ctx.allocator, agentMemoryFeedValueKind(payload_obj, feedWireOperation(event, mode)));
+    try out.appendSlice(ctx.allocator, ",\"content\":");
+    if (try agentMemoryFeedCompatContent(ctx, payload_obj, feedWireOperation(event, mode))) |content| {
+        try json.appendString(out, ctx.allocator, content);
+    } else {
+        try out.appendSlice(ctx.allocator, "null");
+    }
+}
+
+fn agentMemoryFeedValueKind(payload_obj: std.json.ObjectMap, operation: []const u8) ?[]const u8 {
+    if (json.stringField(payload_obj, "value_kind")) |value_kind| return value_kind;
+    if (std.mem.eql(u8, operation, "merge_string_set")) return "string_set";
+    if (std.mem.eql(u8, operation, "merge_object")) return "json_object";
+    return null;
+}
+
+fn agentMemoryFeedCompatContent(ctx: *Context, payload_obj: std.json.ObjectMap, operation: []const u8) !?[]const u8 {
+    if (std.mem.eql(u8, operation, "merge_string_set")) {
+        if (payload_obj.get("values")) |values| return try json.jsonFromValue(ctx.allocator, values);
+        if (payload_obj.get("value")) |value| return try json.jsonFromValue(ctx.allocator, value);
+    } else if (std.mem.eql(u8, operation, "merge_object")) {
+        if (payload_obj.get("object")) |object| return try json.jsonFromValue(ctx.allocator, object);
+        if (payload_obj.get("value")) |value| return try json.jsonFromValue(ctx.allocator, value);
+    } else {
+        if (json.stringField(payload_obj, "content")) |content| return content;
+        if (json.stringField(payload_obj, "text")) |text| return text;
+        if (payload_obj.get("value")) |value| return try json.jsonFromValue(ctx.allocator, value);
+    }
+    return null;
+}
+
+fn feedPayloadIsRedacted(payload_json: []const u8) bool {
+    return std.mem.indexOf(u8, payload_json, "\"redacted\":true") != null;
 }
 
 fn feedPayloadForActor(ctx: *Context, event: store_mod.FeedEvent) ![]const u8 {
@@ -9231,9 +9691,13 @@ fn canProposeRecord(ctx: *Context, scope: []const u8, permissions_json: []const 
 }
 
 fn recordVisibleToActor(ctx: *Context, scope: []const u8, permissions_json: []const u8) bool {
-    if (!domain.recordVisible(scope, permissions_json, ctx.actor_scopes_json)) return false;
+    return recordVisibleToScopes(ctx, scope, permissions_json, ctx.actor_scopes_json);
+}
+
+fn recordVisibleToScopes(ctx: *Context, scope: []const u8, permissions_json: []const u8, scopes_json: []const u8) bool {
+    if (!domain.recordVisible(scope, permissions_json, scopes_json)) return false;
     const policy = ctx.store.getPolicyScope(ctx.allocator, scope) catch return false;
-    if (policy) |p| return domain.recordVisible(p.scope, p.permissions_json, ctx.actor_scopes_json);
+    if (policy) |p| return domain.recordVisible(p.scope, p.permissions_json, scopes_json);
     return true;
 }
 
@@ -10279,6 +10743,72 @@ test "api direct agent memory mutations emit replayable merge and delete feed ev
     try std.testing.expect(std.mem.indexOf(u8, merged.body, "[\\\"postgres\\\",\\\"zig\\\"]") != null);
     const deleted = handleRequest(&target_ctx, "GET", "/v1/agent-memory/feed.delete", "", "");
     try std.testing.expectEqualStrings("404 Not Found", deleted.status);
+}
+
+test "api nullclaw memory adapter exposes replayable api-memory feed contract" {
+    var source_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer source_store.deinit();
+    var target_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer target_store.deinit();
+    var source_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source_arena.deinit();
+    var target_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer target_arena.deinit();
+    var source_ctx = Context{
+        .allocator = source_arena.allocator(),
+        .store = &source_store,
+        .actor_id = "agent:nullclaw",
+        .actor_scopes_json = "[\"public\",\"write:public\",\"actor:agent:nullclaw\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"export\",\"feed_apply\"]",
+    };
+    var target_ctx = Context{
+        .allocator = target_arena.allocator(),
+        .store = &target_store,
+        .actor_id = "agent:nullclaw",
+        .actor_scopes_json = "[\"public\",\"write:public\",\"actor:agent:nullclaw\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"export\",\"feed_apply\"]",
+    };
+
+    const apply_body =
+        \\{"origin_instance_id":"nullclaw-a","origin_sequence":1,"timestamp_ms":123,"operation":"merge_string_set","key":"api.tags","category":"core","value_kind":"string_set","content":"[\"zig\"]","scope":"public"}
+    ;
+    const first_apply = handleRequest(&source_ctx, "POST", "/v1/agent/memory/apply", apply_body, "");
+    try std.testing.expectEqualStrings("200 OK", first_apply.status);
+    const retry_apply = handleRequest(&source_ctx, "POST", "/v1/agent/memory/apply", apply_body, "");
+    try std.testing.expectEqualStrings("200 OK", retry_apply.status);
+
+    const applied_memory = handleRequest(&source_ctx, "GET", "/v1/agent-memory/api.tags", "", "");
+    try std.testing.expectEqualStrings("200 OK", applied_memory.status);
+    try std.testing.expect(std.mem.indexOf(u8, applied_memory.body, "[\\\"zig\\\"]") != null);
+
+    const non_agent = handleRequest(&source_ctx, "POST", "/v1/memory/events", "{\"event_type\":\"memory.note\",\"operation\":\"put\",\"object_type\":\"memory_atom\",\"object_id\":\"not_agent_memory\",\"scope\":\"public\",\"payload\":{\"text\":\"not nullclaw feed\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", non_agent.status);
+
+    const feed = handleRequest(&source_ctx, "GET", "/v1/agent/memory/events?after=0&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"schema_version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"timestamp_ms\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"key\":\"api.tags\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"value_kind\":\"string_set\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"content\":\"[\\\"zig\\\"]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "not nullclaw feed") == null);
+
+    const status = handleRequest(&source_ctx, "GET", "/v1/agent/memory/status", "", "");
+    try std.testing.expectEqualStrings("200 OK", status.status);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"visible_events\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"last_sequence\":2") != null);
+
+    const checkpoint = handleRequest(&source_ctx, "GET", "/v1/agent/memory/checkpoint?after=0&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"key\":\"api.tags\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"object_type\":\"agent_memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "not nullclaw feed") == null);
+
+    const restore = handleRequest(&target_ctx, "POST", "/v1/agent/memory/checkpoint", checkpoint.body, "");
+    try std.testing.expectEqualStrings("200 OK", restore.status);
+    const restored = handleRequest(&target_ctx, "GET", "/v1/agent-memory/api.tags", "", "");
+    try std.testing.expectEqualStrings("200 OK", restored.status);
+    try std.testing.expect(std.mem.indexOf(u8, restored.body, "[\\\"zig\\\"]") != null);
 }
 
 test "api memory feed endpoints honor named runtime route selection" {
@@ -13087,6 +13617,34 @@ test "api graph neighbors and path are acl aware" {
     try std.testing.expect(std.mem.indexOf(u8, context_command.body, "\"persisted\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, context_command.body, "Graph C") != null);
     try std.testing.expect(std.mem.indexOf(u8, context_command.body, "\"included_result_refs\"") != null);
+
+    const agent_memory_graph_command = handleRequest(&ctx, "POST", "/v1/agent-memory/search", path_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", agent_memory_graph_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, agent_memory_graph_command.body, "\"memories\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent_memory_graph_command.body, "\"store\":\"graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent_memory_graph_command.body, "Graph C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent_memory_graph_command.body, secret_source.id) == null);
+
+    const nullclaw_agent_memory_graph_command = handleRequest(&ctx, "POST", "/v1/agent/memories/search", path_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", nullclaw_agent_memory_graph_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, nullclaw_agent_memory_graph_command.body, "\"entries\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nullclaw_agent_memory_graph_command.body, "\"store\":\"graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nullclaw_agent_memory_graph_command.body, "implements") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nullclaw_agent_memory_graph_command.body, "Secret Graph Service") == null);
+
+    var wide_ctx = Context{ .allocator = alloc, .store = &store };
+    const wide_secret_command_body = try std.fmt.allocPrint(alloc, "{{\"query\":\"kg:path:{s}:{s}:1\",\"limit\":20}}", .{ b.id, secret.id });
+    const wide_secret_command = handleRequest(&wide_ctx, "POST", "/v1/search", wide_secret_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", wide_secret_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, wide_secret_command.body, "Secret Graph Service") != null);
+
+    const narrowed_secret_command_body = try std.fmt.allocPrint(alloc, "{{\"query\":\"kg:path:{s}:{s}:1\",\"limit\":20,\"scopes\":[\"public\"]}}", .{ b.id, secret.id });
+    const narrowed_secret_search = handleRequest(&wide_ctx, "POST", "/v1/search", narrowed_secret_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", narrowed_secret_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, narrowed_secret_search.body, "Secret Graph Service") == null);
+    const narrowed_secret_agent_memory = handleRequest(&wide_ctx, "POST", "/v1/agent-memory/search", narrowed_secret_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", narrowed_secret_agent_memory.status);
+    try std.testing.expect(std.mem.indexOf(u8, narrowed_secret_agent_memory.body, "Secret Graph Service") == null);
 
     const secret_path_body = try std.fmt.allocPrint(alloc, "{{\"from_entity_id\":\"{s}\",\"to_entity_id\":\"{s}\",\"max_depth\":3}}", .{ a.id, secret.id });
     const secret_path = handleRequest(&ctx, "POST", "/v1/graph/path", secret_path_body, "");
