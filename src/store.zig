@@ -1715,6 +1715,7 @@ pub const Store = struct {
             .use_temporal_decay = input.use_temporal_decay,
             .use_mmr = input.use_mmr,
             .allow_reranker = input.allow_reranker,
+            .min_relevance = input.min_relevance,
             .query_embedding_json = input.query_embedding_json,
             .query_embedding_provider = input.query_embedding_provider,
             .embedding_dimensions = input.embedding_dimensions,
@@ -3108,6 +3109,7 @@ pub const SearchInput = struct {
     use_temporal_decay: bool = true,
     use_mmr: bool = true,
     allow_reranker: bool = false,
+    min_relevance: f64 = 0,
     half_life_days: f64 = 30,
     query_embedding_json: ?[]const u8 = null,
     query_embedding_provider: []const u8 = "none",
@@ -3560,6 +3562,7 @@ pub const ContextPackInput = struct {
     use_temporal_decay: bool = true,
     use_mmr: bool = true,
     allow_reranker: bool = false,
+    min_relevance: f64 = 0,
     actor_id: ?[]const u8 = null,
     agent_memory_route: AgentMemoryStorageRoute = .{},
     preselected_results: ?[]domain.SearchResult = null,
@@ -7591,6 +7594,7 @@ pub const SQLiteStore = struct {
             .use_temporal_decay = input.use_temporal_decay,
             .use_mmr = input.use_mmr,
             .allow_reranker = input.allow_reranker,
+            .min_relevance = input.min_relevance,
             .query_embedding_json = input.query_embedding_json,
             .query_embedding_provider = input.query_embedding_provider,
             .embedding_dimensions = input.embedding_dimensions,
@@ -10575,6 +10579,7 @@ pub const PostgresStore = struct {
             .use_temporal_decay = input.use_temporal_decay,
             .use_mmr = input.use_mmr,
             .allow_reranker = input.allow_reranker,
+            .min_relevance = input.min_relevance,
             .query_embedding_json = input.query_embedding_json,
             .query_embedding_provider = input.query_embedding_provider,
             .embedding_dimensions = input.embedding_dimensions,
@@ -12173,6 +12178,8 @@ fn finalizeSearchResults(allocator: std.mem.Allocator, input: SearchInput, candi
     }
 
     var ordered = try unique.toOwnedSlice(allocator);
+    ordered = try filterSearchResultsByMinRelevance(allocator, ordered, input.min_relevance);
+    if (ordered.len == 0) return ordered;
     if (input.use_temporal_decay or input.allow_reranker) {
         var ranked = try allocator.alloc(retrieval_mod.RankedItem, ordered.len);
         defer allocator.free(ranked);
@@ -12213,6 +12220,31 @@ fn finalizeSearchResults(allocator: std.mem.Allocator, input: SearchInput, candi
     }
     if (ordered.len > limit) return allocator.realloc(ordered, limit);
     return ordered;
+}
+
+fn filterSearchResultsByMinRelevance(allocator: std.mem.Allocator, ordered: []domain.SearchResult, min_relevance_raw: f64) ![]domain.SearchResult {
+    const min_relevance = if (std.math.isNan(min_relevance_raw) or min_relevance_raw < 0) 0 else min_relevance_raw;
+    const threshold_active = min_relevance > 0;
+    var keep: usize = 0;
+    var changed = false;
+    for (ordered, 0..) |result, i| {
+        const allowed = !std.math.isNan(result.score) and (!threshold_active or result.score >= min_relevance);
+        if (allowed) {
+            if (keep != i) {
+                ordered[keep] = result;
+                changed = true;
+            }
+            keep += 1;
+        } else {
+            changed = true;
+        }
+    }
+    if (!changed) return ordered;
+    if (keep == 0) {
+        allocator.free(ordered);
+        return allocator.alloc(domain.SearchResult, 0);
+    }
+    return allocator.realloc(ordered, keep);
 }
 
 fn searchResultAllowedForSession(_: SearchInput, _: domain.SearchResult) bool {
@@ -12767,6 +12799,41 @@ test "sqlite retrieval applies temporal quality ranking before truncation" {
     try std.testing.expect(results.len >= 2);
     try std.testing.expect(!std.mem.eql(u8, results[0].id, old.id));
     try std.testing.expect(std.mem.indexOf(u8, results[0].text, "fresh decision") != null);
+}
+
+test "sqlite retrieval applies minimum relevance before final limit" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createMemoryAtom(alloc, .{
+        .text = "minimum relevance exact sentinel",
+        .scope = "public",
+        .created_by = "human",
+    });
+
+    const default_results = try store.search(alloc, .{
+        .query = "minimum relevance sentinel",
+        .scopes_json = "[\"public\"]",
+        .limit = 10,
+        .use_vector = false,
+        .use_temporal_decay = false,
+        .use_mmr = false,
+    });
+    try std.testing.expect(default_results.len >= 1);
+
+    const filtered = try store.search(alloc, .{
+        .query = "minimum relevance sentinel",
+        .scopes_json = "[\"public\"]",
+        .limit = 10,
+        .use_vector = false,
+        .use_temporal_decay = false,
+        .use_mmr = false,
+        .min_relevance = 999,
+    });
+    try std.testing.expectEqual(@as(usize, 0), filtered.len);
 }
 
 test "sqlite vector layer stores chunks searches and enqueues outbox" {
