@@ -471,6 +471,18 @@ pub const Store = struct {
         return self.vector_backend.backend.name();
     }
 
+    pub fn localVectorEngineName(self: *Store) []const u8 {
+        return switch (self.backend) {
+            .sqlite => "sqlite_local_vector",
+            .postgres => "pgvector",
+        };
+    }
+
+    pub fn effectiveVectorSearchEngineName(self: *Store) []const u8 {
+        if (self.vector_backend.externalEnabled()) return self.vector_backend.backend.name();
+        return self.localVectorEngineName();
+    }
+
     pub fn vectorExternalSinksJson(self: *Store) []const u8 {
         return switch (self.vector_backend.backend) {
             .local => "[]",

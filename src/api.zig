@@ -226,6 +226,10 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return lifecycleDiagnostics(ctx);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "migrate") and is_post) {
         return lifecycleMigrate(ctx, body);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "export-jsonl") and is_post) {
+        return lifecycleExportJsonl(ctx, body);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and eql(seg3, "export-jsonl") and is_post) {
+        return lifecycleExportJsonl(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and eql(seg3, "export") and is_post) {
         return lifecycleSnapshotExport(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "snapshot") and eql(seg3, "import") and is_post) {
@@ -1994,6 +1998,7 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/conflicts/scan", .post = "scanConflicts" },
         .{ .path = "/lifecycle/diagnostics", .get = "diagnostics" },
         .{ .path = "/lifecycle/migrate", .post = "migrateLifecycleStorage" },
+        .{ .path = "/lifecycle/export-jsonl", .post = "exportJsonlDataset" },
         .{ .path = "/lifecycle/snapshot", .post = "createSnapshot" },
         .{ .path = "/lifecycle/snapshot/export", .post = "exportSnapshot" },
         .{ .path = "/lifecycle/snapshot/import", .post = "importSnapshot" },
@@ -2049,7 +2054,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","nullclaw_api_memory_adapter","bootstrap_prompts","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","lifecycle_migrate","lifecycle_rollout","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","nullclaw_api_memory_adapter","bootstrap_prompts","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","jsonl_export","lifecycle_migrate","lifecycle_rollout","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -2979,7 +2984,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_memory_events":"GET /v1/agent/memory/events","nullclaw_api_memory_status":"GET /v1/agent/memory/status","nullclaw_api_memory_compact":"POST /v1/agent/memory/compact","nullclaw_api_memory_checkpoint":"GET|POST /v1/agent/memory/checkpoint","nullclaw_api_memory_apply":"POST /v1/agent/memory/apply","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","lifecycle_rollout":"POST /v1/lifecycle/rollout","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_memory_events":"GET /v1/agent/memory/events","nullclaw_api_memory_status":"GET /v1/agent/memory/status","nullclaw_api_memory_compact":"POST /v1/agent/memory/compact","nullclaw_api_memory_checkpoint":"GET|POST /v1/agent/memory/checkpoint","nullclaw_api_memory_apply":"POST /v1/agent/memory/apply","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","lifecycle_migrate":"POST /v1/lifecycle/migrate","lifecycle_rollout":"POST /v1/lifecycle/rollout","jsonl_export":"POST /v1/lifecycle/export-jsonl","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -3667,6 +3672,10 @@ fn vectorStatus(ctx: *Context) HttpResponse {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"vector\":{\"backend\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, ctx.store.vectorBackendName()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"local_engine\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.store.localVectorEngineName()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"search_engine\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.store.effectiveVectorSearchEngineName()) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"collection\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, cfg.collection) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"external_enabled\":") catch return serverError(ctx);
@@ -3757,7 +3766,7 @@ fn vectorReconcile(ctx: *Context, body: []const u8) HttpResponse {
 fn vectorMaintenanceResponse(ctx: *Context, key: []const u8, result: store_mod.VectorMaintenanceResult) HttpResponse {
     const body = std.fmt.allocPrint(
         ctx.allocator,
-        "{{\"{s}\":{{\"canonical_chunks\":{d},\"enqueued_upserts\":{d},\"requeued_failed\":{d},\"external_enabled\":{s},\"active_sink\":\"{s}\",\"external_sinks\":{s}}}}}",
+        "{{\"{s}\":{{\"canonical_chunks\":{d},\"enqueued_upserts\":{d},\"requeued_failed\":{d},\"external_enabled\":{s},\"active_sink\":\"{s}\",\"local_engine\":\"{s}\",\"search_engine\":\"{s}\",\"external_sinks\":{s}}}}}",
         .{
             key,
             result.canonical_chunks,
@@ -3765,6 +3774,8 @@ fn vectorMaintenanceResponse(ctx: *Context, key: []const u8, result: store_mod.V
             result.requeued_failed,
             if (result.external_enabled) "true" else "false",
             ctx.store.vectorBackendName(),
+            ctx.store.localVectorEngineName(),
+            ctx.store.effectiveVectorSearchEngineName(),
             ctx.store.vectorExternalSinksJson(),
         },
     ) catch return serverError(ctx);
@@ -3783,7 +3794,7 @@ fn vectorOutboxStatus(ctx: *Context) HttpResponse {
     const failed_external_index = ctx.store.countVectorOutbox("failed_external_index") catch return serverError(ctx);
     const failed_external_delete = ctx.store.countVectorOutbox("failed_external_delete") catch return serverError(ctx);
     const total = ctx.store.countVectorOutbox(null) catch return serverError(ctx);
-    const body = std.fmt.allocPrint(ctx.allocator, "{{\"outbox\":{{\"pending\":{d},\"running\":{d},\"embedded\":{d},\"failed_embedding\":{d},\"indexed_local\":{d},\"indexed_external\":{d},\"deleted_external\":{d},\"failed_external_index\":{d},\"failed_external_delete\":{d},\"active_sink\":\"{s}\",\"external_sinks\":{s},\"total\":{d}}}}}", .{ pending, running, embedded, failed_embedding, indexed_local, indexed_external, deleted_external, failed_external_index, failed_external_delete, ctx.store.vectorBackendName(), ctx.store.vectorExternalSinksJson(), total }) catch return serverError(ctx);
+    const body = std.fmt.allocPrint(ctx.allocator, "{{\"outbox\":{{\"pending\":{d},\"running\":{d},\"embedded\":{d},\"failed_embedding\":{d},\"indexed_local\":{d},\"indexed_external\":{d},\"deleted_external\":{d},\"failed_external_index\":{d},\"failed_external_delete\":{d},\"active_sink\":\"{s}\",\"local_engine\":\"{s}\",\"search_engine\":\"{s}\",\"external_sinks\":{s},\"total\":{d}}}}}", .{ pending, running, embedded, failed_embedding, indexed_local, indexed_external, deleted_external, failed_external_index, failed_external_delete, ctx.store.vectorBackendName(), ctx.store.localVectorEngineName(), ctx.store.effectiveVectorSearchEngineName(), ctx.store.vectorExternalSinksJson(), total }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = body };
 }
 
@@ -3815,7 +3826,7 @@ fn vectorOutboxRun(ctx: *Context, body: []const u8) HttpResponse {
     const indexed_local = ctx.store.countVectorOutbox("indexed_local") catch return serverError(ctx);
     const indexed_external = ctx.store.countVectorOutbox("indexed_external") catch return serverError(ctx);
     const deleted_external = ctx.store.countVectorOutbox("deleted_external") catch return serverError(ctx);
-    const response = std.fmt.allocPrint(ctx.allocator, "{{\"outbox_run\":{{\"processed\":{d},\"failed\":{d},\"pending\":{d},\"embedded\":{d},\"indexed_local\":{d},\"indexed_external\":{d},\"deleted_external\":{d},\"active_sink\":\"{s}\",\"external_sinks\":{s}}}}}", .{ result.processed, result.failed, pending, embedded, indexed_local, indexed_external, deleted_external, ctx.store.vectorBackendName(), ctx.store.vectorExternalSinksJson() }) catch return serverError(ctx);
+    const response = std.fmt.allocPrint(ctx.allocator, "{{\"outbox_run\":{{\"processed\":{d},\"failed\":{d},\"pending\":{d},\"embedded\":{d},\"indexed_local\":{d},\"indexed_external\":{d},\"deleted_external\":{d},\"active_sink\":\"{s}\",\"local_engine\":\"{s}\",\"search_engine\":\"{s}\",\"external_sinks\":{s}}}}}", .{ result.processed, result.failed, pending, embedded, indexed_local, indexed_external, deleted_external, ctx.store.vectorBackendName(), ctx.store.localVectorEngineName(), ctx.store.effectiveVectorSearchEngineName(), ctx.store.vectorExternalSinksJson() }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
 }
 
@@ -6249,6 +6260,10 @@ fn appendRuntimeDiagnostics(ctx: *Context, out: *std.ArrayListUnmanaged(u8), sch
     try appendAgentMemoryRuntimeDiagnostics(ctx, out);
     try out.appendSlice(ctx.allocator, ",\"vector\":{\"backend\":");
     try json.appendString(out, ctx.allocator, ctx.store.vectorBackendName());
+    try out.appendSlice(ctx.allocator, ",\"local_engine\":");
+    try json.appendString(out, ctx.allocator, ctx.store.localVectorEngineName());
+    try out.appendSlice(ctx.allocator, ",\"search_engine\":");
+    try json.appendString(out, ctx.allocator, ctx.store.effectiveVectorSearchEngineName());
     try out.appendSlice(ctx.allocator, ",\"external_enabled\":");
     try out.appendSlice(ctx.allocator, if (ctx.store.vector_backend.externalEnabled()) "true" else "false");
     try out.appendSlice(ctx.allocator, ",\"external_sinks\":");
@@ -6477,6 +6492,33 @@ fn lifecycleSnapshotExport(ctx: *Context, body: []const u8) HttpResponse {
     out.appendSlice(ctx.allocator, ",\"objects\":") catch return serverError(ctx);
     appendSnapshotObjects(ctx, &out, results) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn lifecycleExportJsonl(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read") or !hasCapability(ctx, "export")) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const query = json.stringField(obj, "query") orelse "";
+    const include_internal = json.boolField(obj, "include_internal") orelse false;
+    const include_pii = json.boolField(obj, "include_pii") orelse false;
+    var input = buildSearchInput(ctx, obj, query, positiveLimit(json.intField(obj, "limit"), 1000), true) catch return serverError(ctx);
+    input.include_deprecated = json.boolField(obj, "include_deprecated") orelse true;
+    input.use_vector = json.boolField(obj, "use_vector") orelse false;
+    const results = ctx.store.search(ctx.allocator, input) catch |err| switch (err) {
+        error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+        else => return serverError(ctx),
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var written: usize = 0;
+    for (results) |result| {
+        if (!include_internal and exportResultIsInternal(result)) continue;
+        if (written > 0) out.append(ctx.allocator, '\n') catch return serverError(ctx);
+        appendJsonlExportRecord(ctx, &out, result, include_pii) catch return serverError(ctx);
+        written += 1;
+    }
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
@@ -8389,6 +8431,123 @@ fn appendSnapshotObjects(ctx: *Context, out: *std.ArrayListUnmanaged(u8), result
         try appendSnapshotObject(ctx, out, result);
     }
     try out.append(ctx.allocator, ']');
+}
+
+fn exportResultIsInternal(result: domain.SearchResult) bool {
+    if (std.mem.eql(u8, result.result_type, "agent_memory")) {
+        return domain.isInternalMemoryEntryKeyOrContent(result.title, result.text);
+    }
+    if (std.mem.eql(u8, result.result_type, "session_message")) {
+        const sep = std.mem.lastIndexOfScalar(u8, result.title, ':') orelse return false;
+        const role = result.title[sep + 1 ..];
+        return domain.isAutosaveSessionRole(role) or !domain.sessionMessageVisibleInHistory(role);
+    }
+    return false;
+}
+
+fn appendJsonlExportRecord(ctx: *Context, out: *std.ArrayListUnmanaged(u8), result: domain.SearchResult, include_pii: bool) !void {
+    const title = if (include_pii) result.title else try redactExportText(ctx.allocator, result.title);
+    const content = if (include_pii) result.text else try redactExportText(ctx.allocator, result.text);
+    try out.appendSlice(ctx.allocator, "{\"schema_version\":\"nullpantry.memory_jsonl.v1\",\"id\":");
+    try json.appendString(out, ctx.allocator, result.id);
+    try out.appendSlice(ctx.allocator, ",\"key\":");
+    try json.appendString(out, ctx.allocator, result.id);
+    try out.appendSlice(ctx.allocator, ",\"object_type\":");
+    try json.appendString(out, ctx.allocator, result.result_type);
+    try out.appendSlice(ctx.allocator, ",\"category\":");
+    try json.appendString(out, ctx.allocator, result.result_type);
+    try out.appendSlice(ctx.allocator, ",\"title\":");
+    try json.appendString(out, ctx.allocator, title);
+    try out.appendSlice(ctx.allocator, ",\"content\":");
+    try json.appendString(out, ctx.allocator, content);
+    try out.appendSlice(ctx.allocator, ",\"scope\":");
+    try json.appendString(out, ctx.allocator, result.scope);
+    try out.appendSlice(ctx.allocator, ",\"status\":");
+    try json.appendString(out, ctx.allocator, result.status);
+    try out.print(ctx.allocator, ",\"timestamp\":{d},\"created_at_ms\":{d},\"score\":{d},\"confidence\":{d},\"actor_isolated\":{s}", .{ result.created_at_ms, result.created_at_ms, result.score, result.confidence, if (result.actor_isolated) "true" else "false" });
+    try out.appendSlice(ctx.allocator, ",\"session_id\":");
+    try json.appendNullableString(out, ctx.allocator, exportResultSessionId(result));
+    if (result.store.len > 0) {
+        try out.appendSlice(ctx.allocator, ",\"store\":");
+        try json.appendString(out, ctx.allocator, result.store);
+        try out.appendSlice(ctx.allocator, ",\"storage\":");
+        try json.appendString(out, ctx.allocator, result.store);
+    }
+    try out.appendSlice(ctx.allocator, ",\"required_scopes\":");
+    try json.appendRawJsonOr(out, ctx.allocator, result.required_scopes_json, "[]");
+    try out.appendSlice(ctx.allocator, ",\"citations\":");
+    try json.appendRawJsonOr(out, ctx.allocator, result.source_ids_json, "[]");
+    try out.appendSlice(ctx.allocator, ",\"pii_redacted\":");
+    try out.appendSlice(ctx.allocator, if (include_pii) "false" else "true");
+    try out.append(ctx.allocator, '}');
+}
+
+fn exportResultSessionId(result: domain.SearchResult) ?[]const u8 {
+    if (!std.mem.eql(u8, result.result_type, "session_message")) return null;
+    const sep = std.mem.lastIndexOfScalar(u8, result.title, ':') orelse return null;
+    if (sep == 0) return null;
+    return result.title[0..sep];
+}
+
+fn redactExportText(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (std.ascii.isWhitespace(text[i])) {
+            try out.append(allocator, text[i]);
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < text.len and !std.ascii.isWhitespace(text[i])) : (i += 1) {}
+        const token = text[start..i];
+        if (looksLikeEmailToken(token)) {
+            try out.appendSlice(allocator, "[REDACTED_EMAIL]");
+        } else if (looksLikeSecretToken(token)) {
+            try out.appendSlice(allocator, "[REDACTED_SECRET]");
+        } else {
+            try out.appendSlice(allocator, token);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn looksLikeEmailToken(token: []const u8) bool {
+    const trimmed = std.mem.trim(u8, token, ".,;:()[]{}<>\"'");
+    const at = std.mem.indexOfScalar(u8, trimmed, '@') orelse return false;
+    if (at == 0 or at + 1 >= trimmed.len) return false;
+    const local = trimmed[0..at];
+    const domain_part = trimmed[at + 1 ..];
+    if (std.mem.indexOfScalar(u8, domain_part, '.') == null) return false;
+    if (std.mem.indexOfAny(u8, local, "/\\") != null) return false;
+    if (std.mem.indexOfAny(u8, domain_part, "/\\") != null) return false;
+    return true;
+}
+
+fn looksLikeSecretToken(token: []const u8) bool {
+    const trimmed = std.mem.trim(u8, token, ".,;:()[]{}<>\"'");
+    if (trimmed.len == 0) return false;
+    if (std.ascii.startsWithIgnoreCase(trimmed, "sk-")) return true;
+    if (std.ascii.startsWithIgnoreCase(trimmed, "ghp_")) return true;
+    if (std.ascii.startsWithIgnoreCase(trimmed, "github_pat_")) return true;
+    if (std.ascii.startsWithIgnoreCase(trimmed, "xoxb-")) return true;
+    if (std.ascii.startsWithIgnoreCase(trimmed, "xoxp-")) return true;
+    if (std.ascii.startsWithIgnoreCase(trimmed, "pat_")) return true;
+    if (std.ascii.indexOfIgnoreCase(trimmed, "api_key=") != null) return true;
+    if (std.ascii.indexOfIgnoreCase(trimmed, "apikey=") != null) return true;
+    if (std.ascii.indexOfIgnoreCase(trimmed, "password=") != null) return true;
+    if (std.ascii.indexOfIgnoreCase(trimmed, "token=") != null) return true;
+    if (std.ascii.indexOfIgnoreCase(trimmed, "secret=") != null) return true;
+    if (trimmed.len < 24) return false;
+    var has_alpha = false;
+    var has_digit = false;
+    var has_secret_symbol = false;
+    for (trimmed) |ch| {
+        if (std.ascii.isAlphabetic(ch)) has_alpha = true;
+        if (std.ascii.isDigit(ch)) has_digit = true;
+        if (ch == '_' or ch == '-' or ch == '.') has_secret_symbol = true;
+    }
+    return has_alpha and has_digit and has_secret_symbol;
 }
 
 fn appendSnapshotObject(ctx: *Context, out: *std.ArrayListUnmanaged(u8), result: domain.SearchResult) !void {
@@ -11671,6 +11830,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expectEqualStrings("200 OK", engines_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"none\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"memory_lru\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"pgvector\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"qdrant\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"lancedb\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"lucid\"") != null);
@@ -11686,6 +11846,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"reconcileVectorIndex\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"putAgentMemoryByKey\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"migrateLifecycleStorage\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"exportJsonlDataset\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "created_by_actor_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"loadAgentSessionMessages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"min_relevance\"") != null);
@@ -11697,6 +11858,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_rebuild\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_reconcile\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"vector_status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"jsonl_export\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"lifecycle_migrate\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"min_relevance\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"adaptive_retrieval\"") != null);
@@ -11735,6 +11897,8 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     const vector_status = handleRequest(&ctx, "GET", "/v1/vector/status", "", "");
     try std.testing.expectEqualStrings("200 OK", vector_status.status);
     try std.testing.expect(std.mem.indexOf(u8, vector_status.body, "\"backend\":\"local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vector_status.body, "\"local_engine\":\"sqlite_local_vector\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vector_status.body, "\"search_engine\":\"sqlite_local_vector\"") != null);
 
     const atom_resp = handleRequest(&ctx, "POST", "/v1/memory-atoms", "{\"text\":\"agent memory\",\"scope\":\"public\",\"created_by\":\"agent\"}", "");
     try std.testing.expectEqualStrings("200 OK", atom_resp.status);
@@ -11896,6 +12060,56 @@ test "api lifecycle snapshot export and import are permission aware" {
     const hydrate_search = handleRequest(&writer_ctx, "POST", "/v1/search", "{\"query\":\"hydrated snapshot memory\",\"scopes\":[\"public\"]}", "");
     try std.testing.expectEqualStrings("200 OK", hydrate_search.status);
     try std.testing.expect(std.mem.indexOf(u8, hydrate_search.body, "hydrated snapshot memory") != null);
+}
+
+test "api lifecycle jsonl export is governed and redacts pii by default" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createSource(alloc, .{
+        .title = "JSONL dataset source",
+        .content = "jsonl dataset contact alice@example.com with token sk-jsonl-secret-123456",
+        .scope = "public",
+    });
+    _ = try store.createMemoryAtom(alloc, .{
+        .text = "jsonl dataset fact for export",
+        .scope = "public",
+        .created_by = "human",
+        .status = "verified",
+    });
+    _ = try store.agentMemoryStore(alloc, .{
+        .key = "__bootstrap.prompt.AGENTS.md",
+        .content = "jsonl dataset internal bootstrap leak alice@example.com",
+        .category = "bootstrap",
+        .actor_id = "agent:jsonl",
+        .scope = "public",
+    });
+
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_id = "agent:jsonl",
+        .actor_scopes_json = "[\"public\"]",
+        .actor_capabilities_json = "[\"read\",\"export\"]",
+    };
+    const redacted = handleRequest(&ctx, "POST", "/v1/lifecycle/export-jsonl", "{\"query\":\"jsonl dataset\",\"scopes\":[\"public\"],\"limit\":20,\"use_vector\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", redacted.status);
+    try std.testing.expect(std.mem.indexOf(u8, redacted.body, "\"schema_version\":\"nullpantry.memory_jsonl.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted.body, "[REDACTED_EMAIL]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted.body, "[REDACTED_SECRET]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted.body, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted.body, "sk-jsonl-secret-123456") == null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted.body, "internal bootstrap leak") == null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted.body, "\"pii_redacted\":true") != null);
+
+    const raw = handleRequest(&ctx, "POST", "/v1/lifecycle/export-jsonl", "{\"query\":\"jsonl dataset\",\"scopes\":[\"public\"],\"limit\":20,\"use_vector\":false,\"include_pii\":true}", "");
+    try std.testing.expectEqualStrings("200 OK", raw.status);
+    try std.testing.expect(std.mem.indexOf(u8, raw.body, "alice@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw.body, "sk-jsonl-secret-123456") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw.body, "\"pii_redacted\":false") != null);
 }
 
 test "api lifecycle snapshot hydrate preserves typed primitives" {

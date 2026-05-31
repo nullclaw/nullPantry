@@ -8,6 +8,7 @@ pub const EngineKind = enum {
     memory_lru,
     lucid,
     postgres,
+    pgvector,
     redis,
     api,
     clickhouse,
@@ -24,6 +25,7 @@ pub const EngineKind = enum {
             .memory_lru => "memory_lru",
             .lucid => "lucid",
             .postgres => "postgres",
+            .pgvector => "pgvector",
             .redis => "redis",
             .api => "api",
             .clickhouse => "clickhouse",
@@ -53,7 +55,8 @@ pub const descriptors = [_]EngineDescriptor{
     .{ .kind = .qmd, .role = "QMD-compatible markdown/session result ingestion and export", .durability = "canonicalized", .planes_json = "[\"connector\",\"retrieval_source\",\"import_export\"]", .primary_for = "qmd_search_results,agent_session_exports,markdown_corpus", .nullpantry_strategy = "normalize qmd JSON results into canonical Sources and export permission-checked agent sessions into a QMD markdown corpus with provenance, ACL, extraction, vectors, feed, and lifecycle instead of serving them as an ungoverned sidecar", .nullclaw_boundary = "NullClaw QMD retrieval and session export move to NullPantry connectors so agents query governed central knowledge", .runtime_supported = true, .remote_primary_supported = false },
     .{ .kind = .memory_lru, .role = "ephemeral process memory", .durability = "ephemeral", .planes_json = "[\"agent_memory\",\"session\",\"usage\",\"cache\",\"test\"]", .primary_for = "agent_memory,session,usage,cache,test", .nullpantry_strategy = "in-process runtime plane for tests, single-process agents, and named scratch stores; not durable shared memory", .nullclaw_boundary = "NullClaw baseline in-process engine; NullPantry can expose it centrally for parity and scratch stores", .runtime_supported = true, .remote_primary_supported = false },
     .{ .kind = .lucid, .role = "local semantic memory projection", .durability = "durable", .planes_json = "[\"projection\",\"semantic_context\"]", .primary_for = "projection", .nullpantry_strategy = "optional Lucid CLI projection adapter backed by durable projection jobs, lifecycle retractions, status, and rebuild; NullPantry remains source of truth and ACL gate", .nullclaw_boundary = "advanced semantic memory projection belongs in NullPantry, not NullClaw core", .runtime_supported = true, .remote_primary_supported = false },
-    .{ .kind = .postgres, .role = "durable relational memory target", .durability = "durable", .planes_json = "[\"record\",\"agent_memory\",\"session\",\"vector\",\"cache\",\"lifecycle\",\"feed\"]", .primary_for = "record,agent_memory,session,vector,cache,lifecycle,feed", .nullpantry_strategy = "native libpq runtime adapter with pgvector schema", .nullclaw_boundary = "shared durable memory belongs in NullPantry service", .runtime_supported = true, .remote_primary_supported = true },
+    .{ .kind = .postgres, .role = "durable relational memory target", .durability = "durable", .planes_json = "[\"record\",\"agent_memory\",\"session\",\"cache\",\"lifecycle\",\"feed\"]", .primary_for = "record,agent_memory,session,cache,lifecycle,feed", .nullpantry_strategy = "native libpq runtime adapter for canonical primitives, lifecycle, cache, feed, jobs, sessions, and agent memory", .nullclaw_boundary = "shared durable memory belongs in NullPantry service", .runtime_supported = true, .remote_primary_supported = true },
+    .{ .kind = .pgvector, .role = "Postgres-coupled vector index", .durability = "durable", .planes_json = "[\"vector\",\"record_coupled\"]", .primary_for = "vector", .nullpantry_strategy = "pgvector-backed vector chunks inside the Postgres system-of-record backend with dynamic dimensions, ACL hydration, reconcile, rebuild, and retrieval fallback through NullPantry", .nullclaw_boundary = "pgvector/vector database complexity belongs in NullPantry service, not NullClaw core", .runtime_supported = true, .remote_primary_supported = true },
     .{ .kind = .redis, .role = "low-latency shared agent memory", .durability = "configurable", .planes_json = "[\"agent_memory\",\"session\",\"usage\"]", .primary_for = "agent_memory,session,usage", .nullpantry_strategy = "native RESP runtime backend for shared/isolated agent memory and sessions", .nullclaw_boundary = "shared remote agent memory belongs in NullPantry service", .runtime_supported = true, .remote_primary_supported = true },
     .{ .kind = .api, .role = "remote NullPantry-compatible agent memory API", .durability = "remote", .planes_json = "[\"agent_memory\",\"session\",\"usage\",\"feed\"]", .primary_for = "agent_memory,session,usage,feed", .nullpantry_strategy = "HTTP runtime backend that proxies agent memory, sessions, usage, and deterministic feed peer operations to another NullPantry-compatible /v1 API with actor/scope/capability forwarding", .nullclaw_boundary = "remote agent memory belongs behind NullPantry API rather than NullClaw core", .runtime_supported = true, .remote_primary_supported = true },
     .{ .kind = .clickhouse, .role = "analytics and high-volume history", .durability = "durable", .planes_json = "[\"analytics\",\"audit_export\",\"event_history\"]", .primary_for = "analytics,audit_export", .nullpantry_strategy = "native ClickHouse HTTP runtime adapter for audit/feed event export", .nullclaw_boundary = "analytics/history belongs in NullPantry service", .runtime_supported = true, .remote_primary_supported = true },
@@ -100,6 +103,7 @@ test "engine registry includes storage and adapter contracts" {
     try std.testing.expect(parse("memory_lru") == .memory_lru);
     try std.testing.expect(parse("lucid") == .lucid);
     try std.testing.expect(parse("postgres") == .postgres);
+    try std.testing.expect(parse("pgvector") == .pgvector);
     try std.testing.expect(parse("redis") == .redis);
     try std.testing.expect(parse("api") == .api);
     try std.testing.expect(parse("clickhouse") == .clickhouse);
@@ -127,9 +131,20 @@ test "api is a remote NullPantry-compatible agent memory plane" {
     try std.testing.expect(std.mem.indexOf(u8, descriptor.nullpantry_strategy, "/v1 API") != null);
 }
 
-test "advanced external planes are advertised only after runtime wiring" {
+test "advanced runtime planes are advertised only after runtime wiring" {
     try std.testing.expect(descriptors[@intFromEnum(EngineKind.lucid)].runtime_supported);
     try std.testing.expect(descriptors[@intFromEnum(EngineKind.clickhouse)].runtime_supported);
+    try std.testing.expect(descriptors[@intFromEnum(EngineKind.pgvector)].runtime_supported);
     try std.testing.expect(descriptors[@intFromEnum(EngineKind.qdrant)].runtime_supported);
     try std.testing.expect(descriptors[@intFromEnum(EngineKind.lancedb)].runtime_supported);
+}
+
+test "pgvector is advertised as its own Postgres-coupled vector plane" {
+    const descriptor = descriptors[@intFromEnum(EngineKind.pgvector)];
+    try std.testing.expect(descriptor.runtime_supported);
+    try std.testing.expect(descriptor.remote_primary_supported);
+    try std.testing.expect(std.mem.indexOf(u8, descriptor.planes_json, "vector") != null);
+    try std.testing.expect(std.mem.indexOf(u8, descriptor.planes_json, "record_coupled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, descriptor.nullpantry_strategy, "ACL hydration") != null);
+    try std.testing.expect(std.mem.indexOf(u8, descriptor.nullclaw_boundary, "NullPantry service") != null);
 }
