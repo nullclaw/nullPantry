@@ -10097,6 +10097,73 @@ test "api memory checkpoint restore replays autosave cleanup" {
     try std.testing.expect(std.mem.indexOf(u8, messages.body, "draft should be cleaned") == null);
 }
 
+test "api memory checkpoint restore preserves subset routed session state" {
+    var source_store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "archive", .config = .{ .backend = .memory_lru } },
+        },
+    });
+    defer source_store.deinit();
+    var target_store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "archive", .config = .{ .backend = .memory_lru } },
+        },
+    });
+    defer target_store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var source_actor = Context{ .allocator = alloc, .store = &source_store, .actor_id = "agent:subset", .actor_scopes_json = "[\"session:route\",\"write:session:route\"]" };
+    var source_admin = Context{ .allocator = alloc, .store = &source_store };
+
+    const keep = handleRequest(&source_actor, "POST", "/v1/agent-sessions/route/messages", "{\"role\":\"user\",\"content\":\"Subset routed kept message\",\"created_at_ms\":501,\"stores\":[\"scratch\",\"archive\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", keep.status);
+    const draft = handleRequest(&source_actor, "POST", "/v1/agent-sessions/route/messages", "{\"role\":\"autosave_user\",\"content\":\"Subset routed draft cleaned\",\"created_at_ms\":502,\"stores\":[\"scratch\",\"archive\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", draft.status);
+    const usage = handleRequest(&source_actor, "PUT", "/v1/agent-sessions/route/usage", "{\"total_tokens\":61,\"stores\":[\"scratch\",\"archive\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", usage.status);
+    const cleanup = handleRequest(&source_actor, "DELETE", "/v1/agent-sessions/auto-saved?session_id=route&stores=scratch,archive", "", "");
+    try std.testing.expectEqualStrings("200 OK", cleanup.status);
+
+    const checkpoint = handleRequest(&source_admin, "GET", "/v1/memory/checkpoint?limit=100", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"stores\":[\"scratch\",\"archive\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"operation\":\"delete_autosaved\"") != null);
+
+    var target_admin = Context{ .allocator = alloc, .store = &target_store };
+    const restore = handleRequest(&target_admin, "POST", "/v1/memory/checkpoint", checkpoint.body, "");
+    try std.testing.expectEqualStrings("200 OK", restore.status);
+
+    var target_actor = Context{ .allocator = alloc, .store = &target_store, .actor_id = "agent:subset", .actor_scopes_json = "[\"session:route\",\"write:session:route\"]" };
+    const scratch_messages = handleRequest(&target_actor, "GET", "/v1/agent-sessions/route/messages?store=scratch", "", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_messages.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_messages.body, "Subset routed kept message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_messages.body, "Subset routed draft cleaned") == null);
+    const archive_messages = handleRequest(&target_actor, "GET", "/v1/agent-sessions/route/messages?store=archive", "", "");
+    try std.testing.expectEqualStrings("200 OK", archive_messages.status);
+    try std.testing.expect(std.mem.indexOf(u8, archive_messages.body, "Subset routed kept message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, archive_messages.body, "Subset routed draft cleaned") == null);
+    const native_messages = handleRequest(&target_actor, "GET", "/v1/agent-sessions/route/messages?storage=native", "", "");
+    try std.testing.expectEqualStrings("200 OK", native_messages.status);
+    try std.testing.expect(std.mem.indexOf(u8, native_messages.body, "Subset routed kept message") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native_messages.body, "Subset routed draft cleaned") == null);
+    const subset_messages = handleRequest(&target_actor, "GET", "/v1/agent-sessions/route/messages?stores=scratch,archive", "", "");
+    try std.testing.expectEqualStrings("200 OK", subset_messages.status);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, subset_messages.body, "Subset routed kept message"));
+
+    const scratch_usage = handleRequest(&target_actor, "GET", "/v1/agent-sessions/route/usage?store=scratch", "", "");
+    try std.testing.expectEqualStrings("200 OK", scratch_usage.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_usage.body, "\"total_tokens\":61") != null);
+    const archive_usage = handleRequest(&target_actor, "GET", "/v1/agent-sessions/route/usage?store=archive", "", "");
+    try std.testing.expectEqualStrings("200 OK", archive_usage.status);
+    try std.testing.expect(std.mem.indexOf(u8, archive_usage.body, "\"total_tokens\":61") != null);
+    const native_usage = handleRequest(&target_actor, "GET", "/v1/agent-sessions/route/usage?storage=native", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", native_usage.status);
+}
+
 test "api memory feed excludes internal runtime command session payloads" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
