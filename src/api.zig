@@ -6040,21 +6040,26 @@ fn buildAskPrompt(ctx: *Context, query: []const u8, results: []domain.SearchResu
 fn maybeLlmRerankResults(ctx: *Context, query: []const u8, results: []domain.SearchResult, enabled: bool) ![]domain.SearchResult {
     if (!enabled or results.len <= 1 or ctx.llm_base_url == null or ctx.llm_model == null) return results;
     const prompt = try buildRerankPrompt(ctx.allocator, query, results);
-    const completion = providers.completeAnswer(ctx.allocator, .{
-        .base_url = ctx.llm_base_url,
-        .api_key = ctx.llm_api_key,
-        .model = ctx.llm_model,
-        .timeout_secs = ctx.provider_timeout_secs,
-        .allow_insecure_http = ctx.llm_allow_insecure_http,
-        .runtime = ctx.provider_runtime,
-    }, prompt) catch return results;
+    const completion = providers.completeWithSystem(
+        ctx.allocator,
+        .{
+            .base_url = ctx.llm_base_url,
+            .api_key = ctx.llm_api_key,
+            .model = ctx.llm_model,
+            .timeout_secs = ctx.provider_timeout_secs,
+            .allow_insecure_http = ctx.llm_allow_insecure_http,
+            .runtime = ctx.provider_runtime,
+        },
+        "You are a retrieval reranker. Return only valid JSON using one of these schemas: [\"candidate_id\"] or {\"ranked_ids\":[\"candidate_id\"]}. Do not include explanations.",
+        prompt,
+    ) catch return results;
     return parseRerankOrder(ctx.allocator, completion.content, results) catch results;
 }
 
 fn buildRerankPrompt(allocator: std.mem.Allocator, query: []const u8, results: []domain.SearchResult) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "Rerank these retrieval candidates for the query. Return only a JSON array of candidate ids, best first.\nQuery: ");
+    try out.appendSlice(allocator, "Rerank these retrieval candidates for the query. Return candidate ids best first as strict JSON.\nQuery: ");
     try out.appendSlice(allocator, query);
     try out.appendSlice(allocator, "\nCandidates:\n");
     const max_candidates = @min(results.len, @as(usize, 24));
@@ -6081,18 +6086,16 @@ fn parseRerankOrder(allocator: std.mem.Allocator, llm_output: []const u8, result
     var out: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
     errdefer out.deinit(allocator);
 
-    if (std.json.parseFromSlice(std.json.Value, allocator, llm_output, .{})) |parsed| {
+    var extracted_from_json = false;
+    const parsed_json = std.json.parseFromSlice(std.json.Value, allocator, llm_output, .{}) catch null;
+    if (parsed_json) |parsed| {
         defer parsed.deinit();
-        if (parsed.value == .array) {
-            for (parsed.value.array.items) |item| {
-                const id_text = switch (item) {
-                    .string => |s| s,
-                    else => continue,
-                };
-                try appendRerankedResult(allocator, &out, results, selected, id_text);
-            }
-        }
-    } else |_| {
+        const before = out.items.len;
+        try appendRerankOrderFromJsonValue(allocator, &out, results, selected, parsed.value);
+        extracted_from_json = out.items.len > before;
+    }
+
+    if (!extracted_from_json) {
         var it = std.mem.tokenizeAny(u8, llm_output, " \t\r\n,;[]{}()\"'");
         while (it.next()) |token| {
             try appendRerankedResult(allocator, &out, results, selected, token);
@@ -6105,6 +6108,61 @@ fn parseRerankOrder(allocator: std.mem.Allocator, llm_output: []const u8, result
     }
     allocator.free(selected);
     return out.toOwnedSlice(allocator);
+}
+
+fn appendRerankOrderFromJsonValue(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(domain.SearchResult),
+    results: []const domain.SearchResult,
+    selected: []bool,
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .array => |array| {
+            for (array.items) |item| {
+                try appendRerankOrderFromJsonValue(allocator, out, results, selected, item);
+            }
+        },
+        .object => |object| {
+            if (rerankIdFromObject(object)) |id_text| {
+                try appendRerankedResult(allocator, out, results, selected, id_text);
+            }
+            const array_fields = [_][]const u8{
+                "ids",
+                "ranked_ids",
+                "reranked_ids",
+                "candidate_ids",
+                "result_ids",
+                "order",
+                "ranking",
+                "results",
+                "candidates",
+            };
+            for (&array_fields) |field| {
+                if (object.get(field)) |nested| {
+                    try appendRerankOrderFromJsonValue(allocator, out, results, selected, nested);
+                }
+            }
+        },
+        .string => |id_text| try appendRerankedResult(allocator, out, results, selected, id_text),
+        else => {},
+    }
+}
+
+fn rerankIdFromObject(object: std.json.ObjectMap) ?[]const u8 {
+    const id_fields = [_][]const u8{
+        "id",
+        "candidate_id",
+        "result_id",
+        "document_id",
+        "memory_id",
+    };
+    for (&id_fields) |field| {
+        if (object.get(field)) |value| {
+            if (value == .string and value.string.len > 0) return value.string;
+        }
+    }
+    return null;
 }
 
 fn appendRerankedResult(
@@ -11059,6 +11117,27 @@ test "api rerank parser reorders by returned ids and keeps omitted results" {
     try std.testing.expectEqualStrings("mem_b", reranked[0].id);
     try std.testing.expectEqualStrings("mem_a", reranked[1].id);
     try std.testing.expectEqualStrings("mem_c", reranked[2].id);
+}
+
+test "api rerank parser accepts structured object responses" {
+    const alloc = std.testing.allocator;
+    const results = [_]domain.SearchResult{
+        .{ .id = "mem_a", .result_type = "memory_atom", .title = "A", .text = "alpha", .scope = "public", .status = "verified", .score = 0.4, .source_ids_json = "[]", .created_at_ms = 1, .confidence = 0.5 },
+        .{ .id = "mem_b", .result_type = "memory_atom", .title = "B", .text = "beta", .scope = "public", .status = "verified", .score = 0.9, .source_ids_json = "[]", .created_at_ms = 2, .confidence = 0.5 },
+        .{ .id = "mem_c", .result_type = "memory_atom", .title = "C", .text = "gamma", .scope = "public", .status = "verified", .score = 0.1, .source_ids_json = "[]", .created_at_ms = 3, .confidence = 0.5 },
+    };
+
+    const ranked_ids = try parseRerankOrder(alloc, "{\"ranked_ids\":[\"mem_c\",\"mem_b\"]}", results[0..]);
+    defer alloc.free(ranked_ids);
+    try std.testing.expectEqualStrings("mem_c", ranked_ids[0].id);
+    try std.testing.expectEqualStrings("mem_b", ranked_ids[1].id);
+    try std.testing.expectEqualStrings("mem_a", ranked_ids[2].id);
+
+    const object_items = try parseRerankOrder(alloc, "{\"ranking\":[{\"id\":\"mem_b\"},{\"candidate_id\":\"mem_a\"}]}", results[0..]);
+    defer alloc.free(object_items);
+    try std.testing.expectEqualStrings("mem_b", object_items[0].id);
+    try std.testing.expectEqualStrings("mem_a", object_items[1].id);
+    try std.testing.expectEqualStrings("mem_c", object_items[2].id);
 }
 
 test "api markdown import creates source artifact and extracted memory" {
