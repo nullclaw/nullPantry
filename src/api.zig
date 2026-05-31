@@ -1159,7 +1159,7 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/conflicts", .get = "listConflicts" },
         .{ .path = "/conflicts/scan", .post = "scanConflicts" },
         .{ .path = "/lifecycle/diagnostics", .get = "diagnostics" },
-        .{ .path = "/lifecycle/migrate", .post = "migrateAgentMemory" },
+        .{ .path = "/lifecycle/migrate", .post = "migrateLifecycleStorage" },
         .{ .path = "/lifecycle/snapshot", .post = "createSnapshot" },
         .{ .path = "/lifecycle/snapshot/export", .post = "exportSnapshot" },
         .{ .path = "/lifecycle/snapshot/import", .post = "importSnapshot" },
@@ -3727,10 +3727,6 @@ fn lifecycleMigrate(ctx: *Context, body: []const u8) HttpResponse {
     const obj = parsed.value.object;
 
     const kind = json.stringField(obj, "object_type") orelse json.stringField(obj, "kind") orelse "agent_memory";
-    if (!std.mem.eql(u8, kind, "agent_memory")) {
-        return json.errorResponse(ctx.allocator, 400, "unsupported_migration_kind", "Only agent_memory migration is currently supported");
-    }
-
     const source_route = (agentMemoryStorageTargetFromAliasedObject(ctx.allocator, obj, &.{
         "from",
         "source",
@@ -3756,6 +3752,13 @@ fn lifecycleMigrate(ctx: *Context, body: []const u8) HttpResponse {
     const dry_run = json.boolField(obj, "dry_run") orelse !execute;
     const delete_source = json.boolField(obj, "delete_source") orelse false;
     if (delete_source and !hasCapability(ctx, "delete")) return forbidden(ctx);
+
+    if (isAgentSessionMigrationKind(kind)) {
+        return lifecycleMigrateAgentSessions(ctx, obj, kind, source_route, target_route, dry_run, delete_source);
+    }
+    if (!isAgentMemoryMigrationKind(kind)) {
+        return json.errorResponse(ctx.allocator, 400, "unsupported_migration_kind", "Supported migration kinds are agent_memory and agent_sessions");
+    }
 
     const session_id = json.nullableStringField(obj, "session_id");
     if (session_id) |sid| {
@@ -3952,6 +3955,297 @@ fn appendAgentMemoryStorageRouteJson(allocator: std.mem.Allocator, out: *std.Arr
         try out.append(allocator, ']');
     }
     try out.append(allocator, '}');
+}
+
+fn isAgentMemoryMigrationKind(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "agent_memory") or std.mem.eql(u8, kind, "agent_memories") or std.mem.eql(u8, kind, "memory");
+}
+
+fn isAgentSessionMigrationKind(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "agent_session") or std.mem.eql(u8, kind, "agent_sessions") or std.mem.eql(u8, kind, "session") or std.mem.eql(u8, kind, "sessions");
+}
+
+fn positiveBoundedInt(value: ?i64, default_value: usize, max_value: usize) usize {
+    const raw = value orelse return default_value;
+    if (raw <= 0) return default_value;
+    return @intCast(@min(raw, @as(i64, @intCast(max_value))));
+}
+
+const AgentSessionMigrationEntry = struct {
+    session_id: []const u8,
+    source_message_count: u64,
+    target_message_count: u64,
+    source_usage_tokens: ?u64,
+    target_usage_exists: bool,
+    action: []const u8,
+    messages_copied: usize = 0,
+    usage_copied: bool = false,
+};
+
+const AgentSessionMigrationResponseInput = struct {
+    kind: []const u8,
+    dry_run: bool,
+    delete_source: bool,
+    append: bool,
+    overwrite: bool,
+    actor_id: []const u8,
+    source_route: store_mod.AgentMemoryStorageRoute,
+    target_route: store_mod.AgentMemoryStorageRoute,
+    matched: usize,
+    skipped: usize,
+    limit: usize,
+    offset: usize,
+    message_limit: usize,
+    entries: []const AgentSessionMigrationEntry,
+};
+
+fn lifecycleMigrateAgentSessions(
+    ctx: *Context,
+    obj: std.json.ObjectMap,
+    kind: []const u8,
+    source_route: store_mod.AgentMemoryStorageRoute,
+    target_route: store_mod.AgentMemoryStorageRoute,
+    dry_run: bool,
+    delete_source: bool,
+) HttpResponse {
+    const migration_actor_id = json.stringField(obj, "actor_id") orelse ctx.actor_id;
+    if (!domain.hasActorScope(ctx.actor_scopes_json, "admin") and !std.mem.eql(u8, migration_actor_id, ctx.actor_id)) return forbidden(ctx);
+
+    const append = json.boolField(obj, "append") orelse false;
+    const overwrite = json.boolField(obj, "overwrite") orelse false;
+    if (append and overwrite) return json.errorResponse(ctx.allocator, 400, "bad_request", "append and overwrite cannot both be true");
+
+    const limit = positiveLimit(json.intField(obj, "limit"), 100);
+    const offset = positiveLimit(json.intField(obj, "offset"), 0);
+    const message_limit = positiveBoundedInt(json.intField(obj, "message_limit"), 10000, 100000);
+
+    var requested: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (json.stringField(obj, "session_id")) |sid| {
+        tryAppendUniqueSessionId(ctx.allocator, &requested, sid) catch return serverError(ctx);
+    }
+    if (obj.get("session_ids")) |value| {
+        if (value != .array) return json.errorResponse(ctx.allocator, 400, "bad_request", "session_ids must be an array");
+        for (value.array.items) |item| {
+            if (item != .string) return json.errorResponse(ctx.allocator, 400, "bad_request", "session_ids must contain strings");
+            tryAppendUniqueSessionId(ctx.allocator, &requested, item.string) catch return serverError(ctx);
+        }
+    }
+
+    var candidates: std.ArrayListUnmanaged(store_mod.SessionInfo) = .empty;
+    var matched: usize = 0;
+    if (requested.items.len > 0) {
+        matched = requested.items.len;
+        const start = @min(offset, requested.items.len);
+        const end = @min(start + limit, requested.items.len);
+        for (requested.items[start..end]) |sid| {
+            if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
+            const history = ctx.store.historyRouted(ctx.allocator, sid, 1, 0, migration_actor_id, source_route) catch |err| switch (err) {
+                error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                else => return serverError(ctx),
+            };
+            const usage = ctx.store.loadUsageRouted(sid, migration_actor_id, source_route) catch |err| switch (err) {
+                error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                else => return serverError(ctx),
+            };
+            if (history.total == 0 and usage == null) continue;
+            const first = if (history.messages.len > 0) history.messages[0].created_at_ms else 0;
+            candidates.append(ctx.allocator, .{
+                .session_id = sid,
+                .message_count = history.total,
+                .first_message_at = first,
+                .last_message_at = first,
+            }) catch return serverError(ctx);
+        }
+    } else {
+        if (!allAgentSessionsReadAllowed(ctx)) return forbidden(ctx);
+        const listed = ctx.store.listSessionsRouted(ctx.allocator, limit, offset, migration_actor_id, source_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        matched = @intCast(listed.total);
+        candidates.appendSlice(ctx.allocator, listed.sessions) catch return serverError(ctx);
+    }
+
+    var entries: std.ArrayListUnmanaged(AgentSessionMigrationEntry) = .empty;
+    var skipped: usize = if (requested.items.len > 0) @min(offset, requested.items.len) else offset;
+    const message_limit_u64: u64 = @intCast(message_limit);
+
+    for (candidates.items) |candidate| {
+        const sid = candidate.session_id;
+        if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
+        if (!dry_run and !agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+        if (delete_source and !agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+
+        const source_history = ctx.store.historyRouted(ctx.allocator, sid, message_limit, 0, migration_actor_id, source_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        if (source_history.total > message_limit_u64) {
+            return json.errorResponse(ctx.allocator, 400, "message_limit_exceeded", "Session has more messages than message_limit; raise message_limit before migrating");
+        }
+        const source_usage = ctx.store.loadUsageRouted(sid, migration_actor_id, source_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        if (source_history.total == 0 and source_usage == null) {
+            skipped += 1;
+            continue;
+        }
+
+        const target_history = ctx.store.historyRouted(ctx.allocator, sid, 1, 0, migration_actor_id, target_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        const target_usage = ctx.store.loadUsageRouted(sid, migration_actor_id, target_route) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        if (!append and !overwrite and (target_history.total > 0 or target_usage != null)) {
+            return json.errorResponse(ctx.allocator, 409, "target_session_exists", "Target session already contains messages or usage; use overwrite or append");
+        }
+
+        entries.append(ctx.allocator, .{
+            .session_id = sid,
+            .source_message_count = source_history.total,
+            .target_message_count = target_history.total,
+            .source_usage_tokens = source_usage,
+            .target_usage_exists = target_usage != null,
+            .action = if (dry_run) "dry_run" else if (overwrite) "overwrite" else if (append) "append" else "copy",
+        }) catch return serverError(ctx);
+    }
+
+    if (!dry_run) {
+        for (entries.items) |*entry| {
+            if (overwrite) {
+                ctx.store.clearMessagesRouted(entry.session_id, migration_actor_id, target_route) catch |err| switch (err) {
+                    error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                    else => return serverError(ctx),
+                };
+                _ = ctx.store.deleteUsageRouted(entry.session_id, migration_actor_id, target_route) catch |err| switch (err) {
+                    error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                    else => return serverError(ctx),
+                };
+            }
+
+            const source_history = ctx.store.historyRouted(ctx.allocator, entry.session_id, message_limit, 0, migration_actor_id, source_route) catch |err| switch (err) {
+                error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                else => return serverError(ctx),
+            };
+            if (source_history.total > message_limit_u64) {
+                return json.errorResponse(ctx.allocator, 400, "message_limit_exceeded", "Session has more messages than message_limit; raise message_limit before migrating");
+            }
+            for (source_history.messages) |message| {
+                ctx.store.saveMessageRoutedAt(entry.session_id, message.role, message.content, message.created_at_ms, migration_actor_id, target_route) catch |err| switch (err) {
+                    error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                    else => return serverError(ctx),
+                };
+                entry.messages_copied += 1;
+            }
+            if (entry.source_usage_tokens) |total| {
+                ctx.store.saveUsageRouted(entry.session_id, total, migration_actor_id, target_route) catch |err| switch (err) {
+                    error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                    else => return serverError(ctx),
+                };
+                entry.usage_copied = true;
+            }
+            if (delete_source) {
+                ctx.store.clearMessagesRouted(entry.session_id, migration_actor_id, source_route) catch |err| switch (err) {
+                    error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                    else => return serverError(ctx),
+                };
+                _ = ctx.store.deleteUsageRouted(entry.session_id, migration_actor_id, source_route) catch |err| switch (err) {
+                    error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                    else => return serverError(ctx),
+                };
+            }
+        }
+    }
+
+    return lifecycleSessionMigrationResponse(ctx, .{
+        .kind = kind,
+        .dry_run = dry_run,
+        .delete_source = delete_source,
+        .append = append,
+        .overwrite = overwrite,
+        .actor_id = migration_actor_id,
+        .source_route = source_route,
+        .target_route = target_route,
+        .matched = matched,
+        .skipped = skipped,
+        .limit = limit,
+        .offset = offset,
+        .message_limit = message_limit,
+        .entries = entries.items,
+    });
+}
+
+fn tryAppendUniqueSessionId(allocator: std.mem.Allocator, ids_list: *std.ArrayListUnmanaged([]const u8), session_id: []const u8) !void {
+    for (ids_list.items) |existing| {
+        if (std.mem.eql(u8, existing, session_id)) return;
+    }
+    try ids_list.append(allocator, session_id);
+}
+
+fn lifecycleSessionMigrationResponse(ctx: *Context, input: AgentSessionMigrationResponseInput) HttpResponse {
+    var migrated: usize = 0;
+    var messages_copied: usize = 0;
+    var usage_copied: usize = 0;
+    for (input.entries) |entry| {
+        if (!input.dry_run) migrated += 1;
+        messages_copied += entry.messages_copied;
+        if (entry.usage_copied) usage_copied += 1;
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"ok\":true,\"migration\":{\"kind\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, input.kind) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"dry_run\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (input.dry_run) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"delete_source\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (input.delete_source) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"append\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (input.append) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"overwrite\":") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, if (input.overwrite) "true" else "false") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"actor_id\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, input.actor_id) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"source_route\":") catch return serverError(ctx);
+    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.source_route) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"target_route\":") catch return serverError(ctx);
+    appendAgentMemoryStorageRouteJson(ctx.allocator, &out, input.target_route) catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"matched\":{d},\"selected\":{d},\"migrated\":{d},\"messages_copied\":{d},\"usage_copied\":{d},\"skipped\":{d},\"limit\":{d},\"offset\":{d},\"message_limit\":{d},\"entries\":[", .{
+        input.matched,
+        input.entries.len,
+        migrated,
+        messages_copied,
+        usage_copied,
+        input.skipped,
+        input.limit,
+        input.offset,
+        input.message_limit,
+    }) catch return serverError(ctx);
+    for (input.entries, 0..) |entry, i| {
+        if (i > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
+        appendAgentSessionMigrationEntryJson(ctx.allocator, &out, entry) catch return serverError(ctx);
+    }
+    out.appendSlice(ctx.allocator, "]}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn appendAgentSessionMigrationEntryJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: AgentSessionMigrationEntry) !void {
+    try out.appendSlice(allocator, "{\"session_id\":");
+    try json.appendString(out, allocator, entry.session_id);
+    try out.print(allocator, ",\"source_message_count\":{d},\"target_message_count\":{d},\"source_usage_tokens\":", .{ entry.source_message_count, entry.target_message_count });
+    if (entry.source_usage_tokens) |total| {
+        try out.print(allocator, "{d}", .{total});
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+    try out.appendSlice(allocator, ",\"target_usage_exists\":");
+    try out.appendSlice(allocator, if (entry.target_usage_exists) "true" else "false");
+    try out.appendSlice(allocator, ",\"action\":");
+    try json.appendString(out, allocator, entry.action);
+    try out.print(allocator, ",\"messages_copied\":{d},\"usage_copied\":{s}}}", .{ entry.messages_copied, if (entry.usage_copied) "true" else "false" });
 }
 
 fn appendRuntimeDiagnostics(ctx: *Context, out: *std.ArrayListUnmanaged(u8), schema_version: i64, schema_ok: bool, store_diag: store_mod.LifecycleDiagnostics) !void {
@@ -5810,8 +6104,9 @@ fn saveMessage(ctx: *Context, session_id: []const u8, body: []const u8, query: [
     const obj = parsed.value.object;
     const role = json.stringField(obj, "role") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing role");
     const content = json.stringField(obj, "content") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing content");
+    const created_at_ms = json.intField(obj, "created_at_ms") orelse ids.nowMs();
     const storage_target = agentMemoryStorageTargetFromObjectOrQuery(ctx.allocator, obj, query) catch return serverError(ctx);
-    ctx.store.saveMessageRouted(session_id, role, content, ctx.actor_id, storage_target) catch |err| switch (err) {
+    ctx.store.saveMessageRoutedAt(session_id, role, content, created_at_ms, ctx.actor_id, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
@@ -7657,6 +7952,66 @@ test "api lifecycle migrate moves agent memory between storage planes" {
     try std.testing.expectEqualStrings("404 Not Found", scratch_after.status);
 }
 
+test "api lifecycle migrate moves agent session state between storage planes" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory = .{ .backend = .memory_lru },
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "archive", .config = .{ .backend = .memory_lru } },
+        },
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const principals =
+        \\{"agent-route":{"actor_id":"agent:route","scopes":["session:migrate-session","write:session:migrate-session"],"capabilities":["read","write","delete"]}}
+    ;
+    var ctx = Context{ .allocator = alloc, .store = &store, .token_principals_json = principals };
+
+    const source_message = handleRequest(&ctx, "POST", "/v1/agent-sessions/migrate-session/messages", "{\"role\":\"assistant\",\"content\":\"Migrate scratch session message\",\"created_at_ms\":12345,\"store\":\"scratch\"}", "POST /v1/agent-sessions/migrate-session/messages HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", source_message.status);
+    const source_usage = handleRequest(&ctx, "PUT", "/v1/agent-sessions/migrate-session/usage", "{\"total_tokens\":321,\"store\":\"scratch\"}", "PUT /v1/agent-sessions/migrate-session/usage HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", source_usage.status);
+
+    const dry_run = handleRequest(&ctx, "POST", "/v1/lifecycle/migrate", "{\"kind\":\"agent_sessions\",\"from\":\"scratch\",\"to\":\"archive\",\"session_id\":\"migrate-session\",\"dry_run\":true}", "POST /v1/lifecycle/migrate HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", dry_run.status);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"kind\":\"agent_sessions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"selected\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"migrated\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"source_message_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry_run.body, "\"source_usage_tokens\":321") != null);
+
+    const target_message = handleRequest(&ctx, "POST", "/v1/agent-sessions/migrate-session/messages", "{\"role\":\"assistant\",\"content\":\"Existing archive session message\",\"store\":\"archive\"}", "POST /v1/agent-sessions/migrate-session/messages HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", target_message.status);
+    const conflict = handleRequest(&ctx, "POST", "/v1/lifecycle/migrate", "{\"kind\":\"agent_sessions\",\"from\":\"scratch\",\"to\":\"archive\",\"session_id\":\"migrate-session\",\"execute\":true}", "POST /v1/lifecycle/migrate HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("409 Conflict", conflict.status);
+    try std.testing.expect(std.mem.indexOf(u8, conflict.body, "target_session_exists") != null);
+
+    const clear_target = handleRequest(&ctx, "DELETE", "/v1/agent-sessions/migrate-session/messages?store=archive", "", "DELETE /v1/agent-sessions/migrate-session/messages?store=archive HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", clear_target.status);
+    const execute = handleRequest(&ctx, "POST", "/v1/lifecycle/migrate", "{\"kind\":\"agent_sessions\",\"from_store\":\"scratch\",\"to_store\":\"archive\",\"session_id\":\"migrate-session\",\"execute\":true,\"delete_source\":true}", "POST /v1/lifecycle/migrate HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", execute.status);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"dry_run\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"migrated\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"messages_copied\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, execute.body, "\"usage_copied\":1") != null);
+
+    const archive_history = handleRequest(&ctx, "GET", "/v1/agent-sessions/migrate-session?store=archive", "", "GET /v1/agent-sessions/migrate-session?store=archive HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", archive_history.status);
+    try std.testing.expect(std.mem.indexOf(u8, archive_history.body, "Migrate scratch session message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, archive_history.body, "\"created_at\":\"12345\"") != null);
+    const archive_usage = handleRequest(&ctx, "GET", "/v1/agent-sessions/migrate-session/usage?store=archive", "", "GET /v1/agent-sessions/migrate-session/usage?store=archive HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", archive_usage.status);
+    try std.testing.expect(std.mem.indexOf(u8, archive_usage.body, "\"total_tokens\":321") != null);
+
+    const scratch_history = handleRequest(&ctx, "GET", "/v1/agent-sessions/migrate-session?store=scratch", "", "GET /v1/agent-sessions/migrate-session?store=scratch HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", scratch_history.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_history.body, "\"total\":0") != null);
+    const scratch_usage = handleRequest(&ctx, "GET", "/v1/agent-sessions/migrate-session/usage?store=scratch", "", "GET /v1/agent-sessions/migrate-session/usage?store=scratch HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("404 Not Found", scratch_usage.status);
+}
+
 test "api memory checkpoint restore preserves named runtime storage plane" {
     var source_store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
         .agent_memory_stores = &.{
@@ -8315,7 +8670,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"rebuildVectorIndex\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"reconcileVectorIndex\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"putAgentMemoryByKey\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"migrateAgentMemory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"migrateLifecycleStorage\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "created_by_actor_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"loadAgentSessionMessages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"min_relevance\"") != null);

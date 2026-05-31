@@ -227,12 +227,16 @@ pub const Runtime = union(BackendKind) {
     }
 
     pub fn saveMessage(self: *Runtime, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
+        return self.saveMessageAt(session_id, role, content, ids.nowMs(), actor_id);
+    }
+
+    pub fn saveMessageAt(self: *Runtime, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8) !void {
         return switch (self.*) {
             .none => {},
             .native => error.NativeAgentMemoryRuntime,
-            .memory_lru => |*engine| engine.saveMessage(session_id, role, content, actor_id),
-            .redis => |*engine| engine.saveMessage(session_id, role, content, actor_id),
-            .api => |*engine| engine.saveMessage(session_id, role, content, actor_id),
+            .memory_lru => |*engine| engine.saveMessageAt(session_id, role, content, created_at_ms, actor_id),
+            .redis => |*engine| engine.saveMessageAt(session_id, role, content, created_at_ms, actor_id),
+            .api => |*engine| engine.saveMessageAt(session_id, role, content, created_at_ms, actor_id),
         };
     }
 
@@ -559,16 +563,19 @@ pub const MemoryAgentMemory = struct {
     }
 
     pub fn saveMessage(self: *MemoryAgentMemory, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
+        return self.saveMessageAt(session_id, role, content, ids.nowMs(), actor_id);
+    }
+
+    pub fn saveMessageAt(self: *MemoryAgentMemory, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8) !void {
         self.purgeExpired();
         const actor = try access.requiredActorId(actor_id);
-        const now = ids.nowMs();
         const stored = MemorySessionMessage{
             .actor_id = try self.allocator.dupe(u8, actor),
             .session_id = try self.allocator.dupe(u8, session_id),
             .role = try self.allocator.dupe(u8, role),
             .content = try self.allocator.dupe(u8, content),
-            .created_at_ms = now,
-            .last_access_ms = now,
+            .created_at_ms = created_at_ms,
+            .last_access_ms = ids.nowMs(),
         };
         errdefer {
             var cleanup = stored;
@@ -1120,8 +1127,11 @@ pub const RedisAgentMemory = struct {
     }
 
     pub fn saveMessage(self: *RedisAgentMemory, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
+        return self.saveMessageAt(session_id, role, content, ids.nowMs(), actor_id);
+    }
+
+    pub fn saveMessageAt(self: *RedisAgentMemory, session_id: []const u8, role: []const u8, content: []const u8, created_at: i64, actor_id: ?[]const u8) !void {
         const actor = try access.requiredActorId(actor_id);
-        const created_at = ids.nowMs();
         const list_key = try self.sessionListKey(self.allocator, actor, session_id);
         defer self.allocator.free(list_key);
         const meta_key = try self.sessionMetaKey(self.allocator, actor, session_id);
@@ -1728,12 +1738,16 @@ pub const ApiAgentMemory = struct {
     }
 
     pub fn saveMessage(self: *ApiAgentMemory, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
+        return self.saveMessageAt(session_id, role, content, ids.nowMs(), actor_id);
+    }
+
+    pub fn saveMessageAt(self: *ApiAgentMemory, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8) !void {
         const actor = try access.requiredActorId(actor_id);
         const path = try sessionPath(self.allocator, session_id, "/messages");
         defer self.allocator.free(path);
         const scopes = try sessionScopesJson(self.allocator, session_id, true);
         defer self.allocator.free(scopes);
-        const body = try messagePayload(self.allocator, role, content, ids.nowMs());
+        const body = try messagePayload(self.allocator, role, content, created_at_ms);
         defer self.allocator.free(body);
         const response = try self.request(self.allocator, .POST, path, "", actor, scopes, body);
         defer self.allocator.free(response.body);

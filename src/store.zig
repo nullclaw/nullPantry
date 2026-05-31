@@ -2118,9 +2118,13 @@ pub const Store = struct {
     }
 
     fn saveMessageSubset(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror!void {
+        return self.saveMessageSubsetAt(session_id, role, content, ids.nowMs(), actor_id, route);
+    }
+
+    fn saveMessageSubsetAt(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror!void {
         const stores = try requireSubsetStores(route);
         for (stores) |store_name| {
-            try self.saveMessageRouted(session_id, role, content, actor_id, routeForSubsetStoreName(store_name));
+            try self.saveMessageRoutedAt(session_id, role, content, created_at_ms, actor_id, routeForSubsetStoreName(store_name));
         }
     }
 
@@ -2530,31 +2534,43 @@ pub const Store = struct {
     }
 
     pub fn saveMessage(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
-        if (self.agent_memory.isExternal()) return self.agent_memory.saveMessage(session_id, role, content, actor_id);
-        return self.saveMessageNative(session_id, role, content, actor_id);
+        return self.saveMessageAt(session_id, role, content, ids.nowMs(), actor_id);
+    }
+
+    pub fn saveMessageAt(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8) !void {
+        if (self.agent_memory.isExternal()) return self.agent_memory.saveMessageAt(session_id, role, content, created_at_ms, actor_id);
+        return self.saveMessageNativeAt(session_id, role, content, created_at_ms, actor_id);
     }
 
     pub fn saveMessageRouted(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        return self.saveMessageRoutedAt(session_id, role, content, ids.nowMs(), actor_id, route);
+    }
+
+    pub fn saveMessageRoutedAt(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
         return switch (route.target) {
-            .primary => self.saveMessage(session_id, role, content, actor_id),
-            .native => self.saveMessageNative(session_id, role, content, actor_id),
-            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.saveMessage(session_id, role, content, actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).saveMessage(session_id, role, content, actor_id),
-            .subset => self.saveMessageSubset(session_id, role, content, actor_id, route),
+            .primary => self.saveMessageAt(session_id, role, content, created_at_ms, actor_id),
+            .native => self.saveMessageNativeAt(session_id, role, content, created_at_ms, actor_id),
+            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.saveMessageAt(session_id, role, content, created_at_ms, actor_id) else error.AgentMemoryStorageUnavailable,
+            .named => (try self.namedAgentMemoryRuntime(route)).saveMessageAt(session_id, role, content, created_at_ms, actor_id),
+            .subset => self.saveMessageSubsetAt(session_id, role, content, created_at_ms, actor_id, route),
             .all => {
-                try self.saveMessageNative(session_id, role, content, actor_id);
-                if (self.agent_memory.isExternal()) try self.agent_memory.saveMessage(session_id, role, content, actor_id);
+                try self.saveMessageNativeAt(session_id, role, content, created_at_ms, actor_id);
+                if (self.agent_memory.isExternal()) try self.agent_memory.saveMessageAt(session_id, role, content, created_at_ms, actor_id);
                 for (self.agent_memory_stores.stores.items) |*named| {
-                    try named.runtime.saveMessage(session_id, role, content, actor_id);
+                    try named.runtime.saveMessageAt(session_id, role, content, created_at_ms, actor_id);
                 }
             },
         };
     }
 
     fn saveMessageNative(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
+        return self.saveMessageNativeAt(session_id, role, content, ids.nowMs(), actor_id);
+    }
+
+    fn saveMessageNativeAt(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8) !void {
         return switch (self.backend) {
-            .sqlite => |*s| s.saveMessage(session_id, role, content, actor_id),
-            .postgres => |*p| p.saveMessage(session_id, role, content, actor_id),
+            .sqlite => |*s| s.saveMessageAt(session_id, role, content, created_at_ms, actor_id),
+            .postgres => |*p| p.saveMessageAt(session_id, role, content, created_at_ms, actor_id),
         };
     }
 
@@ -8037,6 +8053,10 @@ pub const SQLiteStore = struct {
     }
 
     pub fn saveMessage(self: *Self, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
+        return self.saveMessageAt(session_id, role, content, ids.nowMs(), actor_id);
+    }
+
+    pub fn saveMessageAt(self: *Self, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8) !void {
         const actor = try requiredActorId(actor_id);
         const stmt = try self.prepare("INSERT INTO session_messages (session_id, actor_id, role, content, created_at_ms) VALUES (?1,?2,?3,?4,?5)");
         defer _ = c.sqlite3_finalize(stmt);
@@ -8044,7 +8064,7 @@ pub const SQLiteStore = struct {
         bindText(stmt, 2, actor);
         bindText(stmt, 3, role);
         bindText(stmt, 4, content);
-        _ = c.sqlite3_bind_int64(stmt, 5, ids.nowMs());
+        _ = c.sqlite3_bind_int64(stmt, 5, created_at_ms);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
         var id_buf: [32]u8 = undefined;
         const id_text = try std.fmt.bufPrint(&id_buf, "{d}", .{c.sqlite3_last_insert_rowid(self.db)});
@@ -10797,11 +10817,15 @@ pub const PostgresStore = struct {
     }
 
     pub fn saveMessage(self: *PostgresStore, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
+        return self.saveMessageAt(session_id, role, content, ids.nowMs(), actor_id);
+    }
+
+    pub fn saveMessageAt(self: *PostgresStore, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8) !void {
         const actor = try requiredActorId(actor_id);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO session_messages (session_id,actor_id,role,content,created_at_ms) VALUES ({s},{s},{s},{s},{d})", .{ try sqlString(allocator, session_id), try sqlString(allocator, actor), try sqlString(allocator, role), try sqlString(allocator, content), ids.nowMs() });
+        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO session_messages (session_id,actor_id,role,content,created_at_ms) VALUES ({s},{s},{s},{s},{d})", .{ try sqlString(allocator, session_id), try sqlString(allocator, actor), try sqlString(allocator, role), try sqlString(allocator, content), created_at_ms });
         try self.runSql(sql);
     }
 
