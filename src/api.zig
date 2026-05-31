@@ -3145,7 +3145,7 @@ fn workersRun(ctx: *Context, body: []const u8) HttpResponse {
 
 fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
-    const since_id = if (json.queryParam(query, "since_id")) |raw| std.fmt.parseInt(i64, raw, 10) catch 0 else 0;
+    const since_id = feedCursorFromQuery(query);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
     const events = ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch |err| switch (err) {
@@ -3168,9 +3168,16 @@ fn memoryFeedCompact(ctx: *Context, body: []const u8) HttpResponse {
     if (!(hasCapability(ctx, "feed_apply") and (hasCapability(ctx, "export") or hasCapability(ctx, "delete")))) return forbidden(ctx);
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
-    const before_id = json.intField(parsed.value.object, "before_id") orelse json.intField(parsed.value.object, "before_event_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing before_id");
+    const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    const status = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
+    const before_id = json.intField(parsed.value.object, "before_id") orelse
+        json.intField(parsed.value.object, "before_event_id") orelse
+        json.intField(parsed.value.object, "before_sequence") orelse
+        json.intField(parsed.value.object, "through_id") orelse
+        json.intField(parsed.value.object, "through_sequence") orelse
+        status.max_event_id;
     const result = ctx.store.compactFeed(before_id, ctx.actor_id) catch return serverError(ctx);
-    const response = std.fmt.allocPrint(ctx.allocator, "{{\"cursor_floor\":{d},\"max_event_id\":{d},\"compacted_events\":{d}}}", .{ result.cursor_floor, result.max_event_id, result.compacted_events }) catch return serverError(ctx);
+    const response = std.fmt.allocPrint(ctx.allocator, "{{\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"compacted_events\":{d}}}", .{ result.cursor_floor, result.cursor_floor, result.max_event_id, result.max_event_id, result.compacted_events }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
 }
 
@@ -3178,17 +3185,25 @@ fn memoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
     if (!(hasCapability(ctx, "read") and hasCapability(ctx, "export"))) return forbidden(ctx);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
     const status = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
-    const since_id = if (json.queryParam(query, "since_id")) |raw| std.fmt.parseInt(i64, raw, 10) catch 0 else 0;
+    const since_id = feedCursorFromQuery(query);
     const limit = parseLimit(json.queryParam(query, "limit"), 500);
     const events = ctx.store.listFeedEvents(ctx.allocator, .{ .since_id = since_id, .limit = limit, .scopes_json = feed_scopes, .ignore_cursor_floor = true, .actor_id = ctx.actor_id }) catch |err| switch (err) {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor"),
         else => return serverError(ctx),
     };
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    out.print(ctx.allocator, "{{\"cursor_floor\":{d},\"max_event_id\":{d},\"events\":[", .{ status.cursor_floor, status.max_event_id }) catch return serverError(ctx);
+    out.print(ctx.allocator, "{{\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"events\":[", .{ status.cursor_floor, status.cursor_floor, status.max_event_id, status.max_event_id }) catch return serverError(ctx);
     _ = appendFeedEventsForActor(ctx, &out, events) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, "]}") catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn feedCursorFromQuery(query: []const u8) i64 {
+    if (json.queryParam(query, "since_id")) |raw| return std.fmt.parseInt(i64, raw, 10) catch 0;
+    if (json.queryParam(query, "after")) |raw| return std.fmt.parseInt(i64, raw, 10) catch 0;
+    if (json.queryParam(query, "after_id")) |raw| return std.fmt.parseInt(i64, raw, 10) catch 0;
+    if (json.queryParam(query, "after_sequence")) |raw| return std.fmt.parseInt(i64, raw, 10) catch 0;
+    return 0;
 }
 
 fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8) HttpResponse {
@@ -9939,6 +9954,13 @@ test "api memory feed lifecycle exposes status checkpoint compaction and cursor 
 
     const status = handleRequest(&ctx, "GET", "/v1/memory/status", "", "");
     try std.testing.expectEqualStrings("200 OK", status.status);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"instance_id\":\"nullpantry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"storage_kind\":\"native\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"supports_compaction\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"compacted_through_sequence\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"oldest_available_sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"last_sequence\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"next_local_origin_sequence\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, status.body, "\"visible_events\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, status.body, "\"pending_events\":2") != null);
 
@@ -9950,6 +9972,8 @@ test "api memory feed lifecycle exposes status checkpoint compaction and cursor 
     const compact = handleRequest(&ctx, "POST", "/v1/memory/compact", "{\"before_id\":1}", "");
     try std.testing.expectEqualStrings("200 OK", compact.status);
     try std.testing.expect(std.mem.indexOf(u8, compact.body, "\"cursor_floor\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact.body, "\"compacted_through_sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact.body, "\"last_sequence\":2") != null);
 
     const expired = handleRequest(&ctx, "GET", "/v1/memory/events?since_id=0", "", "");
     try std.testing.expectEqualStrings("410 Gone", expired.status);
@@ -9960,10 +9984,40 @@ test "api memory feed lifecycle exposes status checkpoint compaction and cursor 
     try std.testing.expect(std.mem.indexOf(u8, recovery_checkpoint.body, "mem_one") != null);
     try std.testing.expect(std.mem.indexOf(u8, recovery_checkpoint.body, "mem_two") != null);
 
-    const after_floor = handleRequest(&ctx, "GET", "/v1/memory/events?since_id=1", "", "");
+    const after_floor = handleRequest(&ctx, "GET", "/v1/memory/events?after=1", "", "");
     try std.testing.expectEqualStrings("200 OK", after_floor.status);
     try std.testing.expect(std.mem.indexOf(u8, after_floor.body, "mem_two") != null);
     try std.testing.expect(std.mem.indexOf(u8, after_floor.body, "mem_one") == null);
+}
+
+test "api memory compact defaults through current feed head" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Context{ .allocator = alloc, .store = &store, .actor_scopes_json = "[\"public\",\"write:public\"]" };
+
+    const first = handleRequest(&ctx, "POST", "/v1/memory/events", "{\"event_type\":\"memory.note\",\"operation\":\"put\",\"object_type\":\"memory_atom\",\"object_id\":\"default_compact_one\",\"scope\":\"public\",\"payload\":{\"text\":\"one\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", first.status);
+    const second = handleRequest(&ctx, "POST", "/v1/memory/events", "{\"event_type\":\"memory.note\",\"operation\":\"put\",\"object_type\":\"memory_atom\",\"object_id\":\"default_compact_two\",\"scope\":\"public\",\"payload\":{\"text\":\"two\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", second.status);
+
+    const compact = handleRequest(&ctx, "POST", "/v1/memory/compact", "{}", "");
+    try std.testing.expectEqualStrings("200 OK", compact.status);
+    try std.testing.expect(std.mem.indexOf(u8, compact.body, "\"cursor_floor\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact.body, "\"compacted_through_sequence\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact.body, "\"last_sequence\":2") != null);
+
+    const expired = handleRequest(&ctx, "GET", "/v1/memory/events?after=0", "", "");
+    try std.testing.expectEqualStrings("410 Gone", expired.status);
+    try std.testing.expect(std.mem.indexOf(u8, expired.body, "cursor_expired") != null);
+
+    const checkpoint = handleRequest(&ctx, "GET", "/v1/memory/checkpoint?after=0&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"compacted_through_sequence\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "default_compact_one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "default_compact_two") != null);
 }
 
 test "api memory checkpoint restore preserves actors and session deletes" {

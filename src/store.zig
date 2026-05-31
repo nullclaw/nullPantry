@@ -3893,8 +3893,8 @@ pub const FeedStatus = struct {
     pub fn writeJson(self: FeedStatus, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
         try out.print(
             allocator,
-            "{{\"cursor_floor\":{d},\"max_event_id\":{d},\"visible_events\":{d},\"pending_events\":{d},\"applying_events\":{d},\"applied_events\":{d}}}",
-            .{ self.cursor_floor, self.max_event_id, self.visible_events, self.pending_events, self.applying_events, self.applied_events },
+            "{{\"instance_id\":\"nullpantry\",\"storage_kind\":\"native\",\"supports_compaction\":true,\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"oldest_available_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"next_local_origin_sequence\":{d},\"visible_events\":{d},\"pending_events\":{d},\"applying_events\":{d},\"applied_events\":{d}}}",
+            .{ self.cursor_floor, self.cursor_floor, self.cursor_floor + 1, self.max_event_id, self.max_event_id, self.max_event_id + 1, self.visible_events, self.pending_events, self.applying_events, self.applied_events },
         );
     }
 };
