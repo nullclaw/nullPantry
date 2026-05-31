@@ -4311,9 +4311,23 @@ fn sortAgentMemoryResults(items: []domain.AgentMemory) void {
 }
 
 fn trimAgentMemoryResults(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), limit: usize) void {
-    if (limit == 0 or out.items.len <= limit) return;
+    if (out.items.len <= limit) return;
     for (out.items[limit..]) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
     out.shrinkRetainingCapacity(limit);
+}
+
+fn detachAgentMemoryResult(entry: *domain.AgentMemory) void {
+    entry.id = "";
+    entry.key = "";
+    entry.content = "";
+    entry.category = "";
+    entry.timestamp = "";
+    entry.session_id = null;
+    entry.actor_id = "";
+    entry.writer_actor_id = "";
+    entry.scope = "";
+    entry.permissions_json = "";
+    entry.store = "";
 }
 
 fn agentMemorySliceContains(entries: []const domain.AgentMemory, needle: domain.AgentMemory) bool {
@@ -8572,10 +8586,14 @@ pub const SQLiteStore = struct {
     }
 
     pub fn agentMemorySearch(self: *Self, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
+        if (limit == 0) return try allocator.alloc(domain.AgentMemory, 0);
         const capped = @max(@as(usize, 1), @min(limit, 100));
         const request_actor = actor_id orelse return try allocator.alloc(domain.AgentMemory, 0);
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer {
+            for (out.items) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+            out.deinit(allocator);
+        }
         const fts_query = try retrieval_mod.buildFts5Query(allocator, query);
         defer allocator.free(fts_query);
         if (fts_query.len > 0) {
@@ -8590,6 +8608,8 @@ pub const SQLiteStore = struct {
             while (c.sqlite3_step(stmt) == c.SQLITE_ROW and out.items.len < capped) {
                 if (!try self.agentMemoryStmtVisible(allocator, stmt, scopes_json, request_actor)) continue;
                 var entry = try readAgentMemory(allocator, stmt);
+                var entry_owned = true;
+                defer if (entry_owned) agent_memory_runtime.freeAgentMemory(allocator, &entry);
                 if (domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
                 entry.score = @max(0.0, 8.0 - c.sqlite3_column_double(stmt, 11));
                 if (session_id) |expected| {
@@ -8598,18 +8618,24 @@ pub const SQLiteStore = struct {
                     continue;
                 }
                 try out.append(allocator, entry);
+                entry_owned = false;
             }
             return out.toOwnedSlice(allocator);
         }
         const all = try self.agentMemoryListVisible(allocator, null, session_id, request_actor, scopes_json);
-        for (all) |entry| {
-            if (out.items.len >= capped) break;
+        defer {
+            for (all) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+            allocator.free(all);
+        }
+        for (all) |*entry| {
             const score = scoreText(query, entry.key) + scoreText(query, entry.content);
             if (score <= 0 and query.len > 0) continue;
-            var copy = entry;
-            copy.score = score + 0.5;
-            try out.append(allocator, copy);
+            entry.score = score + 0.5;
+            try out.append(allocator, entry.*);
+            detachAgentMemoryResult(entry);
         }
+        sortAgentMemoryResults(out.items);
+        trimAgentMemoryResults(allocator, &out, capped);
         return out.toOwnedSlice(allocator);
     }
 
@@ -11576,19 +11602,28 @@ pub const PostgresStore = struct {
     }
 
     pub fn agentMemorySearch(self: *PostgresStore, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
+        if (limit == 0) return try allocator.alloc(domain.AgentMemory, 0);
         const capped = @max(@as(usize, 1), @min(limit, 100));
         const request_actor = actor_id orelse return try allocator.alloc(domain.AgentMemory, 0);
         const all = try self.agentMemoryListVisible(allocator, null, session_id, request_actor, scopes_json);
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
-        for (all) |entry| {
-            if (out.items.len >= capped) break;
+        errdefer {
+            for (out.items) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+            out.deinit(allocator);
+        }
+        defer {
+            for (all) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+            allocator.free(all);
+        }
+        for (all) |*entry| {
             const score = pgScoreText(query, entry.key) + pgScoreText(query, entry.content);
             if (score <= 0 and query.len > 0) continue;
-            var copy = entry;
-            copy.score = score + 0.5;
-            try out.append(allocator, copy);
+            entry.score = score + 0.5;
+            try out.append(allocator, entry.*);
+            detachAgentMemoryResult(entry);
         }
+        sortAgentMemoryResults(out.items);
+        trimAgentMemoryResults(allocator, &out, capped);
         return out.toOwnedSlice(allocator);
     }
 
@@ -16068,13 +16103,19 @@ test "native agent memory search preserves direct memories" {
     const actor = "agent:test";
 
     _ = try store.agentMemoryStore(alloc, .{ .key = "pref.direct", .content = "Use direct native memory first", .category = "core", .session_id = null, .actor_id = actor });
+    _ = try store.agentMemoryStore(alloc, .{ .key = "pref.extra", .content = "Newer visible native memory", .category = "core", .session_id = null, .actor_id = actor });
+    try testingSqliteExec(&store, "UPDATE agent_memory_items SET timestamp_ms = CASE key WHEN 'pref.direct' THEN 1000 WHEN 'pref.extra' THEN 2000 ELSE timestamp_ms END");
+
     const results = try store.agentMemorySearch(alloc, "direct native", 1, null, "[]", actor);
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("pref.direct", results[0].key);
 
-    const visible_list = try store.agentMemorySearch(alloc, "", 10, null, "[]", actor);
+    const visible_list = try store.agentMemorySearch(alloc, "", 1, null, "[]", actor);
     try std.testing.expectEqual(@as(usize, 1), visible_list.len);
-    try std.testing.expectEqualStrings("pref.direct", visible_list[0].key);
+    try std.testing.expectEqualStrings("pref.extra", visible_list[0].key);
+
+    const zero_limit = try store.agentMemorySearch(alloc, "", 0, null, "[]", actor);
+    try std.testing.expectEqual(@as(usize, 0), zero_limit.len);
 
     const no_terms = try store.agentMemorySearch(alloc, "??? OR AND the", 10, null, "[]", actor);
     try std.testing.expectEqual(@as(usize, 0), no_terms.len);
@@ -16151,6 +16192,15 @@ test "postgres storage contract covers primitives when configured" {
         if (std.mem.eql(u8, result.result_type, "agent_memory") and std.mem.indexOf(u8, result.text, "postgres shared team agent memory") != null) saw_pg_shared = true;
     }
     try std.testing.expect(saw_pg_shared);
+    const pg_rank_high_key = try std.fmt.allocPrint(alloc, "{s}.rank.high", .{unique});
+    const pg_rank_low_key = try std.fmt.allocPrint(alloc, "{s}.rank.low", .{unique});
+    _ = try store.agentMemoryStore(alloc, .{ .key = pg_rank_high_key, .content = "alpha beta gamma", .category = "core", .actor_id = "agent:postgres" });
+    _ = try store.agentMemoryStore(alloc, .{ .key = pg_rank_low_key, .content = "alpha", .category = "core", .actor_id = "agent:postgres" });
+    const pg_ranked = try store.agentMemorySearch(alloc, "alpha beta gamma", 1, null, "[]", "agent:postgres");
+    try std.testing.expectEqual(@as(usize, 1), pg_ranked.len);
+    try std.testing.expectEqualStrings(pg_rank_high_key, pg_ranked[0].key);
+    const pg_zero_limit = try store.agentMemorySearch(alloc, "alpha", 0, null, "[]", "agent:postgres");
+    try std.testing.expectEqual(@as(usize, 0), pg_zero_limit.len);
 
     try store.saveMessage(unique, "user", "hello postgres history", "agent:postgres");
     const history_result = try store.history(alloc, unique, 10, 0, "agent:postgres");
