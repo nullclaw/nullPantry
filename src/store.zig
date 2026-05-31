@@ -1008,6 +1008,22 @@ pub const Store = struct {
         };
     }
 
+    pub fn contextPackById(self: *Store, allocator: std.mem.Allocator, id: []const u8) !?ContextPackResult {
+        return switch (self.backend) {
+            .sqlite => |*s| s.contextPackById(allocator, id),
+            .postgres => |*p| p.contextPackById(allocator, id),
+        };
+    }
+
+    pub fn agentMemoryById(self: *Store, allocator: std.mem.Allocator, id: []const u8) !?domain.AgentMemory {
+        var entry = try switch (self.backend) {
+            .sqlite => |*s| s.agentMemoryById(allocator, id),
+            .postgres => |*p| p.agentMemoryById(allocator, id),
+        };
+        if (entry) |*value| try tagAgentMemoryStore(allocator, value, "native");
+        return entry;
+    }
+
     pub fn search(self: *Store, allocator: std.mem.Allocator, input: SearchInput) ![]domain.SearchResult {
         var merged: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         defer merged.deinit(allocator);
@@ -1719,6 +1735,24 @@ pub const Store = struct {
         if (!input.suppress_feed and pack.persisted) try self.appendContextPackPutFeedEvent(allocator, pack, scope, permissions, input.actor_id, input.agent_memory_route);
         try self.mirrorKnowledgePrimitive(allocator, .context_pack, pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id, input.agent_memory_route);
         if (pack.persisted) try self.enqueueLucidProjectionPut(allocator, "context_pack", pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id);
+        return pack;
+    }
+
+    pub fn importContextPackSnapshot(self: *Store, allocator: std.mem.Allocator, input: ContextPackSnapshotInput) !ContextPackResult {
+        try self.ensureKnowledgePrimitiveMirrorRoute(.{});
+        const pack = try switch (self.backend) {
+            .sqlite => |*s| s.importContextPackSnapshot(allocator, input),
+            .postgres => |*p| p.importContextPackSnapshot(allocator, input),
+        };
+        if (!input.suppress_feed) {
+            const scope = try contextPackFeedScope(allocator, pack);
+            defer allocator.free(scope);
+            const permissions = try contextPackFeedPermissions(allocator, pack);
+            defer allocator.free(permissions);
+            try self.appendContextPackPutFeedEvent(allocator, pack, scope, permissions, input.actor_id, .{});
+            try self.mirrorKnowledgePrimitive(allocator, .context_pack, pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id, .{});
+            try self.enqueueLucidProjectionPut(allocator, "context_pack", pack.id, pack.query, pack.generated_summary, scope, permissions, input.actor_id);
+        }
         return pack;
     }
 
@@ -3527,6 +3561,24 @@ pub const ContextPackInput = struct {
     actor_id: ?[]const u8 = null,
     agent_memory_route: AgentMemoryStorageRoute = .{},
     preselected_results: ?[]domain.SearchResult = null,
+    suppress_feed: bool = false,
+};
+
+pub const ContextPackSnapshotInput = struct {
+    id: ?[]const u8 = null,
+    purpose: []const u8 = "snapshot_hydrate",
+    target: []const u8 = "agent",
+    query: []const u8,
+    generated_summary: []const u8,
+    included_sources_json: []const u8 = "[]",
+    included_artifacts_json: []const u8 = "[]",
+    included_memory_atoms_json: []const u8 = "[]",
+    included_result_refs_json: []const u8 = "[]",
+    required_scopes_json: []const u8 = "[\"admin\"]",
+    actor_id: ?[]const u8 = null,
+    actor_isolated: bool = false,
+    token_budget: i64 = 12000,
+    actor_id_for_audit: ?[]const u8 = null,
     suppress_feed: bool = false,
 };
 
@@ -5468,6 +5520,39 @@ pub const SQLiteStore = struct {
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+    }
+
+    pub fn contextPackById(self: *Self, allocator: std.mem.Allocator, id: []const u8) !?ContextPackResult {
+        const stmt = try self.prepare("SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated,generated_summary,token_budget,created_at_ms FROM context_packs WHERE id = ?1 LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try readSqliteContextPackResult(allocator, stmt);
+    }
+
+    fn readSqliteContextPackResult(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !ContextPackResult {
+        const sources = try columnText(allocator, stmt, 4);
+        return .{
+            .id = try columnText(allocator, stmt, 0),
+            .purpose = try columnText(allocator, stmt, 1),
+            .target = try columnText(allocator, stmt, 2),
+            .query = try columnText(allocator, stmt, 3),
+            .generated_summary = try columnText(allocator, stmt, 11),
+            .sections_json = "{}",
+            .citations_json = try allocator.dupe(u8, sources),
+            .forbidden_assumptions_json = context_pack.forbidden_assumptions_json,
+            .suggested_next_steps_json = context_pack.suggested_next_steps_json,
+            .included_sources_json = sources,
+            .included_artifacts_json = try columnText(allocator, stmt, 5),
+            .included_memory_atoms_json = try columnText(allocator, stmt, 6),
+            .included_result_refs_json = try columnText(allocator, stmt, 7),
+            .required_scopes_json = try columnText(allocator, stmt, 8),
+            .actor_id = try columnTextNullable(allocator, stmt, 9),
+            .actor_isolated = c.sqlite3_column_int(stmt, 10) != 0,
+            .token_budget = c.sqlite3_column_int64(stmt, 12),
+            .created_at_ms = c.sqlite3_column_int64(stmt, 13),
+            .persisted = true,
+        };
     }
 
     pub fn contextPackLifecycleTarget(self: *Self, allocator: std.mem.Allocator, id: []const u8, actor_id: ?[]const u8, scopes_json: []const u8) !?PrimitiveLifecycleTarget {
@@ -7572,6 +7657,51 @@ pub const SQLiteStore = struct {
         return .{ .id = id, .purpose = input.purpose, .target = input.target, .query = input.query, .generated_summary = summary, .sections_json = sections, .citations_json = sources, .forbidden_assumptions_json = context_pack.forbidden_assumptions_json, .suggested_next_steps_json = context_pack.suggested_next_steps_json, .included_sources_json = sources, .included_artifacts_json = artifacts, .included_memory_atoms_json = atoms, .included_result_refs_json = result_refs, .required_scopes_json = required_scopes, .actor_id = input.actor_id, .actor_isolated = actor_isolated, .token_budget = input.token_budget, .created_at_ms = now, .persisted = input.persist };
     }
 
+    pub fn importContextPackSnapshot(self: *Self, allocator: std.mem.Allocator, input: ContextPackSnapshotInput) !ContextPackResult {
+        const id = try idOrMake(allocator, input.id, "ctx_");
+        const now = ids.nowMs();
+        const stmt = try self.prepare("INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated,generated_summary,token_budget,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, id);
+        bindText(stmt, 2, input.purpose);
+        bindText(stmt, 3, input.target);
+        bindText(stmt, 4, input.query);
+        bindText(stmt, 5, input.included_sources_json);
+        bindText(stmt, 6, input.included_artifacts_json);
+        bindText(stmt, 7, input.included_memory_atoms_json);
+        bindText(stmt, 8, input.included_result_refs_json);
+        bindText(stmt, 9, input.required_scopes_json);
+        bindNullableText(stmt, 10, input.actor_id);
+        _ = c.sqlite3_bind_int(stmt, 11, if (input.actor_isolated) 1 else 0);
+        bindText(stmt, 12, input.generated_summary);
+        _ = c.sqlite3_bind_int64(stmt, 13, input.token_budget);
+        _ = c.sqlite3_bind_int64(stmt, 14, now);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+        try self.upsertContextPackFts(id, input.purpose, input.target, input.query, input.generated_summary);
+        try self.insertAuditActor("context_pack.created", input.actor_id_for_audit orelse input.actor_id, "context_pack", id);
+        return .{
+            .id = id,
+            .purpose = input.purpose,
+            .target = input.target,
+            .query = input.query,
+            .generated_summary = input.generated_summary,
+            .sections_json = "{}",
+            .citations_json = input.included_sources_json,
+            .forbidden_assumptions_json = context_pack.forbidden_assumptions_json,
+            .suggested_next_steps_json = context_pack.suggested_next_steps_json,
+            .included_sources_json = input.included_sources_json,
+            .included_artifacts_json = input.included_artifacts_json,
+            .included_memory_atoms_json = input.included_memory_atoms_json,
+            .included_result_refs_json = input.included_result_refs_json,
+            .required_scopes_json = input.required_scopes_json,
+            .actor_id = input.actor_id,
+            .actor_isolated = input.actor_isolated,
+            .token_budget = input.token_budget,
+            .created_at_ms = now,
+            .persisted = true,
+        };
+    }
+
     fn appendUniqueJsonString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), count: *usize, value: []const u8) !void {
         const needle = try std.fmt.allocPrint(allocator, "\"{s}\"", .{value});
         defer allocator.free(needle);
@@ -9482,6 +9612,18 @@ pub const PostgresStore = struct {
         return std.mem.eql(u8, text, "true");
     }
 
+    pub fn contextPackById(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?ContextPackResult {
+        const inner = try std.fmt.allocPrint(
+            allocator,
+            "SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated,generated_summary,token_budget,created_at_ms FROM context_packs WHERE id = {s} LIMIT 1",
+            .{try sqlString(allocator, id)},
+        );
+        const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value == .null) return null;
+        return try readPgContextPackResult(allocator, parsed.value.object);
+    }
+
     pub fn contextPackLifecycleTarget(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8, actor_id: ?[]const u8, scopes_json: []const u8) !?PrimitiveLifecycleTarget {
         const inner = try std.fmt.allocPrint(allocator, "SELECT id,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated FROM context_packs WHERE id = {s} LIMIT 1", .{try sqlString(allocator, id)});
         const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
@@ -10463,6 +10605,59 @@ pub const PostgresStore = struct {
             try self.runSql(sql);
         }
         return .{ .id = id, .purpose = input.purpose, .target = input.target, .query = input.query, .generated_summary = summary, .sections_json = sections, .citations_json = sources, .forbidden_assumptions_json = context_pack.forbidden_assumptions_json, .suggested_next_steps_json = context_pack.suggested_next_steps_json, .included_sources_json = sources, .included_artifacts_json = artifacts, .included_memory_atoms_json = atoms, .included_result_refs_json = result_refs, .required_scopes_json = required_scopes, .actor_id = input.actor_id, .actor_isolated = actor_isolated, .token_budget = input.token_budget, .created_at_ms = now, .persisted = input.persist };
+    }
+
+    pub fn importContextPackSnapshot(self: *PostgresStore, allocator: std.mem.Allocator, input: ContextPackSnapshotInput) !ContextPackResult {
+        const id = try idOrMake(allocator, input.id, "ctx_");
+        const now = ids.nowMs();
+        const sql = try std.fmt.allocPrint(
+            allocator,
+            "BEGIN; " ++
+                "INSERT INTO context_packs (id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated,generated_summary,token_budget,created_at_ms) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{d}); " ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('context_pack.created',{s},'context_pack',{s},'{{}}'::jsonb,{d}); " ++
+                "COMMIT;",
+            .{
+                try sqlString(allocator, id),
+                try sqlString(allocator, input.purpose),
+                try sqlString(allocator, input.target),
+                try sqlString(allocator, input.query),
+                try sqlJsonb(allocator, input.included_sources_json),
+                try sqlJsonb(allocator, input.included_artifacts_json),
+                try sqlJsonb(allocator, input.included_memory_atoms_json),
+                try sqlJsonb(allocator, input.included_result_refs_json),
+                try sqlJsonb(allocator, input.required_scopes_json),
+                try sqlNullableString(allocator, input.actor_id),
+                if (input.actor_isolated) "true" else "false",
+                try sqlString(allocator, input.generated_summary),
+                input.token_budget,
+                now,
+                try sqlNullableString(allocator, input.actor_id_for_audit orelse input.actor_id),
+                try sqlString(allocator, id),
+                now,
+            },
+        );
+        try self.runSql(sql);
+        return .{
+            .id = id,
+            .purpose = input.purpose,
+            .target = input.target,
+            .query = input.query,
+            .generated_summary = input.generated_summary,
+            .sections_json = "{}",
+            .citations_json = input.included_sources_json,
+            .forbidden_assumptions_json = context_pack.forbidden_assumptions_json,
+            .suggested_next_steps_json = context_pack.suggested_next_steps_json,
+            .included_sources_json = input.included_sources_json,
+            .included_artifacts_json = input.included_artifacts_json,
+            .included_memory_atoms_json = input.included_memory_atoms_json,
+            .included_result_refs_json = input.included_result_refs_json,
+            .required_scopes_json = input.required_scopes_json,
+            .actor_id = input.actor_id,
+            .actor_isolated = input.actor_isolated,
+            .token_budget = input.token_budget,
+            .created_at_ms = now,
+            .persisted = true,
+        };
     }
 
     pub fn agentMemoryStore(self: *PostgresStore, allocator: std.mem.Allocator, input: AgentMemoryInput) !domain.AgentMemory {
@@ -11611,6 +11806,31 @@ fn rawJsonField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, name: []c
     const value = obj.get(name) orelse return allocator.dupe(u8, fallback);
     if (value == .null) return allocator.dupe(u8, fallback);
     return try json.jsonFromValue(allocator, value);
+}
+
+fn readPgContextPackResult(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !ContextPackResult {
+    const sources = try rawJsonField(allocator, obj, "included_sources_json", "[]");
+    return .{
+        .id = try dupStringField(allocator, obj, "id", ""),
+        .purpose = try dupStringField(allocator, obj, "purpose", "context"),
+        .target = try dupStringField(allocator, obj, "target", "agent"),
+        .query = try dupStringField(allocator, obj, "query_text", ""),
+        .generated_summary = try dupStringField(allocator, obj, "generated_summary", ""),
+        .sections_json = "{}",
+        .citations_json = try allocator.dupe(u8, sources),
+        .forbidden_assumptions_json = context_pack.forbidden_assumptions_json,
+        .suggested_next_steps_json = context_pack.suggested_next_steps_json,
+        .included_sources_json = sources,
+        .included_artifacts_json = try rawJsonField(allocator, obj, "included_artifacts_json", "[]"),
+        .included_memory_atoms_json = try rawJsonField(allocator, obj, "included_memory_atoms_json", "[]"),
+        .included_result_refs_json = try rawJsonField(allocator, obj, "included_result_refs_json", "[]"),
+        .required_scopes_json = try rawJsonField(allocator, obj, "required_scopes_json", "[]"),
+        .actor_id = try dupNullableStringField(allocator, obj, "actor_id"),
+        .actor_isolated = json.boolField(obj, "actor_isolated") orelse false,
+        .token_budget = json.intField(obj, "token_budget") orelse 0,
+        .created_at_ms = json.intField(obj, "created_at_ms") orelse 0,
+        .persisted = true,
+    };
 }
 
 fn readPgVectorChunk(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !VectorChunk {
