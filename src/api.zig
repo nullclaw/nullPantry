@@ -4419,11 +4419,19 @@ fn writeExtractiveAnswer(ctx: *Context, out: *std.ArrayListUnmanaged(u8), result
     try out.appendSlice(ctx.allocator, "Based on accessible NullPantry evidence: ");
     for (results, 0..) |result, i| {
         if (i > 0) try out.appendSlice(ctx.allocator, " ");
+        try appendResultStorePrefix(ctx, out, result);
         try out.appendSlice(ctx.allocator, result.text);
         try out.appendSlice(ctx.allocator, " [");
         try out.appendSlice(ctx.allocator, try citationLabel(ctx, result));
         try out.appendSlice(ctx.allocator, "]");
     }
+}
+
+fn appendResultStorePrefix(ctx: *Context, out: *std.ArrayListUnmanaged(u8), result: domain.SearchResult) !void {
+    if (result.store.len == 0) return;
+    try out.appendSlice(ctx.allocator, "[store:");
+    try out.appendSlice(ctx.allocator, result.store);
+    try out.appendSlice(ctx.allocator, "] ");
 }
 
 fn buildAskPrompt(ctx: *Context, query: []const u8, results: []domain.SearchResult) ![]const u8 {
@@ -4439,6 +4447,10 @@ fn buildAskPrompt(ctx: *Context, query: []const u8, results: []domain.SearchResu
         try out.appendSlice(ctx.allocator, result.result_type);
         try out.appendSlice(ctx.allocator, " status=");
         try out.appendSlice(ctx.allocator, result.status);
+        if (result.store.len > 0) {
+            try out.appendSlice(ctx.allocator, " store=");
+            try out.appendSlice(ctx.allocator, result.store);
+        }
         try out.appendSlice(ctx.allocator, " title=");
         try out.appendSlice(ctx.allocator, result.title);
         try out.appendSlice(ctx.allocator, "\n  ");
@@ -4575,7 +4587,7 @@ fn answerCitationsValid(ctx: *Context, answer: []const u8, results: []const doma
 }
 
 fn looksLikeCitationToken(token: []const u8) bool {
-    const prefixes = [_][]const u8{ "src_", "art_", "mem_", "ent_", "rel_", "ctx_", "spc_", "pol_", "agm_", "policy:", "feed:", "session:" };
+    const prefixes = [_][]const u8{ "src_", "art_", "mem_", "ent_", "rel_", "ctx_", "spc_", "pol_", "agm_", "agent_memory:", "policy:", "feed:", "session:" };
     inline for (prefixes) |prefix| {
         if (std.mem.startsWith(u8, token, prefix)) return true;
     }
@@ -6553,6 +6565,15 @@ test "api agent memory supports named stores and federated runtime reads" {
     try std.testing.expect(saw_scratch_ref);
     try std.testing.expect(saw_archive_ref);
 
+    const federated_same_ask = handleRequest(&ctx, "POST", "/v1/ask", "{\"query\":\"Cross Store Same Key Marker\",\"stores\":[\"scratch\",\"archive\"],\"use_vector\":false,\"use_temporal_decay\":false,\"use_mmr\":false}", "POST /v1/ask HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", federated_same_ask.status);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_ask.body, "[store:scratch] Cross Store Same Key Scratch Marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_ask.body, "[store:archive] Cross Store Same Key Archive Marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_ask.body, "[agent_memory:scratch:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_ask.body, "[agent_memory:archive:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_ask.body, "\"store\":\"scratch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_same_ask.body, "\"store\":\"archive\"") != null);
+
     const global_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Named Archive Unique\",\"use_vector\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", global_search.status);
     try std.testing.expect(std.mem.indexOf(u8, global_search.body, "Named Archive Unique") != null);
@@ -7640,10 +7661,12 @@ test "api ask citation guard rejects uncited or unknown LLM citations" {
     var ctx = Context{ .allocator = alloc, .store = &store };
     const results = [_]domain.SearchResult{
         .{ .id = "mem_1", .result_type = "memory_atom", .title = "Decision", .text = "Decision: cite evidence.", .scope = "public", .status = "verified", .score = 1, .source_ids_json = "[\"src_1\"]" },
+        .{ .id = "agent_memory:scratch:agm_1", .result_type = "agent_memory", .title = "Preference", .text = "Agent memory from scratch.", .scope = "agent:agent:a", .status = "active", .score = 1, .source_ids_json = "[]", .store = "scratch" },
     };
 
     try std.testing.expect(try answerCitationsValid(&ctx, "Use the cited decision [src_1].", &results));
     try std.testing.expect(try answerCitationsValid(&ctx, "Use the cited decision [mem_1].", &results));
+    try std.testing.expect(try answerCitationsValid(&ctx, "Use routed memory [agent_memory:scratch:agm_1].", &results));
     try std.testing.expect(!try answerCitationsValid(&ctx, "Use the cited decision.", &results));
     try std.testing.expect(!try answerCitationsValid(&ctx, "Use the hidden decision [src_secret].", &results));
 }
