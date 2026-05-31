@@ -3448,6 +3448,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     var agent_memory_delete_key: ?[]const u8 = null;
     var agent_memory_delete_session_id: ?[]const u8 = null;
     var agent_memory_delete_actor_id: ?[]const u8 = null;
+    var agent_memory_delete_all = false;
     var agent_memory_route: store_mod.AgentMemoryStorageRoute = .{};
     if (std.mem.eql(u8, object_type, "agent_memory")) {
         const prepared = buildAppliedAgentMemoryInput(ctx, operation, payload_json, event_object_id, event_actor_id) catch |err| switch (err) {
@@ -3461,6 +3462,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
             agent_memory_delete_key = key;
             agent_memory_delete_session_id = prepared.delete_session_id;
             agent_memory_delete_actor_id = prepared.delete_actor_id;
+            agent_memory_delete_all = prepared.delete_all;
         } else {
             agent_memory_input = prepared.input;
         }
@@ -3611,6 +3613,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
             .delete_key = delete_key,
             .delete_session_id = agent_memory_delete_session_id,
             .delete_owner_actor_id = agent_memory_delete_actor_id orelse event_actor_id,
+            .delete_all = agent_memory_delete_all,
             .writer_actor_id = event_actor_id,
         }, agent_memory_route) catch |err| {
             if (reserved_event_id) |event_id| {
@@ -3815,6 +3818,7 @@ const AgentMemoryApplyInput = struct {
     delete_key: ?[]const u8 = null,
     delete_session_id: ?[]const u8 = null,
     delete_actor_id: ?[]const u8 = null,
+    delete_all: bool = false,
     route: store_mod.AgentMemoryStorageRoute = .{},
 };
 
@@ -3838,10 +3842,12 @@ const AgentSessionUsageApplyInput = struct {
 };
 
 fn operationFromEventType(event_type: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, event_type, ".delete_all") or std.mem.endsWith(u8, event_type, "_delete_all")) return "delete_all";
+    if (std.mem.endsWith(u8, event_type, ".delete_scoped") or std.mem.endsWith(u8, event_type, "_delete_scoped")) return "delete_scoped";
     if (std.mem.endsWith(u8, event_type, ".delete") or std.mem.endsWith(u8, event_type, ".forget")) return "delete";
     if (std.mem.endsWith(u8, event_type, ".delete_autosaved") or std.mem.endsWith(u8, event_type, ".clear_autosaved")) return "delete_autosaved";
-    if (std.mem.endsWith(u8, event_type, ".merge_object")) return "merge_object";
-    if (std.mem.endsWith(u8, event_type, ".merge_string_set")) return "merge_string_set";
+    if (std.mem.endsWith(u8, event_type, ".merge_object") or std.mem.endsWith(u8, event_type, "_merge_object")) return "merge_object";
+    if (std.mem.endsWith(u8, event_type, ".merge_string_set") or std.mem.endsWith(u8, event_type, "_merge_string_set")) return "merge_string_set";
     return "put";
 }
 
@@ -3921,7 +3927,10 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
     const computed_owner_id = try access.agentMemoryOwner(ctx.allocator, event_actor_id, scope);
     const owner_actor_id = json.stringField(obj, "owner_id") orelse computed_owner_id;
     if (!std.mem.eql(u8, owner_actor_id, computed_owner_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
-    if (std.mem.eql(u8, operation, "delete") or std.mem.eql(u8, operation, "forget")) {
+    if (std.mem.eql(u8, operation, "delete_all")) {
+        return .{ .delete_key = key, .delete_session_id = null, .delete_actor_id = owner_actor_id, .delete_all = true, .route = route };
+    }
+    if (std.mem.eql(u8, operation, "delete") or std.mem.eql(u8, operation, "forget") or std.mem.eql(u8, operation, "delete_scoped")) {
         return .{ .delete_key = key, .delete_session_id = session_id, .delete_actor_id = owner_actor_id, .route = route };
     }
     const permissions_json = rawField(ctx.allocator, obj, "permissions", "[]") catch return error.InvalidPayload;
@@ -10443,6 +10452,21 @@ test "api memory checkpoint restore preserves actors and session deletes" {
     const session_delete = handleRequest(&actor_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.delete\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"session.pref\",\"session_id\":\"s1\"}}", "");
     try std.testing.expectEqualStrings("200 OK", session_delete.status);
     try std.testing.expect((try store.agentMemoryGet(alloc, "session.pref", "s1", "agent:restored")) == null);
+
+    const all_global_put = handleRequest(&actor_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"delete.all.pref\",\"content\":\"global value\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", all_global_put.status);
+    const all_session_put = handleRequest(&actor_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"delete.all.pref\",\"content\":\"session value\",\"session_id\":\"s1\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", all_session_put.status);
+    const scoped_delete = handleRequest(&actor_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.delete_scoped\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"delete.all.pref\",\"session_id\":\"s1\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", scoped_delete.status);
+    try std.testing.expect((try store.agentMemoryGet(alloc, "delete.all.pref", "s1", "agent:restored")) == null);
+    try std.testing.expect((try store.agentMemoryGet(alloc, "delete.all.pref", null, "agent:restored")) != null);
+    const all_session_reput = handleRequest(&actor_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"delete.all.pref\",\"content\":\"session value again\",\"session_id\":\"s1\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", all_session_reput.status);
+    const all_delete = handleRequest(&actor_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.delete_all\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"delete.all.pref\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", all_delete.status);
+    try std.testing.expect((try store.agentMemoryGet(alloc, "delete.all.pref", null, "agent:restored")) == null);
+    try std.testing.expect((try store.agentMemoryGet(alloc, "delete.all.pref", "s1", "agent:restored")) == null);
 
     var agent_a_ctx = Context{ .allocator = alloc, .store = &store, .actor_id = "agent:a", .actor_scopes_json = "[]" };
     const spoof = handleRequest(&agent_a_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"actor_id\":\"agent:b\",\"payload\":{\"key\":\"spoof\",\"content\":\"blocked\"}}", "");

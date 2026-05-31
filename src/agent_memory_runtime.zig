@@ -217,6 +217,16 @@ pub const Runtime = union(BackendKind) {
         };
     }
 
+    pub fn deleteAll(self: *Runtime, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        return switch (self.*) {
+            .none => false,
+            .native => error.NativeAgentMemoryRuntime,
+            .memory_lru => |*engine| engine.deleteAll(key, actor_id, writer_actor_id),
+            .redis => |*engine| engine.deleteAll(key, actor_id, writer_actor_id),
+            .api => |*engine| engine.deleteAll(key, actor_id, writer_actor_id),
+        };
+    }
+
     pub fn count(self: *Runtime, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
         return switch (self.*) {
             .none => 0,
@@ -547,6 +557,24 @@ pub const MemoryAgentMemory = struct {
         var removed = self.entries.orderedRemove(idx);
         freeAgentMemory(self.allocator, &removed.entry);
         return true;
+    }
+
+    pub fn deleteAll(self: *MemoryAgentMemory, key: []const u8, actor_id: ?[]const u8, _: ?[]const u8) !bool {
+        self.purgeExpired();
+        const owner = actor_id orelse return false;
+        var changed = false;
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i].entry;
+            if (std.mem.eql(u8, entry.actor_id, owner) and std.mem.eql(u8, entry.key, key)) {
+                var removed = self.entries.orderedRemove(i);
+                freeAgentMemory(self.allocator, &removed.entry);
+                changed = true;
+                continue;
+            }
+            i += 1;
+        }
+        return changed;
     }
 
     pub fn count(self: *MemoryAgentMemory, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
@@ -1109,6 +1137,76 @@ pub const RedisAgentMemory = struct {
             .integer => |changed| changed > 0,
             else => false,
         };
+    }
+
+    pub fn deleteAll(self: *RedisAgentMemory, key: []const u8, actor_id: ?[]const u8, _: ?[]const u8) !bool {
+        const owner = actor_id orelse return false;
+        const Candidate = struct {
+            redis_key: []u8,
+            entry: domain.AgentMemory,
+        };
+        const owner_index = try self.ownerIndexKey(self.allocator, owner);
+        defer self.allocator.free(owner_index);
+        var members_resp = try self.client.command(&.{ "SMEMBERS", owner_index });
+        defer members_resp.deinit(self.allocator);
+        const members = switch (members_resp) {
+            .array => |maybe_items| maybe_items orelse return false,
+            else => return false,
+        };
+        var candidates: std.ArrayListUnmanaged(Candidate) = .empty;
+        defer {
+            for (candidates.items) |*candidate| {
+                self.allocator.free(candidate.redis_key);
+                freeAgentMemory(self.allocator, &candidate.entry);
+            }
+            candidates.deinit(self.allocator);
+        }
+        for (members) |member| {
+            const redis_key = member.asString() orelse continue;
+            var hash = try self.client.command(&.{ "HGETALL", redis_key });
+            const maybe_entry = self.agentMemoryFromHash(self.allocator, hash) catch |err| {
+                hash.deinit(self.allocator);
+                return err;
+            };
+            hash.deinit(self.allocator);
+            var entry = maybe_entry orelse continue;
+            if (!std.mem.eql(u8, entry.actor_id, owner) or !std.mem.eql(u8, entry.key, key)) {
+                freeAgentMemory(self.allocator, &entry);
+                continue;
+            }
+            const redis_key_copy = try self.allocator.dupe(u8, redis_key);
+            var appended = false;
+            errdefer if (!appended) {
+                self.allocator.free(redis_key_copy);
+                freeAgentMemory(self.allocator, &entry);
+            };
+            try candidates.append(self.allocator, .{
+                .redis_key = redis_key_copy,
+                .entry = entry,
+            });
+            appended = true;
+        }
+        if (candidates.items.len == 0) return false;
+
+        try self.beginTransaction();
+        var committed = false;
+        defer if (!committed) self.discardTransaction();
+        for (candidates.items) |candidate| {
+            try self.queueRemoveEntryIndexes(candidate.redis_key, candidate.entry);
+            try self.queueCommand(&.{ "DEL", candidate.redis_key });
+        }
+        var resp = try self.execTransaction();
+        committed = true;
+        defer resp.deinit(self.allocator);
+        const replies = switch (resp) {
+            .array => |maybe_items| maybe_items orelse return false,
+            else => return false,
+        };
+        for (replies) |reply| switch (reply) {
+            .integer => |changed| if (changed > 0) return true,
+            else => {},
+        };
+        return false;
     }
 
     pub fn count(self: *RedisAgentMemory, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
@@ -1808,6 +1906,18 @@ pub const ApiAgentMemory = struct {
         return true;
     }
 
+    pub fn deleteAll(self: *ApiAgentMemory, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        const owner = actor_id orelse return false;
+        const actor = writer_actor_id orelse owner;
+        const body = try agentMemoryDeleteAllApplyPayload(self.allocator, key, owner, actor);
+        defer self.allocator.free(body);
+        const response = try self.request(self.allocator, .POST, "/memory/apply", "", actor, self.config.actor_scopes_json, body);
+        defer self.allocator.free(response.body);
+        if (response.status == .not_found) return false;
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return true;
+    }
+
     pub fn count(self: *ApiAgentMemory, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
         const actor = actor_id orelse "";
         const response = try self.request(self.allocator, .GET, "/agent-memory/count", "", actor, scopes_json, "");
@@ -2011,6 +2121,23 @@ fn agentMemoryApplyPayload(allocator: std.mem.Allocator, input: Input, actor_id:
             try json.appendRawJsonOr(&out, allocator, input.content, "{}");
         },
     }
+    try out.appendSlice(allocator, "}}");
+    return out.toOwnedSlice(allocator);
+}
+
+fn agentMemoryDeleteAllApplyPayload(allocator: std.mem.Allocator, key: []const u8, owner_actor_id: []const u8, writer_actor_id: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"event_type\":\"agent_memory.delete_all\",\"operation\":\"delete_all\",\"object_type\":\"agent_memory\",\"actor_id\":");
+    try json.appendString(&out, allocator, writer_actor_id);
+    try out.appendSlice(allocator, ",\"payload\":{\"key\":");
+    try json.appendString(&out, allocator, key);
+    if (sharedScopeFromOwner(owner_actor_id)) |scope| {
+        try out.appendSlice(allocator, ",\"scope\":");
+        try json.appendString(&out, allocator, scope);
+    }
+    try out.appendSlice(allocator, ",\"owner_id\":");
+    try json.appendString(&out, allocator, owner_actor_id);
     try out.appendSlice(allocator, "}}");
     return out.toOwnedSlice(allocator);
 }
@@ -2788,6 +2915,27 @@ test "memory_lru and none agent memory runtimes match agent memory contract" {
         var copy = stopword_only;
         freeAgentMemory(std.testing.allocator, &copy);
     }
+    const delete_all_global = try runtime.store(std.testing.allocator, .{ .key = "delete.all", .content = "global delete-all value", .actor_id = "agent:a" });
+    defer {
+        var copy = delete_all_global;
+        freeAgentMemory(std.testing.allocator, &copy);
+    }
+    const delete_all_session = try runtime.store(std.testing.allocator, .{ .key = "delete.all", .content = "session delete-all value", .session_id = "sess", .actor_id = "agent:a" });
+    defer {
+        var copy = delete_all_session;
+        freeAgentMemory(std.testing.allocator, &copy);
+    }
+    try std.testing.expect(try runtime.delete("delete.all", "sess", "agent:a", "agent:a"));
+    try std.testing.expect((try runtime.get(std.testing.allocator, "delete.all", "sess", "agent:a")) == null);
+    const delete_all_session_again = try runtime.store(std.testing.allocator, .{ .key = "delete.all", .content = "session delete-all value again", .session_id = "sess", .actor_id = "agent:a" });
+    defer {
+        var copy = delete_all_session_again;
+        freeAgentMemory(std.testing.allocator, &copy);
+    }
+    try std.testing.expect(try runtime.deleteAll("delete.all", "agent:a", "agent:a"));
+    try std.testing.expect((try runtime.get(std.testing.allocator, "delete.all", null, "agent:a")) == null);
+    try std.testing.expect((try runtime.get(std.testing.allocator, "delete.all", "sess", "agent:a")) == null);
+    try std.testing.expect(!(try runtime.deleteAll("delete.all", "agent:b", "agent:b")));
 
     const a = (try runtime.get(std.testing.allocator, "pref.lang", null, "agent:a")).?;
     defer {

@@ -193,6 +193,10 @@ fn agentMemoryDeleteFeedEventType(store_name: []const u8) []const u8 {
     return if (std.mem.eql(u8, store_name, "native")) "agent_memory.delete" else "agent_memory.runtime_delete";
 }
 
+fn agentMemoryDeleteAllFeedEventType(store_name: []const u8) []const u8 {
+    return if (std.mem.eql(u8, store_name, "native")) "agent_memory.delete_all" else "agent_memory.runtime_delete_all";
+}
+
 fn agentMemoryFeedPayloadJson(allocator: std.mem.Allocator, store_name: []const u8, entry: domain.AgentMemory, operation: domain.AgentMemoryOperation, operation_content: []const u8) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -2042,7 +2046,10 @@ pub const Store = struct {
             object_id = saved.id;
             entry = saved;
         } else if (input.delete_key) |key| {
-            deleted = try self.agentMemoryDeleteRoutedInner(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, route, true);
+            deleted = if (input.delete_all)
+                try self.agentMemoryDeleteAllRoutedInner(key, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, route, true)
+            else
+                try self.agentMemoryDeleteRoutedInner(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, route, true);
             object_id = key;
         }
 
@@ -2194,6 +2201,13 @@ pub const Store = struct {
         };
     }
 
+    fn deprecateRuntimeAgentMemoryMirrorsAllSessions(self: *Store, allocator: std.mem.Allocator, store_name: []const u8, key: []const u8, owner_actor_id: []const u8, writer_actor_id: ?[]const u8) !void {
+        return switch (self.backend) {
+            .sqlite => |*s| s.deprecateRuntimeAgentMemoryMirrorsAllSessions(store_name, key, owner_actor_id, writer_actor_id),
+            .postgres => |*p| p.deprecateRuntimeAgentMemoryMirrorsAllSessions(allocator, store_name, key, owner_actor_id, writer_actor_id),
+        };
+    }
+
     fn deprecateRuntimeAgentMemoryMirrorsForDelete(self: *Store, key: []const u8, session_id: ?[]const u8, owner_actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
         const owner = owner_actor_id orelse return;
         switch (route.target) {
@@ -2209,6 +2223,26 @@ pub const Store = struct {
                 if (self.agent_memory.isExternal()) try self.deprecateRuntimeAgentMemoryMirrors(self.allocator, "runtime", key, session_id, owner, writer_actor_id);
                 for (self.agent_memory_stores.stores.items) |named| {
                     try self.deprecateRuntimeAgentMemoryMirrors(self.allocator, named.name, key, session_id, owner, writer_actor_id);
+                }
+            },
+        }
+    }
+
+    fn deprecateRuntimeAgentMemoryMirrorsForDeleteAll(self: *Store, key: []const u8, owner_actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        const owner = owner_actor_id orelse return;
+        switch (route.target) {
+            .primary => if (self.agent_memory.isExternal()) try self.deprecateRuntimeAgentMemoryMirrorsAllSessions(self.allocator, "runtime", key, owner, writer_actor_id),
+            .native => {},
+            .runtime => if (self.agent_memory.isExternal()) try self.deprecateRuntimeAgentMemoryMirrorsAllSessions(self.allocator, "runtime", key, owner, writer_actor_id),
+            .named => try self.deprecateRuntimeAgentMemoryMirrorsAllSessions(self.allocator, route.name orelse "named", key, owner, writer_actor_id),
+            .subset => {
+                const stores = try requireSubsetStores(route);
+                for (stores) |store_name| try self.deprecateRuntimeAgentMemoryMirrorsForDeleteAll(key, owner, writer_actor_id, routeForSubsetStoreName(store_name));
+            },
+            .all => {
+                if (self.agent_memory.isExternal()) try self.deprecateRuntimeAgentMemoryMirrorsAllSessions(self.allocator, "runtime", key, owner, writer_actor_id);
+                for (self.agent_memory_stores.stores.items) |named| {
+                    try self.deprecateRuntimeAgentMemoryMirrorsAllSessions(self.allocator, named.name, key, owner, writer_actor_id);
                 }
             },
         }
@@ -2268,6 +2302,27 @@ pub const Store = struct {
             .object_id = key,
             .scope = scope,
             .permissions_json = permissions_json,
+            .actor_id = writer_actor_id orelse owner_actor_id,
+            .payload_json = payload,
+            .status = "applied",
+        });
+    }
+
+    fn appendAgentMemoryDeleteAllFeedEvent(self: *Store, allocator: std.mem.Allocator, route: AgentMemoryStorageRoute, key: []const u8, requested_owner_actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !void {
+        if (domain.isInternalMemoryKey(key)) return;
+        const owner_actor_id = requested_owner_actor_id orelse return;
+        const store_name = self.agentMemoryDeleteRouteStoreName(route);
+        const scope = try agentMemoryScope(allocator, owner_actor_id, null, null);
+        defer allocator.free(scope);
+        const payload = try agentMemoryDeleteFeedPayloadJson(allocator, store_name, key, null, owner_actor_id, scope, "[]");
+        defer allocator.free(payload);
+        _ = try self.appendFeedEvent(.{
+            .event_type = agentMemoryDeleteAllFeedEventType(store_name),
+            .operation = "delete_all",
+            .object_type = "agent_memory",
+            .object_id = key,
+            .scope = scope,
+            .permissions_json = "[]",
             .actor_id = writer_actor_id orelse owner_actor_id,
             .payload_json = payload,
             .status = "applied",
@@ -2564,6 +2619,15 @@ pub const Store = struct {
         var deleted = false;
         for (stores) |store_name| {
             deleted = (try self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, routeForSubsetStoreName(store_name), suppress_feed)) or deleted;
+        }
+        return deleted;
+    }
+
+    fn agentMemoryDeleteAllSubsetInner(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) anyerror!bool {
+        const stores = try requireSubsetStores(route);
+        var deleted = false;
+        for (stores) |store_name| {
+            deleted = (try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, routeForSubsetStoreName(store_name), suppress_feed)) or deleted;
         }
         return deleted;
     }
@@ -2997,6 +3061,42 @@ pub const Store = struct {
         return self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, route, false);
     }
 
+    pub fn agentMemoryDeleteAllRouted(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
+        return self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, route, false);
+    }
+
+    fn agentMemoryDeleteAllRoutedInner(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !bool {
+        switch (route.target) {
+            .subset => return self.agentMemoryDeleteAllSubsetInner(key, actor_id, writer_actor_id, route, suppress_feed),
+            .all => {
+                var deleted = try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, .{ .target = .native }, suppress_feed);
+                if (self.agent_memory.isExternal()) {
+                    deleted = (try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, .{ .target = .runtime }, suppress_feed)) or deleted;
+                }
+                for (self.agent_memory_stores.stores.items) |named| {
+                    deleted = (try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, .{ .target = .named, .name = named.name }, suppress_feed)) or deleted;
+                }
+                return deleted;
+            },
+            else => {},
+        }
+
+        const deleted = try switch (route.target) {
+            .primary => self.agentMemoryDeleteAll(key, actor_id, writer_actor_id),
+            .native => self.agentMemoryDeleteAllNative(key, actor_id, writer_actor_id),
+            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.deleteAll(key, actor_id, writer_actor_id) else error.AgentMemoryStorageUnavailable,
+            .named => (try self.namedAgentMemoryRuntime(route)).deleteAll(key, actor_id, writer_actor_id),
+            .subset, .all => unreachable,
+        };
+        if (deleted) {
+            try self.deprecateRuntimeAgentMemoryMirrorsForDeleteAll(key, actor_id, writer_actor_id, route);
+            if (!suppress_feed) {
+                try self.appendAgentMemoryDeleteAllFeedEvent(self.allocator, route, key, actor_id, writer_actor_id);
+            }
+        }
+        return deleted;
+    }
+
     fn agentMemoryDeleteRoutedInner(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !bool {
         switch (route.target) {
             .subset => return self.agentMemoryDeleteSubsetInner(key, session_id, actor_id, writer_actor_id, route, suppress_feed),
@@ -3039,6 +3139,18 @@ pub const Store = struct {
         return switch (self.backend) {
             .sqlite => |*s| s.agentMemoryDelete(key, session_id, actor_id, writer_actor_id),
             .postgres => |*p| p.agentMemoryDelete(key, session_id, actor_id, writer_actor_id),
+        };
+    }
+
+    pub fn agentMemoryDeleteAll(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        if (self.agent_memory.isExternal()) return self.agent_memory.deleteAll(key, actor_id, writer_actor_id);
+        return self.agentMemoryDeleteAllNative(key, actor_id, writer_actor_id);
+    }
+
+    fn agentMemoryDeleteAllNative(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        return switch (self.backend) {
+            .sqlite => |*s| s.agentMemoryDeleteAll(key, actor_id, writer_actor_id),
+            .postgres => |*p| p.agentMemoryDeleteAll(key, actor_id, writer_actor_id),
         };
     }
 
@@ -4311,6 +4423,7 @@ pub const FeedAgentMemoryApplyInput = struct {
     delete_key: ?[]const u8 = null,
     delete_session_id: ?[]const u8 = null,
     delete_owner_actor_id: ?[]const u8 = null,
+    delete_all: bool = false,
     writer_actor_id: ?[]const u8 = null,
 };
 
@@ -5876,7 +5989,10 @@ pub const SQLiteStore = struct {
             object_id = saved.id;
             entry = saved;
         } else if (input.delete_key) |key| {
-            deleted = try self.agentMemoryDeleteInTx(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id);
+            deleted = if (input.delete_all)
+                try self.agentMemoryDeleteAllInTx(key, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id)
+            else
+                try self.agentMemoryDeleteInTx(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id);
             object_id = key;
         }
 
@@ -8618,6 +8734,29 @@ pub const SQLiteStore = struct {
         }
     }
 
+    fn deprecateRuntimeAgentMemoryMirrorsAllSessions(self: *Self, store_name: []const u8, key: []const u8, owner_actor_id: []const u8, writer_actor_id: ?[]const u8) !void {
+        const stmt = try self.prepare(
+            "UPDATE memory_atoms SET status = 'deprecated' " ++
+                "WHERE predicate = 'agent.memory' AND object = ?1 AND status NOT IN ('deprecated','superseded','rejected') " ++
+                "AND EXISTS (" ++
+                "SELECT 1 FROM json_each(memory_atoms.source_ids_json) sid " ++
+                "JOIN sources s ON s.id = sid.value " ++
+                "WHERE json_extract(s.metadata_json, '$.native') = 'agent_memory_runtime' " ++
+                "AND json_extract(s.metadata_json, '$.store') = ?2 " ++
+                "AND json_extract(s.metadata_json, '$.key') = ?1 " ++
+                "AND json_extract(s.metadata_json, '$.owner_id') = ?3" ++
+                ")",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key);
+        bindText(stmt, 2, store_name);
+        bindText(stmt, 3, owner_actor_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+        if (c.sqlite3_changes(self.db) > 0) {
+            try self.insertAuditActor("agent_memory.runtime_mirrors_deprecated_all", writer_actor_id, "agent_memory", key);
+        }
+    }
+
     pub fn agentMemoryGet(self: *Self, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
         const stmt = try self.prepare(agentMemorySelectSql("AND ami.key = ?1", "ORDER BY ami.timestamp_ms DESC LIMIT 1"));
         defer _ = c.sqlite3_finalize(stmt);
@@ -8741,6 +8880,16 @@ pub const SQLiteStore = struct {
         return changed;
     }
 
+    pub fn agentMemoryDeleteAll(self: *Self, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        self.tx_mutex.lockUncancelable(compat.io());
+        defer self.tx_mutex.unlock(compat.io());
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        const changed = try self.agentMemoryDeleteAllInTx(key, actor_id, writer_actor_id);
+        try self.exec("COMMIT");
+        return changed;
+    }
+
     fn agentMemoryDeleteInTx(self: *Self, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
         const audit_actor = writer_actor_id orelse actor_id;
         {
@@ -8766,6 +8915,33 @@ pub const SQLiteStore = struct {
         if (c.sqlite3_step(del) != c.SQLITE_DONE) return error.DeleteFailed;
         const changed = c.sqlite3_changes(self.db) > 0;
         if (changed) try self.insertAuditActor("agent_memory.deleted", audit_actor, "agent_memory", key);
+        return changed;
+    }
+
+    fn agentMemoryDeleteAllInTx(self: *Self, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        const owner_actor = actor_id orelse return false;
+        const audit_actor = writer_actor_id orelse owner_actor;
+        {
+            const stmt = try self.prepare("SELECT memory_atom_id,id FROM agent_memory_items WHERE key = ?1 AND actor_id = ?2");
+            defer _ = c.sqlite3_finalize(stmt);
+            bindText(stmt, 1, key);
+            bindText(stmt, 2, owner_actor);
+            while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                const id_text = try columnText(self.allocator, stmt, 0);
+                defer self.allocator.free(id_text);
+                _ = try self.patchMemoryAtomStatusActor(id_text, "deprecated", false, audit_actor);
+                const item_id = try columnText(self.allocator, stmt, 1);
+                defer self.allocator.free(item_id);
+                try self.deleteFtsRow("agent_memory_fts", item_id);
+            }
+        }
+        const del = try self.prepare("DELETE FROM agent_memory_items WHERE key = ?1 AND actor_id = ?2");
+        defer _ = c.sqlite3_finalize(del);
+        bindText(del, 1, key);
+        bindText(del, 2, owner_actor);
+        if (c.sqlite3_step(del) != c.SQLITE_DONE) return error.DeleteFailed;
+        const changed = c.sqlite3_changes(self.db) > 0;
+        if (changed) try self.insertAuditActor("agent_memory.deleted_all", audit_actor, "agent_memory", key);
         return changed;
     }
 
@@ -10178,7 +10354,10 @@ pub const PostgresStore = struct {
             object_id = saved.id;
             entry = saved;
         } else if (input.delete_key) |key| {
-            deleted = try self.agentMemoryDelete(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id);
+            deleted = if (input.delete_all)
+                try self.agentMemoryDeleteAll(key, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id)
+            else
+                try self.agentMemoryDelete(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id);
             object_id = key;
         }
 
@@ -11765,6 +11944,25 @@ pub const PostgresStore = struct {
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
+    pub fn agentMemoryDeleteAll(self: *PostgresStore, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        const owner_actor = actor_id orelse return false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH rows AS (" ++
+                "DELETE FROM agent_memory_items WHERE key = $1 AND actor_id = $2 RETURNING memory_atom_id" ++
+                "), upd AS (" ++
+                "UPDATE memory_atoms SET status='deprecated' WHERE id IN (SELECT memory_atom_id FROM rows) RETURNING 1" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'agent_memory.deleted_all',$3,'agent_memory',$1,'{}'::jsonb,(extract(epoch from clock_timestamp()) * 1000)::bigint WHERE EXISTS (SELECT 1 FROM rows) RETURNING 1" ++
+                ") SELECT count(*)::text FROM rows",
+            &.{ key, owner_actor, writer_actor_id orelse owner_actor },
+        );
+        return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
+    }
+
     fn deprecateRuntimeAgentMemoryMirrors(self: *PostgresStore, allocator: std.mem.Allocator, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, writer_actor_id: ?[]const u8) !void {
         const text = try self.queryParamsText(
             allocator,
@@ -11784,6 +11982,28 @@ pub const PostgresStore = struct {
                 "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'agent_memory.runtime_mirrors_deprecated',$5,'agent_memory',$1,'{}'::jsonb,(extract(epoch from clock_timestamp()) * 1000)::bigint WHERE EXISTS (SELECT 1 FROM updated) RETURNING 1" ++
                 ") SELECT count(*)::text FROM updated",
             &.{ key, store_name, session_id, owner_actor_id, writer_actor_id },
+        );
+        allocator.free(text);
+    }
+
+    fn deprecateRuntimeAgentMemoryMirrorsAllSessions(self: *PostgresStore, allocator: std.mem.Allocator, store_name: []const u8, key: []const u8, owner_actor_id: []const u8, writer_actor_id: ?[]const u8) !void {
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH updated AS (" ++
+                "UPDATE memory_atoms ma SET status = 'deprecated' " ++
+                "WHERE ma.predicate = 'agent.memory' AND ma.object = $1 AND ma.status NOT IN ('deprecated','superseded','rejected') " ++
+                "AND EXISTS (" ++
+                "SELECT 1 FROM jsonb_array_elements_text(ma.source_ids_json) sid(id) " ++
+                "JOIN sources s ON s.id = sid.id " ++
+                "WHERE s.metadata_json->>'native' = 'agent_memory_runtime' " ++
+                "AND s.metadata_json->>'store' = $2 " ++
+                "AND s.metadata_json->>'key' = $1 " ++
+                "AND s.metadata_json->>'owner_id' = $3" ++
+                ") RETURNING ma.id" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'agent_memory.runtime_mirrors_deprecated_all',$4,'agent_memory',$1,'{}'::jsonb,(extract(epoch from clock_timestamp()) * 1000)::bigint WHERE EXISTS (SELECT 1 FROM updated) RETURNING 1" ++
+                ") SELECT count(*)::text FROM updated",
+            &.{ key, store_name, owner_actor_id, writer_actor_id },
         );
         allocator.free(text);
     }
