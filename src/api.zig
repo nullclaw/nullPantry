@@ -36,6 +36,7 @@ pub const Context = struct {
     embedding_api_key: ?[]const u8 = null,
     embedding_model: ?[]const u8 = null,
     embedding_provider: providers.EmbeddingProviderKind = .openai_compatible,
+    embedding_fallbacks: []const providers.EmbeddingEndpointConfig = &.{},
     embedding_dimensions: usize = 64,
     llm_base_url: ?[]const u8 = null,
     llm_api_key: ?[]const u8 = null,
@@ -1196,7 +1197,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -2250,6 +2251,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
                 .model = ctx.embedding_model,
                 .dimensions = ctx.embedding_dimensions,
                 .timeout_secs = ctx.provider_timeout_secs,
+                .fallbacks = ctx.embedding_fallbacks,
             }, chunk_text, ctx.embedding_dimensions) catch return count;
             const embedding_json = try vector_mod.embeddingToJson(ctx.allocator, embedding_result.embedding);
             _ = try ctx.store.upsertVectorChunk(ctx.allocator, .{
@@ -2356,6 +2358,7 @@ fn runJob(ctx: *Context, id: []const u8) HttpResponse {
         .embedding_api_key = ctx.embedding_api_key,
         .embedding_model = ctx.embedding_model,
         .embedding_provider = ctx.embedding_provider,
+        .embedding_fallbacks = ctx.embedding_fallbacks,
         .embedding_dimensions = ctx.embedding_dimensions,
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
@@ -2584,6 +2587,7 @@ fn vectorEmbed(ctx: *Context, body: []const u8) HttpResponse {
         .model = ctx.embedding_model,
         .dimensions = @min(dimensions, 4096),
         .timeout_secs = ctx.provider_timeout_secs,
+        .fallbacks = ctx.embedding_fallbacks,
     };
     const result = providers.embedText(ctx.allocator, cfg, text, @min(dimensions, 4096)) catch return serverError(ctx);
     const embedding_json = @import("vector.zig").embeddingToJson(ctx.allocator, result.embedding) catch return serverError(ctx);
@@ -2743,6 +2747,7 @@ fn vectorOutboxRun(ctx: *Context, body: []const u8) HttpResponse {
         .embedding_api_key = ctx.embedding_api_key,
         .embedding_model = ctx.embedding_model,
         .embedding_provider = ctx.embedding_provider,
+        .embedding_fallbacks = ctx.embedding_fallbacks,
         .embedding_dimensions = ctx.embedding_dimensions,
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
@@ -2876,6 +2881,7 @@ fn workersRun(ctx: *Context, body: []const u8) HttpResponse {
         .embedding_api_key = ctx.embedding_api_key,
         .embedding_model = ctx.embedding_model,
         .embedding_provider = ctx.embedding_provider,
+        .embedding_fallbacks = ctx.embedding_fallbacks,
         .embedding_dimensions = ctx.embedding_dimensions,
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
@@ -5428,6 +5434,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
             .model = ctx.embedding_model,
             .dimensions = embedding_dimensions,
             .timeout_secs = ctx.provider_timeout_secs,
+            .fallbacks = ctx.embedding_fallbacks,
         }, query, embedding_dimensions) catch |err| {
             if (strict_vector) return err;
             use_vector = false;
@@ -6992,6 +6999,33 @@ test "api search falls back to keyword when embedding provider fails" {
 
     const strict = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"provider fallback\",\"scopes\":[\"public\"],\"use_vector\":true,\"strict_vector\":true}", "");
     try std.testing.expectEqualStrings("500 Internal Server Error", strict.status);
+}
+
+test "api vector embed uses configured embedding fallback chain and rejects provider override" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const fallbacks = [_]providers.EmbeddingEndpointConfig{.{ .provider = .local_deterministic, .dimensions = 5 }};
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .embedding_base_url = "://bad-provider-url",
+        .embedding_model = "bad-model",
+        .embedding_dimensions = 5,
+        .embedding_fallbacks = &fallbacks,
+        .provider_timeout_secs = 1,
+    };
+
+    const resp = handleRequest(&ctx, "POST", "/v1/vector/embed", "{\"text\":\"fallback provider vector\"}", "");
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"provider\":\"local-deterministic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"dimensions\":5") != null);
+
+    const override = handleRequest(&ctx, "POST", "/v1/vector/embed", "{\"text\":\"x\",\"provider\":\"gemini\"}", "");
+    try std.testing.expectEqualStrings("400 Bad Request", override.status);
 }
 
 test "api search and ask do not return unrelated fallback evidence on zero hit" {

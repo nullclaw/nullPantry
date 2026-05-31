@@ -44,7 +44,7 @@ pub const EmbeddingProviderKind = enum {
     }
 };
 
-pub const EmbeddingConfig = struct {
+pub const EmbeddingEndpointConfig = struct {
     provider: EmbeddingProviderKind = .openai_compatible,
     base_url: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
@@ -52,11 +52,36 @@ pub const EmbeddingConfig = struct {
     dimensions: usize = 64,
     timeout_secs: u32 = 30,
 
-    pub fn enabled(self: EmbeddingConfig) bool {
+    pub fn enabled(self: EmbeddingEndpointConfig) bool {
         return switch (self.provider) {
             .local_deterministic => false,
             .openai_compatible => self.base_url != null and self.model != null,
             .gemini, .voyage => self.api_key != null,
+        };
+    }
+};
+
+pub const EmbeddingConfig = struct {
+    provider: EmbeddingProviderKind = .openai_compatible,
+    base_url: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    dimensions: usize = 64,
+    timeout_secs: u32 = 30,
+    fallbacks: []const EmbeddingEndpointConfig = &.{},
+
+    pub fn enabled(self: EmbeddingConfig) bool {
+        return self.primaryEndpoint().enabled();
+    }
+
+    fn primaryEndpoint(self: EmbeddingConfig) EmbeddingEndpointConfig {
+        return .{
+            .provider = self.provider,
+            .base_url = self.base_url,
+            .api_key = self.api_key,
+            .model = self.model,
+            .dimensions = self.dimensions,
+            .timeout_secs = self.timeout_secs,
         };
     }
 };
@@ -97,6 +122,7 @@ pub const provider_descriptors = [_]ProviderDescriptor{
     .{ .name = "openai-compatible-embeddings", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "gemini", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /v1beta/models/{model}:embedContent", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "voyage", .role = "query and chunk embeddings", .status = "built_in", .protocol = "POST /v1/embeddings", .env_prefix = "NULLPANTRY_EMBEDDING_" },
+    .{ .name = "embedding-fallback-chain", .role = "server-side embedding failover between configured providers", .status = "built_in", .protocol = "NULLPANTRY_EMBEDDING_FALLBACKS string or JSON", .env_prefix = "NULLPANTRY_EMBEDDING_" },
     .{ .name = "openai-compatible-chat", .role = "ask synthesis, structured extraction, and optional reranking", .status = "built_in", .protocol = "POST /chat/completions", .env_prefix = "NULLPANTRY_LLM_" },
     .{ .name = "ollama", .role = "local provider via OpenAI-compatible endpoint", .status = "compatible", .protocol = "configure Ollama OpenAI compatibility base URL", .env_prefix = "NULLPANTRY_EMBEDDING_|NULLPANTRY_LLM_" },
 };
@@ -121,18 +147,22 @@ pub fn appendProvidersJson(allocator: std.mem.Allocator, out: *std.ArrayListUnma
 }
 
 pub fn embedText(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []const u8, fallback_dimensions: usize) !EmbeddingResult {
-    if (cfg.enabled()) {
-        const embedding = switch (cfg.provider) {
-            .local_deterministic => unreachable,
-            .openai_compatible => try callOpenAICompatibleEmbedding(allocator, cfg, text),
-            .gemini => try callGeminiEmbedding(allocator, cfg, text),
-            .voyage => try callVoyageEmbedding(allocator, cfg, text),
-        };
-        return .{
-            .provider = cfg.provider.name(),
-            .model = embeddingModel(cfg),
-            .embedding = embedding,
-        };
+    const primary = cfg.primaryEndpoint();
+    var first_err: ?anyerror = null;
+    if (primary.enabled() or primary.provider == .local_deterministic) {
+        if (embedWithEndpoint(allocator, primary, text, fallback_dimensions)) |result| return result else |primary_err| {
+            first_err = primary_err;
+        }
+    }
+    for (cfg.fallbacks) |fallback| {
+        if (!fallback.enabled() and fallback.provider != .local_deterministic) continue;
+        if (embedWithEndpoint(allocator, fallback, text, fallback_dimensions)) |result| return result else |fallback_err| {
+            if (first_err == null) first_err = fallback_err;
+            continue;
+        }
+    }
+    if (primary.enabled() or cfg.fallbacks.len > 0) {
+        if (first_err) |err| return err;
     }
 
     return .{
@@ -142,13 +172,97 @@ pub fn embedText(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []con
     };
 }
 
-fn embeddingModel(cfg: EmbeddingConfig) []const u8 {
+fn embedWithEndpoint(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfig, text: []const u8, fallback_dimensions: usize) !EmbeddingResult {
+    if (cfg.provider == .local_deterministic) {
+        return .{
+            .provider = "local-deterministic",
+            .model = "local-deterministic",
+            .embedding = try vector.deterministicEmbedding(allocator, text, fallback_dimensions),
+        };
+    }
+    const embedding = switch (cfg.provider) {
+        .local_deterministic => unreachable,
+        .openai_compatible => try callOpenAICompatibleEmbedding(allocator, cfg, text),
+        .gemini => try callGeminiEmbedding(allocator, cfg, text),
+        .voyage => try callVoyageEmbedding(allocator, cfg, text),
+    };
+    return .{
+        .provider = cfg.provider.name(),
+        .model = embeddingModel(cfg),
+        .embedding = embedding,
+    };
+}
+
+fn embeddingModel(cfg: EmbeddingEndpointConfig) []const u8 {
     return cfg.model orelse switch (cfg.provider) {
         .local_deterministic => "local-deterministic",
         .openai_compatible => "unknown",
         .gemini => "text-embedding-004",
         .voyage => "voyage-3-lite",
     };
+}
+
+pub fn parseEmbeddingFallbacks(allocator: std.mem.Allocator, raw: []const u8, base: EmbeddingConfig) ![]EmbeddingEndpointConfig {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return allocator.alloc(EmbeddingEndpointConfig, 0);
+    if (trimmed[0] == '[') return parseEmbeddingFallbacksJson(allocator, trimmed, base);
+    return parseEmbeddingFallbacksList(allocator, trimmed, base);
+}
+
+fn parseEmbeddingFallbacksList(allocator: std.mem.Allocator, raw: []const u8, base: EmbeddingConfig) ![]EmbeddingEndpointConfig {
+    var out: std.ArrayListUnmanaged(EmbeddingEndpointConfig) = .empty;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |item| {
+        const provider_name = std.mem.trim(u8, item, " \t\r\n");
+        if (provider_name.len == 0) continue;
+        try out.append(allocator, fallbackFromProvider(base, EmbeddingProviderKind.parse(provider_name)));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseEmbeddingFallbacksJson(allocator: std.mem.Allocator, raw: []const u8, base: EmbeddingConfig) ![]EmbeddingEndpointConfig {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return error.InvalidEmbeddingFallbacks;
+    defer parsed.deinit();
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.InvalidEmbeddingFallbacks,
+    };
+    var out: std.ArrayListUnmanaged(EmbeddingEndpointConfig) = .empty;
+    errdefer out.deinit(allocator);
+    for (arr.items) |item| {
+        switch (item) {
+            .string => |name| try out.append(allocator, fallbackFromProvider(base, EmbeddingProviderKind.parse(name))),
+            .object => |obj| {
+                const provider = EmbeddingProviderKind.parse(json.stringField(obj, "provider") orelse json.stringField(obj, "name") orelse "openai-compatible");
+                try out.append(allocator, .{
+                    .provider = provider,
+                    .base_url = try dupOptional(allocator, json.nullableStringField(obj, "base_url")),
+                    .api_key = try dupOptional(allocator, json.nullableStringField(obj, "api_key")),
+                    .model = try dupOptional(allocator, json.nullableStringField(obj, "model")),
+                    .dimensions = @intCast(@max(@as(i64, 1), json.intField(obj, "dimensions") orelse @as(i64, @intCast(base.dimensions)))),
+                    .timeout_secs = @intCast(@max(@as(i64, 1), json.intField(obj, "timeout_secs") orelse @as(i64, @intCast(base.timeout_secs)))),
+                });
+            },
+            else => return error.InvalidEmbeddingFallbacks,
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn fallbackFromProvider(base: EmbeddingConfig, provider: EmbeddingProviderKind) EmbeddingEndpointConfig {
+    return .{
+        .provider = provider,
+        .base_url = base.base_url,
+        .api_key = base.api_key,
+        .model = base.model,
+        .dimensions = base.dimensions,
+        .timeout_secs = base.timeout_secs,
+    };
+}
+
+fn dupOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    if (value) |text| return try allocator.dupe(u8, text);
+    return null;
 }
 
 pub fn completeAnswer(allocator: std.mem.Allocator, cfg: CompletionConfig, prompt: []const u8) !CompletionResult {
@@ -164,7 +278,7 @@ pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: CompletionConfig, s
     };
 }
 
-fn callOpenAICompatibleEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []const u8) ![]f32 {
+fn callOpenAICompatibleEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfig, text: []const u8) ![]f32 {
     const url = try providerUrl(allocator, cfg.base_url.?, "/embeddings");
     defer allocator.free(url);
 
@@ -186,7 +300,7 @@ fn callOpenAICompatibleEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingCon
     return parseEmbeddingResponse(allocator, response);
 }
 
-fn callGeminiEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []const u8) ![]f32 {
+fn callGeminiEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfig, text: []const u8) ![]f32 {
     if (text.len == 0) return allocator.alloc(f32, 0);
     const base_url = cfg.base_url orelse "https://generativelanguage.googleapis.com";
     const model = cfg.model orelse "text-embedding-004";
@@ -203,7 +317,7 @@ fn callGeminiEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text:
     return parseGeminiEmbeddingResponse(allocator, response);
 }
 
-fn callVoyageEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingConfig, text: []const u8) ![]f32 {
+fn callVoyageEmbedding(allocator: std.mem.Allocator, cfg: EmbeddingEndpointConfig, text: []const u8) ![]f32 {
     if (text.len == 0) return allocator.alloc(f32, 0);
     const base_url = cfg.base_url orelse "https://api.voyageai.com";
     const model = cfg.model orelse "voyage-3-lite";
@@ -459,6 +573,43 @@ test "embedding provider kind parsing and defaults" {
     try std.testing.expect((EmbeddingConfig{ .provider = .gemini, .api_key = "key" }).enabled());
     try std.testing.expect((EmbeddingConfig{ .provider = .voyage, .api_key = "key" }).enabled());
     try std.testing.expect(!(EmbeddingConfig{ .provider = .gemini }).enabled());
+}
+
+test "embedding fallback parsing supports csv and json endpoint specs" {
+    const base = EmbeddingConfig{ .base_url = "https://example.test/v1", .api_key = "key", .model = "model", .dimensions = 42, .timeout_secs = 7 };
+    const csv = try parseEmbeddingFallbacks(std.testing.allocator, "voyage, local-deterministic", base);
+    defer std.testing.allocator.free(csv);
+    try std.testing.expectEqual(@as(usize, 2), csv.len);
+    try std.testing.expectEqual(EmbeddingProviderKind.voyage, csv[0].provider);
+    try std.testing.expectEqualStrings("key", csv[0].api_key.?);
+    try std.testing.expectEqual(EmbeddingProviderKind.local_deterministic, csv[1].provider);
+
+    const json_spec =
+        \\[{"provider":"gemini","api_key":"g","model":"text-embedding-004","dimensions":768},{"provider":"local-deterministic"}]
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try parseEmbeddingFallbacks(arena.allocator(), json_spec, base);
+    try std.testing.expectEqual(@as(usize, 2), parsed.len);
+    try std.testing.expectEqual(EmbeddingProviderKind.gemini, parsed[0].provider);
+    try std.testing.expectEqualStrings("g", parsed[0].api_key.?);
+    try std.testing.expectEqual(@as(usize, 768), parsed[0].dimensions);
+    try std.testing.expectEqual(EmbeddingProviderKind.local_deterministic, parsed[1].provider);
+}
+
+test "embedding fallback chain can recover to deterministic local embeddings" {
+    const fallbacks = [_]EmbeddingEndpointConfig{.{ .provider = .local_deterministic, .dimensions = 3 }};
+    const result = try embedText(std.testing.allocator, .{
+        .provider = .openai_compatible,
+        .base_url = "://bad-provider-url",
+        .model = "broken",
+        .dimensions = 3,
+        .timeout_secs = 1,
+        .fallbacks = &fallbacks,
+    }, "fallback memory", 3);
+    defer std.testing.allocator.free(result.embedding);
+    try std.testing.expectEqualStrings("local-deterministic", result.provider);
+    try std.testing.expectEqual(@as(usize, 3), result.embedding.len);
 }
 
 test "providers parse openai-compatible chat response" {

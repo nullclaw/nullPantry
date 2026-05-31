@@ -37,6 +37,7 @@ const RuntimeConfig = struct {
     embedding_api_key: ?[]const u8 = null,
     embedding_model: ?[]const u8 = null,
     embedding_provider: providers.EmbeddingProviderKind = .openai_compatible,
+    embedding_fallbacks: []const providers.EmbeddingEndpointConfig = &.{},
     embedding_dimensions: usize = 64,
     llm_base_url: ?[]const u8 = null,
     llm_api_key: ?[]const u8 = null,
@@ -166,6 +167,7 @@ fn handleConnection(state: *ServerState, conn_value: std.Io.net.Stream) void {
         .embedding_api_key = state.cfg.embedding_api_key,
         .embedding_model = state.cfg.embedding_model,
         .embedding_provider = state.cfg.embedding_provider,
+        .embedding_fallbacks = state.cfg.embedding_fallbacks,
         .embedding_dimensions = state.cfg.embedding_dimensions,
         .llm_base_url = state.cfg.llm_base_url,
         .llm_api_key = state.cfg.llm_api_key,
@@ -203,6 +205,7 @@ fn workerLoop(state: *ServerState) void {
             .embedding_api_key = state.cfg.embedding_api_key,
             .embedding_model = state.cfg.embedding_model,
             .embedding_provider = state.cfg.embedding_provider,
+            .embedding_fallbacks = state.cfg.embedding_fallbacks,
             .embedding_dimensions = state.cfg.embedding_dimensions,
             .llm_base_url = state.cfg.llm_base_url,
             .llm_api_key = state.cfg.llm_api_key,
@@ -284,6 +287,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_PROVIDER_TIMEOUT_SECS")) |secs| {
         cfg.provider_timeout_secs = std.fmt.parseInt(u32, secs, 10) catch cfg.provider_timeout_secs;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_EMBEDDING_FALLBACKS")) |fallbacks| {
+        defer allocator.free(fallbacks);
+        cfg.embedding_fallbacks = try providers.parseEmbeddingFallbacks(allocator, fallbacks, embeddingConfigFromRuntime(cfg));
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_WORKER_INTERVAL_MS")) |interval| {
         cfg.worker_interval_ms = std.fmt.parseInt(u64, interval, 10) catch cfg.worker_interval_ms;
@@ -506,6 +513,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--embedding-provider") and i + 1 < args.len) {
             i += 1;
             cfg.embedding_provider = providers.EmbeddingProviderKind.parse(args[i]);
+        } else if (std.mem.eql(u8, arg, "--embedding-fallbacks") and i + 1 < args.len) {
+            i += 1;
+            cfg.embedding_fallbacks = try providers.parseEmbeddingFallbacks(allocator, args[i], embeddingConfigFromRuntime(cfg));
         } else if (std.mem.eql(u8, arg, "--embedding-dimensions") and i + 1 < args.len) {
             i += 1;
             cfg.embedding_dimensions = try std.fmt.parseInt(usize, args[i], 10);
@@ -650,6 +660,18 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         }
     }
     return cfg;
+}
+
+fn embeddingConfigFromRuntime(cfg: RuntimeConfig) providers.EmbeddingConfig {
+    return .{
+        .provider = cfg.embedding_provider,
+        .base_url = cfg.embedding_base_url,
+        .api_key = cfg.embedding_api_key,
+        .model = cfg.embedding_model,
+        .dimensions = cfg.embedding_dimensions,
+        .timeout_secs = cfg.provider_timeout_secs,
+        .fallbacks = cfg.embedding_fallbacks,
+    };
 }
 
 fn parseAgentMemoryStoreConfigsJson(allocator: std.mem.Allocator, raw: []const u8) ![]agent_memory_runtime.NamedConfig {
@@ -810,6 +832,7 @@ fn printUsage() void {
         \\  NULLPANTRY_EMBEDDING_API_KEY
         \\  NULLPANTRY_EMBEDDING_MODEL
         \\  NULLPANTRY_EMBEDDING_PROVIDER
+        \\  NULLPANTRY_EMBEDDING_FALLBACKS
         \\  NULLPANTRY_EMBEDDING_DIMENSIONS
         \\  NULLPANTRY_LLM_BASE_URL
         \\  NULLPANTRY_LLM_API_KEY

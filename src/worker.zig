@@ -18,6 +18,7 @@ pub const RunOptions = struct {
     embedding_api_key: ?[]const u8 = null,
     embedding_model: ?[]const u8 = null,
     embedding_provider: providers.EmbeddingProviderKind = .openai_compatible,
+    embedding_fallbacks: []const providers.EmbeddingEndpointConfig = &.{},
     embedding_dimensions: usize = 64,
     llm_base_url: ?[]const u8 = null,
     llm_api_key: ?[]const u8 = null,
@@ -408,6 +409,7 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
                 .model = options.embedding_model,
                 .dimensions = options.embedding_dimensions,
                 .timeout_secs = options.provider_timeout_secs,
+                .fallbacks = options.embedding_fallbacks,
             }, chunk_text, options.embedding_dimensions) catch return count;
             const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
             _ = try store.upsertVectorChunk(allocator, .{
@@ -463,6 +465,7 @@ fn processEmbeddingOutboxEntry(allocator: std.mem.Allocator, store: *store_mod.S
         .model = options.embedding_model,
         .dimensions = dimensions,
         .timeout_secs = options.provider_timeout_secs,
+        .fallbacks = options.embedding_fallbacks,
     }, text, dimensions);
     const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
     _ = try store.upsertVectorChunk(allocator, .{

@@ -144,6 +144,7 @@ Provider-backed embeddings, Ask generation, and LLM reranking are optional. With
 
 ```sh
 export NULLPANTRY_EMBEDDING_PROVIDER="openai-compatible" # openai-compatible | gemini | voyage | local-deterministic
+export NULLPANTRY_EMBEDDING_FALLBACKS='[{"provider":"voyage","api_key":"..."},{"provider":"local-deterministic"}]'
 export NULLPANTRY_EMBEDDING_BASE_URL="https://api.example.com/v1"
 export NULLPANTRY_EMBEDDING_MODEL="text-embedding-model"
 export NULLPANTRY_EMBEDDING_API_KEY="..."
@@ -154,7 +155,7 @@ export NULLPANTRY_LLM_MODEL="chat-model"
 export NULLPANTRY_LLM_API_KEY="..."
 ```
 
-Provider endpoints and API keys are server-side configuration only; request bodies cannot override provider `provider`, `base_url`, `api_key`, model, or timeout fields. Embeddings are first-class for OpenAI-compatible APIs, Gemini `embedContent`, Voyage `/v1/embeddings`, and local deterministic fallback. If no embedding provider is configured, NullPantry uses deterministic local embeddings. Explicit embedding/indexing operations fail closed when the configured provider fails. Retrieval endpoints degrade to permission-filtered keyword/global/entity search by default so `/v1/search`, `/v1/ask`, and `/v1/context-packs` remain usable during provider outages; pass `"strict_vector": true` to fail the request instead. `/v1/ask` remains extractive by default even when an LLM provider is configured; callers must pass `"use_llm": true` to send retrieved evidence to the provider. `GET /v1/providers` exposes the concrete and compatible provider contracts for agents and deployment tooling.
+Provider endpoints and API keys are server-side configuration only; request bodies cannot override provider `provider`, `base_url`, `api_key`, model, or timeout fields. Embeddings are first-class for OpenAI-compatible APIs, Gemini `embedContent`, Voyage `/v1/embeddings`, and local deterministic fallback. `NULLPANTRY_EMBEDDING_FALLBACKS` accepts a comma-separated provider list or JSON endpoint objects and is tried server-side after the primary provider fails. If no embedding provider is configured, NullPantry uses deterministic local embeddings. Explicit embedding/indexing operations fail closed when the configured provider fails and no fallback succeeds. Retrieval endpoints degrade to permission-filtered keyword/global/entity search by default so `/v1/search`, `/v1/ask`, and `/v1/context-packs` remain usable during provider outages; pass `"strict_vector": true` to fail the request instead. `/v1/ask` remains extractive by default even when an LLM provider is configured; callers must pass `"use_llm": true` to send retrieved evidence to the provider. `GET /v1/providers` exposes the concrete and compatible provider contracts for agents and deployment tooling.
 
 The built-in worker loop runs every 5 seconds by default with its own service principal. By default the worker uses `["admin"]` so token-principal deployments do not strand queued project/team jobs behind a read-only request token. Narrow it with `NULLPANTRY_WORKER_SCOPES` and `NULLPANTRY_WORKER_CAPABILITIES`, set `NULLPANTRY_WORKER_INTERVAL_MS=0` to disable it, or call `POST /v1/workers/run` manually with the caller's request principal.
 
