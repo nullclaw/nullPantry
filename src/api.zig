@@ -94,6 +94,8 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         if (is_get and seg2 == null) return connectors(ctx);
         if (is_get and seg2 != null and eql(seg3, "cursor")) return connectorCursorGet(ctx, seg2.?, parsed.query);
         if (is_post and seg2 != null and eql(seg3, "cursor")) return connectorCursorUpsert(ctx, seg2.?, body);
+        if (is_post and eql(seg2, "qmd") and eql(seg3, "export-sessions")) return qmdSessionExport(ctx, body);
+        if (is_post and eql(seg2, "qmd") and eql(seg3, "prune-sessions")) return qmdSessionPrune(ctx, body);
         if (is_post and seg2 != null and eql(seg3, "ingest")) return connectorIngest(ctx, seg2.?, body);
     } else if (eql(seg1, "markdown")) {
         if (is_post and eql(seg2, "import")) return markdownImport(ctx, body);
@@ -1082,6 +1084,8 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/connectors", .get = "listConnectors" },
         .{ .path = "/connectors/{name}/cursor", .get = "connectorGetCursor", .post = "connectorUpsertCursor" },
         .{ .path = "/connectors/{name}/ingest", .post = "connectorIngest" },
+        .{ .path = "/connectors/qmd/export-sessions", .post = "qmdExportAgentSessions" },
+        .{ .path = "/connectors/qmd/prune-sessions", .post = "qmdPruneAgentSessionExports" },
         .{ .path = "/markdown/import", .post = "importMarkdown" },
         .{ .path = "/markdown/import-directory", .post = "importMarkdownDirectory" },
         .{ .path = "/markdown/export", .post = "exportMarkdown" },
@@ -1200,7 +1204,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -1214,7 +1218,7 @@ fn providerRegistry(ctx: *Context) HttpResponse {
 
 fn connectors(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"connectors":[{"name":"manual","status":"built_in","source_types":["manual","text"],"ingest":"POST /v1/connectors/manual/ingest","cursor":"GET|POST /v1/connectors/manual/cursor"},{"name":"markdown","status":"built_in_filesystem_import_export","source_types":["markdown","md"],"ingest":"POST /v1/connectors/markdown/ingest","import":"POST /v1/markdown/import","import_directory":"POST /v1/markdown/import-directory","export":"POST /v1/markdown/export","export_directory":"POST /v1/markdown/export-directory","cursor":"GET|POST /v1/connectors/markdown/cursor"},{"name":"qmd","status":"built_in_qmd_json_ingest","source_types":["qmd","markdown","session_export"],"ingest":"POST /v1/connectors/qmd/ingest","cursor":"GET|POST /v1/connectors/qmd/cursor","note":"Accepts qmd search JSON results and stores them as canonical Sources before extraction/retrieval."},{"name":"transcript","status":"built_in","source_types":["transcript","chat"],"ingest":"POST /v1/connectors/transcript/ingest","cursor":"GET|POST /v1/connectors/transcript/cursor"},{"name":"ticket","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/ticket/ingest","cursor":"GET|POST /v1/connectors/ticket/cursor"},{"name":"git","status":"built_in_push","source_types":["pr","commit","repo"],"ingest":"POST /v1/connectors/git/ingest","cursor":"GET|POST /v1/connectors/git/cursor"},{"name":"incident","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/incident/ingest","cursor":"GET|POST /v1/connectors/incident/cursor"},{"name":"nulltickets","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/nulltickets/ingest","cursor":"GET|POST /v1/connectors/nulltickets/cursor"},{"name":"nullwatch","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/nullwatch/ingest","cursor":"GET|POST /v1/connectors/nullwatch/cursor"},{"name":"nullhub","status":"consumer"}]}
+        \\{"connectors":[{"name":"manual","status":"built_in","source_types":["manual","text"],"ingest":"POST /v1/connectors/manual/ingest","cursor":"GET|POST /v1/connectors/manual/cursor"},{"name":"markdown","status":"built_in_filesystem_import_export","source_types":["markdown","md"],"ingest":"POST /v1/connectors/markdown/ingest","import":"POST /v1/markdown/import","import_directory":"POST /v1/markdown/import-directory","export":"POST /v1/markdown/export","export_directory":"POST /v1/markdown/export-directory","cursor":"GET|POST /v1/connectors/markdown/cursor"},{"name":"qmd","status":"built_in_qmd_json_ingest_session_export","source_types":["qmd","markdown","session_export"],"ingest":"POST /v1/connectors/qmd/ingest","export_sessions":"POST /v1/connectors/qmd/export-sessions","prune_sessions":"POST /v1/connectors/qmd/prune-sessions","cursor":"GET|POST /v1/connectors/qmd/cursor","note":"Accepts qmd search JSON results as canonical Sources and exports permission-checked agent sessions into a QMD markdown corpus."},{"name":"transcript","status":"built_in","source_types":["transcript","chat"],"ingest":"POST /v1/connectors/transcript/ingest","cursor":"GET|POST /v1/connectors/transcript/cursor"},{"name":"ticket","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/ticket/ingest","cursor":"GET|POST /v1/connectors/ticket/cursor"},{"name":"git","status":"built_in_push","source_types":["pr","commit","repo"],"ingest":"POST /v1/connectors/git/ingest","cursor":"GET|POST /v1/connectors/git/cursor"},{"name":"incident","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/incident/ingest","cursor":"GET|POST /v1/connectors/incident/cursor"},{"name":"nulltickets","status":"built_in_push","source_types":["ticket","issue"],"ingest":"POST /v1/connectors/nulltickets/ingest","cursor":"GET|POST /v1/connectors/nulltickets/cursor"},{"name":"nullwatch","status":"built_in_push","source_types":["incident"],"ingest":"POST /v1/connectors/nullwatch/ingest","cursor":"GET|POST /v1/connectors/nullwatch/cursor"},{"name":"nullhub","status":"consumer"}]}
     );
 }
 
@@ -1385,6 +1389,138 @@ fn qmdConnectorIngest(ctx: *Context, connector: []const u8, obj: std.json.Object
     }
     out.append(ctx.allocator, '}') catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn qmdSessionExport(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "read") or !hasCapability(ctx, "export")) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const directory = json.stringField(obj, "directory") orelse json.stringField(obj, "path") orelse json.stringField(obj, "export_dir") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing directory");
+    if (directory.len == 0) return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing directory");
+
+    const storage_target = agentMemoryStorageTargetFromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx);
+    const session_limit = positiveBounded(json.intField(obj, "session_limit") orelse json.intField(obj, "limit"), 100, 5000);
+    const session_offset = positiveBounded(json.intField(obj, "offset"), 0, 1000000);
+    const message_limit = positiveBounded(json.intField(obj, "message_limit") orelse json.intField(obj, "max_messages"), 10000, 50000);
+    const max_message_chars = positiveBounded(json.intField(obj, "max_message_chars"), 64 * 1024, 1024 * 1024);
+    const max_existing_bytes = positiveBounded(json.intField(obj, "max_existing_bytes"), 16 * 1024 * 1024, 128 * 1024 * 1024);
+    const markdown_options = qmd_adapter.SessionMarkdownOptions{
+        .include_internal = json.boolField(obj, "include_internal") orelse false,
+        .max_message_chars = max_message_chars,
+    };
+
+    var session_ids: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer session_ids.deinit(ctx.allocator);
+    if (json.stringField(obj, "session_id")) |sid| {
+        tryAppendVisibleQmdSession(ctx, &session_ids, sid) catch |err| switch (err) {
+            error.Forbidden => return forbidden(ctx),
+            else => return serverError(ctx),
+        };
+    }
+    if (obj.get("session_ids")) |value| {
+        if (value != .array) return json.errorResponse(ctx.allocator, 400, "bad_request", "session_ids must be an array");
+        for (value.array.items) |item| {
+            if (item != .string) return json.errorResponse(ctx.allocator, 400, "bad_request", "session_ids must contain strings");
+            tryAppendVisibleQmdSession(ctx, &session_ids, item.string) catch |err| switch (err) {
+                error.Forbidden => return forbidden(ctx),
+                else => return serverError(ctx),
+            };
+        }
+    }
+    if (session_ids.items.len == 0) {
+        if (!allAgentSessionsReadAllowed(ctx)) return forbidden(ctx);
+        const listed = ctx.store.listSessionsRouted(ctx.allocator, session_limit, session_offset, actorFilter(ctx), storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+        for (listed.sessions) |session| {
+            tryAppendVisibleQmdSession(ctx, &session_ids, session.session_id) catch |err| switch (err) {
+                error.Forbidden => return forbidden(ctx),
+                else => return serverError(ctx),
+            };
+        }
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"connector\":\"qmd\",\"directory\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, directory) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"files\":[") catch return serverError(ctx);
+
+    var exported: usize = 0;
+    var written: usize = 0;
+    var unchanged: usize = 0;
+    var skipped: usize = 0;
+    var first = true;
+    for (session_ids.items) |session_id| {
+        const history = ctx.store.historyRouted(ctx.allocator, session_id, message_limit, 0, actorFilter(ctx), storage_target) catch |err| switch (err) {
+            error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+            else => return serverError(ctx),
+        };
+
+        var markdown: std.ArrayListUnmanaged(u8) = .empty;
+        qmd_adapter.appendSessionHeader(ctx.allocator, &markdown, session_id) catch return serverError(ctx);
+        var exported_messages: usize = 0;
+        for (history.messages) |message| {
+            if (qmd_adapter.appendSessionMessage(ctx.allocator, &markdown, message.role, message.content, message.created_at_ms, markdown_options) catch return serverError(ctx)) {
+                exported_messages += 1;
+            }
+        }
+        if (exported_messages == 0) {
+            skipped += 1;
+            continue;
+        }
+
+        const file = qmd_adapter.writeSessionExport(ctx.allocator, directory, session_id, markdown.items, max_existing_bytes) catch return serverError(ctx);
+        if (!first) out.append(ctx.allocator, ',') catch return serverError(ctx);
+        first = false;
+        out.appendSlice(ctx.allocator, "{\"session_id\":") catch return serverError(ctx);
+        json.appendString(&out, ctx.allocator, session_id) catch return serverError(ctx);
+        out.appendSlice(ctx.allocator, ",\"path\":") catch return serverError(ctx);
+        json.appendString(&out, ctx.allocator, file.path) catch return serverError(ctx);
+        out.print(ctx.allocator, ",\"messages\":{d},\"total_messages\":{d},\"truncated\":{s},\"written\":{s},\"unchanged\":{s},\"bytes\":{d}}}", .{
+            exported_messages,
+            history.total,
+            if (history.total > history.messages.len) "true" else "false",
+            if (file.written) "true" else "false",
+            if (file.unchanged) "true" else "false",
+            file.bytes,
+        }) catch return serverError(ctx);
+        exported += 1;
+        if (file.written) written += 1;
+        if (file.unchanged) unchanged += 1;
+    }
+
+    out.print(ctx.allocator, "],\"exported\":{d},\"written\":{d},\"unchanged\":{d},\"skipped\":{d},\"message_limit\":{d}}}", .{ exported, written, unchanged, skipped, message_limit }) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn qmdSessionPrune(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "export") or !hasCapability(ctx, "delete")) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const directory = json.stringField(obj, "directory") orelse json.stringField(obj, "path") orelse json.stringField(obj, "export_dir") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing directory");
+    if (directory.len == 0) return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing directory");
+    var retention_raw = json.intField(obj, "retention_days") orelse 30;
+    if (retention_raw < 0) retention_raw = 0;
+    if (retention_raw > 36500) retention_raw = 36500;
+    const retention_days: u32 = @intCast(retention_raw);
+    const pruned = qmd_adapter.pruneSessionExports(directory, retention_days) catch |err| switch (err) {
+        error.FileNotFound => return json.errorResponse(ctx.allocator, 404, "not_found", "QMD session export directory not found"),
+        error.NotDir => return json.errorResponse(ctx.allocator, 400, "bad_request", "QMD session export path is not a directory"),
+        else => return serverError(ctx),
+    };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"connector\":\"qmd\",\"directory\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, directory) catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"retention_days\":{d},\"deleted\":{d},\"skipped\":{d}}}", .{ retention_days, pruned.deleted, pruned.skipped }) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn tryAppendVisibleQmdSession(ctx: *Context, out: *std.ArrayListUnmanaged([]const u8), session_id: []const u8) !void {
+    if (!agentSessionReadAllowed(ctx, session_id)) return error.Forbidden;
+    try out.append(ctx.allocator, session_id);
 }
 
 fn connectorCursorInputFromIngest(ctx: *Context, connector: []const u8, obj: std.json.ObjectMap, default_scope: []const u8, default_permissions: []const u8) !?store_mod.ConnectorCursorInput {
@@ -2013,7 +2149,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -8624,6 +8760,59 @@ test "api qmd connector canonicalizes search results before extraction and retri
     const search_resp = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"canonical pantry sources\",\"scopes\":[\"public\"],\"use_vector\":false}", "");
     try std.testing.expectEqualStrings("200 OK", search_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, search_resp.body, "QMD search results become canonical pantry sources") != null);
+}
+
+test "api qmd connector exports and prunes visible agent sessions" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const session_id = "qmd-session";
+    const root_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/qmd-session-export", .{tmp.sub_path});
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_id = "agent:qmd",
+        .actor_scopes_json = "[\"session:qmd-session\",\"write:session:qmd-session\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"export\",\"delete\"]",
+    };
+
+    const raw = "POST /v1/agent-sessions/qmd-session/messages HTTP/1.1\r\nAuthorization: Bearer local\r\n\r\n{}";
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&ctx, "POST", "/v1/agent-sessions/qmd-session/messages", "{\"role\":\"user\",\"content\":\"Need shared QMD context\"}", raw).status);
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&ctx, "POST", "/v1/agent-sessions/qmd-session/messages", "{\"role\":\"system\",\"content\":\"hidden runtime prompt\"}", raw).status);
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&ctx, "POST", "/v1/agent-sessions/qmd-session/messages", "{\"role\":\"assistant\",\"content\":\"Use NullPantry as the governed memory layer\"}", raw).status);
+
+    const export_body = try std.fmt.allocPrint(alloc, "{{\"directory\":\"{s}\",\"session_ids\":[\"{s}\"]}}", .{ root_path, session_id });
+    const exported = handleRequest(&ctx, "POST", "/v1/connectors/qmd/export-sessions", export_body, raw);
+    try std.testing.expectEqualStrings("200 OK", exported.status);
+    try std.testing.expect(std.mem.indexOf(u8, exported.body, "\"exported\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported.body, "\"written\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported.body, "\"messages\":2") != null);
+
+    const exported_path = try qmd_adapter.sessionExportPath(alloc, root_path, session_id);
+    const exported_markdown = try std.Io.Dir.cwd().readFileAlloc(compat.io(), exported_path, alloc, .limited(64 * 1024));
+    try std.testing.expect(std.mem.indexOf(u8, exported_markdown, "Need shared QMD context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported_markdown, "Use NullPantry as the governed memory layer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported_markdown, "hidden runtime prompt") == null);
+
+    const second_export = handleRequest(&ctx, "POST", "/v1/connectors/qmd/export-sessions", export_body, raw);
+    try std.testing.expectEqualStrings("200 OK", second_export.status);
+    try std.testing.expect(std.mem.indexOf(u8, second_export.body, "\"unchanged\":1") != null);
+
+    var denied_ctx = ctx;
+    denied_ctx.actor_scopes_json = "[\"session:other\"]";
+    const denied = handleRequest(&denied_ctx, "POST", "/v1/connectors/qmd/export-sessions", export_body, raw);
+    try std.testing.expectEqualStrings("403 Forbidden", denied.status);
+
+    const prune_body = try std.fmt.allocPrint(alloc, "{{\"directory\":\"{s}\",\"retention_days\":0}}", .{root_path});
+    const pruned = handleRequest(&ctx, "POST", "/v1/connectors/qmd/prune-sessions", prune_body, raw);
+    try std.testing.expectEqualStrings("200 OK", pruned.status);
+    try std.testing.expect(std.mem.indexOf(u8, pruned.body, "\"deleted\":1") != null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(compat.io(), exported_path, .{}));
 }
 
 test "api connector ingest only advances cursor after all items succeed" {
