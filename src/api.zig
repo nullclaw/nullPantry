@@ -3530,11 +3530,22 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
     }
     if (session_message_input) |input| {
         const object_id = event_object_id orelse blk: {
-            if (input.delete_all) break :blk store_mod.agentSessionMessageSetObjectId(ctx.allocator, input.session_id, input.actor_id) catch return serverError(ctx);
-            break :blk store_mod.agentSessionMessageObjectId(ctx.allocator, input.session_id, input.role, input.content, input.created_at_ms, input.actor_id) catch return serverError(ctx);
+            if (input.delete_autosaved) break :blk store_mod.agentSessionAutosaveSetObjectId(ctx.allocator, input.session_id, input.actor_id) catch return serverError(ctx);
+            const sid = input.session_id orelse return serverError(ctx);
+            if (input.delete_all) break :blk store_mod.agentSessionMessageSetObjectId(ctx.allocator, sid, input.actor_id) catch return serverError(ctx);
+            break :blk store_mod.agentSessionMessageObjectId(ctx.allocator, sid, input.role, input.content, input.created_at_ms, input.actor_id) catch return serverError(ctx);
         };
-        if (input.delete_all) {
-            ctx.store.clearMessagesRoutedSuppressFeed(input.session_id, input.actor_id, input.route) catch |err| {
+        if (input.delete_autosaved) {
+            ctx.store.clearAutoSavedRoutedSuppressFeed(input.session_id, input.actor_id, input.route) catch |err| {
+                if (reserved_event_id) |event_id| _ = ctx.store.releaseFeedEventReservation(event_id) catch {};
+                return switch (err) {
+                    error.AgentMemoryStorageUnavailable => agentMemoryStorageUnavailable(ctx),
+                    else => serverError(ctx),
+                };
+            };
+        } else if (input.delete_all) {
+            const sid = input.session_id orelse return serverError(ctx);
+            ctx.store.clearMessagesRoutedSuppressFeed(sid, input.actor_id, input.route) catch |err| {
                 if (reserved_event_id) |event_id| _ = ctx.store.releaseFeedEventReservation(event_id) catch {};
                 return switch (err) {
                     error.AgentMemoryStorageUnavailable => agentMemoryStorageUnavailable(ctx),
@@ -3542,7 +3553,8 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
                 };
             };
         } else {
-            ctx.store.saveMessageRoutedAtSuppressFeed(input.session_id, input.role, input.content, input.created_at_ms, input.actor_id, input.route) catch |err| {
+            const sid = input.session_id orelse return serverError(ctx);
+            ctx.store.saveMessageRoutedAtSuppressFeed(sid, input.role, input.content, input.created_at_ms, input.actor_id, input.route) catch |err| {
                 if (reserved_event_id) |event_id| _ = ctx.store.releaseFeedEventReservation(event_id) catch {};
                 return switch (err) {
                     error.AgentMemoryStorageUnavailable => agentMemoryStorageUnavailable(ctx),
@@ -3711,12 +3723,13 @@ const AgentMemoryApplyInput = struct {
 };
 
 const AgentSessionMessageApplyInput = struct {
-    session_id: []const u8,
+    session_id: ?[]const u8,
     role: []const u8 = "",
     content: []const u8 = "",
     created_at_ms: i64 = 0,
     actor_id: ?[]const u8,
     delete_all: bool = false,
+    delete_autosaved: bool = false,
     route: store_mod.AgentMemoryStorageRoute = .{},
 };
 
@@ -3730,6 +3743,7 @@ const AgentSessionUsageApplyInput = struct {
 
 fn operationFromEventType(event_type: []const u8) []const u8 {
     if (std.mem.endsWith(u8, event_type, ".delete") or std.mem.endsWith(u8, event_type, ".forget")) return "delete";
+    if (std.mem.endsWith(u8, event_type, ".delete_autosaved") or std.mem.endsWith(u8, event_type, ".clear_autosaved")) return "delete_autosaved";
     if (std.mem.endsWith(u8, event_type, ".merge_object")) return "merge_object";
     if (std.mem.endsWith(u8, event_type, ".merge_string_set")) return "merge_string_set";
     return "put";
@@ -3742,7 +3756,10 @@ fn feedEventScope(ctx: *Context, obj: std.json.ObjectMap, object_type: []const u
     if (payload.value == .object) {
         if (json.stringField(payload.value.object, "scope")) |scope| return scope;
         if (isAgentSessionFeedObject(object_type)) {
-            const session_id = json.stringField(payload.value.object, "session_id") orelse return error.InvalidPayload;
+            const session_id = json.stringField(payload.value.object, "session_id") orelse {
+                if (json.boolField(payload.value.object, "delete_autosaved") orelse json.boolField(payload.value.object, "autosave_only") orelse false) return "session:*";
+                return error.InvalidPayload;
+            };
             return std.fmt.allocPrint(ctx.allocator, "session:{s}", .{session_id});
         }
     }
@@ -3846,19 +3863,27 @@ fn buildAppliedAgentSessionMessageInput(ctx: *Context, operation: []const u8, pa
     // Returned input fields borrow slices from this request-arena parse tree.
     if (payload.value != .object) return error.InvalidPayload;
     const obj = payload.value.object;
-    const session_id = json.stringField(obj, "session_id") orelse return error.MissingRequiredField;
-    if (!agentSessionWriteAllowed(ctx, session_id)) return error.Forbidden;
+    const session_id = json.nullableStringField(obj, "session_id");
+    if (session_id) |sid| {
+        if (!agentSessionWriteAllowed(ctx, sid)) return error.Forbidden;
+    } else if (!std.mem.eql(u8, operation, "delete_autosaved") or !allAgentSessionsWriteAllowed(ctx)) {
+        return error.Forbidden;
+    }
     const payload_actor = json.nullableStringField(obj, "actor_id") orelse event_actor_id;
     if (!std.mem.eql(u8, payload_actor, event_actor_id) and !domain.hasActorScope(ctx.actor_scopes_json, "admin")) return error.Forbidden;
     const route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    if (std.mem.eql(u8, operation, "delete_autosaved")) {
+        return .{ .session_id = session_id, .actor_id = payload_actor, .delete_autosaved = true, .route = route };
+    }
+    const concrete_session_id = session_id orelse return error.MissingRequiredField;
     if (std.mem.eql(u8, operation, "delete") or std.mem.eql(u8, operation, "forget")) {
-        return .{ .session_id = session_id, .actor_id = payload_actor, .delete_all = true, .route = route };
+        return .{ .session_id = concrete_session_id, .actor_id = payload_actor, .delete_all = true, .route = route };
     }
     const role = json.stringField(obj, "role") orelse return error.MissingRequiredField;
     if (domain.isRuntimeCommandRole(role)) return error.InternalAgentSessionMessage;
     const content = json.stringField(obj, "content") orelse return error.MissingRequiredField;
     return .{
-        .session_id = session_id,
+        .session_id = concrete_session_id,
         .role = role,
         .content = content,
         .created_at_ms = json.intField(obj, "created_at_ms") orelse ids.nowMs(),
@@ -10039,6 +10064,37 @@ test "api memory checkpoint restore replays isolated agent session messages and 
     const restored_b_usage = handleRequest(&target_b, "GET", "/v1/agent-sessions/sync/usage", "", "");
     try std.testing.expectEqualStrings("200 OK", restored_b_usage.status);
     try std.testing.expect(std.mem.indexOf(u8, restored_b_usage.body, "\"total_tokens\":29") != null);
+}
+
+test "api memory checkpoint restore replays autosave cleanup" {
+    var source_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer source_store.deinit();
+    var target_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer target_store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var source_actor = Context{ .allocator = alloc, .store = &source_store, .actor_id = "agent:auto", .actor_scopes_json = "[\"session:auto\",\"write:session:auto\"]" };
+    var source_admin = Context{ .allocator = alloc, .store = &source_store };
+
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&source_actor, "POST", "/v1/agent-sessions/auto/messages", "{\"role\":\"autosave_user\",\"content\":\"draft should be cleaned\",\"created_at_ms\":401}", "").status);
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&source_actor, "POST", "/v1/agent-sessions/auto/messages", "{\"role\":\"assistant\",\"content\":\"kept after autosave cleanup\",\"created_at_ms\":402}", "").status);
+    try std.testing.expectEqualStrings("200 OK", handleRequest(&source_actor, "DELETE", "/v1/agent-sessions/auto-saved?session_id=auto", "", "").status);
+
+    const checkpoint = handleRequest(&source_admin, "GET", "/v1/memory/checkpoint?limit=100", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"operation\":\"delete_autosaved\"") != null);
+
+    var target_admin = Context{ .allocator = alloc, .store = &target_store };
+    const restore = handleRequest(&target_admin, "POST", "/v1/memory/checkpoint", checkpoint.body, "");
+    try std.testing.expectEqualStrings("200 OK", restore.status);
+
+    var target_actor = Context{ .allocator = alloc, .store = &target_store, .actor_id = "agent:auto", .actor_scopes_json = "[\"session:auto\",\"write:session:auto\"]" };
+    const messages = handleRequest(&target_actor, "GET", "/v1/agent-sessions/auto/messages", "", "");
+    try std.testing.expectEqualStrings("200 OK", messages.status);
+    try std.testing.expect(std.mem.indexOf(u8, messages.body, "kept after autosave cleanup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages.body, "draft should be cleaned") == null);
 }
 
 test "api memory feed excludes internal runtime command session payloads" {

@@ -339,8 +339,9 @@ fn contextPackFeedPayloadJson(allocator: std.mem.Allocator, pack: ContextPackRes
     return out.toOwnedSlice(allocator);
 }
 
-fn agentSessionScope(allocator: std.mem.Allocator, session_id: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "session:{s}", .{session_id});
+fn agentSessionScope(allocator: std.mem.Allocator, session_id: ?[]const u8) ![]u8 {
+    if (session_id) |sid| return std.fmt.allocPrint(allocator, "session:{s}", .{sid});
+    return allocator.dupe(u8, "session:*");
 }
 
 fn agentSessionPermissionsJson(allocator: std.mem.Allocator, actor_id: ?[]const u8) ![]u8 {
@@ -370,6 +371,14 @@ pub fn agentSessionMessageSetObjectId(allocator: std.mem.Allocator, session_id: 
     hasher.update("\n");
     hasher.update(actor_id orelse "");
     return std.fmt.allocPrint(allocator, "agsm_clear_{x}", .{hasher.final()});
+}
+
+pub fn agentSessionAutosaveSetObjectId(allocator: std.mem.Allocator, session_id: ?[]const u8, actor_id: ?[]const u8) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(session_id orelse "*");
+    hasher.update("\n");
+    hasher.update(actor_id orelse "");
+    return std.fmt.allocPrint(allocator, "agsm_autosave_clear_{x}", .{hasher.final()});
 }
 
 pub fn agentSessionUsageObjectId(allocator: std.mem.Allocator, session_id: []const u8, actor_id: ?[]const u8) ![]u8 {
@@ -410,6 +419,23 @@ fn agentSessionMessageDeleteFeedPayloadJson(allocator: std.mem.Allocator, route:
     try out.appendSlice(allocator, ",\"actor_id\":");
     try json.appendNullableString(&out, allocator, actor_id);
     try out.appendSlice(allocator, ",\"delete_all\":true,\"scope\":");
+    try json.appendString(&out, allocator, scope);
+    try out.appendSlice(allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(&out, allocator, permissions_json, "[]");
+    try out.append(allocator, '}');
+    const payload = try out.toOwnedSlice(allocator);
+    defer allocator.free(payload);
+    return payloadWithStorageRouteJson(allocator, payload, route);
+}
+
+fn agentSessionAutosaveDeleteFeedPayloadJson(allocator: std.mem.Allocator, route: AgentMemoryStorageRoute, session_id: ?[]const u8, actor_id: ?[]const u8, scope: []const u8, permissions_json: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"session_id\":");
+    try json.appendNullableString(&out, allocator, session_id);
+    try out.appendSlice(allocator, ",\"actor_id\":");
+    try json.appendNullableString(&out, allocator, actor_id);
+    try out.appendSlice(allocator, ",\"delete_autosaved\":true,\"autosave_only\":true,\"scope\":");
     try json.appendString(&out, allocator, scope);
     try out.appendSlice(allocator, ",\"permissions\":");
     try json.appendRawJsonOr(&out, allocator, permissions_json, "[]");
@@ -2325,6 +2351,28 @@ pub const Store = struct {
         });
     }
 
+    fn appendAgentSessionAutosaveDeleteFeedEvent(self: *Store, allocator: std.mem.Allocator, session_id: ?[]const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        const object_id = try agentSessionAutosaveSetObjectId(allocator, session_id, actor_id);
+        defer allocator.free(object_id);
+        const scope = try agentSessionScope(allocator, session_id);
+        defer allocator.free(scope);
+        const permissions_json = try agentSessionPermissionsJson(allocator, actor_id);
+        defer allocator.free(permissions_json);
+        const payload = try agentSessionAutosaveDeleteFeedPayloadJson(allocator, route, session_id, actor_id, scope, permissions_json);
+        defer allocator.free(payload);
+        _ = try self.appendFeedEvent(.{
+            .event_type = "agent_session_message.delete_autosaved",
+            .operation = "delete_autosaved",
+            .object_type = "agent_session_message",
+            .object_id = object_id,
+            .scope = scope,
+            .permissions_json = permissions_json,
+            .actor_id = actor_id,
+            .payload_json = payload,
+            .status = "applied",
+        });
+    }
+
     fn appendAgentSessionUsagePutFeedEvent(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
         const object_id = try agentSessionUsageObjectId(allocator, session_id, actor_id);
         defer allocator.free(object_id);
@@ -2493,7 +2541,7 @@ pub const Store = struct {
     fn clearAutoSavedSubset(self: *Store, session_id: ?[]const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror!void {
         const stores = try requireSubsetStores(route);
         for (stores) |store_name| {
-            try self.clearAutoSavedRouted(session_id, actor_id, routeForSubsetStoreName(store_name));
+            try self.clearAutoSavedRoutedInner(session_id, actor_id, routeForSubsetStoreName(store_name), true);
         }
     }
 
@@ -3023,7 +3071,15 @@ pub const Store = struct {
     }
 
     pub fn clearAutoSavedRouted(self: *Store, session_id: ?[]const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
-        return switch (route.target) {
+        return self.clearAutoSavedRoutedInner(session_id, actor_id, route, false);
+    }
+
+    pub fn clearAutoSavedRoutedSuppressFeed(self: *Store, session_id: ?[]const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        return self.clearAutoSavedRoutedInner(session_id, actor_id, route, true);
+    }
+
+    fn clearAutoSavedRoutedInner(self: *Store, session_id: ?[]const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !void {
+        try switch (route.target) {
             .primary => self.clearAutoSaved(session_id, actor_id),
             .native => self.clearAutoSavedNative(session_id, actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.clearAutoSaved(session_id, actor_id) else error.AgentMemoryStorageUnavailable,
@@ -3037,6 +3093,7 @@ pub const Store = struct {
                 }
             },
         };
+        if (!suppress_feed) try self.appendAgentSessionAutosaveDeleteFeedEvent(self.allocator, session_id, actor_id, route);
     }
 
     fn clearAutoSavedNative(self: *Store, session_id: ?[]const u8, actor_id: ?[]const u8) !void {
