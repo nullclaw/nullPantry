@@ -3640,6 +3640,8 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
 fn lifecycleDiagnostics(ctx: *Context) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const store_diag = ctx.store.lifecycleDiagnostics() catch return serverError(ctx);
+    const schema_version = ctx.store.schemaVersion() catch -1;
+    const schema_ok = schema_version >= migrations.expected_schema_version;
     const diagnostics = lifecycle.Diagnostics{
         .total_memory_atoms = store_diag.total_memory_atoms,
         .stale_memory_atoms = store_diag.stale_memory_atoms,
@@ -3655,20 +3657,62 @@ fn lifecycleDiagnostics(ctx: *Context) HttpResponse {
         .agent_memories = store_diag.agent_memories,
         .sessions = store_diag.sessions,
     };
-    const body = std.fmt.allocPrint(
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.print(
         ctx.allocator,
-        "{{\"diagnostics\":{{\"health\":\"{s}\",\"total_memory_atoms\":{d},\"stale_memory_atoms\":{d},\"vector_outbox_pending\":{d},\"lucid_projection_pending\":{d},\"lucid_projection_failed\":{d},\"cache_entries\":{d},\"queued_jobs\":{d},\"running_jobs\":{d},\"failed_jobs\":{d},\"pending_feed_events\":{d},\"open_conflicts\":{d},\"agent_memories\":{d},\"sessions\":{d}}}}}",
+        "{{\"diagnostics\":{{\"health\":\"{s}\",\"total_memory_atoms\":{d},\"stale_memory_atoms\":{d},\"vector_outbox_pending\":{d},\"lucid_projection_pending\":{d},\"lucid_projection_failed\":{d},\"cache_entries\":{d},\"queued_jobs\":{d},\"running_jobs\":{d},\"failed_jobs\":{d},\"pending_feed_events\":{d},\"open_conflicts\":{d},\"agent_memories\":{d},\"sessions\":{d},\"runtime\":",
         .{ diagnostics.health(), diagnostics.total_memory_atoms, diagnostics.stale_memory_atoms, diagnostics.vector_outbox_pending, diagnostics.lucid_projection_pending, diagnostics.lucid_projection_failed, diagnostics.cache_entries, diagnostics.queued_jobs, diagnostics.running_jobs, diagnostics.failed_jobs, diagnostics.pending_feed_events, diagnostics.open_conflicts, diagnostics.agent_memories, diagnostics.sessions },
     ) catch return serverError(ctx);
+    appendRuntimeDiagnostics(ctx, &out, schema_version, schema_ok, store_diag) catch return serverError(ctx);
     if (ctx.provider_runtime) |runtime| {
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        out.appendSlice(ctx.allocator, body[0 .. body.len - 2]) catch return serverError(ctx);
         out.appendSlice(ctx.allocator, ",\"providers\":") catch return serverError(ctx);
         runtime.appendStatusJson(ctx.allocator, &out) catch return serverError(ctx);
-        out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
-        return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
     }
-    return .{ .status = "200 OK", .body = body };
+    out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn appendRuntimeDiagnostics(ctx: *Context, out: *std.ArrayListUnmanaged(u8), schema_version: i64, schema_ok: bool, store_diag: store_mod.LifecycleDiagnostics) !void {
+    try out.appendSlice(ctx.allocator, "{\"record_backend\":");
+    try json.appendString(out, ctx.allocator, ctx.store.backendName());
+    try out.appendSlice(ctx.allocator, ",\"record_backend_healthy\":");
+    try out.appendSlice(ctx.allocator, if (ctx.store.health()) "true" else "false");
+    try out.print(ctx.allocator, ",\"schema_version\":{d},\"expected_schema_version\":{d},\"schema_ok\":{s},\"agent_memory_backend\":", .{ schema_version, migrations.expected_schema_version, if (schema_ok) "true" else "false" });
+    try json.appendString(out, ctx.allocator, ctx.store.agentMemoryBackendName());
+    try out.appendSlice(ctx.allocator, ",\"vector\":{\"backend\":");
+    try json.appendString(out, ctx.allocator, ctx.store.vectorBackendName());
+    try out.appendSlice(ctx.allocator, ",\"external_enabled\":");
+    try out.appendSlice(ctx.allocator, if (ctx.store.vector_backend.externalEnabled()) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"external_sinks\":");
+    try json.appendRawJsonOr(out, ctx.allocator, ctx.store.vectorExternalSinksJson(), "[]");
+    try out.print(ctx.allocator, ",\"outbox_active\":true,\"outbox_pending\":{d}}}", .{store_diag.vector_outbox_pending});
+    try out.appendSlice(ctx.allocator, ",\"lucid\":{\"backend\":");
+    try json.appendString(out, ctx.allocator, ctx.store.lucidBackendName());
+    try out.appendSlice(ctx.allocator, ",\"enabled\":");
+    try out.appendSlice(ctx.allocator, if (ctx.store.lucid_projection.isEnabled()) "true" else "false");
+    try out.print(ctx.allocator, ",\"pending\":{d},\"failed\":{d}}}", .{ store_diag.lucid_projection_pending, store_diag.lucid_projection_failed });
+    try out.appendSlice(ctx.allocator, ",\"analytics\":{\"backend\":");
+    try json.appendString(out, ctx.allocator, ctx.store.analyticsBackendName());
+    try out.appendSlice(ctx.allocator, "},\"cache\":{\"response_cache_active\":true,\"semantic_cache_active\":true,\"entries\":");
+    try out.print(ctx.allocator, "{d}", .{store_diag.cache_entries});
+    try out.appendSlice(ctx.allocator, "},\"retrieval\":{\"keyword\":true,\"vector\":true,\"graph\":true,\"query_expansion\":true,\"rrf\":true,\"temporal_decay\":true,\"mmr\":true,\"llm_rerank_configured\":");
+    try out.appendSlice(ctx.allocator, if (ctx.llm_base_url != null and ctx.llm_model != null) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"summarizer\":true},\"embedding_provider\":{\"provider\":");
+    try json.appendString(out, ctx.allocator, ctx.embedding_provider.name());
+    try out.appendSlice(ctx.allocator, ",\"external_configured\":");
+    try out.appendSlice(ctx.allocator, if (embeddingProviderConfigured(ctx)) "true" else "false");
+    try out.print(ctx.allocator, ",\"fallback_count\":{d},\"dimensions\":{d}}}", .{ ctx.embedding_fallbacks.len, ctx.embedding_dimensions });
+    try out.appendSlice(ctx.allocator, ",\"completion_provider\":{\"configured\":");
+    try out.appendSlice(ctx.allocator, if (ctx.llm_base_url != null and ctx.llm_model != null) "true" else "false");
+    try out.appendSlice(ctx.allocator, "}}");
+}
+
+fn embeddingProviderConfigured(ctx: *Context) bool {
+    return switch (ctx.embedding_provider) {
+        .local_deterministic => false,
+        .openai_compatible => ctx.embedding_base_url != null and ctx.embedding_model != null,
+        .gemini, .voyage => ctx.embedding_api_key != null,
+    };
 }
 
 fn lifecycleLucidStatus(ctx: *Context) HttpResponse {
@@ -7268,6 +7312,15 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"queued_jobs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"pending_feed_events\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"agent_memories\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"runtime\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"record_backend\":\"sqlite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"record_backend_healthy\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"schema_ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"agent_memory_backend\":\"native\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"vector\":{\"backend\":\"local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"retrieval\":{\"keyword\":true,\"vector\":true,\"graph\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"embedding_provider\":{\"provider\":\"openai-compatible\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"completion_provider\":{\"configured\":false") != null);
     const analytics_status = handleRequest(&ctx, "GET", "/v1/lifecycle/analytics/status", "", "");
     try std.testing.expectEqualStrings("400 Bad Request", analytics_status.status);
     const analytics_query = handleRequest(&ctx, "POST", "/v1/lifecycle/analytics/query", "{\"limit\":10}", "");
