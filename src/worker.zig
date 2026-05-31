@@ -4,6 +4,7 @@ const domain = @import("domain.zig");
 const extraction = @import("extraction.zig");
 const providers = @import("providers.zig");
 const vector = @import("vector.zig");
+const vector_text = @import("vector_text.zig");
 const json = @import("json_util.zig");
 const ids = @import("ids.zig");
 const compat = @import("compat.zig");
@@ -359,6 +360,14 @@ fn extractSource(allocator: std.mem.Allocator, store: *store_mod.Store, source: 
     counts.vector_chunk_count += try upsertVector(allocator, store, options, "source", source.id, source.content, source.scope, source.permissions_json);
     if (applied.artifact) |artifact| {
         counts.vector_chunk_count += try upsertVector(allocator, store, options, "artifact", artifact.id, artifact.body, artifact.scope, artifact.permissions_json);
+    }
+    for (applied.entities) |entity| {
+        const text = try vector_text.entity(allocator, entity);
+        counts.vector_chunk_count += try upsertVector(allocator, store, options, "entity", entity.id, text, entity.scope, entity.permissions_json);
+    }
+    for (applied.relations) |relation| {
+        const text = try vector_text.relation(allocator, relation);
+        counts.vector_chunk_count += try upsertVector(allocator, store, options, "relation", relation.id, text, relation.scope, relation.permissions_json);
     }
     for (applied.atoms) |atom| {
         counts.vector_chunk_count += try upsertVector(allocator, store, options, "memory_atom", atom.id, atom.text, atom.scope, atom.permissions_json);

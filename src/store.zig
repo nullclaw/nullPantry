@@ -1062,6 +1062,7 @@ pub const Store = struct {
             .limit = @max(@as(usize, 20), input.limit),
             .include_deprecated = input.include_deprecated,
             .strict_external = input.strict_vector,
+            .actor_id = input.actor_id,
         });
         for (matches) |match| {
             if (try self.searchResultForVectorMatch(allocator, match, input)) |result| try results.append(allocator, result);
@@ -1213,6 +1214,13 @@ pub const Store = struct {
         return switch (self.backend) {
             .sqlite => |*s| s.deleteVectorChunk(allocator, id, actor_id),
             .postgres => |*p| p.deleteVectorChunk(allocator, id, actor_id),
+        };
+    }
+
+    pub fn vectorObjectAcl(self: *Store, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, actor_id: ?[]const u8) !?VectorObjectAcl {
+        return switch (self.backend) {
+            .sqlite => |*s| s.vectorObjectAcl(allocator, object_type, object_id, actor_id),
+            .postgres => |*p| p.vectorObjectAcl(allocator, object_type, object_id, actor_id),
         };
     }
 
@@ -3064,6 +3072,12 @@ pub const VectorSearchInput = struct {
     limit: usize = 10,
     include_deprecated: bool = false,
     strict_external: bool = false,
+    actor_id: ?[]const u8 = null,
+};
+
+pub const VectorObjectAcl = struct {
+    scope: []const u8,
+    permissions_json: []const u8,
 };
 
 pub const VectorOutboxInput = struct {
@@ -4141,12 +4155,20 @@ pub const SQLiteStore = struct {
         try self.exec("UPDATE schema_migrations SET name = 'ingest_jobs_conflicts', checksum = 'np-004-ingest-jobs-conflicts' WHERE version = 4");
         try self.exec("UPDATE schema_migrations SET name = 'spaces_policy_scopes', checksum = 'np-005-spaces-policy-scopes' WHERE version = 5");
         try self.exec("UPDATE schema_migrations SET name = 'connector_cursor_permissions', checksum = 'np-006-connector-cursor-permissions' WHERE version = 6");
-        try self.exec("DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact')");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact','entity','relation','context_pack','agent_memory','space','policy_scope')");
         try self.exec("DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND NOT EXISTS (SELECT 1 FROM memory_atoms WHERE memory_atoms.id = vector_chunks.object_id)");
         try self.exec("DELETE FROM vector_chunks WHERE object_type = 'source' AND NOT EXISTS (SELECT 1 FROM sources WHERE sources.id = vector_chunks.object_id)");
         try self.exec("DELETE FROM vector_chunks WHERE object_type = 'artifact' AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.id = vector_chunks.object_id)");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'entity' AND NOT EXISTS (SELECT 1 FROM entities WHERE entities.id = vector_chunks.object_id)");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'relation' AND NOT EXISTS (SELECT 1 FROM relations WHERE relations.id = vector_chunks.object_id)");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'context_pack' AND NOT EXISTS (SELECT 1 FROM context_packs WHERE context_packs.id = vector_chunks.object_id)");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'agent_memory' AND NOT EXISTS (SELECT 1 FROM agent_memory_items WHERE agent_memory_items.id = vector_chunks.object_id)");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'space' AND NOT EXISTS (SELECT 1 FROM spaces WHERE spaces.id = vector_chunks.object_id)");
+        try self.exec("DELETE FROM vector_chunks WHERE object_type = 'policy_scope' AND NOT EXISTS (SELECT 1 FROM policy_scopes WHERE policy_scopes.scope = vector_chunks.object_id)");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (7, 'vector_backing_invariant', 'np-007-vector-backing-invariant', strftime('%s','now') * 1000)");
         try self.exec("UPDATE schema_migrations SET name = 'vector_backing_invariant', checksum = 'np-007-vector-backing-invariant' WHERE version = 7");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (22, 'expanded_vector_primitives', 'np-022-expanded-vector-primitives', strftime('%s','now') * 1000)");
+        try self.exec("UPDATE schema_migrations SET name = 'expanded_vector_primitives', checksum = 'np-022-expanded-vector-primitives' WHERE version = 22");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (8, 'agent_actor_isolation', 'np-008-agent-actor-isolation', strftime('%s','now') * 1000)");
         try self.exec("UPDATE schema_migrations SET name = 'agent_actor_isolation', checksum = 'np-008-agent-actor-isolation' WHERE version = 8");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (9, 'strict_actor_memory', 'np-009-strict-actor-memory', strftime('%s','now') * 1000)");
@@ -6050,7 +6072,7 @@ pub const SQLiteStore = struct {
             const embedding = try vector_mod.deterministicEmbedding(allocator, expanded_query, dimensions);
             break :blk try vector_mod.embeddingToJson(allocator, embedding);
         };
-        const matches = try self.vectorSearch(allocator, .{ .embedding_json = embedding_json, .scopes_json = input.scopes_json, .limit = @max(@as(usize, 20), input.limit), .include_deprecated = input.include_deprecated, .strict_external = input.strict_vector });
+        const matches = try self.vectorSearch(allocator, .{ .embedding_json = embedding_json, .scopes_json = input.scopes_json, .limit = @max(@as(usize, 20), input.limit), .include_deprecated = input.include_deprecated, .strict_external = input.strict_vector, .actor_id = input.actor_id });
         for (matches) |match| {
             const result = try self.searchResultForVectorMatch(allocator, match, input);
             if (result) |value| try results.append(allocator, value);
@@ -6062,7 +6084,7 @@ pub const SQLiteStore = struct {
             const atom = (try self.getMemoryAtom(allocator, match.object_id)) orelse return null;
             if (std.mem.eql(u8, atom.predicate, "agent.memory")) return null;
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(atom.status)) return null;
-            if (!try self.recordVisibleWithPolicy(allocator, atom.scope, atom.permissions_json, input.scopes_json)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, atom.scope, atom.permissions_json, input.scopes_json, input.actor_id)) return null;
             return .{
                 .id = atom.id,
                 .result_type = "memory_atom",
@@ -6083,7 +6105,7 @@ pub const SQLiteStore = struct {
             if (std.mem.indexOf(u8, source.metadata_json, "\"native\":\"agent_memory\"") != null) return null;
             const status = try self.primitiveLifecycleStatus(allocator, "source", source.id);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
-            if (!try self.recordVisibleWithPolicy(allocator, source.scope, source.permissions_json, input.scopes_json)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, source.scope, source.permissions_json, input.scopes_json, input.actor_id)) return null;
             return .{
                 .id = source.id,
                 .result_type = "source",
@@ -6102,7 +6124,7 @@ pub const SQLiteStore = struct {
         if (std.mem.eql(u8, match.object_type, "artifact")) {
             const artifact = (try self.getArtifact(allocator, match.object_id)) orelse return null;
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(artifact.status)) return null;
-            if (!try self.recordVisibleWithPolicy(allocator, artifact.scope, artifact.permissions_json, input.scopes_json)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, artifact.scope, artifact.permissions_json, input.scopes_json, input.actor_id)) return null;
             return .{
                 .id = artifact.id,
                 .result_type = "artifact",
@@ -6118,7 +6140,153 @@ pub const SQLiteStore = struct {
                 .confidence = if (std.mem.eql(u8, artifact.status, "accepted") or std.mem.eql(u8, artifact.status, "verified")) 0.85 else 0.55,
             };
         }
+        if (std.mem.eql(u8, match.object_type, "entity")) {
+            const entity = (try self.getEntity(allocator, match.object_id)) orelse return null;
+            const status = try self.primitiveLifecycleStatus(allocator, "entity", entity.id);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, entity.scope, entity.permissions_json, input.scopes_json, input.actor_id)) return null;
+            const text = entity.description orelse entity.name;
+            return .{
+                .id = entity.id,
+                .result_type = "entity",
+                .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ entity.entity_type, entity.name }),
+                .text = text,
+                .scope = entity.scope,
+                .status = status,
+                .score = match.score + 0.25,
+                .source_ids_json = "[]",
+                .required_scopes_json = try requiredAccessJsonGlobal(allocator, entity.scope, entity.permissions_json, input.actor_id),
+                .actor_isolated = resultActorIsolatedGlobal(allocator, "entity", entity.scope, entity.permissions_json, input.actor_id),
+                .created_at_ms = entity.updated_at_ms,
+                .confidence = 0.6,
+            };
+        }
+        if (std.mem.eql(u8, match.object_type, "relation")) {
+            const relation = (try self.getRelation(allocator, match.object_id)) orelse return null;
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(relation.status)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, relation.scope, relation.permissions_json, input.scopes_json, input.actor_id)) return null;
+            const from_entity = (try self.getEntity(allocator, relation.from_entity_id)) orelse return null;
+            const to_entity = (try self.getEntity(allocator, relation.to_entity_id)) orelse return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, from_entity.scope, from_entity.permissions_json, input.scopes_json, input.actor_id)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, to_entity.scope, to_entity.permissions_json, input.scopes_json, input.actor_id)) return null;
+            return .{
+                .id = relation.id,
+                .result_type = "relation",
+                .title = relation.relation_type,
+                .text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ from_entity.name, relation.relation_type, to_entity.name }),
+                .scope = relation.scope,
+                .status = relation.status,
+                .score = match.score + relation.confidence,
+                .source_ids_json = try self.sanitizeSourceIds(allocator, relation.source_ids_json, input.scopes_json),
+                .required_scopes_json = try requiredAccessJsonGlobal(allocator, relation.scope, relation.permissions_json, input.actor_id),
+                .actor_isolated = resultActorIsolatedGlobal(allocator, "relation", relation.scope, relation.permissions_json, input.actor_id),
+                .created_at_ms = relation.created_at_ms,
+                .confidence = relation.confidence,
+            };
+        }
+        if (std.mem.eql(u8, match.object_type, "context_pack")) {
+            return try self.contextPackSearchResultForVector(allocator, match, input);
+        }
+        if (std.mem.eql(u8, match.object_type, "agent_memory")) {
+            const entry = (try self.agentMemoryById(allocator, match.object_id)) orelse return null;
+            if (!try self.agentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, input.scopes_json, input.actor_id)) return null;
+            if (domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) return null;
+            return .{
+                .id = entry.id,
+                .result_type = "agent_memory",
+                .title = entry.key,
+                .text = entry.content,
+                .scope = entry.scope,
+                .status = "active",
+                .score = match.score + (entry.score orelse 0.5),
+                .source_ids_json = "[]",
+                .required_scopes_json = try requiredAccessJsonGlobal(allocator, entry.scope, entry.permissions_json, input.actor_id),
+                .actor_isolated = !isSharedAgentMemoryOwner(entry.actor_id),
+                .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0,
+                .confidence = entry.score orelse 0.7,
+            };
+        }
+        if (std.mem.eql(u8, match.object_type, "space")) {
+            const space = (try self.getSpace(allocator, match.object_id)) orelse return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, space.scope, space.permissions_json, input.scopes_json, input.actor_id)) return null;
+            const text = if (space.description) |description|
+                try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ space.name, space.title, description, space.metadata_json })
+            else
+                try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ space.name, space.title, space.metadata_json });
+            return .{
+                .id = space.id,
+                .result_type = "space",
+                .title = space.title,
+                .text = text,
+                .scope = space.scope,
+                .status = "active",
+                .score = match.score + 0.2,
+                .source_ids_json = "[]",
+                .required_scopes_json = try requiredAccessJsonGlobal(allocator, space.scope, space.permissions_json, input.actor_id),
+                .actor_isolated = resultActorIsolatedGlobal(allocator, "space", space.scope, space.permissions_json, input.actor_id),
+                .created_at_ms = space.updated_at_ms,
+                .confidence = 0.7,
+            };
+        }
+        if (std.mem.eql(u8, match.object_type, "policy_scope")) {
+            const policy = (try self.getPolicyScope(allocator, match.object_id)) orelse return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, policy.scope, policy.permissions_json, input.scopes_json, input.actor_id)) return null;
+            const text = if (policy.owner) |owner|
+                try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ policy.scope, policy.visibility, owner, policy.metadata_json })
+            else
+                try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ policy.scope, policy.visibility, policy.metadata_json });
+            return .{
+                .id = policy.scope,
+                .result_type = "policy_scope",
+                .title = policy.scope,
+                .text = text,
+                .scope = policy.scope,
+                .status = policy.visibility,
+                .score = match.score + 0.2,
+                .source_ids_json = "[]",
+                .required_scopes_json = try requiredAccessJsonGlobal(allocator, policy.scope, policy.permissions_json, input.actor_id),
+                .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", policy.scope, policy.permissions_json, input.actor_id),
+                .created_at_ms = policy.updated_at_ms,
+                .confidence = 0.7,
+            };
+        }
         return null;
+    }
+
+    fn contextPackSearchResultForVector(self: *Self, allocator: std.mem.Allocator, match: vector_mod.VectorMatch, input: SearchInput) !?domain.SearchResult {
+        const stmt = try self.prepare("SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,generated_summary,created_at_ms,required_scopes_json,actor_id,actor_isolated FROM context_packs WHERE id = ?1 LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, match.object_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const id_text = try columnText(allocator, stmt, 0);
+        const purpose = try columnText(allocator, stmt, 1);
+        const target = try columnText(allocator, stmt, 2);
+        const source_ids = try columnText(allocator, stmt, 4);
+        const artifact_ids = try columnText(allocator, stmt, 5);
+        const atom_ids = try columnText(allocator, stmt, 6);
+        const result_refs = try columnText(allocator, stmt, 7);
+        const summary = try columnText(allocator, stmt, 8);
+        const created_at_ms = c.sqlite3_column_int64(stmt, 9);
+        const required_scopes = try columnText(allocator, stmt, 10);
+        const actor_id = try columnTextNullable(allocator, stmt, 11);
+        const actor_isolated = c.sqlite3_column_int(stmt, 12) != 0;
+        if (!try self.contextPackVisible(allocator, source_ids, artifact_ids, atom_ids, result_refs, required_scopes, actor_id, actor_isolated, input.scopes_json, input.actor_id, input.include_deprecated)) return null;
+        const status = try self.primitiveLifecycleStatus(allocator, "context_pack", id_text);
+        if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
+        return .{
+            .id = id_text,
+            .result_type = "context_pack",
+            .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ purpose, target }),
+            .text = summary,
+            .scope = "context",
+            .status = status,
+            .score = match.score + 0.4,
+            .source_ids_json = try self.sanitizeSourceIds(allocator, source_ids, input.scopes_json),
+            .required_scopes_json = required_scopes,
+            .actor_isolated = actor_isolated,
+            .created_at_ms = created_at_ms,
+            .confidence = 0.65,
+        };
     }
 
     fn contextPackVisible(self: *Self, allocator: std.mem.Allocator, sources_json: []const u8, artifacts_json: []const u8, atoms_json: []const u8, result_refs_json: []const u8, required_scopes_json: []const u8, row_actor_id: ?[]const u8, actor_isolated: bool, scopes_json: []const u8, request_actor_id: ?[]const u8, include_deprecated: bool) !bool {
@@ -6430,7 +6598,7 @@ pub const SQLiteStore = struct {
             const scope = try columnText(allocator, stmt, 4);
             const permissions = try columnText(allocator, stmt, 5);
             const embedding_json = try columnText(allocator, stmt, 6);
-            if (!try self.vectorChunkObjectVisible(allocator, object_type, object_id, scope, permissions, input.scopes_json, input.include_deprecated)) continue;
+            if (!try self.vectorChunkObjectVisible(allocator, object_type, object_id, scope, permissions, input.scopes_json, input.actor_id, input.include_deprecated)) continue;
             const embedding = vector_mod.embeddingFromJson(allocator, embedding_json) catch continue;
             try records.append(allocator, .{
                 .id = id_text,
@@ -6450,7 +6618,7 @@ pub const SQLiteStore = struct {
         const capped = @max(@as(usize, 1), @min(input.limit, 100));
         for (candidates) |candidate| {
             const chunk = (try self.getVectorChunk(allocator, candidate.vector_id)) orelse continue;
-            if (!try self.vectorChunkObjectVisible(allocator, chunk.object_type, chunk.object_id, chunk.scope, chunk.permissions_json, input.scopes_json, input.include_deprecated)) continue;
+            if (!try self.vectorChunkObjectVisible(allocator, chunk.object_type, chunk.object_id, chunk.scope, chunk.permissions_json, input.scopes_json, input.actor_id, input.include_deprecated)) continue;
             try out.append(allocator, .{
                 .id = chunk.id,
                 .object_id = chunk.object_id,
@@ -6481,24 +6649,48 @@ pub const SQLiteStore = struct {
         };
     }
 
-    fn vectorChunkObjectVisible(self: *Self, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_scope: []const u8, chunk_permissions: []const u8, scopes_json: []const u8, include_deprecated: bool) !bool {
+    fn vectorChunkObjectVisible(self: *Self, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_scope: []const u8, chunk_permissions: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
         _ = chunk_scope;
         _ = chunk_permissions;
         if (std.mem.eql(u8, object_type, "memory_atom")) {
             const atom = (try self.getMemoryAtom(allocator, object_id)) orelse return false;
             if (!include_deprecated and !domain.isDefaultVisibleStatus(atom.status)) return false;
-            return try self.recordVisibleWithPolicy(allocator, atom.scope, atom.permissions_json, scopes_json);
+            return try self.recordVisibleWithPolicyForActor(allocator, atom.scope, atom.permissions_json, scopes_json, actor_id);
         }
         if (std.mem.eql(u8, object_type, "source")) {
             const source = (try self.getSource(allocator, object_id)) orelse return false;
             const status = try self.primitiveLifecycleStatus(allocator, "source", source.id);
             if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
-            return try self.recordVisibleWithPolicy(allocator, source.scope, source.permissions_json, scopes_json);
+            return try self.recordVisibleWithPolicyForActor(allocator, source.scope, source.permissions_json, scopes_json, actor_id);
         }
         if (std.mem.eql(u8, object_type, "artifact")) {
             const artifact = (try self.getArtifact(allocator, object_id)) orelse return false;
             if (!include_deprecated and !domain.isDefaultVisibleStatus(artifact.status)) return false;
-            return try self.recordVisibleWithPolicy(allocator, artifact.scope, artifact.permissions_json, scopes_json);
+            return try self.recordVisibleWithPolicyForActor(allocator, artifact.scope, artifact.permissions_json, scopes_json, actor_id);
+        }
+        if (std.mem.eql(u8, object_type, "entity")) {
+            const entity = (try self.getEntity(allocator, object_id)) orelse return false;
+            const status = try self.primitiveLifecycleStatus(allocator, "entity", entity.id);
+            if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
+            return try self.recordVisibleWithPolicyForActor(allocator, entity.scope, entity.permissions_json, scopes_json, actor_id);
+        }
+        if (std.mem.eql(u8, object_type, "relation")) {
+            return try self.vectorRelationVisible(allocator, object_id, scopes_json, actor_id, include_deprecated);
+        }
+        if (std.mem.eql(u8, object_type, "context_pack")) {
+            return try self.vectorContextPackVisible(allocator, object_id, scopes_json, actor_id, include_deprecated);
+        }
+        if (std.mem.eql(u8, object_type, "agent_memory")) {
+            const entry = (try self.agentMemoryById(allocator, object_id)) orelse return false;
+            return try self.agentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, scopes_json, actor_id);
+        }
+        if (std.mem.eql(u8, object_type, "space")) {
+            const space = (try self.getSpace(allocator, object_id)) orelse return false;
+            return try self.recordVisibleWithPolicyForActor(allocator, space.scope, space.permissions_json, scopes_json, actor_id);
+        }
+        if (std.mem.eql(u8, object_type, "policy_scope")) {
+            const policy = (try self.getPolicyScope(allocator, object_id)) orelse return false;
+            return try self.recordVisibleWithPolicyForActor(allocator, policy.scope, policy.permissions_json, scopes_json, actor_id);
         }
         return false;
     }
@@ -6507,7 +6699,111 @@ pub const SQLiteStore = struct {
         if (std.mem.eql(u8, object_type, "memory_atom")) return (try self.getMemoryAtom(allocator, object_id)) != null;
         if (std.mem.eql(u8, object_type, "source")) return (try self.getSource(allocator, object_id)) != null;
         if (std.mem.eql(u8, object_type, "artifact")) return (try self.getArtifact(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "entity")) return (try self.getEntity(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "relation")) return (try self.getRelation(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "context_pack")) return try self.contextPackExists(object_id);
+        if (std.mem.eql(u8, object_type, "agent_memory")) return (try self.agentMemoryById(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "space")) return (try self.getSpace(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "policy_scope")) return (try self.getPolicyScope(allocator, object_id)) != null;
         return false;
+    }
+
+    pub fn vectorObjectAcl(self: *Self, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, actor_id: ?[]const u8) !?VectorObjectAcl {
+        if (std.mem.eql(u8, object_type, "memory_atom")) {
+            const atom = (try self.getMemoryAtom(allocator, object_id)) orelse return null;
+            return .{ .scope = atom.scope, .permissions_json = atom.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "source")) {
+            const source = (try self.getSource(allocator, object_id)) orelse return null;
+            return .{ .scope = source.scope, .permissions_json = source.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "artifact")) {
+            const artifact = (try self.getArtifact(allocator, object_id)) orelse return null;
+            return .{ .scope = artifact.scope, .permissions_json = artifact.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "entity")) {
+            const entity = (try self.getEntity(allocator, object_id)) orelse return null;
+            return .{ .scope = entity.scope, .permissions_json = entity.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "relation")) {
+            const relation = (try self.getRelation(allocator, object_id)) orelse return null;
+            return .{ .scope = relation.scope, .permissions_json = relation.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "context_pack")) {
+            return try self.vectorContextPackAcl(allocator, object_id, actor_id);
+        }
+        if (std.mem.eql(u8, object_type, "agent_memory")) {
+            const entry = (try self.agentMemoryById(allocator, object_id)) orelse return null;
+            return .{ .scope = entry.scope, .permissions_json = entry.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "space")) {
+            const space = (try self.getSpace(allocator, object_id)) orelse return null;
+            return .{ .scope = space.scope, .permissions_json = space.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "policy_scope")) {
+            const policy = (try self.getPolicyScope(allocator, object_id)) orelse return null;
+            return .{ .scope = policy.scope, .permissions_json = policy.permissions_json };
+        }
+        return null;
+    }
+
+    fn vectorRelationVisible(self: *Self, allocator: std.mem.Allocator, relation_id: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
+        const relation = (try self.getRelation(allocator, relation_id)) orelse return false;
+        if (!include_deprecated and !domain.isDefaultVisibleStatus(relation.status)) return false;
+        if (!try self.recordVisibleWithPolicyForActor(allocator, relation.scope, relation.permissions_json, scopes_json, actor_id)) return false;
+        const from_entity = (try self.getEntity(allocator, relation.from_entity_id)) orelse return false;
+        if (!try self.recordVisibleWithPolicyForActor(allocator, from_entity.scope, from_entity.permissions_json, scopes_json, actor_id)) return false;
+        const to_entity = (try self.getEntity(allocator, relation.to_entity_id)) orelse return false;
+        if (!try self.recordVisibleWithPolicyForActor(allocator, to_entity.scope, to_entity.permissions_json, scopes_json, actor_id)) return false;
+        return true;
+    }
+
+    fn vectorContextPackAcl(self: *Self, allocator: std.mem.Allocator, id: []const u8, actor_id: ?[]const u8) !?VectorObjectAcl {
+        const stmt = try self.prepare("SELECT required_scopes_json,actor_id,actor_isolated FROM context_packs WHERE id = ?1 LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const required_scopes = try columnText(allocator, stmt, 0);
+        const row_actor = try columnTextNullable(allocator, stmt, 1);
+        const actor_isolated = c.sqlite3_column_int(stmt, 2) != 0;
+        if (actor_isolated) {
+            const actor = actor_id orelse return null;
+            if (!actorMatches(actor_id, row_actor)) return null;
+            return .{ .scope = try domain.defaultAgentMemoryScope(allocator, actor), .permissions_json = try domain.actorGrantJson(allocator, actor) };
+        }
+        return .{
+            .scope = try firstScopeOrDefault(allocator, required_scopes, "public"),
+            .permissions_json = required_scopes,
+        };
+    }
+
+    fn vectorContextPackVisible(self: *Self, allocator: std.mem.Allocator, id: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
+        const stmt = try self.prepare("SELECT included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated FROM context_packs WHERE id = ?1 LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+        const source_ids = try columnText(allocator, stmt, 0);
+        const artifact_ids = try columnText(allocator, stmt, 1);
+        const atom_ids = try columnText(allocator, stmt, 2);
+        const result_refs = try columnText(allocator, stmt, 3);
+        const required_scopes = try columnText(allocator, stmt, 4);
+        const row_actor = try columnTextNullable(allocator, stmt, 5);
+        const actor_isolated = c.sqlite3_column_int(stmt, 6) != 0;
+        if (!try self.contextPackVisible(allocator, source_ids, artifact_ids, atom_ids, result_refs, required_scopes, row_actor, actor_isolated, scopes_json, actor_id, include_deprecated)) return false;
+        const status = try self.primitiveLifecycleStatus(allocator, "context_pack", id);
+        if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
+        return true;
+    }
+
+    fn agentMemoryById(self: *Self, allocator: std.mem.Allocator, id: []const u8) !?domain.AgentMemory {
+        const stmt = try self.prepare(
+            "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
+                "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.id = ?1 LIMIT 1",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try readAgentMemory(allocator, stmt);
     }
 
     pub fn enqueueVectorOutbox(self: *Self, input: VectorOutboxInput) !i64 {
@@ -8162,13 +8458,22 @@ pub const PostgresStore = struct {
             \\UPDATE schema_migrations SET name = 'ingest_jobs_conflicts', checksum = 'np-004-ingest-jobs-conflicts' WHERE version = 4;
             \\UPDATE schema_migrations SET name = 'spaces_policy_scopes', checksum = 'np-005-spaces-policy-scopes' WHERE version = 5;
             \\UPDATE schema_migrations SET name = 'connector_cursor_permissions', checksum = 'np-006-connector-cursor-permissions' WHERE version = 6;
-            \\DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact');
+            \\DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact','entity','relation','context_pack','agent_memory','space','policy_scope');
             \\DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND NOT EXISTS (SELECT 1 FROM memory_atoms WHERE memory_atoms.id = vector_chunks.object_id);
             \\DELETE FROM vector_chunks WHERE object_type = 'source' AND NOT EXISTS (SELECT 1 FROM sources WHERE sources.id = vector_chunks.object_id);
             \\DELETE FROM vector_chunks WHERE object_type = 'artifact' AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.id = vector_chunks.object_id);
-            \\DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'vector_chunks_object_type_chk') THEN ALTER TABLE vector_chunks ADD CONSTRAINT vector_chunks_object_type_chk CHECK (object_type IN ('memory_atom','source','artifact')); END IF; END $$;
+            \\DELETE FROM vector_chunks WHERE object_type = 'entity' AND NOT EXISTS (SELECT 1 FROM entities WHERE entities.id = vector_chunks.object_id);
+            \\DELETE FROM vector_chunks WHERE object_type = 'relation' AND NOT EXISTS (SELECT 1 FROM relations WHERE relations.id = vector_chunks.object_id);
+            \\DELETE FROM vector_chunks WHERE object_type = 'context_pack' AND NOT EXISTS (SELECT 1 FROM context_packs WHERE context_packs.id = vector_chunks.object_id);
+            \\DELETE FROM vector_chunks WHERE object_type = 'agent_memory' AND NOT EXISTS (SELECT 1 FROM agent_memory_items WHERE agent_memory_items.id = vector_chunks.object_id);
+            \\DELETE FROM vector_chunks WHERE object_type = 'space' AND NOT EXISTS (SELECT 1 FROM spaces WHERE spaces.id = vector_chunks.object_id);
+            \\DELETE FROM vector_chunks WHERE object_type = 'policy_scope' AND NOT EXISTS (SELECT 1 FROM policy_scopes WHERE policy_scopes.scope = vector_chunks.object_id);
+            \\ALTER TABLE vector_chunks DROP CONSTRAINT IF EXISTS vector_chunks_object_type_chk;
+            \\ALTER TABLE vector_chunks ADD CONSTRAINT vector_chunks_object_type_chk CHECK (object_type IN ('memory_atom','source','artifact','entity','relation','context_pack','agent_memory','space','policy_scope'));
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (7, 'vector_backing_invariant', 'np-007-vector-backing-invariant', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
             \\UPDATE schema_migrations SET name = 'vector_backing_invariant', checksum = 'np-007-vector-backing-invariant' WHERE version = 7;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (22, 'expanded_vector_primitives', 'np-022-expanded-vector-primitives', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\UPDATE schema_migrations SET name = 'expanded_vector_primitives', checksum = 'np-022-expanded-vector-primitives' WHERE version = 22;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (8, 'agent_actor_isolation', 'np-008-agent-actor-isolation', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
             \\UPDATE schema_migrations SET name = 'agent_actor_isolation', checksum = 'np-008-agent-actor-isolation' WHERE version = 8;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (9, 'strict_actor_memory', 'np-009-strict-actor-memory', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
@@ -9143,6 +9448,19 @@ pub const PostgresStore = struct {
         return true;
     }
 
+    fn agentMemoryResultVisible(self: *PostgresStore, allocator: std.mem.Allocator, owner_actor_id: []const u8, scope: []const u8, permissions: []const u8, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) !bool {
+        return access.agentMemoryVisible(allocator, .{
+            .owner_actor_id = owner_actor_id,
+            .scope = scope,
+            .permissions_json = permissions,
+            .session_id = session_id,
+            .request_actor_id = actor_id,
+            .request_scopes_json = scopes_json,
+            .record_visible = try self.recordVisibleWithPolicy(allocator, scope, permissions, scopes_json),
+            .session_visible = if (session_id) |sid| sessionVisibleForScopes(allocator, sid, scopes_json) else true,
+        });
+    }
+
     pub fn upsertVectorChunk(self: *PostgresStore, allocator: std.mem.Allocator, input: VectorChunkInput) !VectorChunk {
         _ = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
         if (!try self.vectorBackingObjectExists(allocator, input.object_type, input.object_id)) return error.InvalidVectorTarget;
@@ -9229,11 +9547,24 @@ pub const PostgresStore = struct {
         {
             const embedding_sql = try std.fmt.allocPrint(allocator, "{s}::vector", .{try sqlString(allocator, input.embedding_json)});
             const candidate_limit = pgSearchCandidateLimit(input.limit, 20, 5000);
-            const ma_visible = try pgRecordVisibleSql(allocator, "ma.scope", "ma.permissions_json", input.scopes_json, null);
-            const source_visible = try pgRecordVisibleSql(allocator, "src.scope", "src.permissions_json", input.scopes_json, null);
-            const artifact_visible = try pgRecordVisibleSql(allocator, "art.scope", "art.permissions_json", input.scopes_json, null);
+            const ma_visible = try pgRecordVisibleSql(allocator, "ma.scope", "ma.permissions_json", input.scopes_json, input.actor_id);
+            const source_visible = try pgRecordVisibleSql(allocator, "src.scope", "src.permissions_json", input.scopes_json, input.actor_id);
+            const artifact_visible = try pgRecordVisibleSql(allocator, "art.scope", "art.permissions_json", input.scopes_json, input.actor_id);
+            const entity_visible = try pgRecordVisibleSql(allocator, "ent.scope", "ent.permissions_json", input.scopes_json, input.actor_id);
+            const relation_visible = try pgRecordVisibleSql(allocator, "rel.scope", "rel.permissions_json", input.scopes_json, input.actor_id);
+            const relation_from_visible = try pgRecordVisibleSql(allocator, "rel_from.scope", "rel_from.permissions_json", input.scopes_json, input.actor_id);
+            const relation_to_visible = try pgRecordVisibleSql(allocator, "rel_to.scope", "rel_to.permissions_json", input.scopes_json, input.actor_id);
+            const agent_memory_visible = try pgRecordVisibleSql(allocator, "ami.scope", "ami.permissions_json", input.scopes_json, input.actor_id);
+            const space_visible = try pgRecordVisibleSql(allocator, "sp.scope", "sp.permissions_json", input.scopes_json, input.actor_id);
+            const policy_visible = try pgRecordVisibleSql(allocator, "ps.scope", "ps.permissions_json", input.scopes_json, input.actor_id);
+            const context_actor_filter = if (input.actor_id) |actor|
+                try std.fmt.allocPrint(allocator, "(cp.actor_isolated = false OR cp.actor_id = {s})", .{try sqlString(allocator, actor)})
+            else
+                "(cp.actor_isolated = false)";
             const ma_status_filter = if (input.include_deprecated) "" else " AND ma.status NOT IN ('rejected','deprecated','superseded')";
             const artifact_status_filter = if (input.include_deprecated) "" else " AND art.status NOT IN ('rejected','deprecated','superseded')";
+            const relation_status_filter = if (input.include_deprecated) "" else " AND rel.status NOT IN ('rejected','deprecated','superseded')";
+            const agent_status_filter = if (input.include_deprecated) "" else " AND agma.status NOT IN ('rejected','deprecated','superseded')";
             const inner = try std.fmt.allocPrint(
                 allocator,
                 "SELECT vc.id,vc.object_id,vc.object_type,vc.text,vc.scope,vc.permissions_json,vc.embedding_json,(1 - (vc.embedding <=> {s})) AS score " ++
@@ -9241,12 +9572,47 @@ pub const PostgresStore = struct {
                     "LEFT JOIN memory_atoms ma ON vc.object_type = 'memory_atom' AND ma.id = vc.object_id " ++
                     "LEFT JOIN sources src ON vc.object_type = 'source' AND src.id = vc.object_id " ++
                     "LEFT JOIN artifacts art ON vc.object_type = 'artifact' AND art.id = vc.object_id " ++
+                    "LEFT JOIN entities ent ON vc.object_type = 'entity' AND ent.id = vc.object_id " ++
+                    "LEFT JOIN relations rel ON vc.object_type = 'relation' AND rel.id = vc.object_id " ++
+                    "LEFT JOIN entities rel_from ON rel_from.id = rel.from_entity_id " ++
+                    "LEFT JOIN entities rel_to ON rel_to.id = rel.to_entity_id " ++
+                    "LEFT JOIN context_packs cp ON vc.object_type = 'context_pack' AND cp.id = vc.object_id " ++
+                    "LEFT JOIN agent_memory_items ami ON vc.object_type = 'agent_memory' AND ami.id = vc.object_id " ++
+                    "LEFT JOIN memory_atoms agma ON agma.id = ami.memory_atom_id " ++
+                    "LEFT JOIN spaces sp ON vc.object_type = 'space' AND sp.id = vc.object_id " ++
+                    "LEFT JOIN policy_scopes ps ON vc.object_type = 'policy_scope' AND ps.scope = vc.object_id " ++
                     "WHERE vc.embedding IS NOT NULL AND vc.dimensions = {d} AND ((" ++
                     "vc.object_type = 'memory_atom' AND ma.id IS NOT NULL{s} AND ({s})) OR (" ++
                     "vc.object_type = 'source' AND src.id IS NOT NULL AND ({s})) OR (" ++
-                    "vc.object_type = 'artifact' AND art.id IS NOT NULL{s} AND ({s}))) " ++
+                    "vc.object_type = 'artifact' AND art.id IS NOT NULL{s} AND ({s})) OR (" ++
+                    "vc.object_type = 'entity' AND ent.id IS NOT NULL AND ({s})) OR (" ++
+                    "vc.object_type = 'relation' AND rel.id IS NOT NULL{s} AND ({s}) AND rel_from.id IS NOT NULL AND ({s}) AND rel_to.id IS NOT NULL AND ({s})) OR (" ++
+                    "vc.object_type = 'context_pack' AND cp.id IS NOT NULL AND {s}) OR (" ++
+                    "vc.object_type = 'agent_memory' AND ami.id IS NOT NULL AND agma.id IS NOT NULL{s} AND ({s})) OR (" ++
+                    "vc.object_type = 'space' AND sp.id IS NOT NULL AND ({s})) OR (" ++
+                    "vc.object_type = 'policy_scope' AND ps.scope IS NOT NULL AND ({s}))) " ++
                     "ORDER BY vc.embedding <=> {s} LIMIT {d}",
-                .{ embedding_sql, query.len, ma_status_filter, ma_visible, source_visible, artifact_status_filter, artifact_visible, embedding_sql, candidate_limit },
+                .{
+                    embedding_sql,
+                    query.len,
+                    ma_status_filter,
+                    ma_visible,
+                    source_visible,
+                    artifact_status_filter,
+                    artifact_visible,
+                    entity_visible,
+                    relation_status_filter,
+                    relation_visible,
+                    relation_from_visible,
+                    relation_to_visible,
+                    context_actor_filter,
+                    agent_status_filter,
+                    agent_memory_visible,
+                    space_visible,
+                    policy_visible,
+                    embedding_sql,
+                    candidate_limit,
+                },
             );
             const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
             defer parsed.deinit();
@@ -9259,7 +9625,7 @@ pub const PostgresStore = struct {
                     const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
                     const object_id = try dupStringField(allocator, obj, "object_id", "");
                     const object_type = try dupStringField(allocator, obj, "object_type", "");
-                    if (!try self.vectorChunkObjectVisible(allocator, object_type, object_id, scope, permissions, input.scopes_json, input.include_deprecated)) continue;
+                    if (!try self.vectorChunkObjectVisible(allocator, object_type, object_id, scope, permissions, input.scopes_json, input.actor_id, input.include_deprecated)) continue;
                     try out.append(allocator, .{
                         .id = try dupStringField(allocator, obj, "id", ""),
                         .object_id = object_id,
@@ -9281,7 +9647,7 @@ pub const PostgresStore = struct {
         const capped = @max(@as(usize, 1), @min(input.limit, 100));
         for (candidates) |candidate| {
             const chunk = (try self.getVectorChunk(allocator, candidate.vector_id)) orelse continue;
-            if (!try self.vectorChunkObjectVisible(allocator, chunk.object_type, chunk.object_id, chunk.scope, chunk.permissions_json, input.scopes_json, input.include_deprecated)) continue;
+            if (!try self.vectorChunkObjectVisible(allocator, chunk.object_type, chunk.object_id, chunk.scope, chunk.permissions_json, input.scopes_json, input.actor_id, input.include_deprecated)) continue;
             try out.append(allocator, .{
                 .id = chunk.id,
                 .object_id = chunk.object_id,
@@ -9295,24 +9661,48 @@ pub const PostgresStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    fn vectorChunkObjectVisible(self: *PostgresStore, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_scope: []const u8, chunk_permissions: []const u8, scopes_json: []const u8, include_deprecated: bool) !bool {
+    fn vectorChunkObjectVisible(self: *PostgresStore, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, chunk_scope: []const u8, chunk_permissions: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
         _ = chunk_scope;
         _ = chunk_permissions;
         if (std.mem.eql(u8, object_type, "memory_atom")) {
             const atom = (try self.getMemoryAtom(allocator, object_id)) orelse return false;
             if (!include_deprecated and !domain.isDefaultVisibleStatus(atom.status)) return false;
-            return try self.recordVisibleWithPolicy(allocator, atom.scope, atom.permissions_json, scopes_json);
+            return try self.recordVisibleWithPolicyForActor(allocator, atom.scope, atom.permissions_json, scopes_json, actor_id);
         }
         if (std.mem.eql(u8, object_type, "source")) {
             const source = (try self.getSource(allocator, object_id)) orelse return false;
             const status = try self.primitiveLifecycleStatus(allocator, "source", source.id);
             if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
-            return try self.recordVisibleWithPolicy(allocator, source.scope, source.permissions_json, scopes_json);
+            return try self.recordVisibleWithPolicyForActor(allocator, source.scope, source.permissions_json, scopes_json, actor_id);
         }
         if (std.mem.eql(u8, object_type, "artifact")) {
             const artifact = (try self.getArtifact(allocator, object_id)) orelse return false;
             if (!include_deprecated and !domain.isDefaultVisibleStatus(artifact.status)) return false;
-            return try self.recordVisibleWithPolicy(allocator, artifact.scope, artifact.permissions_json, scopes_json);
+            return try self.recordVisibleWithPolicyForActor(allocator, artifact.scope, artifact.permissions_json, scopes_json, actor_id);
+        }
+        if (std.mem.eql(u8, object_type, "entity")) {
+            const entity = (try self.getEntity(allocator, object_id)) orelse return false;
+            const status = try self.primitiveLifecycleStatus(allocator, "entity", entity.id);
+            if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
+            return try self.recordVisibleWithPolicyForActor(allocator, entity.scope, entity.permissions_json, scopes_json, actor_id);
+        }
+        if (std.mem.eql(u8, object_type, "relation")) {
+            return try self.vectorRelationVisible(allocator, object_id, scopes_json, actor_id, include_deprecated);
+        }
+        if (std.mem.eql(u8, object_type, "context_pack")) {
+            return try self.vectorContextPackVisible(allocator, object_id, scopes_json, actor_id, include_deprecated);
+        }
+        if (std.mem.eql(u8, object_type, "agent_memory")) {
+            const entry = (try self.agentMemoryById(allocator, object_id)) orelse return false;
+            return try self.agentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, scopes_json, actor_id);
+        }
+        if (std.mem.eql(u8, object_type, "space")) {
+            const space = (try self.getSpace(allocator, object_id)) orelse return false;
+            return try self.recordVisibleWithPolicyForActor(allocator, space.scope, space.permissions_json, scopes_json, actor_id);
+        }
+        if (std.mem.eql(u8, object_type, "policy_scope")) {
+            const policy = (try self.getPolicyScope(allocator, object_id)) orelse return false;
+            return try self.recordVisibleWithPolicyForActor(allocator, policy.scope, policy.permissions_json, scopes_json, actor_id);
         }
         return false;
     }
@@ -9321,7 +9711,115 @@ pub const PostgresStore = struct {
         if (std.mem.eql(u8, object_type, "memory_atom")) return (try self.getMemoryAtom(allocator, object_id)) != null;
         if (std.mem.eql(u8, object_type, "source")) return (try self.getSource(allocator, object_id)) != null;
         if (std.mem.eql(u8, object_type, "artifact")) return (try self.getArtifact(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "entity")) return (try self.getEntity(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "relation")) return (try self.getRelation(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "context_pack")) return try self.contextPackExists(allocator, object_id);
+        if (std.mem.eql(u8, object_type, "agent_memory")) return (try self.agentMemoryById(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "space")) return (try self.getSpace(allocator, object_id)) != null;
+        if (std.mem.eql(u8, object_type, "policy_scope")) return (try self.getPolicyScope(allocator, object_id)) != null;
         return false;
+    }
+
+    pub fn vectorObjectAcl(self: *PostgresStore, allocator: std.mem.Allocator, object_type: []const u8, object_id: []const u8, actor_id: ?[]const u8) !?VectorObjectAcl {
+        if (std.mem.eql(u8, object_type, "memory_atom")) {
+            const atom = (try self.getMemoryAtom(allocator, object_id)) orelse return null;
+            return .{ .scope = atom.scope, .permissions_json = atom.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "source")) {
+            const source = (try self.getSource(allocator, object_id)) orelse return null;
+            return .{ .scope = source.scope, .permissions_json = source.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "artifact")) {
+            const artifact = (try self.getArtifact(allocator, object_id)) orelse return null;
+            return .{ .scope = artifact.scope, .permissions_json = artifact.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "entity")) {
+            const entity = (try self.getEntity(allocator, object_id)) orelse return null;
+            return .{ .scope = entity.scope, .permissions_json = entity.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "relation")) {
+            const relation = (try self.getRelation(allocator, object_id)) orelse return null;
+            return .{ .scope = relation.scope, .permissions_json = relation.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "context_pack")) {
+            return try self.vectorContextPackAcl(allocator, object_id, actor_id);
+        }
+        if (std.mem.eql(u8, object_type, "agent_memory")) {
+            const entry = (try self.agentMemoryById(allocator, object_id)) orelse return null;
+            return .{ .scope = entry.scope, .permissions_json = entry.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "space")) {
+            const space = (try self.getSpace(allocator, object_id)) orelse return null;
+            return .{ .scope = space.scope, .permissions_json = space.permissions_json };
+        }
+        if (std.mem.eql(u8, object_type, "policy_scope")) {
+            const policy = (try self.getPolicyScope(allocator, object_id)) orelse return null;
+            return .{ .scope = policy.scope, .permissions_json = policy.permissions_json };
+        }
+        return null;
+    }
+
+    fn vectorRelationVisible(self: *PostgresStore, allocator: std.mem.Allocator, relation_id: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
+        const relation = (try self.getRelation(allocator, relation_id)) orelse return false;
+        if (!include_deprecated and !domain.isDefaultVisibleStatus(relation.status)) return false;
+        if (!try self.recordVisibleWithPolicyForActor(allocator, relation.scope, relation.permissions_json, scopes_json, actor_id)) return false;
+        const from_entity = (try self.getEntity(allocator, relation.from_entity_id)) orelse return false;
+        if (!try self.recordVisibleWithPolicyForActor(allocator, from_entity.scope, from_entity.permissions_json, scopes_json, actor_id)) return false;
+        const to_entity = (try self.getEntity(allocator, relation.to_entity_id)) orelse return false;
+        if (!try self.recordVisibleWithPolicyForActor(allocator, to_entity.scope, to_entity.permissions_json, scopes_json, actor_id)) return false;
+        return true;
+    }
+
+    fn vectorContextPackAcl(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8, actor_id: ?[]const u8) !?VectorObjectAcl {
+        const inner = try std.fmt.allocPrint(allocator, "SELECT required_scopes_json,actor_id,actor_isolated FROM context_packs WHERE id = {s} LIMIT 1", .{try sqlString(allocator, id)});
+        const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value == .null) return null;
+        const obj = parsed.value.object;
+        const required_scopes = try rawJsonField(allocator, obj, "required_scopes_json", "[]");
+        const row_actor = try dupNullableStringField(allocator, obj, "actor_id");
+        const actor_isolated = json.boolField(obj, "actor_isolated") orelse false;
+        if (actor_isolated) {
+            const actor = actor_id orelse return null;
+            if (!actorMatches(actor_id, row_actor)) return null;
+            return .{ .scope = try domain.defaultAgentMemoryScope(allocator, actor), .permissions_json = try domain.actorGrantJson(allocator, actor) };
+        }
+        return .{
+            .scope = try firstScopeOrDefault(allocator, required_scopes, "public"),
+            .permissions_json = required_scopes,
+        };
+    }
+
+    fn vectorContextPackVisible(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8, scopes_json: []const u8, actor_id: ?[]const u8, include_deprecated: bool) !bool {
+        const inner = try std.fmt.allocPrint(allocator, "SELECT included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,required_scopes_json,actor_id,actor_isolated FROM context_packs WHERE id = {s} LIMIT 1", .{try sqlString(allocator, id)});
+        const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value == .null) return false;
+        const obj = parsed.value.object;
+        const source_ids = try rawJsonField(allocator, obj, "included_sources_json", "[]");
+        const artifact_ids = try rawJsonField(allocator, obj, "included_artifacts_json", "[]");
+        const atom_ids = try rawJsonField(allocator, obj, "included_memory_atoms_json", "[]");
+        const result_refs = try rawJsonField(allocator, obj, "included_result_refs_json", "[]");
+        const required_scopes = try rawJsonField(allocator, obj, "required_scopes_json", "[]");
+        const row_actor = try dupNullableStringField(allocator, obj, "actor_id");
+        const actor_isolated = json.boolField(obj, "actor_isolated") orelse false;
+        if (!try self.contextPackVisible(allocator, source_ids, artifact_ids, atom_ids, result_refs, required_scopes, row_actor, actor_isolated, scopes_json, actor_id, include_deprecated)) return false;
+        const status = try self.primitiveLifecycleStatus(allocator, "context_pack", id);
+        if (!include_deprecated and !domain.isDefaultVisibleStatus(status)) return false;
+        return true;
+    }
+
+    fn agentMemoryById(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?domain.AgentMemory {
+        const inner = try std.fmt.allocPrint(
+            allocator,
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+                "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.id = {s} LIMIT 1",
+            .{try sqlString(allocator, id)},
+        );
+        const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value == .null) return null;
+        return try readPgAgentMemory(allocator, parsed.value.object);
     }
 
     pub fn enqueueVectorOutbox(self: *PostgresStore, input: VectorOutboxInput) !i64 {
@@ -10633,7 +11131,7 @@ pub const PostgresStore = struct {
             const embedding = try vector_mod.deterministicEmbedding(allocator, expanded_query, dimensions);
             break :blk try vector_mod.embeddingToJson(allocator, embedding);
         };
-        const matches = try self.vectorSearch(allocator, .{ .embedding_json = embedding_json, .scopes_json = input.scopes_json, .limit = @max(@as(usize, 20), input.limit), .include_deprecated = input.include_deprecated, .strict_external = input.strict_vector });
+        const matches = try self.vectorSearch(allocator, .{ .embedding_json = embedding_json, .scopes_json = input.scopes_json, .limit = @max(@as(usize, 20), input.limit), .include_deprecated = input.include_deprecated, .strict_external = input.strict_vector, .actor_id = input.actor_id });
         for (matches) |match| {
             if (try self.searchResultForVectorMatch(allocator, match, input)) |result| try results.append(allocator, result);
         }
@@ -10644,7 +11142,7 @@ pub const PostgresStore = struct {
             const atom = (try self.getMemoryAtom(allocator, match.object_id)) orelse return null;
             if (std.mem.eql(u8, atom.predicate, "agent.memory")) return null;
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(atom.status)) return null;
-            if (!try self.recordVisibleWithPolicy(allocator, atom.scope, atom.permissions_json, input.scopes_json)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, atom.scope, atom.permissions_json, input.scopes_json, input.actor_id)) return null;
             return .{ .id = atom.id, .result_type = "memory_atom", .title = atom.id, .text = atom.text, .scope = atom.scope, .status = atom.status, .score = match.score + atom.confidence, .source_ids_json = try self.sanitizeSourceIds(allocator, atom.source_ids_json, input.scopes_json), .required_scopes_json = try requiredAccessJsonGlobal(allocator, atom.scope, atom.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "memory_atom", atom.scope, atom.permissions_json, input.actor_id), .created_at_ms = atom.created_at_ms, .confidence = atom.confidence };
         }
         if (std.mem.eql(u8, match.object_type, "source")) {
@@ -10652,16 +11150,85 @@ pub const PostgresStore = struct {
             if (std.mem.indexOf(u8, source.metadata_json, "\"native\":\"agent_memory\"") != null) return null;
             const status = try self.primitiveLifecycleStatus(allocator, "source", source.id);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
-            if (!try self.recordVisibleWithPolicy(allocator, source.scope, source.permissions_json, input.scopes_json)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, source.scope, source.permissions_json, input.scopes_json, input.actor_id)) return null;
             return .{ .id = source.id, .result_type = "source", .title = source.title, .text = source.content, .scope = source.scope, .status = status, .score = match.score, .source_ids_json = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{source.id}), .required_scopes_json = try requiredAccessJsonGlobal(allocator, source.scope, source.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "source", source.scope, source.permissions_json, input.actor_id), .created_at_ms = source.imported_at_ms, .confidence = 0.7 };
         }
         if (std.mem.eql(u8, match.object_type, "artifact")) {
             const artifact = (try self.getArtifact(allocator, match.object_id)) orelse return null;
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(artifact.status)) return null;
-            if (!try self.recordVisibleWithPolicy(allocator, artifact.scope, artifact.permissions_json, input.scopes_json)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, artifact.scope, artifact.permissions_json, input.scopes_json, input.actor_id)) return null;
             return .{ .id = artifact.id, .result_type = "artifact", .title = artifact.title, .text = try artifactTextWithFields(allocator, artifact.body, artifact.fields_json), .scope = artifact.scope, .status = artifact.status, .score = match.score, .source_ids_json = try self.sanitizeSourceIds(allocator, artifact.source_ids_json, input.scopes_json), .required_scopes_json = try requiredAccessJsonGlobal(allocator, artifact.scope, artifact.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "artifact", artifact.scope, artifact.permissions_json, input.actor_id), .created_at_ms = artifact.updated_at_ms, .confidence = if (std.mem.eql(u8, artifact.status, "accepted") or std.mem.eql(u8, artifact.status, "verified")) 0.85 else 0.55 };
         }
+        if (std.mem.eql(u8, match.object_type, "entity")) {
+            const entity = (try self.getEntity(allocator, match.object_id)) orelse return null;
+            const status = try self.primitiveLifecycleStatus(allocator, "entity", entity.id);
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, entity.scope, entity.permissions_json, input.scopes_json, input.actor_id)) return null;
+            const text = entity.description orelse entity.name;
+            return .{ .id = entity.id, .result_type = "entity", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ entity.entity_type, entity.name }), .text = text, .scope = entity.scope, .status = status, .score = match.score + 0.25, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, entity.scope, entity.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "entity", entity.scope, entity.permissions_json, input.actor_id), .created_at_ms = entity.updated_at_ms, .confidence = 0.6 };
+        }
+        if (std.mem.eql(u8, match.object_type, "relation")) {
+            const relation = (try self.getRelation(allocator, match.object_id)) orelse return null;
+            if (!input.include_deprecated and !domain.isDefaultVisibleStatus(relation.status)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, relation.scope, relation.permissions_json, input.scopes_json, input.actor_id)) return null;
+            const from_entity = (try self.getEntity(allocator, relation.from_entity_id)) orelse return null;
+            const to_entity = (try self.getEntity(allocator, relation.to_entity_id)) orelse return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, from_entity.scope, from_entity.permissions_json, input.scopes_json, input.actor_id)) return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, to_entity.scope, to_entity.permissions_json, input.scopes_json, input.actor_id)) return null;
+            return .{ .id = relation.id, .result_type = "relation", .title = relation.relation_type, .text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ from_entity.name, relation.relation_type, to_entity.name }), .scope = relation.scope, .status = relation.status, .score = match.score + relation.confidence, .source_ids_json = try self.sanitizeSourceIds(allocator, relation.source_ids_json, input.scopes_json), .required_scopes_json = try requiredAccessJsonGlobal(allocator, relation.scope, relation.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "relation", relation.scope, relation.permissions_json, input.actor_id), .created_at_ms = relation.created_at_ms, .confidence = relation.confidence };
+        }
+        if (std.mem.eql(u8, match.object_type, "context_pack")) {
+            return try self.contextPackSearchResultForVector(allocator, match, input);
+        }
+        if (std.mem.eql(u8, match.object_type, "agent_memory")) {
+            const entry = (try self.agentMemoryById(allocator, match.object_id)) orelse return null;
+            if (!try self.agentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, input.scopes_json, input.actor_id)) return null;
+            if (domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) return null;
+            return .{ .id = entry.id, .result_type = "agent_memory", .title = entry.key, .text = entry.content, .scope = entry.scope, .status = "active", .score = match.score + (entry.score orelse 0.5), .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, entry.scope, entry.permissions_json, input.actor_id), .actor_isolated = !isSharedAgentMemoryOwner(entry.actor_id), .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0, .confidence = entry.score orelse 0.7 };
+        }
+        if (std.mem.eql(u8, match.object_type, "space")) {
+            const space = (try self.getSpace(allocator, match.object_id)) orelse return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, space.scope, space.permissions_json, input.scopes_json, input.actor_id)) return null;
+            const text = if (space.description) |description|
+                try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ space.name, space.title, description, space.metadata_json })
+            else
+                try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ space.name, space.title, space.metadata_json });
+            return .{ .id = space.id, .result_type = "space", .title = space.title, .text = text, .scope = space.scope, .status = "active", .score = match.score + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, space.scope, space.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "space", space.scope, space.permissions_json, input.actor_id), .created_at_ms = space.updated_at_ms, .confidence = 0.7 };
+        }
+        if (std.mem.eql(u8, match.object_type, "policy_scope")) {
+            const policy = (try self.getPolicyScope(allocator, match.object_id)) orelse return null;
+            if (!try self.recordVisibleWithPolicyForActor(allocator, policy.scope, policy.permissions_json, input.scopes_json, input.actor_id)) return null;
+            const text = if (policy.owner) |owner|
+                try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ policy.scope, policy.visibility, owner, policy.metadata_json })
+            else
+                try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ policy.scope, policy.visibility, policy.metadata_json });
+            return .{ .id = policy.scope, .result_type = "policy_scope", .title = policy.scope, .text = text, .scope = policy.scope, .status = policy.visibility, .score = match.score + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, policy.scope, policy.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", policy.scope, policy.permissions_json, input.actor_id), .created_at_ms = policy.updated_at_ms, .confidence = 0.7 };
+        }
         return null;
+    }
+
+    fn contextPackSearchResultForVector(self: *PostgresStore, allocator: std.mem.Allocator, match: vector_mod.VectorMatch, input: SearchInput) !?domain.SearchResult {
+        const inner = try std.fmt.allocPrint(allocator, "SELECT id,purpose,target,query_text,included_sources_json,included_artifacts_json,included_memory_atoms_json,included_result_refs_json,generated_summary,created_at_ms,required_scopes_json,actor_id,actor_isolated FROM context_packs WHERE id = {s} LIMIT 1", .{try sqlString(allocator, match.object_id)});
+        const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
+        defer parsed.deinit();
+        if (parsed.value == .null) return null;
+        const obj = parsed.value.object;
+        const id_text = try dupStringField(allocator, obj, "id", "");
+        const purpose = try dupStringField(allocator, obj, "purpose", "context");
+        const target = try dupStringField(allocator, obj, "target", "agent");
+        const source_ids = try rawJsonField(allocator, obj, "included_sources_json", "[]");
+        const artifact_ids = try rawJsonField(allocator, obj, "included_artifacts_json", "[]");
+        const atom_ids = try rawJsonField(allocator, obj, "included_memory_atoms_json", "[]");
+        const result_refs = try rawJsonField(allocator, obj, "included_result_refs_json", "[]");
+        const summary = try dupStringField(allocator, obj, "generated_summary", "");
+        const created_at_ms = json.intField(obj, "created_at_ms") orelse 0;
+        const required_scopes = try rawJsonField(allocator, obj, "required_scopes_json", "[]");
+        const row_actor = try dupNullableStringField(allocator, obj, "actor_id");
+        const actor_isolated = json.boolField(obj, "actor_isolated") orelse false;
+        if (!try self.contextPackVisible(allocator, source_ids, artifact_ids, atom_ids, result_refs, required_scopes, row_actor, actor_isolated, input.scopes_json, input.actor_id, input.include_deprecated)) return null;
+        const status = try self.primitiveLifecycleStatus(allocator, "context_pack", id_text);
+        if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
+        return .{ .id = id_text, .result_type = "context_pack", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ purpose, target }), .text = summary, .scope = "context", .status = status, .score = match.score + 0.4, .source_ids_json = try self.sanitizeSourceIds(allocator, source_ids, input.scopes_json), .required_scopes_json = required_scopes, .actor_isolated = actor_isolated, .created_at_ms = created_at_ms, .confidence = 0.65 };
     }
 
     fn sanitizeSourceIds(self: *PostgresStore, allocator: std.mem.Allocator, source_ids_json: []const u8, scopes_json: []const u8) ![]const u8 {
@@ -11749,6 +12316,75 @@ test "sqlite vector layer stores chunks searches and enqueues outbox" {
     try std.testing.expectEqualStrings(expected_id, results[0].id);
     const chunk = (try store.getVectorChunk(alloc, expected_id)).?;
     try std.testing.expectEqualStrings(atom_a.id, chunk.object_id);
+}
+
+test "sqlite vector search covers expanded NullPantry primitives" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0, 0, 0 });
+    const space = try store.createSpace(alloc, .{ .name = "vector-space", .title = "Vector Space", .description = "Vector indexed workspace", .scope = "public" });
+    const policy = try store.upsertPolicyScope(alloc, .{ .scope = "project:vector", .visibility = "project", .permissions_json = "[]" });
+    const from_entity = try store.resolveEntity(alloc, .{ .entity_type = "project", .name = "Vector Alpha", .description = "Expanded vector entity", .scope = "public" });
+    const to_entity = try store.resolveEntity(alloc, .{ .entity_type = "service", .name = "Vector Beta", .description = "Expanded vector service", .scope = "public" });
+    const relation = try store.createRelation(alloc, .{ .from_entity_id = from_entity.id, .relation_type = "depends_on", .to_entity_id = to_entity.id, .scope = "public", .confidence = 0.8, .status = "verified" });
+    _ = try store.createMemoryAtom(alloc, .{ .text = "Context pack seed for expanded vector primitives.", .scope = "public", .created_by = "human", .status = "verified" });
+    const pack = try store.createContextPack(alloc, .{ .query = "expanded vector primitives", .scopes_json = "[\"public\"]", .use_vector = false, .persist = true });
+    const agent_entry = try store.agentMemoryStore(alloc, .{ .key = "vector.agent.preference", .content = "Agent vector memory participates in semantic retrieval.", .actor_id = "agent:vector" });
+
+    _ = try store.upsertVectorChunk(alloc, .{ .object_type = "space", .object_id = space.id, .text = "Vector Space", .scope = space.scope, .permissions_json = space.permissions_json, .embedding_json = embedding, .dimensions = 4 });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_type = "policy_scope", .object_id = policy.scope, .text = "project vector policy", .scope = policy.scope, .permissions_json = policy.permissions_json, .embedding_json = embedding, .dimensions = 4 });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_type = "entity", .object_id = from_entity.id, .text = "Expanded vector entity", .scope = from_entity.scope, .permissions_json = from_entity.permissions_json, .embedding_json = embedding, .dimensions = 4 });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_type = "relation", .object_id = relation.id, .text = "Vector Alpha depends_on Vector Beta", .scope = relation.scope, .permissions_json = relation.permissions_json, .embedding_json = embedding, .dimensions = 4 });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_type = "context_pack", .object_id = pack.id, .text = pack.generated_summary, .scope = "public", .permissions_json = pack.required_scopes_json, .embedding_json = embedding, .dimensions = 4 });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_type = "agent_memory", .object_id = agent_entry.id, .text = agent_entry.content, .scope = agent_entry.scope, .permissions_json = agent_entry.permissions_json, .embedding_json = embedding, .dimensions = 4 });
+
+    const matches = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\",\"project:vector\"]", .limit = 20, .actor_id = "agent:vector" });
+    var saw_space = false;
+    var saw_policy = false;
+    var saw_entity = false;
+    var saw_relation = false;
+    var saw_pack = false;
+    var saw_agent_memory = false;
+    for (matches) |match| {
+        if (std.mem.eql(u8, match.object_type, "space")) saw_space = true;
+        if (std.mem.eql(u8, match.object_type, "policy_scope")) saw_policy = true;
+        if (std.mem.eql(u8, match.object_type, "entity")) saw_entity = true;
+        if (std.mem.eql(u8, match.object_type, "relation")) saw_relation = true;
+        if (std.mem.eql(u8, match.object_type, "context_pack")) saw_pack = true;
+        if (std.mem.eql(u8, match.object_type, "agent_memory")) saw_agent_memory = true;
+    }
+    try std.testing.expect(saw_space);
+    try std.testing.expect(saw_policy);
+    try std.testing.expect(saw_entity);
+    try std.testing.expect(saw_relation);
+    try std.testing.expect(saw_pack);
+    try std.testing.expect(saw_agent_memory);
+
+    const results = try store.search(alloc, .{ .query = "semantic-only-expanded-vector", .scopes_json = "[\"public\",\"project:vector\"]", .query_embedding_json = embedding, .use_vector = true, .limit = 20, .actor_id = "agent:vector" });
+    saw_space = false;
+    saw_policy = false;
+    saw_entity = false;
+    saw_relation = false;
+    saw_pack = false;
+    saw_agent_memory = false;
+    for (results) |result| {
+        if (std.mem.eql(u8, result.result_type, "space")) saw_space = true;
+        if (std.mem.eql(u8, result.result_type, "policy_scope")) saw_policy = true;
+        if (std.mem.eql(u8, result.result_type, "entity")) saw_entity = true;
+        if (std.mem.eql(u8, result.result_type, "relation")) saw_relation = true;
+        if (std.mem.eql(u8, result.result_type, "context_pack")) saw_pack = true;
+        if (std.mem.eql(u8, result.result_type, "agent_memory")) saw_agent_memory = true;
+    }
+    try std.testing.expect(saw_space);
+    try std.testing.expect(saw_policy);
+    try std.testing.expect(saw_entity);
+    try std.testing.expect(saw_relation);
+    try std.testing.expect(saw_pack);
+    try std.testing.expect(saw_agent_memory);
 }
 
 test "sqlite vector outbox reclaims expired running leases" {

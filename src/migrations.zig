@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const expected_schema_version: i64 = 21;
+pub const expected_schema_version: i64 = 22;
 
 pub const Migration = struct {
     version: i64,
@@ -30,6 +30,7 @@ pub const migration_manifest = [_]Migration{
     .{ .version = 19, .name = "primitive_lifecycle_overlay", .checksum = "np-019-primitive-lifecycle-overlay" },
     .{ .version = 20, .name = "sqlite_full_text_coverage", .checksum = "np-020-sqlite-full-text-coverage" },
     .{ .version = 21, .name = "postgres_full_text_coverage", .checksum = "np-021-postgres-full-text-coverage" },
+    .{ .version = 22, .name = "expanded_vector_primitives", .checksum = "np-022-expanded-vector-primitives" },
 };
 
 pub fn expectedMigration(version: i64) ?Migration {
@@ -152,7 +153,7 @@ pub const sqlite_schema =
     \\CREATE VIRTUAL TABLE IF NOT EXISTS memory_atoms_fts USING fts5(id UNINDEXED, text, predicate, object);
     \\CREATE TABLE IF NOT EXISTS vector_chunks (
     \\  id TEXT PRIMARY KEY,
-    \\  object_type TEXT NOT NULL CHECK (object_type IN ('memory_atom','source','artifact')),
+    \\  object_type TEXT NOT NULL CHECK (object_type IN ('memory_atom','source','artifact','entity','relation','context_pack','agent_memory','space','policy_scope')),
     \\  object_id TEXT NOT NULL,
     \\  chunk_ordinal INTEGER NOT NULL DEFAULT 0,
     \\  text TEXT NOT NULL DEFAULT '',
@@ -364,10 +365,16 @@ pub const sqlite_schema =
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (5, 'spaces_policy_scopes', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (6, 'connector_cursor_permissions', strftime('%s','now') * 1000);
-    \\DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact');
+    \\DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact','entity','relation','context_pack','agent_memory','space','policy_scope');
     \\DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND NOT EXISTS (SELECT 1 FROM memory_atoms WHERE memory_atoms.id = vector_chunks.object_id);
     \\DELETE FROM vector_chunks WHERE object_type = 'source' AND NOT EXISTS (SELECT 1 FROM sources WHERE sources.id = vector_chunks.object_id);
     \\DELETE FROM vector_chunks WHERE object_type = 'artifact' AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'entity' AND NOT EXISTS (SELECT 1 FROM entities WHERE entities.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'relation' AND NOT EXISTS (SELECT 1 FROM relations WHERE relations.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'context_pack' AND NOT EXISTS (SELECT 1 FROM context_packs WHERE context_packs.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'agent_memory' AND NOT EXISTS (SELECT 1 FROM agent_memory_items WHERE agent_memory_items.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'space' AND NOT EXISTS (SELECT 1 FROM spaces WHERE spaces.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'policy_scope' AND NOT EXISTS (SELECT 1 FROM policy_scopes WHERE policy_scopes.scope = vector_chunks.object_id);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (7, 'vector_backing_invariant', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (8, 'agent_actor_isolation', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (9, 'strict_actor_memory', strftime('%s','now') * 1000);
@@ -380,6 +387,7 @@ pub const sqlite_schema =
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (19, 'primitive_lifecycle_overlay', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (20, 'sqlite_full_text_coverage', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (21, 'postgres_full_text_coverage', strftime('%s','now') * 1000);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (22, 'expanded_vector_primitives', strftime('%s','now') * 1000);
 ;
 
 pub const postgres_schema =
@@ -502,7 +510,7 @@ pub const postgres_schema =
     \\CREATE INDEX IF NOT EXISTS memory_atoms_scope_status_idx ON memory_atoms(scope, status);
     \\CREATE TABLE IF NOT EXISTS vector_chunks (
     \\  id text PRIMARY KEY,
-    \\  object_type text NOT NULL CHECK (object_type IN ('memory_atom','source','artifact')),
+    \\  object_type text NOT NULL CHECK (object_type IN ('memory_atom','source','artifact','entity','relation','context_pack','agent_memory','space','policy_scope')),
     \\  object_id text NOT NULL,
     \\  chunk_ordinal bigint NOT NULL DEFAULT 0,
     \\  text text NOT NULL DEFAULT '',
@@ -723,10 +731,16 @@ pub const postgres_schema =
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'ingest_jobs_conflicts', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (5, 'spaces_policy_scopes', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (6, 'connector_cursor_permissions', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
-    \\DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact');
+    \\DELETE FROM vector_chunks WHERE object_type NOT IN ('memory_atom','source','artifact','entity','relation','context_pack','agent_memory','space','policy_scope');
     \\DELETE FROM vector_chunks WHERE object_type = 'memory_atom' AND NOT EXISTS (SELECT 1 FROM memory_atoms WHERE memory_atoms.id = vector_chunks.object_id);
     \\DELETE FROM vector_chunks WHERE object_type = 'source' AND NOT EXISTS (SELECT 1 FROM sources WHERE sources.id = vector_chunks.object_id);
     \\DELETE FROM vector_chunks WHERE object_type = 'artifact' AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'entity' AND NOT EXISTS (SELECT 1 FROM entities WHERE entities.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'relation' AND NOT EXISTS (SELECT 1 FROM relations WHERE relations.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'context_pack' AND NOT EXISTS (SELECT 1 FROM context_packs WHERE context_packs.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'agent_memory' AND NOT EXISTS (SELECT 1 FROM agent_memory_items WHERE agent_memory_items.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'space' AND NOT EXISTS (SELECT 1 FROM spaces WHERE spaces.id = vector_chunks.object_id);
+    \\DELETE FROM vector_chunks WHERE object_type = 'policy_scope' AND NOT EXISTS (SELECT 1 FROM policy_scopes WHERE policy_scopes.scope = vector_chunks.object_id);
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (7, 'vector_backing_invariant', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (8, 'agent_actor_isolation', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (9, 'strict_actor_memory', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
@@ -739,6 +753,7 @@ pub const postgres_schema =
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (19, 'primitive_lifecycle_overlay', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (20, 'sqlite_full_text_coverage', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (21, 'postgres_full_text_coverage', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (22, 'expanded_vector_primitives', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
 ;
 
 test "sqlite migration includes core primitive tables and indexes" {

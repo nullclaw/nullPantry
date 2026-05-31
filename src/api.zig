@@ -7,6 +7,7 @@ const engines = @import("engines.zig");
 const retrieval = @import("retrieval.zig");
 const lifecycle = @import("lifecycle.zig");
 const vector_mod = @import("vector.zig");
+const vector_text = @import("vector_text.zig");
 const analytics_runtime = @import("analytics_runtime.zig");
 const ids = @import("ids.zig");
 const extraction = @import("extraction.zig");
@@ -400,6 +401,7 @@ fn createSource(ctx: *Context, body: []const u8) HttpResponse {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
+    _ = upsertAutoVector(ctx, "source", source.id, source.content, source.scope, source.permissions_json) catch 0;
     return objectResponse(ctx, "source", source);
 }
 
@@ -452,6 +454,7 @@ fn createArtifact(ctx: *Context, body: []const u8) HttpResponse {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
+    _ = upsertAutoVector(ctx, "artifact", artifact.id, artifact.body, artifact.scope, artifact.permissions_json) catch 0;
     return artifactResponse(ctx, artifact);
 }
 
@@ -488,6 +491,8 @@ fn resolveEntity(ctx: *Context, body: []const u8) HttpResponse {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
+    const text = vector_text.entity(ctx.allocator, entity) catch return serverError(ctx);
+    _ = upsertAutoVector(ctx, "entity", entity.id, text, entity.scope, entity.permissions_json) catch 0;
     return objectResponse(ctx, "entity", entity);
 }
 
@@ -524,6 +529,8 @@ fn createRelation(ctx: *Context, body: []const u8) HttpResponse {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
+    const text = vector_text.relation(ctx.allocator, relation) catch return serverError(ctx);
+    _ = upsertAutoVector(ctx, "relation", relation.id, text, relation.scope, relation.permissions_json) catch 0;
     return objectResponse(ctx, "relation", relation);
 }
 
@@ -1188,7 +1195,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime"],"agent_memory_backends":["none","native","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","openai-compatible-chat","ollama-compatible","voyage-compatible","gemini-adapter-contract"],"retrieval":["acl","fts","vector","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","lucid_projection","rrf","temporal_decay","quality_rerank","embedding_mmr","llm_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -1857,6 +1864,8 @@ fn createSpace(ctx: *Context, body: []const u8) HttpResponse {
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch return serverError(ctx),
         .actor_id = ctx.actor_id,
     }) catch return serverError(ctx);
+    const text = vector_text.space(ctx.allocator, space) catch return serverError(ctx);
+    _ = upsertAutoVector(ctx, "space", space.id, text, space.scope, space.permissions_json) catch 0;
     return objectResponse(ctx, "space", space);
 }
 
@@ -1899,6 +1908,8 @@ fn upsertPolicyScope(ctx: *Context, body: []const u8) HttpResponse {
         .metadata_json = rawField(ctx.allocator, obj, "metadata", "{}") catch return serverError(ctx),
         .actor_id = ctx.actor_id,
     }) catch return serverError(ctx);
+    const text = vector_text.policyScope(ctx.allocator, policy) catch return serverError(ctx);
+    _ = upsertAutoVector(ctx, "policy_scope", policy.scope, text, policy.scope, policy.permissions_json) catch 0;
     return objectResponse(ctx, "policy_scope", policy);
 }
 
@@ -2191,6 +2202,14 @@ fn runExtraction(ctx: *Context, source: domain.Source, options: ExtractionOption
     if (applied.artifact) |artifact| {
         vector_chunks += try upsertAutoVector(ctx, "artifact", artifact.id, artifact.body, artifact.scope, artifact.permissions_json);
     }
+    for (applied.entities) |entity| {
+        const text = try vector_text.entity(ctx.allocator, entity);
+        vector_chunks += try upsertAutoVector(ctx, "entity", entity.id, text, entity.scope, entity.permissions_json);
+    }
+    for (applied.relations) |relation| {
+        const text = try vector_text.relation(ctx.allocator, relation);
+        vector_chunks += try upsertAutoVector(ctx, "relation", relation.id, text, relation.scope, relation.permissions_json);
+    }
     for (applied.atoms) |atom| {
         vector_chunks += try upsertAutoVector(ctx, "memory_atom", atom.id, atom.text, atom.scope, atom.permissions_json);
     }
@@ -2416,6 +2435,7 @@ fn createMemoryAtom(ctx: *Context, body: []const u8) HttpResponse {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
+    _ = upsertAutoVector(ctx, "memory_atom", atom.id, atom.text, atom.scope, atom.permissions_json) catch 0;
     return objectResponse(ctx, "memory_atom", atom);
 }
 
@@ -2621,6 +2641,7 @@ fn vectorSearch(ctx: *Context, body: []const u8) HttpResponse {
         .limit = positiveLimit(json.intField(obj, "limit"), 10),
         .include_deprecated = json.boolField(obj, "include_deprecated") orelse false,
         .strict_external = json.boolField(obj, "strict_external") orelse json.boolField(obj, "strict_vector") orelse false,
+        .actor_id = ctx.actor_id,
     }) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"matches\":[") catch return serverError(ctx);
@@ -4199,6 +4220,12 @@ fn contextPack(ctx: *Context, body: []const u8) HttpResponse {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
+    if (pack.persisted) {
+        if (ctx.store.vectorObjectAcl(ctx.allocator, "context_pack", pack.id, ctx.actor_id) catch null) |acl| {
+            const text = vector_text.contextPack(ctx.allocator, pack) catch return serverError(ctx);
+            _ = upsertAutoVector(ctx, "context_pack", pack.id, text, acl.scope, acl.permissions_json) catch 0;
+        }
+    }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"context_pack\":{\"id\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, pack.id) catch return serverError(ctx);
@@ -4282,6 +4309,7 @@ fn agentMemoryStoreParsed(ctx: *Context, key: []const u8, obj: std.json.ObjectMa
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
+    _ = upsertAutoVector(ctx, "agent_memory", entry.id, entry.content, entry.scope, entry.permissions_json) catch 0;
     return agentMemoryEntryResponse(ctx, "memory", entry);
 }
 
@@ -5736,24 +5764,11 @@ const VectorAcl = struct {
 };
 
 fn resolveVectorAcl(ctx: *Context, object_type: []const u8, object_id: []const u8, requested_scope: []const u8, requested_permissions: []const u8) !VectorAcl {
-    if (std.mem.eql(u8, object_type, "memory_atom")) {
-        const atom = (try ctx.store.getMemoryAtom(ctx.allocator, object_id)) orelse return error.NotFound;
-        if (!canWriteRecord(ctx, atom.scope, atom.permissions_json)) return error.Forbidden;
-        return .{ .scope = atom.scope, .permissions_json = atom.permissions_json };
-    }
-    if (std.mem.eql(u8, object_type, "source")) {
-        const source = (try ctx.store.getSource(ctx.allocator, object_id)) orelse return error.NotFound;
-        if (!canWriteRecord(ctx, source.scope, source.permissions_json)) return error.Forbidden;
-        return .{ .scope = source.scope, .permissions_json = source.permissions_json };
-    }
-    if (std.mem.eql(u8, object_type, "artifact")) {
-        const artifact = (try ctx.store.getArtifact(ctx.allocator, object_id)) orelse return error.NotFound;
-        if (!canWriteRecord(ctx, artifact.scope, artifact.permissions_json)) return error.Forbidden;
-        return .{ .scope = artifact.scope, .permissions_json = artifact.permissions_json };
-    }
     _ = requested_scope;
     _ = requested_permissions;
-    return error.NotFound;
+    const acl = (try ctx.store.vectorObjectAcl(ctx.allocator, object_type, object_id, ctx.actor_id)) orelse return error.NotFound;
+    if (!canWriteRecord(ctx, acl.scope, acl.permissions_json)) return error.Forbidden;
+    return .{ .scope = acl.scope, .permissions_json = acl.permissions_json };
 }
 
 fn positiveLimit(value: ?i64, default_value: usize) usize {
@@ -6834,17 +6849,17 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, vector_resp.body, "vec_mem_") != null);
     const outbox_resp = handleRequest(&ctx, "GET", "/v1/vector/outbox", "", "");
     try std.testing.expectEqualStrings("200 OK", outbox_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, outbox_resp.body, "\"pending\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outbox_resp.body, "\"pending\":2") != null);
     const outbox_run = handleRequest(&ctx, "POST", "/v1/vector/outbox/run", "{\"limit\":10}", "");
     try std.testing.expectEqualStrings("200 OK", outbox_run.status);
-    try std.testing.expect(std.mem.indexOf(u8, outbox_run.body, "\"processed\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outbox_run.body, "\"processed\":2") != null);
 
     const embed_payload = try store_mod.vectorEmbedPayloadJson(arena.allocator(), 1, "agent memory replay", "public", "[]", null, 4);
     _ = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = "memory_atom", .object_id = created_atom_id, .payload_json = embed_payload });
     const embed_outbox_run = handleRequest(&ctx, "POST", "/v1/vector/outbox/run", "{\"limit\":10}", "");
     try std.testing.expectEqualStrings("200 OK", embed_outbox_run.status);
-    try std.testing.expect(std.mem.indexOf(u8, embed_outbox_run.body, "\"embedded\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, embed_outbox_run.body, "\"indexed_local\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, embed_outbox_run.body, "\"embedded\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, embed_outbox_run.body, "\"indexed_local\":3") != null);
 
     const reconcile = handleRequest(&ctx, "POST", "/v1/vector/reconcile", "{\"limit\":10}", "");
     try std.testing.expectEqualStrings("200 OK", reconcile.status);
