@@ -3313,11 +3313,22 @@ fn appendMemoryFeed(ctx: *Context, body: []const u8) HttpResponse {
     } else if (isAgentSessionFeedObject(object_type)) {
         if (!canProposeAgentSessionEvent(ctx, ctx.actor_id, scope, permissions_json)) return forbidden(ctx);
     } else if (!canProposeRecord(ctx, scope, permissions_json)) return forbidden(ctx);
+    const event_object_id = json.stringField(obj, "object_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing object_id");
+    if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| {
+        if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key) catch return serverError(ctx)) |event| {
+            if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return forbidden(ctx);
+            if (!feedDedupeMatches(event, event_type, json.stringField(obj, "operation") orelse "put", object_type, event_object_id, scope, permissions_json, ctx.actor_id, rawField(ctx.allocator, obj, "causality", "{}") catch return serverError(ctx), payload_json)) {
+                return feedDedupeConflict(ctx);
+            }
+            const response = std.fmt.allocPrint(ctx.allocator, "{{\"event_id\":{d},\"queued\":true}}", .{event.id}) catch return serverError(ctx);
+            return .{ .status = "200 OK", .body = response };
+        }
+    }
     const id = ctx.store.appendFeedEvent(.{
         .event_type = event_type,
         .operation = json.stringField(obj, "operation") orelse "put",
         .object_type = object_type,
-        .object_id = json.stringField(obj, "object_id") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing object_id"),
+        .object_id = event_object_id,
         .scope = scope,
         .permissions_json = permissions_json,
         .actor_id = ctx.actor_id,
@@ -3417,6 +3428,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
                     return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying");
                 }
             } else {
+                if (!feedDedupeMatches(event, event_type, operation, object_type, event_object_id, scope, event_permissions_json, event_actor_id, causality_json, payload_json)) return feedDedupeConflict(ctx);
                 return appliedFeedObjectResponse(ctx, event.id, event.object_type, event.object_id, if (std.mem.eql(u8, event.object_type, "memory_atom")) event.object_id else null);
             }
         }
@@ -3436,7 +3448,10 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8) HttpResponse {
         }) catch return serverError(ctx);
         const reservation = (ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key) catch return serverError(ctx)) orelse return serverError(ctx);
         if (reservation.id != reserved_event_id.? or !std.mem.eql(u8, reservation.status, "applying") or !std.mem.eql(u8, reservation.object_id, reservation_id)) {
-            if (std.mem.eql(u8, reservation.status, "applied")) return appliedFeedObjectResponse(ctx, reservation.id, reservation.object_type, reservation.object_id, if (std.mem.eql(u8, reservation.object_type, "memory_atom")) reservation.object_id else null);
+            if (std.mem.eql(u8, reservation.status, "applied")) {
+                if (!feedDedupeMatches(reservation, event_type, operation, object_type, event_object_id, scope, event_permissions_json, event_actor_id, causality_json, payload_json)) return feedDedupeConflict(ctx);
+                return appliedFeedObjectResponse(ctx, reservation.id, reservation.object_type, reservation.object_id, if (std.mem.eql(u8, reservation.object_type, "memory_atom")) reservation.object_id else null);
+            }
             return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying");
         }
     }
@@ -7081,6 +7096,25 @@ fn appliedFeedObjectResponse(ctx: *Context, event_id: i64, object_type: []const 
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
 
+fn feedDedupeConflict(ctx: *Context) HttpResponse {
+    return json.errorResponse(ctx.allocator, 409, "conflict", "Feed dedupe key already belongs to a different event payload");
+}
+
+fn feedDedupeMatches(event: store_mod.FeedEvent, event_type: []const u8, operation: []const u8, object_type: []const u8, object_id: ?[]const u8, scope: []const u8, permissions_json: []const u8, actor_id: []const u8, causality_json: []const u8, payload_json: []const u8) bool {
+    if (!std.mem.eql(u8, event.event_type, event_type)) return false;
+    if (!std.mem.eql(u8, event.operation, operation)) return false;
+    if (!std.mem.eql(u8, event.object_type, object_type)) return false;
+    if (object_id) |expected_object_id| {
+        if (!std.mem.eql(u8, event.object_id, expected_object_id)) return false;
+    }
+    if (!std.mem.eql(u8, event.scope, scope)) return false;
+    if (!std.mem.eql(u8, event.permissions_json, permissions_json)) return false;
+    if (event.actor_id == null or !std.mem.eql(u8, event.actor_id.?, actor_id)) return false;
+    if (!std.mem.eql(u8, event.causality_json, causality_json)) return false;
+    if (!std.mem.eql(u8, event.payload_json, payload_json)) return false;
+    return true;
+}
+
 fn feedObjectTypeSupported(object_type: []const u8) bool {
     return std.mem.eql(u8, object_type, "memory_atom") or
         std.mem.eql(u8, object_type, "source") or
@@ -7153,6 +7187,8 @@ fn applyFeedLifecycleMutation(ctx: *Context, obj: std.json.ObjectMap, event_type
 
     const event_id = applyOrAppendFeedEventRecord(ctx, obj, event_type, operation, object_type, target.object_id, target.scope, target.permissions_json, event_actor_id, causality_json, payload_json) catch |err| switch (err) {
         error.FeedConflict => return json.errorResponse(ctx.allocator, 409, "conflict", "Feed event with this dedupe key is already queued or applying"),
+        error.FeedDedupeMismatch => return feedDedupeConflict(ctx),
+        error.Forbidden => return forbidden(ctx),
         else => return serverError(ctx),
     };
     return appliedFeedObjectResponse(ctx, event_id, object_type, target.object_id, null);
@@ -7209,7 +7245,10 @@ fn applyOrAppendFeedEventRecord(ctx: *Context, obj: std.json.ObjectMap, event_ty
     if (json.nullableStringField(obj, "dedupe_key")) |dedupe_key| {
         if (ctx.store.getFeedEventByDedupeKey(ctx.allocator, dedupe_key) catch return error.StoreFailure) |event| {
             if (!recordVisibleToActor(ctx, event.scope, event.permissions_json)) return error.Forbidden;
-            if (std.mem.eql(u8, event.status, "applied")) return event.id;
+            if (std.mem.eql(u8, event.status, "applied")) {
+                if (!feedDedupeMatches(event, event_type, operation, object_type, object_id, scope, permissions_json, event_actor_id, causality_json, payload_json)) return error.FeedDedupeMismatch;
+                return event.id;
+            }
             return error.FeedConflict;
         }
         const reservation_id = try ids.make(ctx.allocator, "apply_");
@@ -9901,6 +9940,10 @@ test "api memory feed and apply are permission aware" {
     try std.testing.expectEqualStrings("200 OK", append_resp.status);
     const queued_dedupe = handleRequest(&public_ctx, "POST", "/v1/memory/feed", "{\"event_type\":\"memory_atom.upsert\",\"object_type\":\"memory_atom\",\"object_id\":\"mem_queued\",\"scope\":\"public\",\"dedupe_key\":\"evt-queued\",\"payload\":{\"text\":\"queued memory\"}}", "");
     try std.testing.expectEqualStrings("200 OK", queued_dedupe.status);
+    const queued_dedupe_retry = handleRequest(&public_ctx, "POST", "/v1/memory/feed", "{\"event_type\":\"memory_atom.upsert\",\"object_type\":\"memory_atom\",\"object_id\":\"mem_queued\",\"scope\":\"public\",\"dedupe_key\":\"evt-queued\",\"payload\":{\"text\":\"queued memory\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", queued_dedupe_retry.status);
+    const queued_dedupe_collision = handleRequest(&public_ctx, "POST", "/v1/memory/feed", "{\"event_type\":\"memory_atom.upsert\",\"object_type\":\"memory_atom\",\"object_id\":\"mem_queued_collision\",\"scope\":\"public\",\"dedupe_key\":\"evt-queued\",\"payload\":{\"text\":\"queued memory collision\"}}", "");
+    try std.testing.expectEqualStrings("409 Conflict", queued_dedupe_collision.status);
     const apply_queued_dedupe = handleRequest(&public_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"memory_atom.upsert\",\"object_type\":\"memory_atom\",\"scope\":\"public\",\"dedupe_key\":\"evt-queued\",\"payload\":{\"text\":\"queued memory\"}}", "");
     try std.testing.expectEqualStrings("409 Conflict", apply_queued_dedupe.status);
     const forbidden_resp = handleRequest(&public_ctx, "POST", "/v1/memory/feed", "{\"event_type\":\"memory_atom.upsert\",\"object_id\":\"mem_secret\",\"scope\":\"project:secret\",\"payload\":{\"text\":\"secret\"}}", "");
@@ -9926,8 +9969,10 @@ test "api memory feed and apply are permission aware" {
 
     const first_apply = handleRequest(&public_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"memory_atom.upsert\",\"object_type\":\"memory_atom\",\"scope\":\"public\",\"dedupe_key\":\"evt-public-1\",\"payload\":{\"text\":\"dedupe memory\",\"created_by\":\"agent\"}}", "");
     try std.testing.expectEqualStrings("200 OK", first_apply.status);
+    const retry_apply = handleRequest(&public_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"memory_atom.upsert\",\"object_type\":\"memory_atom\",\"scope\":\"public\",\"dedupe_key\":\"evt-public-1\",\"payload\":{\"text\":\"dedupe memory\",\"created_by\":\"agent\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", retry_apply.status);
     const second_apply = handleRequest(&public_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"memory_atom.upsert\",\"object_type\":\"memory_atom\",\"scope\":\"public\",\"dedupe_key\":\"evt-public-1\",\"payload\":{\"text\":\"dedupe memory duplicate\",\"created_by\":\"agent\"}}", "");
-    try std.testing.expectEqualStrings("200 OK", second_apply.status);
+    try std.testing.expectEqualStrings("409 Conflict", second_apply.status);
     const duplicate_search = handleRequest(&public_ctx, "POST", "/v1/search", "{\"query\":\"duplicate\",\"scopes\":[\"public\"]}", "");
     try std.testing.expectEqualStrings("200 OK", duplicate_search.status);
     try std.testing.expect(std.mem.indexOf(u8, duplicate_search.body, "dedupe memory duplicate") == null);
@@ -10362,8 +10407,10 @@ test "api memory apply covers pantry primitives and lifecycle reducers" {
     const stale_relation = handleRequest(&ctx, "POST", "/v1/memory/apply", stale_relation_body, "");
     try std.testing.expectEqualStrings("200 OK", stale_relation.status);
 
-    const duplicate_source = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"source.put\",\"object_type\":\"source\",\"scope\":\"public\",\"dedupe_key\":\"primitive-source-1\",\"payload\":{\"title\":\"duplicate source\",\"content\":\"should not create\"}}", "");
+    const duplicate_source = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"source.put\",\"object_type\":\"source\",\"scope\":\"public\",\"dedupe_key\":\"primitive-source-1\",\"payload\":{\"title\":\"Primitive source\",\"content\":\"source evidence\"}}", "");
     try std.testing.expectEqualStrings("200 OK", duplicate_source.status);
+    const conflicting_source = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"source.put\",\"object_type\":\"source\",\"scope\":\"public\",\"dedupe_key\":\"primitive-source-1\",\"payload\":{\"title\":\"duplicate source\",\"content\":\"should not create\"}}", "");
+    try std.testing.expectEqualStrings("409 Conflict", conflicting_source.status);
     const events = try store.listFeedEvents(alloc, .{ .scopes_json = "[\"admin\"]", .limit = 100 });
     var source_dedupe_count: usize = 0;
     for (events) |event| {
