@@ -4003,7 +4003,7 @@ fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
         prepared.append(ctx.allocator, .{ .atom = input, .generated_source = generated_source }) catch return serverError(ctx);
     }
     if (dry_run) {
-        return snapshotHydrateResponse(ctx, 0, prepared.items.len, skipped, true, true, "[]", "[]", "{}");
+        return snapshotHydrateResponse(ctx, 0, 0, prepared.items.len, skipped, true, true, "[]", "[]", "{}");
     }
     const atoms = ctx.store.importMemoryAtomsAtomic(ctx.allocator, prepared.items) catch return serverError(ctx);
     var imported_ids: std.ArrayListUnmanaged(u8) = .empty;
@@ -4013,7 +4013,7 @@ fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
         json.appendString(&imported_ids, ctx.allocator, atom.id) catch return serverError(ctx);
     }
     imported_ids.append(ctx.allocator, ']') catch return serverError(ctx);
-    return snapshotHydrateResponse(ctx, atoms.len, prepared.items.len, skipped, false, true, imported_ids.items, "[]", "{}");
+    return snapshotHydrateResponse(ctx, atoms.len, atoms.len, prepared.items.len, skipped, false, true, imported_ids.items, "[]", "{}");
 }
 
 const SnapshotImportOptions = struct {
@@ -4027,12 +4027,14 @@ const SnapshotImportOptions = struct {
 const SnapshotHydratedObject = struct {
     object_type: []const u8,
     id: []const u8,
+    created: bool = true,
 };
 
 fn lifecycleSnapshotImportStructured(ctx: *Context, items: []const std.json.Value, options: SnapshotImportOptions) HttpResponse {
     var validated: usize = 0;
     var skipped: usize = 0;
     var imported: usize = 0;
+    var hydrated_count: usize = 0;
     var ids_out: std.ArrayListUnmanaged(u8) = .empty;
     ids_out.append(ctx.allocator, '[') catch return serverError(ctx);
     var first_id = true;
@@ -4062,7 +4064,10 @@ fn lifecycleSnapshotImportStructured(ctx: *Context, items: []const std.json.Valu
                 },
                 else => return serverError(ctx),
             };
-            if (!options.dry_run) imported += 1;
+            if (!options.dry_run) {
+                hydrated_count += 1;
+                if (hydrated.created) imported += 1;
+            }
             counts.add(kind);
             if (!first_id) ids_out.append(ctx.allocator, ',') catch return serverError(ctx);
             first_id = false;
@@ -4071,7 +4076,7 @@ fn lifecycleSnapshotImportStructured(ctx: *Context, items: []const std.json.Valu
     }
     ids_out.append(ctx.allocator, ']') catch return serverError(ctx);
     const counts_json = counts.toJson(ctx.allocator) catch return serverError(ctx);
-    return snapshotHydrateResponse(ctx, imported, validated, skipped, options.dry_run, false, "[]", ids_out.items, counts_json);
+    return snapshotHydrateResponse(ctx, imported, hydrated_count, validated, skipped, options.dry_run, false, "[]", ids_out.items, counts_json);
 }
 
 fn snapshotObjectsValue(obj: std.json.ObjectMap) ?std.json.Value {
@@ -4082,9 +4087,9 @@ fn snapshotObjectsValue(obj: std.json.ObjectMap) ?std.json.Value {
     return null;
 }
 
-fn snapshotHydrateResponse(ctx: *Context, imported: usize, validated: usize, skipped: usize, dry_run: bool, atomic: bool, memory_atom_ids_json: []const u8, object_ids_json: []const u8, counts_json: []const u8) HttpResponse {
+fn snapshotHydrateResponse(ctx: *Context, imported: usize, hydrated: usize, validated: usize, skipped: usize, dry_run: bool, atomic: bool, memory_atom_ids_json: []const u8, object_ids_json: []const u8, counts_json: []const u8) HttpResponse {
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    out.print(ctx.allocator, "{{\"imported\":{d},\"hydrated\":{d},\"validated\":{d},\"skipped\":{d},\"dry_run\":{s},\"atomic\":{s},\"memory_atom_ids\":", .{ imported, imported, validated, skipped, if (dry_run) "true" else "false", if (atomic) "true" else "false" }) catch return serverError(ctx);
+    out.print(ctx.allocator, "{{\"imported\":{d},\"hydrated\":{d},\"validated\":{d},\"skipped\":{d},\"dry_run\":{s},\"atomic\":{s},\"memory_atom_ids\":", .{ imported, hydrated, validated, skipped, if (dry_run) "true" else "false", if (atomic) "true" else "false" }) catch return serverError(ctx);
     json.appendRawJsonOr(&out, ctx.allocator, memory_atom_ids_json, "[]") catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"object_ids\":") catch return serverError(ctx);
     json.appendRawJsonOr(&out, ctx.allocator, object_ids_json, "[]") catch return serverError(ctx);
@@ -4167,6 +4172,14 @@ fn snapshotHydrateSource(ctx: *Context, obj: std.json.ObjectMap, options: Snapsh
     const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
     if (!canWriteRecord(ctx, scope, permissions)) return error.Forbidden;
     if (options.dry_run) return .{ .object_type = "source", .id = json.stringField(obj, "id") orelse title };
+    if (options.preserve_ids) {
+        if (json.stringField(obj, "id")) |id| {
+            if (try ctx.store.getSource(ctx.allocator, id)) |existing| {
+                if (!recordVisibleToActor(ctx, existing.scope, existing.permissions_json)) return error.Forbidden;
+                return .{ .object_type = "source", .id = existing.id, .created = false };
+            }
+        }
+    }
     const source_type = json.stringField(obj, "source_type") orelse blk: {
         const raw_type = json.stringField(obj, "type") orelse "manual";
         break :blk if (std.mem.eql(u8, raw_type, "source")) "manual" else raw_type;
@@ -4197,6 +4210,14 @@ fn snapshotHydrateArtifact(ctx: *Context, obj: std.json.ObjectMap, options: Snap
     const status = json.stringField(obj, "status") orelse "draft";
     if (!canChangeGraphPrimitiveStatus(ctx, scope, permissions, status)) return error.Forbidden;
     if (options.dry_run) return .{ .object_type = "artifact", .id = json.stringField(obj, "id") orelse title };
+    if (options.preserve_ids) {
+        if (json.stringField(obj, "id")) |id| {
+            if (try ctx.store.getArtifact(ctx.allocator, id)) |existing| {
+                if (!recordVisibleToActor(ctx, existing.scope, existing.permissions_json)) return error.Forbidden;
+                return .{ .object_type = "artifact", .id = existing.id, .created = false };
+            }
+        }
+    }
     var source_ids = try rawField(ctx.allocator, obj, "source_ids", try rawField(ctx.allocator, obj, "citations", "[]"));
     if (!sourceIdsCanBackRecord(ctx, source_ids, scope, permissions)) source_ids = "[]";
     const artifact_type = json.stringField(obj, "artifact_type") orelse blk: {
@@ -4231,6 +4252,14 @@ fn snapshotHydrateEntity(ctx: *Context, obj: std.json.ObjectMap, options: Snapsh
     const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
     if (!canWriteRecord(ctx, scope, permissions)) return error.Forbidden;
     if (options.dry_run) return .{ .object_type = "entity", .id = json.stringField(obj, "id") orelse name };
+    if (options.preserve_ids) {
+        if (json.stringField(obj, "id")) |id| {
+            if (try ctx.store.getEntity(ctx.allocator, id)) |existing| {
+                if (!recordVisibleToActor(ctx, existing.scope, existing.permissions_json)) return error.Forbidden;
+                return .{ .object_type = "entity", .id = existing.id, .created = false };
+            }
+        }
+    }
     const entity = try ctx.store.resolveEntity(ctx.allocator, .{
         .id = if (options.preserve_ids) json.nullableStringField(obj, "id") else null,
         .entity_type = entity_type,
@@ -4255,6 +4284,14 @@ fn snapshotHydrateRelation(ctx: *Context, obj: std.json.ObjectMap, options: Snap
     const status = json.stringField(obj, "status") orelse "proposed";
     if (!canChangeGraphPrimitiveStatus(ctx, scope, permissions, status)) return error.Forbidden;
     if (options.dry_run) return .{ .object_type = "relation", .id = json.stringField(obj, "id") orelse relation_type };
+    if (options.preserve_ids) {
+        if (json.stringField(obj, "id")) |id| {
+            if (try ctx.store.getRelation(ctx.allocator, id)) |existing| {
+                if (!recordVisibleToActor(ctx, existing.scope, existing.permissions_json)) return error.Forbidden;
+                return .{ .object_type = "relation", .id = existing.id, .created = false };
+            }
+        }
+    }
     var source_ids = try rawField(ctx.allocator, obj, "source_ids", try rawField(ctx.allocator, obj, "citations", "[]"));
     if (!sourceIdsCanBackRecord(ctx, source_ids, scope, permissions)) source_ids = "[]";
     const relation = ctx.store.createRelation(ctx.allocator, .{
@@ -4302,6 +4339,14 @@ fn snapshotHydrateMemoryAtom(ctx: *Context, obj: std.json.ObjectMap, options: Sn
     };
     if (!canCreateMemoryAtom(ctx, input)) return error.Forbidden;
     if (options.dry_run) return .{ .object_type = "memory_atom", .id = json.stringField(obj, "id") orelse text };
+    if (options.preserve_ids) {
+        if (json.stringField(obj, "id")) |id| {
+            if (try ctx.store.getMemoryAtom(ctx.allocator, id)) |existing| {
+                if (!recordVisibleToActor(ctx, existing.scope, existing.permissions_json)) return error.Forbidden;
+                return .{ .object_type = "memory_atom", .id = existing.id, .created = false };
+            }
+        }
+    }
     const atom = try ctx.store.createMemoryAtom(ctx.allocator, input);
     return .{ .object_type = "memory_atom", .id = atom.id };
 }
@@ -4324,6 +4369,11 @@ fn snapshotHydrateAgentMemory(ctx: *Context, obj: std.json.ObjectMap, options: S
     if (options.dry_run) return .{ .object_type = "agent_memory", .id = json.stringField(obj, "id") orelse key };
     const owner_actor_id = json.stringField(obj, "owner_id") orelse json.stringField(obj, "actor_id") orelse (try access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope));
     const route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    if (try ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, route)) |existing| {
+        if (std.mem.eql(u8, existing.content, content) and std.mem.eql(u8, existing.category, category)) {
+            return .{ .object_type = "agent_memory", .id = existing.id, .created = false };
+        }
+    }
     const entry = try ctx.store.agentMemoryStoreRouted(ctx.allocator, .{
         .key = key,
         .content = content,
@@ -4344,6 +4394,13 @@ fn snapshotHydrateContextPack(ctx: *Context, obj: std.json.ObjectMap, options: S
     const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
     if (!canWriteRecord(ctx, scope, permissions)) return error.Forbidden;
     if (options.dry_run) return .{ .object_type = "context_pack", .id = json.stringField(obj, "id") orelse query };
+    if (options.preserve_ids) {
+        if (json.stringField(obj, "id")) |id| {
+            if (try ctx.store.contextPackLifecycleTarget(ctx.allocator, id, ctx.actor_id, ctx.actor_scopes_json)) |_| {
+                return .{ .object_type = "context_pack", .id = id, .created = false };
+            }
+        }
+    }
     const scopes_json = try rawField(ctx.allocator, obj, "scopes", try rawField(ctx.allocator, obj, "required_scopes", try singleStringArrayJson(ctx.allocator, scope)));
     const pack = try ctx.store.createContextPack(ctx.allocator, .{
         .id = if (options.preserve_ids) json.nullableStringField(obj, "id") else null,
@@ -7987,6 +8044,11 @@ test "api lifecycle snapshot hydrate preserves typed primitives" {
     try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"entity\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"relation\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"agent_memory\":1") != null);
+
+    const hydrated_again = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot/hydrate", body, "");
+    try std.testing.expectEqualStrings("200 OK", hydrated_again.status);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated_again.body, "\"imported\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated_again.body, "\"hydrated\":7") != null);
 
     try std.testing.expect((try store.getSource(alloc, "src_snapshot_typed")) != null);
     try std.testing.expect((try store.getArtifact(alloc, "art_snapshot_typed")) != null);
