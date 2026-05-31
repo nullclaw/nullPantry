@@ -10799,11 +10799,18 @@ pub const PostgresStore = struct {
     }
 
     fn agentMemoryListInner(self: *PostgresStore, allocator: std.mem.Allocator, key: ?[]const u8, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8, limit: usize) ![]domain.AgentMemory {
-        const session_filter = try pgAgentMemorySessionFilterQualified(allocator, "ami.", session_id, actor_id);
-        const key_filter = if (key) |k| try std.fmt.allocPrint(allocator, " AND ami.key = {s}", .{try sqlString(allocator, k)}) else "";
-        const cat_filter = if (category) |cat| try std.fmt.allocPrint(allocator, " AND ami.category = {s}", .{try sqlString(allocator, cat)}) else "";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE {s}{s}{s} ORDER BY ami.timestamp_ms DESC LIMIT {d}", .{ session_filter, key_filter, cat_filter, limit });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{limit});
+        defer allocator.free(limit_text);
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+                "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
+                "WHERE ($1::text IS NULL OR ami.key = $1) " ++
+                "AND ($2::text IS NULL OR ami.category = $2) " ++
+                "AND (($3::text IS NULL AND ami.session_id IS NULL AND $4::text IS NOT NULL AND ami.actor_id = $4) OR ($3::text IS NOT NULL AND ami.session_id = $3 AND $4::text IS NOT NULL AND ami.actor_id = $4)) " ++
+                "ORDER BY ami.timestamp_ms DESC LIMIT $5::bigint",
+            &.{ key, category, session_id, actor_id, limit_text },
+        );
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
@@ -10814,11 +10821,18 @@ pub const PostgresStore = struct {
     }
 
     fn agentMemoryListVisibleInner(self: *PostgresStore, allocator: std.mem.Allocator, key: ?[]const u8, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, limit: usize) ![]domain.AgentMemory {
-        const session_filter = try pgAgentMemoryVisibleSessionFilter(allocator, "ami.", session_id);
-        const key_filter = if (key) |k| try std.fmt.allocPrint(allocator, " AND ami.key = {s}", .{try sqlString(allocator, k)}) else "";
-        const cat_filter = if (category) |cat| try std.fmt.allocPrint(allocator, " AND ami.category = {s}", .{try sqlString(allocator, cat)}) else "";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE {s}{s}{s} ORDER BY CASE WHEN ami.actor_id = {s} THEN 0 WHEN ami.actor_id LIKE 'shared:%%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC LIMIT {d}", .{ session_filter, key_filter, cat_filter, try sqlString(allocator, actor_id), limit });
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{limit});
+        defer allocator.free(limit_text);
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+                "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
+                "WHERE ($1::text IS NULL OR ami.key = $1) " ++
+                "AND ($2::text IS NULL OR ami.category = $2) " ++
+                "AND (($3::text IS NULL AND ami.session_id IS NULL) OR ($3::text IS NOT NULL AND ami.session_id = $3)) " ++
+                "ORDER BY CASE WHEN ami.actor_id = $4 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC LIMIT $5::bigint",
+            &.{ key, category, session_id, actor_id, limit_text },
+        );
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
@@ -14968,6 +14982,15 @@ test "postgres storage contract covers primitives when configured" {
     const pg_shared = (try store.agentMemoryGetVisible(alloc, shared_key, null, "agent:pg-a", "[\"team:pg\"]")).?;
     try std.testing.expectEqualStrings("postgres shared team agent memory", pg_shared.content);
     try std.testing.expect((try store.agentMemoryGetVisible(alloc, shared_key, null, "agent:pg-c", "[\"public\"]")) == null);
+    const pg_agent_list = try store.agentMemoryList(alloc, "core", "pg-session", "agent:postgres");
+    try std.testing.expectEqual(@as(usize, 1), pg_agent_list.len);
+    try std.testing.expectEqualStrings(unique, pg_agent_list[0].key);
+    const pg_visible_list = try store.agentMemoryListVisible(alloc, "core", null, "agent:pg-b", "[\"team:pg\"]");
+    var saw_pg_visible_shared = false;
+    for (pg_visible_list) |entry| {
+        if (std.mem.eql(u8, entry.key, shared_key)) saw_pg_visible_shared = true;
+    }
+    try std.testing.expect(saw_pg_visible_shared);
     const pg_shared_search = try store.search(alloc, .{ .query = "postgres shared team", .scopes_json = "[\"team:pg\"]", .limit = 10, .use_vector = false, .actor_id = "agent:pg-b" });
     var saw_pg_shared = false;
     for (pg_shared_search) |result| {
