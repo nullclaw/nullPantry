@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const json = @import("json_util.zig");
 const ids = @import("ids.zig");
+const net_security = @import("net_security.zig");
 
 pub const max_vector_backend_response_bytes: usize = 8 * 1024 * 1024;
 
@@ -38,6 +39,7 @@ pub const Config = struct {
     lancedb_uri: ?[]const u8 = null,
     lancedb_command: []const u8 = "python3",
     timeout_secs: u32 = 30,
+    allow_insecure_http: bool = false,
 
     pub fn externalEnabled(self: Config) bool {
         if (self.collection.len == 0) return false;
@@ -118,7 +120,7 @@ fn qdrantUpsert(allocator: std.mem.Allocator, cfg: Config, input: UpsertInput) !
     try qdrantEnsureCollection(allocator, cfg, input.dimensions);
     const path = try std.fmt.allocPrint(allocator, "/collections/{s}/points?wait=true", .{cfg.collection});
     defer allocator.free(path);
-    const url = try joinUrl(allocator, cfg.base_url.?, path);
+    const url = try backendUrl(allocator, cfg, path);
     defer allocator.free(url);
     const payload = try qdrantUpsertPayload(allocator, input);
     defer allocator.free(payload);
@@ -131,7 +133,7 @@ fn qdrantEnsureCollection(allocator: std.mem.Allocator, cfg: Config, dimensions:
     if (dimensions <= 0) return error.InvalidVectorDimensions;
     const path = try std.fmt.allocPrint(allocator, "/collections/{s}", .{cfg.collection});
     defer allocator.free(path);
-    const url = try joinUrl(allocator, cfg.base_url.?, path);
+    const url = try backendUrl(allocator, cfg, path);
     defer allocator.free(url);
     const body = try std.fmt.allocPrint(allocator, "{{\"vectors\":{{\"size\":{d},\"distance\":\"Cosine\"}}}}", .{dimensions});
     defer allocator.free(body);
@@ -146,7 +148,7 @@ fn qdrantEnsureCollection(allocator: std.mem.Allocator, cfg: Config, dimensions:
 fn qdrantSearch(allocator: std.mem.Allocator, cfg: Config, embedding_json: []const u8, limit: usize) ![]Candidate {
     const path = try std.fmt.allocPrint(allocator, "/collections/{s}/points/search", .{cfg.collection});
     defer allocator.free(path);
-    const url = try joinUrl(allocator, cfg.base_url.?, path);
+    const url = try backendUrl(allocator, cfg, path);
     defer allocator.free(url);
     const payload = try searchPayload(allocator, embedding_json, limit, true);
     defer allocator.free(payload);
@@ -158,7 +160,7 @@ fn qdrantSearch(allocator: std.mem.Allocator, cfg: Config, embedding_json: []con
 fn qdrantDelete(allocator: std.mem.Allocator, cfg: Config, vector_id: []const u8) !void {
     const path = try std.fmt.allocPrint(allocator, "/collections/{s}/points/delete?wait=true", .{cfg.collection});
     defer allocator.free(path);
-    const url = try joinUrl(allocator, cfg.base_url.?, path);
+    const url = try backendUrl(allocator, cfg, path);
     defer allocator.free(url);
     const payload = try std.fmt.allocPrint(allocator, "{{\"points\":[{d}]}}", .{pointId(vector_id)});
     defer allocator.free(payload);
@@ -170,7 +172,7 @@ fn qdrantDelete(allocator: std.mem.Allocator, cfg: Config, vector_id: []const u8
 fn qdrantReset(allocator: std.mem.Allocator, cfg: Config) !void {
     const path = try std.fmt.allocPrint(allocator, "/collections/{s}", .{cfg.collection});
     defer allocator.free(path);
-    const url = try joinUrl(allocator, cfg.base_url.?, path);
+    const url = try backendUrl(allocator, cfg, path);
     defer allocator.free(url);
     const response = requestJson(allocator, .DELETE, url, cfg.api_key, cfg.timeout_secs, "{}") catch |err| switch (err) {
         error.VectorBackendHttpError => return,
@@ -183,7 +185,7 @@ fn qdrantReset(allocator: std.mem.Allocator, cfg: Config) !void {
 fn lancedbHttpUpsert(allocator: std.mem.Allocator, cfg: Config, input: UpsertInput) !void {
     const path = try std.fmt.allocPrint(allocator, "/v1/tables/{s}/vectors/upsert", .{cfg.collection});
     defer allocator.free(path);
-    const url = try joinUrl(allocator, cfg.base_url.?, path);
+    const url = try backendUrl(allocator, cfg, path);
     defer allocator.free(url);
     const payload = try lancedbUpsertPayload(allocator, input);
     defer allocator.free(payload);
@@ -195,7 +197,7 @@ fn lancedbHttpUpsert(allocator: std.mem.Allocator, cfg: Config, input: UpsertInp
 fn lancedbHttpSearch(allocator: std.mem.Allocator, cfg: Config, embedding_json: []const u8, limit: usize) ![]Candidate {
     const path = try std.fmt.allocPrint(allocator, "/v1/tables/{s}/vectors/search", .{cfg.collection});
     defer allocator.free(path);
-    const url = try joinUrl(allocator, cfg.base_url.?, path);
+    const url = try backendUrl(allocator, cfg, path);
     defer allocator.free(url);
     const payload = try searchPayload(allocator, embedding_json, limit, false);
     defer allocator.free(payload);
@@ -207,7 +209,7 @@ fn lancedbHttpSearch(allocator: std.mem.Allocator, cfg: Config, embedding_json: 
 fn lancedbHttpDelete(allocator: std.mem.Allocator, cfg: Config, vector_id: []const u8) !void {
     const path = try std.fmt.allocPrint(allocator, "/v1/tables/{s}/vectors/delete", .{cfg.collection});
     defer allocator.free(path);
-    const url = try joinUrl(allocator, cfg.base_url.?, path);
+    const url = try backendUrl(allocator, cfg, path);
     defer allocator.free(url);
     const payload = try vectorDeletePayload(allocator, vector_id);
     defer allocator.free(payload);
@@ -219,7 +221,7 @@ fn lancedbHttpDelete(allocator: std.mem.Allocator, cfg: Config, vector_id: []con
 fn lancedbHttpReset(allocator: std.mem.Allocator, cfg: Config) !void {
     const path = try std.fmt.allocPrint(allocator, "/v1/tables/{s}/vectors/reset", .{cfg.collection});
     defer allocator.free(path);
-    const url = try joinUrl(allocator, cfg.base_url.?, path);
+    const url = try backendUrl(allocator, cfg, path);
     defer allocator.free(url);
     const response = try requestJson(allocator, .POST, url, cfg.api_key, cfg.timeout_secs, "{}");
     defer allocator.free(response);
@@ -550,6 +552,12 @@ fn pointId(vector_id: []const u8) u64 {
     return if (hash == 0) 1 else hash;
 }
 
+fn backendUrl(allocator: std.mem.Allocator, cfg: Config, suffix: []const u8) ![]u8 {
+    const base_url = cfg.base_url orelse return error.VectorBackendUnavailable;
+    try net_security.validateHttpBaseUrl(base_url, cfg.allow_insecure_http);
+    return joinUrl(allocator, base_url, suffix);
+}
+
 fn joinUrl(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]u8 {
     var end = base_url.len;
     while (end > 0 and base_url[end - 1] == '/') : (end -= 1) {}
@@ -672,6 +680,18 @@ test "vector backend config gates external runtime" {
     try std.testing.expect((Config{ .backend = .lancedb_http, .base_url = "http://127.0.0.1:9000" }).externalEnabled());
     try std.testing.expect(BackendKind.parse("lancedb") == .lancedb);
     try std.testing.expect(BackendKind.parse("lancedb_http") == .lancedb_http);
+    try std.testing.expectError(error.InsecureRuntimeUrl, backendUrl(std.testing.allocator, .{
+        .backend = .qdrant,
+        .base_url = "http://qdrant.internal:6333",
+    }, "/collections/nullpantry_vectors"));
+
+    const url = try backendUrl(std.testing.allocator, .{
+        .backend = .qdrant,
+        .base_url = "http://qdrant.internal:6333",
+        .allow_insecure_http = true,
+    }, "/collections/nullpantry_vectors");
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("http://qdrant.internal:6333/collections/nullpantry_vectors", url);
 }
 
 test "lancedb sdk command contract uses vector lifecycle subcommands" {

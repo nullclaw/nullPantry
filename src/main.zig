@@ -395,6 +395,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_VECTOR_TIMEOUT_SECS")) |secs| {
         cfg.vector_backend.timeout_secs = std.fmt.parseInt(u32, secs, 10) catch cfg.vector_backend.timeout_secs;
     } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_VECTOR_ALLOW_INSECURE_HTTP")) |value| {
+        defer allocator.free(value);
+        cfg.vector_backend.allow_insecure_http = parseBool(value);
+    } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_QDRANT_URL")) |url| {
         cfg.vector_backend.backend = .qdrant;
         cfg.vector_backend.base_url = url;
@@ -405,6 +409,11 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_QDRANT_COLLECTION")) |collection| {
         cfg.vector_backend.backend = .qdrant;
         cfg.vector_backend.collection = collection;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_QDRANT_ALLOW_INSECURE_HTTP")) |value| {
+        defer allocator.free(value);
+        cfg.vector_backend.backend = .qdrant;
+        cfg.vector_backend.allow_insecure_http = parseBool(value);
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LANCEDB_URI")) |uri| {
         cfg.vector_backend.backend = .lancedb;
@@ -423,6 +432,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LANCEDB_TABLE")) |table| {
         cfg.vector_backend.collection = table;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_LANCEDB_ALLOW_INSECURE_HTTP")) |value| {
+        defer allocator.free(value);
+        cfg.vector_backend.allow_insecure_http = parseBool(value);
     } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_ANALYTICS_BACKEND")) |backend| {
         cfg.analytics_backend.backend = analytics_runtime.BackendKind.parse(backend);
@@ -633,6 +646,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         } else if (std.mem.eql(u8, arg, "--vector-timeout-secs") and i + 1 < args.len) {
             i += 1;
             cfg.vector_backend.timeout_secs = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--vector-allow-insecure-http")) {
+            cfg.vector_backend.allow_insecure_http = true;
         } else if (std.mem.eql(u8, arg, "--lancedb-uri") and i + 1 < args.len) {
             i += 1;
             cfg.vector_backend.backend = .lancedb;
@@ -914,14 +929,17 @@ fn printUsage() void {
         \\  NULLPANTRY_VECTOR_API_KEY
         \\  NULLPANTRY_VECTOR_COLLECTION
         \\  NULLPANTRY_VECTOR_TIMEOUT_SECS
+        \\  NULLPANTRY_VECTOR_ALLOW_INSECURE_HTTP
         \\  NULLPANTRY_QDRANT_URL
         \\  NULLPANTRY_QDRANT_API_KEY
         \\  NULLPANTRY_QDRANT_COLLECTION
+        \\  NULLPANTRY_QDRANT_ALLOW_INSECURE_HTTP
         \\  NULLPANTRY_LANCEDB_URI
         \\  NULLPANTRY_LANCEDB_COMMAND
         \\  NULLPANTRY_LANCEDB_URL
         \\  NULLPANTRY_LANCEDB_API_KEY
         \\  NULLPANTRY_LANCEDB_TABLE
+        \\  NULLPANTRY_LANCEDB_ALLOW_INSECURE_HTTP
         \\  NULLPANTRY_ANALYTICS_BACKEND
         \\  NULLPANTRY_ANALYTICS_BASE_URL
         \\  NULLPANTRY_ANALYTICS_API_KEY
@@ -1138,6 +1156,7 @@ test "external vector backend can be configured from args" {
         "np_vectors",
         "--vector-timeout-secs",
         "7",
+        "--vector-allow-insecure-http",
     };
     const cfg = try parseArgs(std.testing.allocator, &args);
 
@@ -1145,6 +1164,7 @@ test "external vector backend can be configured from args" {
     try std.testing.expectEqualStrings("http://127.0.0.1:6333", cfg.vector_backend.base_url.?);
     try std.testing.expectEqualStrings("np_vectors", cfg.vector_backend.collection);
     try std.testing.expectEqual(@as(u32, 7), cfg.vector_backend.timeout_secs);
+    try std.testing.expect(cfg.vector_backend.allow_insecure_http);
 }
 
 test "lancedb sdk vector backend can be configured from args" {
