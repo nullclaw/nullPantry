@@ -40,6 +40,9 @@ pub const Config = struct {
     lancedb_command: []const u8 = "python3",
     timeout_secs: u32 = 30,
     allow_insecure_http: bool = false,
+    circuit_breaker_enabled: bool = true,
+    circuit_breaker_threshold: u32 = 3,
+    circuit_breaker_cooldown_ms: u64 = 30_000,
 
     pub fn externalEnabled(self: Config) bool {
         if (self.collection.len == 0) return false;
@@ -48,6 +51,93 @@ pub const Config = struct {
             .qdrant, .lancedb_http => self.base_url != null,
             .lancedb => self.lancedb_uri != null and self.lancedb_command.len > 0,
         };
+    }
+};
+
+pub const CircuitState = enum {
+    closed,
+    open,
+    half_open,
+};
+
+pub const CircuitBreaker = struct {
+    enabled: bool = true,
+    state: CircuitState = .closed,
+    failure_count: u32 = 0,
+    threshold: u32 = 3,
+    cooldown_ms: u64 = 30_000,
+    opened_at_ms: i64 = 0,
+    half_open_probe_sent: bool = false,
+
+    pub fn init(cfg: Config) CircuitBreaker {
+        return .{
+            .enabled = cfg.circuit_breaker_enabled,
+            .threshold = cfg.circuit_breaker_threshold,
+            .cooldown_ms = cfg.circuit_breaker_cooldown_ms,
+        };
+    }
+
+    pub fn allow(self: *CircuitBreaker) bool {
+        if (!self.enabled) return true;
+        switch (self.state) {
+            .closed => return true,
+            .open => {
+                const now = ids.nowMs();
+                if (self.cooldown_ms == 0 or now - self.opened_at_ms >= @as(i64, @intCast(self.cooldown_ms))) {
+                    self.state = .half_open;
+                    self.half_open_probe_sent = true;
+                    return true;
+                }
+                return false;
+            },
+            .half_open => {
+                if (self.half_open_probe_sent) return false;
+                self.half_open_probe_sent = true;
+                return true;
+            },
+        }
+    }
+
+    pub fn recordSuccess(self: *CircuitBreaker) void {
+        if (!self.enabled) return;
+        self.state = .closed;
+        self.failure_count = 0;
+        self.opened_at_ms = 0;
+        self.half_open_probe_sent = false;
+    }
+
+    pub fn recordFailure(self: *CircuitBreaker) void {
+        if (!self.enabled) return;
+        self.failure_count +|= 1;
+        if (self.state == .half_open or self.failure_count >= self.threshold) {
+            self.state = .open;
+            self.opened_at_ms = ids.nowMs();
+            self.half_open_probe_sent = false;
+        }
+    }
+};
+
+pub const Runtime = struct {
+    circuit_breaker: CircuitBreaker = .{},
+
+    pub fn init(cfg: Config) Runtime {
+        return .{ .circuit_breaker = CircuitBreaker.init(cfg) };
+    }
+
+    pub fn allow(self: *Runtime) bool {
+        return self.circuit_breaker.allow();
+    }
+
+    pub fn recordSuccess(self: *Runtime) void {
+        self.circuit_breaker.recordSuccess();
+    }
+
+    pub fn recordFailure(self: *Runtime) void {
+        self.circuit_breaker.recordFailure();
+    }
+
+    pub fn stateName(self: Runtime) []const u8 {
+        return @tagName(self.circuit_breaker.state);
     }
 };
 
@@ -85,6 +175,20 @@ pub fn upsert(allocator: std.mem.Allocator, cfg: Config, input: UpsertInput) !vo
     };
 }
 
+pub fn upsertWithRuntime(allocator: std.mem.Allocator, cfg: Config, runtime: ?*Runtime, input: UpsertInput) !void {
+    if (!cfg.externalEnabled()) return;
+    if (runtime) |rt| {
+        if (!rt.allow()) return error.VectorBackendCircuitOpen;
+        upsert(allocator, cfg, input) catch |err| {
+            rt.recordFailure();
+            return err;
+        };
+        rt.recordSuccess();
+        return;
+    }
+    return upsert(allocator, cfg, input);
+}
+
 pub fn search(allocator: std.mem.Allocator, cfg: Config, embedding_json: []const u8, limit: usize) ![]Candidate {
     if (!cfg.externalEnabled()) return allocator.alloc(Candidate, 0);
     return switch (cfg.backend) {
@@ -93,6 +197,20 @@ pub fn search(allocator: std.mem.Allocator, cfg: Config, embedding_json: []const
         .lancedb => lancedbSdkSearch(allocator, cfg, embedding_json, limit),
         .lancedb_http => lancedbHttpSearch(allocator, cfg, embedding_json, limit),
     };
+}
+
+pub fn searchWithRuntime(allocator: std.mem.Allocator, cfg: Config, runtime: ?*Runtime, embedding_json: []const u8, limit: usize) ![]Candidate {
+    if (!cfg.externalEnabled()) return allocator.alloc(Candidate, 0);
+    if (runtime) |rt| {
+        if (!rt.allow()) return error.VectorBackendCircuitOpen;
+        const candidates = search(allocator, cfg, embedding_json, limit) catch |err| {
+            rt.recordFailure();
+            return err;
+        };
+        rt.recordSuccess();
+        return candidates;
+    }
+    return search(allocator, cfg, embedding_json, limit);
 }
 
 pub fn delete(allocator: std.mem.Allocator, cfg: Config, vector_id: []const u8) !void {
@@ -106,6 +224,20 @@ pub fn delete(allocator: std.mem.Allocator, cfg: Config, vector_id: []const u8) 
     };
 }
 
+pub fn deleteWithRuntime(allocator: std.mem.Allocator, cfg: Config, runtime: ?*Runtime, vector_id: []const u8) !void {
+    if (!cfg.externalEnabled()) return;
+    if (runtime) |rt| {
+        if (!rt.allow()) return error.VectorBackendCircuitOpen;
+        delete(allocator, cfg, vector_id) catch |err| {
+            rt.recordFailure();
+            return err;
+        };
+        rt.recordSuccess();
+        return;
+    }
+    return delete(allocator, cfg, vector_id);
+}
+
 pub fn reset(allocator: std.mem.Allocator, cfg: Config) !void {
     if (!cfg.externalEnabled()) return;
     return switch (cfg.backend) {
@@ -114,6 +246,20 @@ pub fn reset(allocator: std.mem.Allocator, cfg: Config) !void {
         .lancedb => try lancedbSdkReset(allocator, cfg),
         .lancedb_http => try lancedbHttpReset(allocator, cfg),
     };
+}
+
+pub fn resetWithRuntime(allocator: std.mem.Allocator, cfg: Config, runtime: ?*Runtime) !void {
+    if (!cfg.externalEnabled()) return;
+    if (runtime) |rt| {
+        if (!rt.allow()) return error.VectorBackendCircuitOpen;
+        reset(allocator, cfg) catch |err| {
+            rt.recordFailure();
+            return err;
+        };
+        rt.recordSuccess();
+        return;
+    }
+    return reset(allocator, cfg);
 }
 
 fn qdrantUpsert(allocator: std.mem.Allocator, cfg: Config, input: UpsertInput) !void {
@@ -692,6 +838,57 @@ test "vector backend config gates external runtime" {
     }, "/collections/nullpantry_vectors");
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("http://qdrant.internal:6333/collections/nullpantry_vectors", url);
+}
+
+test "vector runtime circuit breaker opens and recovers through half open probe" {
+    var breaker = CircuitBreaker.init(.{
+        .backend = .qdrant,
+        .base_url = "http://127.0.0.1:6333",
+        .circuit_breaker_threshold = 2,
+        .circuit_breaker_cooldown_ms = 10_000,
+    });
+    try std.testing.expect(breaker.allow());
+    breaker.recordFailure();
+    try std.testing.expectEqual(CircuitState.closed, breaker.state);
+    breaker.recordFailure();
+    try std.testing.expectEqual(CircuitState.open, breaker.state);
+    try std.testing.expect(!breaker.allow());
+
+    breaker.opened_at_ms = ids.nowMs() - 10_000;
+    try std.testing.expect(breaker.allow());
+    try std.testing.expectEqual(CircuitState.half_open, breaker.state);
+    try std.testing.expect(!breaker.allow());
+
+    breaker.recordSuccess();
+    try std.testing.expectEqual(CircuitState.closed, breaker.state);
+    try std.testing.expectEqual(@as(u32, 0), breaker.failure_count);
+}
+
+test "vector runtime wrapper fails fast while circuit is open" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var runtime = Runtime.init(.{
+        .backend = .lancedb,
+        .lancedb_uri = ".zig-cache/tmp/nullpantry-missing-lancedb",
+        .lancedb_command = "/definitely/not/a/nullpantry/vector/backend",
+        .circuit_breaker_threshold = 1,
+        .circuit_breaker_cooldown_ms = 60_000,
+    });
+    const cfg = Config{
+        .backend = .lancedb,
+        .lancedb_uri = ".zig-cache/tmp/nullpantry-missing-lancedb",
+        .lancedb_command = "/definitely/not/a/nullpantry/vector/backend",
+        .circuit_breaker_threshold = 1,
+        .circuit_breaker_cooldown_ms = 60_000,
+    };
+
+    const first = searchWithRuntime(std.testing.allocator, cfg, &runtime, "[1,0]", 1);
+    if (first) |candidates| {
+        defer freeCandidates(std.testing.allocator, candidates);
+        return error.ExpectedVectorBackendFailure;
+    } else |_| {}
+    try std.testing.expectEqual(CircuitState.open, runtime.circuit_breaker.state);
+    try std.testing.expectError(error.VectorBackendCircuitOpen, searchWithRuntime(std.testing.allocator, cfg, &runtime, "[1,0]", 1));
 }
 
 test "lancedb sdk command contract uses vector lifecycle subcommands" {

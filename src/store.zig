@@ -661,6 +661,7 @@ pub const Store = struct {
     agent_memory: agent_memory_runtime.Runtime = .native,
     agent_memory_stores: agent_memory_runtime.RuntimeRegistry,
     vector_backend: vector_runtime.Config = .{},
+    vector_runtime: vector_runtime.Runtime = .{},
     analytics_backend: analytics_runtime.Config = .{},
     lucid_projection: lucid_runtime.Runtime = .{},
 
@@ -686,6 +687,7 @@ pub const Store = struct {
             .agent_memory = agent_memory,
             .agent_memory_stores = agent_memory_stores,
             .vector_backend = options.vector_backend,
+            .vector_runtime = vector_runtime.Runtime.init(options.vector_backend),
             .analytics_backend = options.analytics_backend,
             .lucid_projection = lucid_runtime.Runtime.init(options.lucid_projection),
         };
@@ -708,6 +710,7 @@ pub const Store = struct {
             .agent_memory = agent_memory,
             .agent_memory_stores = agent_memory_stores,
             .vector_backend = options.vector_backend,
+            .vector_runtime = vector_runtime.Runtime.init(options.vector_backend),
             .analytics_backend = options.analytics_backend,
             .lucid_projection = lucid_runtime.Runtime.init(options.lucid_projection),
         };
@@ -1489,7 +1492,7 @@ pub const Store = struct {
 
     pub fn vectorSearch(self: *Store, allocator: std.mem.Allocator, input: VectorSearchInput) ![]vector_mod.VectorMatch {
         if (self.vector_backend.externalEnabled()) {
-            const candidates = vector_runtime.search(allocator, self.vector_backend, input.embedding_json, @max(@as(usize, 1), @min(input.limit * 4, 1000))) catch |err| {
+            const candidates = vector_runtime.searchWithRuntime(allocator, self.vector_backend, &self.vector_runtime, input.embedding_json, @max(@as(usize, 1), @min(input.limit * 4, 1000))) catch |err| {
                 if (input.strict_external) return err;
                 return self.localVectorSearch(allocator, input);
             };
@@ -1573,7 +1576,7 @@ pub const Store = struct {
     pub fn rebuildVectorIndex(self: *Store, allocator: std.mem.Allocator, input: VectorMaintenanceInput) !VectorMaintenanceResult {
         const requeued = if (input.retry_failed) try self.requeueVectorOutboxFailures() else 0;
         if (input.reset_external and self.vector_backend.externalEnabled()) {
-            try vector_runtime.reset(allocator, self.vector_backend);
+            try vector_runtime.resetWithRuntime(allocator, self.vector_backend, &self.vector_runtime);
         }
         var result = try self.enqueueVectorUpsertsFromCanonical(allocator, input.limit);
         result.requeued_failed = requeued;
@@ -1635,10 +1638,15 @@ pub const Store = struct {
                 continue;
             };
             if (std.mem.eql(u8, entry.action, "delete")) {
-                vector_runtime.delete(allocator, self.vector_backend, vector_id) catch {
-                    _ = try self.finishVectorOutboxAs(entry.id, "failed_external_delete", worker_id);
-                    result.failed += 1;
-                    continue;
+                vector_runtime.deleteWithRuntime(allocator, self.vector_backend, &self.vector_runtime, vector_id) catch |err| {
+                    if (err == error.VectorBackendCircuitOpen) {
+                        _ = try self.finishVectorOutboxAs(entry.id, "pending", worker_id);
+                        break;
+                    } else {
+                        _ = try self.finishVectorOutboxAs(entry.id, "failed_external_delete", worker_id);
+                        result.failed += 1;
+                        continue;
+                    }
                 };
                 _ = try self.finishVectorOutboxAs(entry.id, "deleted_external", worker_id);
                 result.processed += 1;
@@ -1649,10 +1657,15 @@ pub const Store = struct {
                 result.failed += 1;
                 continue;
             };
-            vector_runtime.upsert(allocator, self.vector_backend, vectorChunkUpsertInput(chunk)) catch {
-                _ = try self.finishVectorOutboxAs(entry.id, "failed_external_index", worker_id);
-                result.failed += 1;
-                continue;
+            vector_runtime.upsertWithRuntime(allocator, self.vector_backend, &self.vector_runtime, vectorChunkUpsertInput(chunk)) catch |err| {
+                if (err == error.VectorBackendCircuitOpen) {
+                    _ = try self.finishVectorOutboxAs(entry.id, "pending", worker_id);
+                    break;
+                } else {
+                    _ = try self.finishVectorOutboxAs(entry.id, "failed_external_index", worker_id);
+                    result.failed += 1;
+                    continue;
+                }
             };
             _ = try self.finishVectorOutboxAs(entry.id, "indexed_external", worker_id);
             result.processed += 1;
@@ -14098,6 +14111,64 @@ test "strict common search fails closed when external vector plane fails" {
     try std.testing.expect(graceful.len >= 1);
 
     try std.testing.expectError(error.VectorBackendUnavailable, store.search(alloc, .{ .query = "lexical miss for strict vector", .scopes_json = "[\"public\"]", .limit = 10, .query_embedding_json = embedding, .strict_vector = true }));
+}
+
+test "external vector outbox stops claiming while circuit is open" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const tmp_random = try ids.make(std.testing.allocator, "");
+    defer std.testing.allocator.free(tmp_random);
+    const tmp_name = try std.fmt.allocPrint(std.testing.allocator, "np_vector_circuit_{d}_{s}", .{ std.c.getpid(), tmp_random });
+    defer std.testing.allocator.free(tmp_name);
+    const tmp_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp_name});
+    defer std.testing.allocator.free(tmp_path);
+    try std.Io.Dir.cwd().createDirPath(compat.io(), tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.io(), tmp_path) catch {};
+
+    const command = try std.fmt.allocPrint(std.testing.allocator, "{s}/lancedb-adapter", .{tmp_path});
+    defer std.testing.allocator.free(command);
+    const script =
+        \\#!/bin/sh
+        \\cat >/dev/null
+        \\exit 9
+        \\
+    ;
+    var file = try std.Io.Dir.cwd().createFile(compat.io(), command, .{ .read = true });
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.File.Writer = .init(file, compat.io(), &buffer);
+    try writer.interface.writeAll(script);
+    try writer.interface.flush();
+    try file.setPermissions(compat.io(), .executable_file);
+    file.close(compat.io());
+
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{ .vector_backend = .{
+        .backend = .lancedb,
+        .lancedb_uri = ".zig-cache/tmp/nullpantry-lancedb-circuit",
+        .lancedb_command = command,
+        .collection = "vectors",
+        .timeout_secs = 2,
+        .circuit_breaker_threshold = 1,
+        .circuit_breaker_cooldown_ms = 60_000,
+    } });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    const atom_a = try store.createMemoryAtom(alloc, .{ .text = "external vector circuit a", .scope = "public", .created_by = "human" });
+    const atom_b = try store.createMemoryAtom(alloc, .{ .text = "external vector circuit b", .scope = "public", .created_by = "human" });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_id = atom_a.id, .text = atom_a.text, .scope = atom_a.scope, .embedding_json = embedding, .dimensions = 2 });
+    _ = try store.upsertVectorChunk(alloc, .{ .object_id = atom_b.id, .text = atom_b.text, .scope = atom_b.scope, .embedding_json = embedding, .dimensions = 2 });
+    try std.testing.expectEqual(@as(usize, 2), try store.countVectorOutbox("pending"));
+
+    const run = try store.runVectorOutbox(10);
+    try std.testing.expectEqual(@as(usize, 0), run.processed);
+    try std.testing.expectEqual(@as(usize, 1), run.failed);
+    try std.testing.expectEqual(vector_runtime.CircuitState.open, store.vector_runtime.circuit_breaker.state);
+    try std.testing.expectEqual(@as(usize, 1), try store.countVectorOutbox("failed_external_index"));
+    try std.testing.expectEqual(@as(usize, 1), try store.countVectorOutbox("pending"));
+    try std.testing.expectEqual(@as(usize, 0), try store.countVectorOutbox("running"));
 }
 
 test "vector maintenance can requeue failed external outbox entries" {

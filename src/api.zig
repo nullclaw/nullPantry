@@ -4797,6 +4797,11 @@ fn appendRuntimeDiagnostics(ctx: *Context, out: *std.ArrayListUnmanaged(u8), sch
     try out.appendSlice(ctx.allocator, if (ctx.store.vector_backend.externalEnabled()) "true" else "false");
     try out.appendSlice(ctx.allocator, ",\"external_sinks\":");
     try json.appendRawJsonOr(out, ctx.allocator, ctx.store.vectorExternalSinksJson(), "[]");
+    try out.appendSlice(ctx.allocator, ",\"circuit_breaker\":{\"enabled\":");
+    try out.appendSlice(ctx.allocator, if (ctx.store.vector_runtime.circuit_breaker.enabled) "true" else "false");
+    try out.appendSlice(ctx.allocator, ",\"state\":");
+    try json.appendString(out, ctx.allocator, ctx.store.vector_runtime.stateName());
+    try out.print(ctx.allocator, ",\"failure_count\":{d},\"threshold\":{d},\"cooldown_ms\":{d}}}", .{ ctx.store.vector_runtime.circuit_breaker.failure_count, ctx.store.vector_runtime.circuit_breaker.threshold, ctx.store.vector_runtime.circuit_breaker.cooldown_ms });
     try out.print(ctx.allocator, ",\"outbox_active\":true,\"outbox_pending\":{d}}}", .{store_diag.vector_outbox_pending});
     try out.appendSlice(ctx.allocator, ",\"lucid\":{\"backend\":");
     try json.appendString(out, ctx.allocator, ctx.store.lucidBackendName());
@@ -9537,6 +9542,7 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"schema_ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"agent_memory_backend\":\"native\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"vector\":{\"backend\":\"local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"circuit_breaker\":{\"enabled\":true,\"state\":\"closed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"retrieval\":{\"keyword\":true,\"vector\":true,\"adaptive_retrieval\":true,\"graph\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"embedding_provider\":{\"provider\":\"openai-compatible\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"completion_provider\":{\"configured\":false") != null);

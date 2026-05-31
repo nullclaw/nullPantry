@@ -419,6 +419,18 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
         defer allocator.free(value);
         cfg.vector_backend.allow_insecure_http = parseBool(value);
     } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_VECTOR_CIRCUIT_BREAKER_ENABLED")) |value| {
+        defer allocator.free(value);
+        cfg.vector_backend.circuit_breaker_enabled = parseBool(value);
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_VECTOR_CIRCUIT_BREAKER_THRESHOLD")) |value| {
+        defer allocator.free(value);
+        cfg.vector_backend.circuit_breaker_threshold = std.fmt.parseInt(u32, value, 10) catch cfg.vector_backend.circuit_breaker_threshold;
+    } else |_| {}
+    if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_VECTOR_CIRCUIT_BREAKER_COOLDOWN_MS")) |value| {
+        defer allocator.free(value);
+        cfg.vector_backend.circuit_breaker_cooldown_ms = std.fmt.parseInt(u64, value, 10) catch cfg.vector_backend.circuit_breaker_cooldown_ms;
+    } else |_| {}
     if (compat.process.getEnvVarOwned(allocator, "NULLPANTRY_QDRANT_URL")) |url| {
         cfg.vector_backend.backend = .qdrant;
         cfg.vector_backend.base_url = url;
@@ -684,6 +696,14 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !RuntimeC
             cfg.vector_backend.timeout_secs = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--vector-allow-insecure-http")) {
             cfg.vector_backend.allow_insecure_http = true;
+        } else if (std.mem.eql(u8, arg, "--vector-disable-circuit-breaker")) {
+            cfg.vector_backend.circuit_breaker_enabled = false;
+        } else if (std.mem.eql(u8, arg, "--vector-circuit-breaker-threshold") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.circuit_breaker_threshold = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--vector-circuit-breaker-cooldown-ms") and i + 1 < args.len) {
+            i += 1;
+            cfg.vector_backend.circuit_breaker_cooldown_ms = try std.fmt.parseInt(u64, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--lancedb-uri") and i + 1 < args.len) {
             i += 1;
             cfg.vector_backend.backend = .lancedb;
@@ -973,6 +993,9 @@ fn printUsage() void {
         \\  NULLPANTRY_VECTOR_COLLECTION
         \\  NULLPANTRY_VECTOR_TIMEOUT_SECS
         \\  NULLPANTRY_VECTOR_ALLOW_INSECURE_HTTP
+        \\  NULLPANTRY_VECTOR_CIRCUIT_BREAKER_ENABLED
+        \\  NULLPANTRY_VECTOR_CIRCUIT_BREAKER_THRESHOLD
+        \\  NULLPANTRY_VECTOR_CIRCUIT_BREAKER_COOLDOWN_MS
         \\  NULLPANTRY_QDRANT_URL
         \\  NULLPANTRY_QDRANT_API_KEY
         \\  NULLPANTRY_QDRANT_COLLECTION
@@ -1231,6 +1254,10 @@ test "external vector backend can be configured from args" {
         "--vector-timeout-secs",
         "7",
         "--vector-allow-insecure-http",
+        "--vector-circuit-breaker-threshold",
+        "5",
+        "--vector-circuit-breaker-cooldown-ms",
+        "12000",
     };
     const cfg = try parseArgs(std.testing.allocator, &args);
 
@@ -1239,6 +1266,8 @@ test "external vector backend can be configured from args" {
     try std.testing.expectEqualStrings("np_vectors", cfg.vector_backend.collection);
     try std.testing.expectEqual(@as(u32, 7), cfg.vector_backend.timeout_secs);
     try std.testing.expect(cfg.vector_backend.allow_insecure_http);
+    try std.testing.expectEqual(@as(u32, 5), cfg.vector_backend.circuit_breaker_threshold);
+    try std.testing.expectEqual(@as(u64, 12_000), cfg.vector_backend.circuit_breaker_cooldown_ms);
 }
 
 test "lancedb sdk vector backend can be configured from args" {
