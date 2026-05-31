@@ -9833,6 +9833,7 @@ pub const PostgresStore = struct {
             const relation_from_visible = try pgRecordVisibleSql(allocator, "rel_from.scope", "rel_from.permissions_json", input.scopes_json, input.actor_id);
             const relation_to_visible = try pgRecordVisibleSql(allocator, "rel_to.scope", "rel_to.permissions_json", input.scopes_json, input.actor_id);
             const agent_memory_visible = try pgRecordVisibleSql(allocator, "ami.scope", "ami.permissions_json", input.scopes_json, input.actor_id);
+            const agent_memory_prefilter = try std.fmt.allocPrint(allocator, "(({s}) OR ($2::text IS NOT NULL AND ami.actor_id = $2))", .{agent_memory_visible});
             const space_visible = try pgRecordVisibleSql(allocator, "sp.scope", "sp.permissions_json", input.scopes_json, input.actor_id);
             const policy_visible = try pgRecordVisibleSql(allocator, "ps.scope", "ps.permissions_json", input.scopes_json, input.actor_id);
             const context_actor_filter = "(cp.actor_isolated = false OR ($2::text IS NOT NULL AND cp.actor_id = $2))";
@@ -9880,7 +9881,7 @@ pub const PostgresStore = struct {
                     relation_to_visible,
                     context_actor_filter,
                     agent_status_filter,
-                    agent_memory_visible,
+                    agent_memory_prefilter,
                     space_visible,
                     policy_visible,
                 },
@@ -10089,13 +10090,12 @@ pub const PostgresStore = struct {
     }
 
     fn agentMemoryById(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?domain.AgentMemory {
-        const inner = try std.fmt.allocPrint(
+        const parsed = try self.queryRowParamsJson(
             allocator,
             "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
-                "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.id = {s} LIMIT 1",
-            .{try sqlString(allocator, id)},
+                "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.id = $1 LIMIT 1",
+            &.{id},
         );
-        const parsed = try self.queryJson(allocator, try rowJsonSql(allocator, inner));
         defer parsed.deinit();
         if (parsed.value == .null) return null;
         return try readPgAgentMemory(allocator, parsed.value.object);
@@ -10120,23 +10120,14 @@ pub const PostgresStore = struct {
     pub fn listVectorOutbox(self: *PostgresStore, allocator: std.mem.Allocator, input: VectorOutboxListInput) ![]VectorOutboxEntry {
         try self.reclaimExpiredVectorOutbox(allocator);
         const capped = @max(@as(usize, 1), @min(input.limit, 1000));
-        const filter = if (input.action != null and input.status != null)
-            "WHERE action = $1 AND status = $2"
-        else if (input.action != null)
-            "WHERE action = $1"
-        else if (input.status != null)
-            "WHERE status = $1"
-        else
-            "";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms FROM vector_outbox {s} ORDER BY id LIMIT {d}", .{ filter, capped });
-        const parsed = if (input.action != null and input.status != null)
-            try self.queryParamsJson(allocator, try arrayJsonSql(allocator, inner), &.{ input.action.?, input.status.? })
-        else if (input.action != null)
-            try self.queryParamsJson(allocator, try arrayJsonSql(allocator, inner), &.{input.action.?})
-        else if (input.status != null)
-            try self.queryParamsJson(allocator, try arrayJsonSql(allocator, inner), &.{input.status.?})
-        else
-            try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{capped});
+        defer allocator.free(limit_text);
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT id,action,object_type,object_id,status,attempts,payload_json,created_at_ms,updated_at_ms FROM vector_outbox " ++
+                "WHERE ($1::text IS NULL OR action = $1) AND ($2::text IS NULL OR status = $2) ORDER BY id LIMIT $3::bigint",
+            &.{ input.action, input.status, limit_text },
+        );
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(VectorOutboxEntry) = .empty;
         errdefer out.deinit(allocator);
@@ -15088,6 +15079,35 @@ test "postgres storage contract covers primitives when configured" {
         if (std.mem.eql(u8, match.id, vector.id)) saw_vector = true;
     }
     try std.testing.expect(saw_vector);
+
+    const pg_private_vector_entry = try store.agentMemoryStore(alloc, .{
+        .key = try std.fmt.allocPrint(alloc, "{s}.private-vector", .{unique}),
+        .content = "postgres private agent vector memory",
+        .category = "core",
+        .actor_id = "agent:pg-vector",
+    });
+    _ = try store.upsertVectorChunk(alloc, .{
+        .object_type = "agent_memory",
+        .object_id = pg_private_vector_entry.id,
+        .chunk_ordinal = 0,
+        .text = pg_private_vector_entry.content,
+        .scope = pg_private_vector_entry.scope,
+        .permissions_json = pg_private_vector_entry.permissions_json,
+        .embedding_json = "[1,0,0]",
+        .dimensions = 3,
+        .actor_id = "agent:pg-vector",
+    });
+    const private_vector_matches = try store.vectorSearch(alloc, .{ .embedding_json = "[1,0,0]", .scopes_json = "[]", .limit = 20, .actor_id = "agent:pg-vector" });
+    var saw_private_agent_vector = false;
+    for (private_vector_matches) |match| {
+        if (std.mem.eql(u8, match.object_type, "agent_memory") and std.mem.eql(u8, match.object_id, pg_private_vector_entry.id)) saw_private_agent_vector = true;
+    }
+    try std.testing.expect(saw_private_agent_vector);
+    const denied_private_vector_matches = try store.vectorSearch(alloc, .{ .embedding_json = "[1,0,0]", .scopes_json = "[]", .limit = 20, .actor_id = "agent:pg-other" });
+    for (denied_private_vector_matches) |match| {
+        try std.testing.expect(!std.mem.eql(u8, match.object_id, pg_private_vector_entry.id));
+    }
+
     try std.testing.expect((try store.countVectorOutbox("pending")) > 0);
     const outbox = try store.listVectorOutbox(alloc, .{ .action = "upsert", .status = "pending", .limit = 10 });
     try std.testing.expect(outbox.len > 0);
