@@ -2530,6 +2530,15 @@ pub const Store = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    fn agentMemoryCountSubset(self: *Store, actor_id: ?[]const u8, scopes_json: []const u8, route: AgentMemoryStorageRoute) anyerror!usize {
+        const stores = try requireSubsetStores(route);
+        var count: usize = 0;
+        for (stores) |store_name| {
+            count += try self.agentMemoryCountRouted(actor_id, scopes_json, routeForSubsetStoreName(store_name));
+        }
+        return count;
+    }
+
     fn agentMemoryDeleteSubset(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror!bool {
         return self.agentMemoryDeleteSubsetInner(key, session_id, actor_id, writer_actor_id, route, false);
     }
@@ -2910,6 +2919,18 @@ pub const Store = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    fn agentMemoryCountAll(self: *Store, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
+        var count: usize = 0;
+        if (self.agent_memory.isExternal()) {
+            count += try self.agent_memory.count(actor_id, scopes_json);
+        }
+        for (self.agent_memory_stores.stores.items) |*named| {
+            count += try named.runtime.count(actor_id, scopes_json);
+        }
+        count += try self.agentMemoryCountNative(actor_id, scopes_json);
+        return count;
+    }
+
     pub fn agentMemoryDelete(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
         if (self.agent_memory.isExternal()) return self.agent_memory.delete(key, session_id, actor_id, writer_actor_id);
         return self.agentMemoryDeleteNative(key, session_id, actor_id, writer_actor_id);
@@ -2967,6 +2988,20 @@ pub const Store = struct {
     pub fn agentMemoryCount(self: *Store, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
         if (self.agent_memory.isExternal()) return self.agent_memory.count(actor_id, scopes_json);
         return self.agentMemoryCountNative(actor_id, scopes_json);
+    }
+
+    pub fn agentMemoryCountRouted(self: *Store, actor_id: ?[]const u8, scopes_json: []const u8, route: AgentMemoryStorageRoute) !usize {
+        return switch (route.target) {
+            .primary => self.agentMemoryCount(actor_id, scopes_json),
+            .native => self.agentMemoryCountNative(actor_id, scopes_json),
+            .runtime => blk: {
+                if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
+                break :blk try self.agent_memory.count(actor_id, scopes_json);
+            },
+            .named => (try self.namedAgentMemoryRuntime(route)).count(actor_id, scopes_json),
+            .subset => self.agentMemoryCountSubset(actor_id, scopes_json, route),
+            .all => self.agentMemoryCountAll(actor_id, scopes_json),
+        };
     }
 
     fn agentMemoryCountNative(self: *Store, actor_id: ?[]const u8, scopes_json: []const u8) !usize {

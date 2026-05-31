@@ -6541,14 +6541,10 @@ fn agentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResp
 fn agentMemoryCount(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const storage_target = agentMemoryStorageTargetFromQuery(ctx.allocator, query) catch return serverError(ctx);
-    const entries = ctx.store.agentMemoryListVisibleRouted(ctx.allocator, null, null, ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
+    const count = ctx.store.agentMemoryCountRouted(ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
     };
-    var list: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-    appendAgentMemoryEntries(ctx.allocator, &list, entries) catch return serverError(ctx);
-    dedupeAgentMemoryEntries(ctx.allocator, &list);
-    const count = list.items.len;
     const body = std.fmt.allocPrint(ctx.allocator, "{{\"count\":{d}}}", .{count}) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = body };
 }
@@ -8405,6 +8401,18 @@ test "api agent memory supports named stores and federated runtime reads" {
     try std.testing.expectEqualStrings("200 OK", runtime_put.status);
     const native_put = handleRequest(&ctx, "PUT", "/v1/agent-memory/named.native", "{\"content\":\"Named Native Unique\",\"store\":\"native\"}", raw);
     try std.testing.expectEqualStrings("200 OK", native_put.status);
+    const scratch_session_put = handleRequest(&ctx, "PUT", "/v1/agent-memory/named.session", "{\"content\":\"Named Scratch Session Unique\",\"store\":\"scratch\",\"session_id\":\"sess_route\"}", raw);
+    try std.testing.expectEqualStrings("200 OK", scratch_session_put.status);
+
+    const scratch_count = handleRequest(&ctx, "GET", "/v1/agent-memory/count?store=scratch", "", "GET /v1/agent-memory/count?store=scratch HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", scratch_count.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_count.body, "\"count\":2") != null);
+    const subset_count = handleRequest(&ctx, "GET", "/v1/agent-memory/count?stores=scratch,archive", "", "GET /v1/agent-memory/count?stores=scratch,archive HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", subset_count.status);
+    try std.testing.expect(std.mem.indexOf(u8, subset_count.body, "\"count\":3") != null);
+    const federated_count = handleRequest(&ctx, "GET", "/v1/agent-memory/count?storage=all", "", "GET /v1/agent-memory/count?storage=all HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", federated_count.status);
+    try std.testing.expect(std.mem.indexOf(u8, federated_count.body, "\"count\":5") != null);
 
     const scratch_get = handleRequest(&ctx, "GET", "/v1/agent-memory/named.scratch?store=scratch", "", "GET /v1/agent-memory/named.scratch?store=scratch HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", scratch_get.status);
@@ -9023,6 +9031,10 @@ test "api native agent memory applies ACL after actor isolation" {
     try std.testing.expectEqualStrings("200 OK", narrowed_list.status);
     try std.testing.expect(std.mem.indexOf(u8, narrowed_list.body, "Personal API memory") != null);
     try std.testing.expect(std.mem.indexOf(u8, narrowed_list.body, "Secret API memory") == null);
+
+    const full_count = handleRequest(&ctx, "GET", "/v1/agent-memory/count", "", "GET /v1/agent-memory/count HTTP/1.1\r\nAuthorization: Bearer agent-acl\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", full_count.status);
+    try std.testing.expect(std.mem.indexOf(u8, full_count.body, "\"count\":4") != null);
 
     const narrowed_count = handleRequest(&ctx, "GET", "/v1/agent-memory/count", "", "GET /v1/agent-memory/count HTTP/1.1\r\nAuthorization: Bearer agent-acl\r\nX-NullPantry-Actor-Scopes: [\"public\"]\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", narrowed_count.status);

@@ -552,12 +552,12 @@ pub const MemoryAgentMemory = struct {
     pub fn count(self: *MemoryAgentMemory, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
         self.purgeExpired();
         if (actor_id) |actor| {
-            const visible = try self.listVisible(self.allocator, null, null, actor, scopes_json);
-            defer {
-                for (visible) |*entry| freeAgentMemory(self.allocator, entry);
-                self.allocator.free(visible);
+            var visible_count: usize = 0;
+            for (self.entries.items) |wrapped| {
+                if (!try entryVisible(self.allocator, wrapped.entry, actor, scopes_json)) continue;
+                visible_count += 1;
             }
-            return visible.len;
+            return visible_count;
         }
         return self.entries.items.len;
     }
@@ -1112,16 +1112,32 @@ pub const RedisAgentMemory = struct {
     }
 
     pub fn count(self: *RedisAgentMemory, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
-        if (actor_id) |actor| {
-            const visible = try self.listVisible(self.allocator, null, null, actor, scopes_json);
-            defer {
-                for (visible) |*entry| freeAgentMemory(self.allocator, entry);
-                self.allocator.free(visible);
-            }
-            return visible.len;
-        }
         const index_key = try self.globalIndexKey(self.allocator);
         defer self.allocator.free(index_key);
+        if (actor_id) |actor| {
+            var resp = try self.client.command(&.{ "SMEMBERS", index_key });
+            defer resp.deinit(self.allocator);
+            const members = switch (resp) {
+                .array => |maybe_items| maybe_items orelse return 0,
+                else => return 0,
+            };
+            var visible_count: usize = 0;
+            for (members) |member| {
+                const redis_key = member.asString() orelse continue;
+                var hash = try self.client.command(&.{ "HGETALL", redis_key });
+                const maybe_entry = try self.agentMemoryFromHash(self.allocator, hash);
+                hash.deinit(self.allocator);
+                var entry = maybe_entry orelse {
+                    try self.removeIndexMember(index_key, redis_key);
+                    continue;
+                };
+                const visible = try entryVisible(self.allocator, entry, actor, scopes_json);
+                freeAgentMemory(self.allocator, &entry);
+                if (!visible) continue;
+                visible_count += 1;
+            }
+            return visible_count;
+        }
         var resp = try self.client.command(&.{ "SCARD", index_key });
         defer resp.deinit(self.allocator);
         return switch (resp) {
@@ -2885,6 +2901,19 @@ test "memory_lru search ranks before applying limit" {
     }
     try std.testing.expectEqual(@as(usize, 1), ranked.len);
     try std.testing.expectEqualStrings("rank.high", ranked[0].key);
+}
+
+test "memory_lru count includes visible session memory" {
+    var runtime = try Runtime.init(std.testing.allocator, .{ .backend = .memory_lru });
+    defer runtime.deinit();
+
+    var global = try runtime.store(std.testing.allocator, .{ .key = "global", .content = "global", .actor_id = "agent:count" });
+    defer freeAgentMemory(std.testing.allocator, &global);
+    var session = try runtime.store(std.testing.allocator, .{ .key = "session", .content = "session", .session_id = "sess_count", .actor_id = "agent:count" });
+    defer freeAgentMemory(std.testing.allocator, &session);
+
+    try std.testing.expectEqual(@as(usize, 1), try runtime.count("agent:count", "[]"));
+    try std.testing.expectEqual(@as(usize, 2), try runtime.count("agent:count", "[\"session:*\"]"));
 }
 
 test "memory_lru expires entries messages and usage by ttl" {
