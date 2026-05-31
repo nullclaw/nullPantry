@@ -3213,6 +3213,8 @@ fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8) HttpResponse {
     const events_value = checkpointEventsValue(parsed.value.object) orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Checkpoint restore requires an events array");
     if (events_value != .array) return json.errorResponse(ctx.allocator, 400, "bad_request", "Checkpoint restore requires an events array");
     const checkpoint_compacted_through = checkpointCompactedThrough(parsed.value.object);
+    const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    const status_before_restore = ctx.store.feedStatus(ctx.allocator, .{ .scopes_json = feed_scopes, .actor_id = ctx.actor_id }) catch return serverError(ctx);
 
     var restored: usize = 0;
     var applied: usize = 0;
@@ -3256,13 +3258,18 @@ fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8) HttpResponse {
 
     var restored_cursor_floor: i64 = 0;
     var cursor_floor_restored = false;
+    var cursor_floor_restore_skipped = false;
     if (checkpoint_compacted_through > 0 and local_compact_floor > 0) {
-        const compacted = ctx.store.compactFeed(local_compact_floor, ctx.actor_id) catch return serverError(ctx);
-        restored_cursor_floor = compacted.cursor_floor;
-        cursor_floor_restored = true;
+        if (status_before_restore.max_event_id == 0 or status_before_restore.cursor_floor >= local_compact_floor) {
+            const compacted = ctx.store.compactFeed(local_compact_floor, ctx.actor_id) catch return serverError(ctx);
+            restored_cursor_floor = compacted.cursor_floor;
+            cursor_floor_restored = true;
+        } else {
+            cursor_floor_restore_skipped = true;
+        }
     }
 
-    const response = std.fmt.allocPrint(ctx.allocator, "{{\"restored_events\":{d},\"applied_events\":{d},\"queued_events\":{d},\"skipped_events\":{d},\"checkpoint_compacted_through_sequence\":{d},\"restored_cursor_floor\":{d},\"cursor_floor_restored\":{s}}}", .{ restored, applied, queued, skipped, checkpoint_compacted_through, restored_cursor_floor, if (cursor_floor_restored) "true" else "false" }) catch return serverError(ctx);
+    const response = std.fmt.allocPrint(ctx.allocator, "{{\"restored_events\":{d},\"applied_events\":{d},\"queued_events\":{d},\"skipped_events\":{d},\"checkpoint_compacted_through_sequence\":{d},\"restored_cursor_floor\":{d},\"cursor_floor_restored\":{s},\"cursor_floor_restore_skipped\":{s}}}", .{ restored, applied, queued, skipped, checkpoint_compacted_through, restored_cursor_floor, if (cursor_floor_restored) "true" else "false", if (cursor_floor_restore_skipped) "true" else "false" }) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
 }
 
@@ -10168,6 +10175,45 @@ test "api memory checkpoint restore preserves compacted cursor floor" {
     try std.testing.expectEqualStrings("200 OK", recovery_checkpoint.status);
     try std.testing.expect(std.mem.indexOf(u8, recovery_checkpoint.body, "restore_floor_one") != null);
     try std.testing.expect(std.mem.indexOf(u8, recovery_checkpoint.body, "restore_floor_two") != null);
+}
+
+test "api memory checkpoint restore does not compact unrelated target feed history" {
+    var source_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer source_store.deinit();
+    var target_store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer target_store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var source_ctx = Context{ .allocator = alloc, .store = &source_store };
+    var target_ctx = Context{ .allocator = alloc, .store = &target_store };
+
+    const source_first = handleRequest(&source_ctx, "POST", "/v1/memory/events", "{\"event_type\":\"memory.note\",\"operation\":\"put\",\"object_type\":\"memory_atom\",\"object_id\":\"nonempty_restore_source_one\",\"scope\":\"public\",\"payload\":{\"text\":\"one\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", source_first.status);
+    const source_second = handleRequest(&source_ctx, "POST", "/v1/memory/events", "{\"event_type\":\"memory.note\",\"operation\":\"put\",\"object_type\":\"memory_atom\",\"object_id\":\"nonempty_restore_source_two\",\"scope\":\"public\",\"payload\":{\"text\":\"two\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", source_second.status);
+    const source_compact = handleRequest(&source_ctx, "POST", "/v1/memory/compact", "{\"through_sequence\":1}", "");
+    try std.testing.expectEqualStrings("200 OK", source_compact.status);
+    const checkpoint = handleRequest(&source_ctx, "GET", "/v1/memory/checkpoint?after=0&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", checkpoint.status);
+
+    const local_event = handleRequest(&target_ctx, "POST", "/v1/memory/events", "{\"event_type\":\"memory.note\",\"operation\":\"put\",\"object_type\":\"memory_atom\",\"object_id\":\"target_local_history\",\"scope\":\"public\",\"payload\":{\"text\":\"local\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", local_event.status);
+
+    const restore = handleRequest(&target_ctx, "POST", "/v1/memory/checkpoint", checkpoint.body, "");
+    try std.testing.expectEqualStrings("200 OK", restore.status);
+    try std.testing.expect(std.mem.indexOf(u8, restore.body, "\"cursor_floor_restored\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restore.body, "\"cursor_floor_restore_skipped\":true") != null);
+
+    const status = handleRequest(&target_ctx, "GET", "/v1/memory/status", "", "");
+    try std.testing.expectEqualStrings("200 OK", status.status);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"cursor_floor\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"last_sequence\":3") != null);
+
+    const local_history = handleRequest(&target_ctx, "GET", "/v1/memory/events?after=0&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", local_history.status);
+    try std.testing.expect(std.mem.indexOf(u8, local_history.body, "target_local_history") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_history.body, "nonempty_restore_source_one") != null);
 }
 
 test "api memory checkpoint restore preserves actors and session deletes" {
