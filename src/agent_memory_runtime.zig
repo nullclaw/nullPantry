@@ -83,6 +83,12 @@ pub const Input = struct {
     operation: domain.AgentMemoryOperation = .put,
 };
 
+fn normalizeInput(input: Input) Input {
+    var out = input;
+    out.session_id = access.normalizeSessionId(input.session_id);
+    return out;
+}
+
 pub const Message = struct {
     role: []const u8,
     content: []const u8,
@@ -223,32 +229,35 @@ pub const Runtime = union(BackendKind) {
     }
 
     pub fn store(self: *Runtime, allocator: std.mem.Allocator, input: Input) !domain.AgentMemory {
+        const normalized = normalizeInput(input);
         return switch (self.*) {
-            .none => noopAgentMemory(allocator, input),
+            .none => noopAgentMemory(allocator, normalized),
             .native => error.NativeAgentMemoryRuntime,
-            .memory_lru => |*engine| engine.store(allocator, input),
-            .redis => |*engine| engine.store(allocator, input),
-            .api => |*engine| engine.store(allocator, input),
+            .memory_lru => |*engine| engine.store(allocator, normalized),
+            .redis => |*engine| engine.store(allocator, normalized),
+            .api => |*engine| engine.store(allocator, normalized),
         };
     }
 
     pub fn get(self: *Runtime, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (self.*) {
             .none => null,
             .native => error.NativeAgentMemoryRuntime,
-            .memory_lru => |*engine| engine.get(allocator, key, session_id, actor_id),
-            .redis => |*engine| engine.get(allocator, key, session_id, actor_id),
-            .api => |*engine| engine.get(allocator, key, session_id, actor_id),
+            .memory_lru => |*engine| engine.get(allocator, key, normalized_session_id, actor_id),
+            .redis => |*engine| engine.get(allocator, key, normalized_session_id, actor_id),
+            .api => |*engine| engine.get(allocator, key, normalized_session_id, actor_id),
         };
     }
 
     pub fn getVisible(self: *Runtime, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (self.*) {
             .none => null,
             .native => error.NativeAgentMemoryRuntime,
-            .memory_lru => |*engine| engine.getVisible(allocator, key, session_id, actor_id, scopes_json),
-            .redis => |*engine| engine.getVisible(allocator, key, session_id, actor_id, scopes_json),
-            .api => |*engine| engine.getVisible(allocator, key, session_id, actor_id, scopes_json),
+            .memory_lru => |*engine| engine.getVisible(allocator, key, normalized_session_id, actor_id, scopes_json),
+            .redis => |*engine| engine.getVisible(allocator, key, normalized_session_id, actor_id, scopes_json),
+            .api => |*engine| engine.getVisible(allocator, key, normalized_session_id, actor_id, scopes_json),
         };
     }
 
@@ -263,22 +272,24 @@ pub const Runtime = union(BackendKind) {
     }
 
     pub fn list(self: *Runtime, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (self.*) {
             .none => allocator.alloc(domain.AgentMemory, 0),
             .native => error.NativeAgentMemoryRuntime,
-            .memory_lru => |*engine| engine.list(allocator, category, session_id, actor_id),
-            .redis => |*engine| engine.list(allocator, category, session_id, actor_id),
-            .api => |*engine| engine.list(allocator, category, session_id, actor_id),
+            .memory_lru => |*engine| engine.list(allocator, category, normalized_session_id, actor_id),
+            .redis => |*engine| engine.list(allocator, category, normalized_session_id, actor_id),
+            .api => |*engine| engine.list(allocator, category, normalized_session_id, actor_id),
         };
     }
 
     pub fn listVisible(self: *Runtime, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (self.*) {
             .none => allocator.alloc(domain.AgentMemory, 0),
             .native => error.NativeAgentMemoryRuntime,
-            .memory_lru => |*engine| engine.listVisible(allocator, category, session_id, actor_id, scopes_json),
-            .redis => |*engine| engine.listVisible(allocator, category, session_id, actor_id, scopes_json),
-            .api => |*engine| engine.listVisible(allocator, category, session_id, actor_id, scopes_json),
+            .memory_lru => |*engine| engine.listVisible(allocator, category, normalized_session_id, actor_id, scopes_json),
+            .redis => |*engine| engine.listVisible(allocator, category, normalized_session_id, actor_id, scopes_json),
+            .api => |*engine| engine.listVisible(allocator, category, normalized_session_id, actor_id, scopes_json),
         };
     }
 
@@ -293,12 +304,13 @@ pub const Runtime = union(BackendKind) {
     }
 
     pub fn search(self: *Runtime, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (self.*) {
             .none => allocator.alloc(domain.AgentMemory, 0),
             .native => error.NativeAgentMemoryRuntime,
-            .memory_lru => |*engine| engine.search(allocator, query, limit, session_id, scopes_json, actor_id),
-            .redis => |*engine| engine.search(allocator, query, limit, session_id, scopes_json, actor_id),
-            .api => |*engine| engine.search(allocator, query, limit, session_id, scopes_json, actor_id),
+            .memory_lru => |*engine| engine.search(allocator, query, limit, normalized_session_id, scopes_json, actor_id),
+            .redis => |*engine| engine.search(allocator, query, limit, normalized_session_id, scopes_json, actor_id),
+            .api => |*engine| engine.search(allocator, query, limit, normalized_session_id, scopes_json, actor_id),
         };
     }
 
@@ -313,12 +325,13 @@ pub const Runtime = union(BackendKind) {
     }
 
     pub fn delete(self: *Runtime, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (self.*) {
             .none => false,
             .native => error.NativeAgentMemoryRuntime,
-            .memory_lru => |*engine| engine.delete(key, session_id, actor_id, writer_actor_id),
-            .redis => |*engine| engine.delete(key, session_id, actor_id, writer_actor_id),
-            .api => |*engine| engine.delete(key, session_id, actor_id, writer_actor_id),
+            .memory_lru => |*engine| engine.delete(key, normalized_session_id, actor_id, writer_actor_id),
+            .redis => |*engine| engine.delete(key, normalized_session_id, actor_id, writer_actor_id),
+            .api => |*engine| engine.delete(key, normalized_session_id, actor_id, writer_actor_id),
         };
     }
 
@@ -333,12 +346,13 @@ pub const Runtime = union(BackendKind) {
     }
 
     pub fn patchStatus(self: *Runtime, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (self.*) {
             .none => false,
             .native => error.NativeAgentMemoryRuntime,
-            .memory_lru => |*engine| engine.patchStatus(key, session_id, actor_id, status, writer_actor_id),
-            .redis => |*engine| engine.patchStatus(key, session_id, actor_id, status, writer_actor_id),
-            .api => |*engine| engine.patchStatus(allocator, key, session_id, actor_id, status, writer_actor_id),
+            .memory_lru => |*engine| engine.patchStatus(key, normalized_session_id, actor_id, status, writer_actor_id),
+            .redis => |*engine| engine.patchStatus(key, normalized_session_id, actor_id, status, writer_actor_id),
+            .api => |*engine| engine.patchStatus(allocator, key, normalized_session_id, actor_id, status, writer_actor_id),
         };
     }
 
@@ -3725,6 +3739,34 @@ test "memory_lru and none agent memory runtimes match agent memory contract" {
     }
     try std.testing.expectEqual(@as(u64, 1), sessions.total);
     try std.testing.expectEqual(@as(u64, 1), sessions.sessions[0].message_count);
+}
+
+test "memory_lru normalizes empty agent memory session to global" {
+    var runtime = try Runtime.init(std.testing.allocator, .{ .backend = .memory_lru });
+    defer runtime.deinit();
+
+    var global = try runtime.store(std.testing.allocator, .{ .key = "empty.session.pref", .content = "global", .actor_id = "agent:empty" });
+    defer freeAgentMemory(std.testing.allocator, &global);
+    var empty = try runtime.store(std.testing.allocator, .{ .key = "empty.session.pref", .content = "empty becomes global", .session_id = "", .actor_id = "agent:empty" });
+    defer freeAgentMemory(std.testing.allocator, &empty);
+
+    try std.testing.expect(empty.session_id == null);
+    try std.testing.expect(std.mem.startsWith(u8, empty.scope, "agent:"));
+
+    var by_global = (try runtime.get(std.testing.allocator, "empty.session.pref", null, "agent:empty")).?;
+    defer freeAgentMemory(std.testing.allocator, &by_global);
+    try std.testing.expectEqualStrings("empty becomes global", by_global.content);
+
+    var by_empty = (try runtime.get(std.testing.allocator, "empty.session.pref", "", "agent:empty")).?;
+    defer freeAgentMemory(std.testing.allocator, &by_empty);
+    try std.testing.expectEqualStrings("empty becomes global", by_empty.content);
+
+    const listed = try runtime.list(std.testing.allocator, null, "", "agent:empty");
+    defer {
+        for (listed) |*entry| freeAgentMemory(std.testing.allocator, entry);
+        std.testing.allocator.free(listed);
+    }
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
 }
 
 test "memory_lru evicts least recently used agent memory entries" {

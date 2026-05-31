@@ -2003,28 +2003,30 @@ pub const Store = struct {
     }
 
     pub fn agentMemoryStore(self: *Store, allocator: std.mem.Allocator, input: AgentMemoryInput) !domain.AgentMemory {
-        if (self.agent_memory.isExternal()) return self.agentMemoryStoreRuntime(allocator, input);
-        return self.agentMemoryStoreNative(allocator, input);
+        const normalized = normalizeAgentMemoryInput(input);
+        if (self.agent_memory.isExternal()) return self.agentMemoryStoreRuntime(allocator, normalized);
+        return self.agentMemoryStoreNative(allocator, normalized);
     }
 
     pub fn agentMemoryStoreRouted(self: *Store, allocator: std.mem.Allocator, input: AgentMemoryInput, route: AgentMemoryStorageRoute) !domain.AgentMemory {
+        const normalized = normalizeAgentMemoryInput(input);
         return switch (route.target) {
-            .primary => self.agentMemoryStore(allocator, input),
-            .native => self.agentMemoryStoreNative(allocator, input),
-            .runtime => self.agentMemoryStoreRuntime(allocator, input),
-            .named => self.agentMemoryStoreNamed(allocator, input, route),
-            .subset => self.agentMemoryStoreSubset(allocator, input, route),
+            .primary => self.agentMemoryStore(allocator, normalized),
+            .native => self.agentMemoryStoreNative(allocator, normalized),
+            .runtime => self.agentMemoryStoreRuntime(allocator, normalized),
+            .named => self.agentMemoryStoreNamed(allocator, normalized, route),
+            .subset => self.agentMemoryStoreSubset(allocator, normalized, route),
             .all => blk: {
-                var result = try self.agentMemoryStoreNative(allocator, input);
+                var result = try self.agentMemoryStoreNative(allocator, normalized);
                 errdefer agent_memory_runtime.freeAgentMemory(allocator, &result);
                 if (self.agent_memory.isExternal() and !self.agent_memory.isNoop()) {
-                    const next = try self.agentMemoryStoreRuntime(allocator, input);
+                    const next = try self.agentMemoryStoreRuntime(allocator, normalized);
                     agent_memory_runtime.freeAgentMemory(allocator, &result);
                     result = next;
                 }
                 for (self.agent_memory_stores.stores.items) |*named| {
                     if (named.runtime.isNoop()) continue;
-                    const next = try self.agentMemoryStoreInRuntime(allocator, &named.runtime, input, named.name);
+                    const next = try self.agentMemoryStoreInRuntime(allocator, &named.runtime, normalized, named.name);
                     agent_memory_runtime.freeAgentMemory(allocator, &result);
                     result = next;
                 }
@@ -2040,7 +2042,7 @@ pub const Store = struct {
 
     fn agentMemoryStoreRuntime(self: *Store, allocator: std.mem.Allocator, input: AgentMemoryInput) !domain.AgentMemory {
         if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
-        return self.agentMemoryStoreInRuntime(allocator, &self.agent_memory, input, "runtime");
+        return self.agentMemoryStoreInRuntime(allocator, &self.agent_memory, normalizeAgentMemoryInput(input), "runtime");
     }
 
     fn agentMemoryStoreNamed(self: *Store, allocator: std.mem.Allocator, input: AgentMemoryInput, route: AgentMemoryStorageRoute) !domain.AgentMemory {
@@ -2049,17 +2051,18 @@ pub const Store = struct {
     }
 
     fn agentMemoryStoreInRuntime(self: *Store, allocator: std.mem.Allocator, runtime: *agent_memory_runtime.Runtime, input: AgentMemoryInput, store_name: []const u8) !domain.AgentMemory {
+        const normalized = normalizeAgentMemoryInput(input);
         var entry = try runtime.store(allocator, .{
-            .key = input.key,
-            .content = input.content,
-            .category = input.category,
-            .session_id = input.session_id,
-            .scope = input.scope,
-            .permissions_json = input.permissions_json,
-            .metadata_json = input.metadata_json,
-            .actor_id = input.actor_id,
-            .writer_actor_id = input.writer_actor_id,
-            .operation = input.operation,
+            .key = normalized.key,
+            .content = normalized.content,
+            .category = normalized.category,
+            .session_id = normalized.session_id,
+            .scope = normalized.scope,
+            .permissions_json = normalized.permissions_json,
+            .metadata_json = normalized.metadata_json,
+            .actor_id = normalized.actor_id,
+            .writer_actor_id = normalized.writer_actor_id,
+            .operation = normalized.operation,
         });
         try tagAgentMemoryStore(allocator, &entry, store_name);
         errdefer {
@@ -2068,23 +2071,24 @@ pub const Store = struct {
         }
         if (runtime.isNoop()) return entry;
         try self.materializeRuntimeAgentMemory(allocator, entry, store_name);
-        if (!input.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, store_name, input.operation, input.content);
-        try self.enqueueAgentMemoryLucidPut(allocator, entry, input.writer_actor_id orelse input.actor_id);
+        if (!normalized.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, store_name, normalized.operation, normalized.content);
+        try self.enqueueAgentMemoryLucidPut(allocator, entry, normalized.writer_actor_id orelse normalized.actor_id);
         return entry;
     }
 
     fn agentMemoryStoreNative(self: *Store, allocator: std.mem.Allocator, input: AgentMemoryInput) !domain.AgentMemory {
+        const normalized = normalizeAgentMemoryInput(input);
         var entry = try switch (self.backend) {
-            .sqlite => |*s| s.agentMemoryStore(allocator, input),
-            .postgres => |*p| p.agentMemoryStore(allocator, input),
+            .sqlite => |*s| s.agentMemoryStore(allocator, normalized),
+            .postgres => |*p| p.agentMemoryStore(allocator, normalized),
         };
         try tagAgentMemoryStore(allocator, &entry, "native");
         errdefer {
             var cleanup = entry;
             agent_memory_runtime.freeAgentMemory(allocator, &cleanup);
         }
-        if (!input.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, "native", input.operation, input.content);
-        try self.enqueueAgentMemoryLucidPut(allocator, entry, input.writer_actor_id orelse input.actor_id);
+        if (!normalized.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, "native", normalized.operation, normalized.content);
+        try self.enqueueAgentMemoryLucidPut(allocator, entry, normalized.writer_actor_id orelse normalized.actor_id);
         return entry;
     }
 
@@ -2170,32 +2174,33 @@ pub const Store = struct {
     }
 
     pub fn patchAgentMemoryStatusRouted(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, status: []const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (route.target) {
             .primary => if (self.agent_memory.isExternal())
-                self.patchAgentMemoryRuntimeStatus(allocator, &self.agent_memory, "runtime", key, session_id, owner_actor_id, status, writer_actor_id)
+                self.patchAgentMemoryRuntimeStatus(allocator, &self.agent_memory, "runtime", key, normalized_session_id, owner_actor_id, status, writer_actor_id)
             else
-                self.patchAgentMemoryStatusNative(key, session_id, owner_actor_id, status, writer_actor_id),
-            .native => self.patchAgentMemoryStatusNative(key, session_id, owner_actor_id, status, writer_actor_id),
+                self.patchAgentMemoryStatusNative(key, normalized_session_id, owner_actor_id, status, writer_actor_id),
+            .native => self.patchAgentMemoryStatusNative(key, normalized_session_id, owner_actor_id, status, writer_actor_id),
             .runtime => if (self.agent_memory.isExternal())
-                self.patchAgentMemoryRuntimeStatus(allocator, &self.agent_memory, "runtime", key, session_id, owner_actor_id, status, writer_actor_id)
+                self.patchAgentMemoryRuntimeStatus(allocator, &self.agent_memory, "runtime", key, normalized_session_id, owner_actor_id, status, writer_actor_id)
             else
                 error.AgentMemoryStorageUnavailable,
-            .named => self.patchAgentMemoryRuntimeStatus(allocator, try self.namedAgentMemoryRuntime(route), route.name orelse "named", key, session_id, owner_actor_id, status, writer_actor_id),
+            .named => self.patchAgentMemoryRuntimeStatus(allocator, try self.namedAgentMemoryRuntime(route), route.name orelse "named", key, normalized_session_id, owner_actor_id, status, writer_actor_id),
             .subset => blk: {
                 const stores = try requireSubsetStores(route);
                 var changed = false;
                 for (stores) |store_name| {
-                    changed = (try self.patchAgentMemoryStatusRouted(allocator, key, session_id, owner_actor_id, status, writer_actor_id, routeForSubsetStoreName(store_name))) or changed;
+                    changed = (try self.patchAgentMemoryStatusRouted(allocator, key, normalized_session_id, owner_actor_id, status, writer_actor_id, routeForSubsetStoreName(store_name))) or changed;
                 }
                 break :blk changed;
             },
             .all => blk: {
-                var changed = try self.patchAgentMemoryStatusNative(key, session_id, owner_actor_id, status, writer_actor_id);
+                var changed = try self.patchAgentMemoryStatusNative(key, normalized_session_id, owner_actor_id, status, writer_actor_id);
                 if (self.agent_memory.isExternal()) {
-                    changed = (try self.patchAgentMemoryRuntimeStatus(allocator, &self.agent_memory, "runtime", key, session_id, owner_actor_id, status, writer_actor_id)) or changed;
+                    changed = (try self.patchAgentMemoryRuntimeStatus(allocator, &self.agent_memory, "runtime", key, normalized_session_id, owner_actor_id, status, writer_actor_id)) or changed;
                 }
                 for (self.agent_memory_stores.stores.items) |*named| {
-                    changed = (try self.patchAgentMemoryRuntimeStatus(allocator, &named.runtime, named.name, key, session_id, owner_actor_id, status, writer_actor_id)) or changed;
+                    changed = (try self.patchAgentMemoryRuntimeStatus(allocator, &named.runtime, named.name, key, normalized_session_id, owner_actor_id, status, writer_actor_id)) or changed;
                 }
                 break :blk changed;
             },
@@ -2829,46 +2834,48 @@ pub const Store = struct {
     }
 
     pub fn agentMemoryGet(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         if (self.agent_memory.isExternal()) {
-            var entry = try self.agent_memory.get(allocator, key, session_id, actor_id);
+            var entry = try self.agent_memory.get(allocator, key, normalized_session_id, actor_id);
             if (entry) |*value| try tagAgentMemoryStore(allocator, value, "runtime");
             return entry;
         }
-        return self.agentMemoryGetNative(allocator, key, session_id, actor_id);
+        return self.agentMemoryGetNative(allocator, key, normalized_session_id, actor_id);
     }
 
     pub fn agentMemoryGetRouted(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !?domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (route.target) {
-            .primary => self.agentMemoryGet(allocator, key, session_id, actor_id),
-            .native => self.agentMemoryGetNative(allocator, key, session_id, actor_id),
+            .primary => self.agentMemoryGet(allocator, key, normalized_session_id, actor_id),
+            .native => self.agentMemoryGetNative(allocator, key, normalized_session_id, actor_id),
             .runtime => blk: {
                 if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
-                var entry = try self.agent_memory.get(allocator, key, session_id, actor_id);
+                var entry = try self.agent_memory.get(allocator, key, normalized_session_id, actor_id);
                 if (entry) |*value| try tagAgentMemoryStore(allocator, value, "runtime");
                 break :blk entry;
             },
             .named => blk: {
-                var entry = try (try self.namedAgentMemoryRuntime(route)).get(allocator, key, session_id, actor_id);
+                var entry = try (try self.namedAgentMemoryRuntime(route)).get(allocator, key, normalized_session_id, actor_id);
                 if (entry) |*value| try tagAgentMemoryStore(allocator, value, route.name orelse "named");
                 break :blk entry;
             },
-            .subset => self.agentMemoryGetSubset(allocator, key, session_id, actor_id, route),
+            .subset => self.agentMemoryGetSubset(allocator, key, normalized_session_id, actor_id, route),
             .all => blk: {
                 if (self.agent_memory.isExternal()) {
-                    if (try self.agent_memory.get(allocator, key, session_id, actor_id)) |raw| {
+                    if (try self.agent_memory.get(allocator, key, normalized_session_id, actor_id)) |raw| {
                         var entry = raw;
                         try tagAgentMemoryStore(allocator, &entry, "runtime");
                         break :blk entry;
                     }
                 }
                 for (self.agent_memory_stores.stores.items) |*named| {
-                    if (try named.runtime.get(allocator, key, session_id, actor_id)) |raw| {
+                    if (try named.runtime.get(allocator, key, normalized_session_id, actor_id)) |raw| {
                         var entry = raw;
                         try tagAgentMemoryStore(allocator, &entry, named.name);
                         break :blk entry;
                     }
                 }
-                break :blk try self.agentMemoryGetNative(allocator, key, session_id, actor_id);
+                break :blk try self.agentMemoryGetNative(allocator, key, normalized_session_id, actor_id);
             },
         };
     }
@@ -2883,46 +2890,48 @@ pub const Store = struct {
     }
 
     pub fn agentMemoryGetVisible(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         if (self.agent_memory.isExternal()) {
-            var entry = try self.agent_memory.getVisible(allocator, key, session_id, actor_id, scopes_json);
+            var entry = try self.agent_memory.getVisible(allocator, key, normalized_session_id, actor_id, scopes_json);
             if (entry) |*value| try tagAgentMemoryStore(allocator, value, "runtime");
             return entry;
         }
-        return self.agentMemoryGetVisibleNative(allocator, key, session_id, actor_id, scopes_json);
+        return self.agentMemoryGetVisibleNative(allocator, key, normalized_session_id, actor_id, scopes_json);
     }
 
     pub fn agentMemoryGetVisibleRouted(self: *Store, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, route: AgentMemoryStorageRoute) !?domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (route.target) {
-            .primary => self.agentMemoryGetVisible(allocator, key, session_id, actor_id, scopes_json),
-            .native => self.agentMemoryGetVisibleNative(allocator, key, session_id, actor_id, scopes_json),
+            .primary => self.agentMemoryGetVisible(allocator, key, normalized_session_id, actor_id, scopes_json),
+            .native => self.agentMemoryGetVisibleNative(allocator, key, normalized_session_id, actor_id, scopes_json),
             .runtime => blk: {
                 if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
-                var entry = try self.agent_memory.getVisible(allocator, key, session_id, actor_id, scopes_json);
+                var entry = try self.agent_memory.getVisible(allocator, key, normalized_session_id, actor_id, scopes_json);
                 if (entry) |*value| try tagAgentMemoryStore(allocator, value, "runtime");
                 break :blk entry;
             },
             .named => blk: {
-                var entry = try (try self.namedAgentMemoryRuntime(route)).getVisible(allocator, key, session_id, actor_id, scopes_json);
+                var entry = try (try self.namedAgentMemoryRuntime(route)).getVisible(allocator, key, normalized_session_id, actor_id, scopes_json);
                 if (entry) |*value| try tagAgentMemoryStore(allocator, value, route.name orelse "named");
                 break :blk entry;
             },
-            .subset => self.agentMemoryGetVisibleSubset(allocator, key, session_id, actor_id, scopes_json, route),
+            .subset => self.agentMemoryGetVisibleSubset(allocator, key, normalized_session_id, actor_id, scopes_json, route),
             .all => blk: {
                 if (self.agent_memory.isExternal()) {
-                    if (try self.agent_memory.getVisible(allocator, key, session_id, actor_id, scopes_json)) |raw| {
+                    if (try self.agent_memory.getVisible(allocator, key, normalized_session_id, actor_id, scopes_json)) |raw| {
                         var entry = raw;
                         try tagAgentMemoryStore(allocator, &entry, "runtime");
                         break :blk entry;
                     }
                 }
                 for (self.agent_memory_stores.stores.items) |*named| {
-                    if (try named.runtime.getVisible(allocator, key, session_id, actor_id, scopes_json)) |raw| {
+                    if (try named.runtime.getVisible(allocator, key, normalized_session_id, actor_id, scopes_json)) |raw| {
                         var entry = raw;
                         try tagAgentMemoryStore(allocator, &entry, named.name);
                         break :blk entry;
                     }
                 }
-                break :blk try self.agentMemoryGetVisibleNative(allocator, key, session_id, actor_id, scopes_json);
+                break :blk try self.agentMemoryGetVisibleNative(allocator, key, normalized_session_id, actor_id, scopes_json);
             },
         };
     }
@@ -2991,12 +3000,13 @@ pub const Store = struct {
     }
 
     pub fn agentMemoryList(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         if (self.agent_memory.isExternal()) {
-            const entries = try self.agent_memory.list(allocator, category, session_id, actor_id);
+            const entries = try self.agent_memory.list(allocator, category, normalized_session_id, actor_id);
             try tagAgentMemorySliceStore(allocator, entries, "runtime");
             return entries;
         }
-        return self.agentMemoryListNative(allocator, category, session_id, actor_id);
+        return self.agentMemoryListNative(allocator, category, normalized_session_id, actor_id);
     }
 
     fn agentMemoryListNative(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
@@ -3009,51 +3019,54 @@ pub const Store = struct {
     }
 
     pub fn agentMemoryListRouted(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) ![]domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (route.target) {
-            .primary => self.agentMemoryList(allocator, category, session_id, actor_id),
-            .native => self.agentMemoryListNative(allocator, category, session_id, actor_id),
+            .primary => self.agentMemoryList(allocator, category, normalized_session_id, actor_id),
+            .native => self.agentMemoryListNative(allocator, category, normalized_session_id, actor_id),
             .runtime => blk: {
                 if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
-                const entries = try self.agent_memory.list(allocator, category, session_id, actor_id);
+                const entries = try self.agent_memory.list(allocator, category, normalized_session_id, actor_id);
                 try tagAgentMemorySliceStore(allocator, entries, "runtime");
                 break :blk entries;
             },
             .named => blk: {
-                const entries = try (try self.namedAgentMemoryRuntime(route)).list(allocator, category, session_id, actor_id);
+                const entries = try (try self.namedAgentMemoryRuntime(route)).list(allocator, category, normalized_session_id, actor_id);
                 try tagAgentMemorySliceStore(allocator, entries, route.name orelse "named");
                 break :blk entries;
             },
-            .subset => self.agentMemoryListSubset(allocator, category, session_id, actor_id, route),
-            .all => self.agentMemoryListAll(allocator, category, session_id, actor_id),
+            .subset => self.agentMemoryListSubset(allocator, category, normalized_session_id, actor_id, route),
+            .all => self.agentMemoryListAll(allocator, category, normalized_session_id, actor_id),
         };
     }
 
     pub fn agentMemoryListVisible(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         if (self.agent_memory.isExternal()) {
-            const entries = try self.agent_memory.listVisible(allocator, category, session_id, actor_id, scopes_json);
+            const entries = try self.agent_memory.listVisible(allocator, category, normalized_session_id, actor_id, scopes_json);
             try tagAgentMemorySliceStore(allocator, entries, "runtime");
             return entries;
         }
-        return self.agentMemoryListVisibleNative(allocator, category, session_id, actor_id, scopes_json);
+        return self.agentMemoryListVisibleNative(allocator, category, normalized_session_id, actor_id, scopes_json);
     }
 
     pub fn agentMemoryListVisibleRouted(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, route: AgentMemoryStorageRoute) ![]domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (route.target) {
-            .primary => self.agentMemoryListVisible(allocator, category, session_id, actor_id, scopes_json),
-            .native => self.agentMemoryListVisibleNative(allocator, category, session_id, actor_id, scopes_json),
+            .primary => self.agentMemoryListVisible(allocator, category, normalized_session_id, actor_id, scopes_json),
+            .native => self.agentMemoryListVisibleNative(allocator, category, normalized_session_id, actor_id, scopes_json),
             .runtime => blk: {
                 if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
-                const entries = try self.agent_memory.listVisible(allocator, category, session_id, actor_id, scopes_json);
+                const entries = try self.agent_memory.listVisible(allocator, category, normalized_session_id, actor_id, scopes_json);
                 try tagAgentMemorySliceStore(allocator, entries, "runtime");
                 break :blk entries;
             },
             .named => blk: {
-                const entries = try (try self.namedAgentMemoryRuntime(route)).listVisible(allocator, category, session_id, actor_id, scopes_json);
+                const entries = try (try self.namedAgentMemoryRuntime(route)).listVisible(allocator, category, normalized_session_id, actor_id, scopes_json);
                 try tagAgentMemorySliceStore(allocator, entries, route.name orelse "named");
                 break :blk entries;
             },
-            .subset => self.agentMemoryListVisibleSubset(allocator, category, session_id, actor_id, scopes_json, route),
-            .all => self.agentMemoryListVisibleAll(allocator, category, session_id, actor_id, scopes_json),
+            .subset => self.agentMemoryListVisibleSubset(allocator, category, normalized_session_id, actor_id, scopes_json, route),
+            .all => self.agentMemoryListVisibleAll(allocator, category, normalized_session_id, actor_id, scopes_json),
         };
     }
 
@@ -3105,31 +3118,33 @@ pub const Store = struct {
     }
 
     pub fn agentMemorySearch(self: *Store, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         if (self.agent_memory.isExternal()) {
-            const entries = try self.agent_memory.search(allocator, query, limit, session_id, scopes_json, actor_id);
+            const entries = try self.agent_memory.search(allocator, query, limit, normalized_session_id, scopes_json, actor_id);
             try tagAgentMemorySliceStore(allocator, entries, "runtime");
             return entries;
         }
-        return self.agentMemorySearchNative(allocator, query, limit, session_id, scopes_json, actor_id);
+        return self.agentMemorySearchNative(allocator, query, limit, normalized_session_id, scopes_json, actor_id);
     }
 
     pub fn agentMemorySearchRouted(self: *Store, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) ![]domain.AgentMemory {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         return switch (route.target) {
-            .primary => self.agentMemorySearch(allocator, query, limit, session_id, scopes_json, actor_id),
-            .native => self.agentMemorySearchNative(allocator, query, limit, session_id, scopes_json, actor_id),
+            .primary => self.agentMemorySearch(allocator, query, limit, normalized_session_id, scopes_json, actor_id),
+            .native => self.agentMemorySearchNative(allocator, query, limit, normalized_session_id, scopes_json, actor_id),
             .runtime => blk: {
                 if (!self.agent_memory.isExternal()) return error.AgentMemoryStorageUnavailable;
-                const entries = try self.agent_memory.search(allocator, query, limit, session_id, scopes_json, actor_id);
+                const entries = try self.agent_memory.search(allocator, query, limit, normalized_session_id, scopes_json, actor_id);
                 try tagAgentMemorySliceStore(allocator, entries, "runtime");
                 break :blk entries;
             },
             .named => blk: {
-                const entries = try (try self.namedAgentMemoryRuntime(route)).search(allocator, query, limit, session_id, scopes_json, actor_id);
+                const entries = try (try self.namedAgentMemoryRuntime(route)).search(allocator, query, limit, normalized_session_id, scopes_json, actor_id);
                 try tagAgentMemorySliceStore(allocator, entries, route.name orelse "named");
                 break :blk entries;
             },
-            .subset => self.agentMemorySearchSubset(allocator, query, limit, session_id, scopes_json, actor_id, route),
-            .all => self.agentMemorySearchAll(allocator, query, limit, session_id, scopes_json, actor_id),
+            .subset => self.agentMemorySearchSubset(allocator, query, limit, normalized_session_id, scopes_json, actor_id, route),
+            .all => self.agentMemorySearchAll(allocator, query, limit, normalized_session_id, scopes_json, actor_id),
         };
     }
 
@@ -3299,12 +3314,13 @@ pub const Store = struct {
     }
 
     pub fn agentMemoryDelete(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
-        if (self.agent_memory.isExternal()) return self.agent_memory.delete(key, session_id, actor_id, writer_actor_id);
-        return self.agentMemoryDeleteNative(key, session_id, actor_id, writer_actor_id);
+        const normalized_session_id = access.normalizeSessionId(session_id);
+        if (self.agent_memory.isExternal()) return self.agent_memory.delete(key, normalized_session_id, actor_id, writer_actor_id);
+        return self.agentMemoryDeleteNative(key, normalized_session_id, actor_id, writer_actor_id);
     }
 
     pub fn agentMemoryDeleteRouted(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
-        return self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, route, false);
+        return self.agentMemoryDeleteRoutedInner(key, access.normalizeSessionId(session_id), actor_id, writer_actor_id, route, false);
     }
 
     pub fn agentMemoryDeleteAllRouted(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
@@ -3344,38 +3360,39 @@ pub const Store = struct {
     }
 
     fn agentMemoryDeleteRoutedInner(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !bool {
+        const normalized_session_id = access.normalizeSessionId(session_id);
         switch (route.target) {
-            .subset => return self.agentMemoryDeleteSubsetInner(key, session_id, actor_id, writer_actor_id, route, suppress_feed),
+            .subset => return self.agentMemoryDeleteSubsetInner(key, normalized_session_id, actor_id, writer_actor_id, route, suppress_feed),
             .all => {
-                var deleted = try self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, .{ .target = .native }, suppress_feed);
+                var deleted = try self.agentMemoryDeleteRoutedInner(key, normalized_session_id, actor_id, writer_actor_id, .{ .target = .native }, suppress_feed);
                 if (self.agent_memory.isExternal()) {
-                    deleted = (try self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, .{ .target = .runtime }, suppress_feed)) or deleted;
+                    deleted = (try self.agentMemoryDeleteRoutedInner(key, normalized_session_id, actor_id, writer_actor_id, .{ .target = .runtime }, suppress_feed)) or deleted;
                 }
                 for (self.agent_memory_stores.stores.items) |named| {
-                    deleted = (try self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, .{ .target = .named, .name = named.name }, suppress_feed)) or deleted;
+                    deleted = (try self.agentMemoryDeleteRoutedInner(key, normalized_session_id, actor_id, writer_actor_id, .{ .target = .named, .name = named.name }, suppress_feed)) or deleted;
                 }
                 return deleted;
             },
             else => {},
         }
 
-        var existing = self.agentMemoryGetRouted(self.allocator, key, session_id, actor_id, route) catch null;
+        var existing = self.agentMemoryGetRouted(self.allocator, key, normalized_session_id, actor_id, route) catch null;
         defer if (existing) |*entry| agent_memory_runtime.freeAgentMemory(self.allocator, entry);
         const deleted = try switch (route.target) {
-            .primary => self.agentMemoryDelete(key, session_id, actor_id, writer_actor_id),
-            .native => self.agentMemoryDeleteNative(key, session_id, actor_id, writer_actor_id),
-            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.delete(key, session_id, actor_id, writer_actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).delete(key, session_id, actor_id, writer_actor_id),
+            .primary => self.agentMemoryDelete(key, normalized_session_id, actor_id, writer_actor_id),
+            .native => self.agentMemoryDeleteNative(key, normalized_session_id, actor_id, writer_actor_id),
+            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.delete(key, normalized_session_id, actor_id, writer_actor_id) else error.AgentMemoryStorageUnavailable,
+            .named => (try self.namedAgentMemoryRuntime(route)).delete(key, normalized_session_id, actor_id, writer_actor_id),
             .subset, .all => unreachable,
         };
         if (deleted) {
-            try self.deprecateRuntimeAgentMemoryMirrorsForDelete(key, session_id, actor_id, writer_actor_id, route);
+            try self.deprecateRuntimeAgentMemoryMirrorsForDelete(key, normalized_session_id, actor_id, writer_actor_id, route);
             if (!suppress_feed) {
-                try self.appendAgentMemoryDeleteFeedEvent(self.allocator, route, key, session_id, actor_id, writer_actor_id, existing);
+                try self.appendAgentMemoryDeleteFeedEvent(self.allocator, route, key, normalized_session_id, actor_id, writer_actor_id, existing);
             }
             if (existing) |entry| {
                 const owner_actor_id: ?[]const u8 = if (actor_id) |owner| owner else entry.actor_id;
-                try self.enqueueAgentMemoryLucidDelete(self.allocator, key, session_id, owner_actor_id, entry.scope, entry.permissions_json, writer_actor_id);
+                try self.enqueueAgentMemoryLucidDelete(self.allocator, key, normalized_session_id, owner_actor_id, entry.scope, entry.permissions_json, writer_actor_id);
             }
         }
         return deleted;
@@ -4750,6 +4767,12 @@ pub const AgentMemoryInput = struct {
     operation: domain.AgentMemoryOperation = .put,
     suppress_feed: bool = false,
 };
+
+fn normalizeAgentMemoryInput(input: AgentMemoryInput) AgentMemoryInput {
+    var out = input;
+    out.session_id = access.normalizeSessionId(input.session_id);
+    return out;
+}
 
 fn appendAgentMemorySlice(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), entries: []domain.AgentMemory) !void {
     for (entries) |entry| try out.append(allocator, entry);
@@ -16978,6 +17001,28 @@ test "native agent memory respects explicit record scopes for same actor" {
     const allowed_session = try store.agentMemorySearch(alloc, "Session secret", 10, "sess_secret", "[\"project:secret\",\"session:*\"]", actor);
     try std.testing.expectEqual(@as(usize, 1), allowed_session.len);
     try std.testing.expectEqual(@as(usize, 3), try store.agentMemoryCount(actor, "[\"project:secret\",\"session:*\"]"));
+}
+
+test "native agent memory normalizes empty session to global memory" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.agentMemoryStore(alloc, .{ .key = "empty.session.pref", .content = "global value", .actor_id = "agent:empty" });
+    const saved = try store.agentMemoryStore(alloc, .{ .key = "empty.session.pref", .content = "empty is global", .session_id = "", .actor_id = "agent:empty" });
+    try std.testing.expect(saved.session_id == null);
+    try std.testing.expect(std.mem.startsWith(u8, saved.scope, "agent:"));
+
+    const by_global = (try store.agentMemoryGet(alloc, "empty.session.pref", null, "agent:empty")).?;
+    try std.testing.expectEqualStrings("empty is global", by_global.content);
+    const by_empty = (try store.agentMemoryGet(alloc, "empty.session.pref", "", "agent:empty")).?;
+    try std.testing.expectEqualStrings("empty is global", by_empty.content);
+
+    const listed = try store.agentMemoryList(alloc, null, "", "agent:empty");
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expect(listed[0].session_id == null);
 }
 
 test "native agent memory isolates actors and sessions" {

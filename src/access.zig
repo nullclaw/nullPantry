@@ -90,11 +90,17 @@ pub fn requiredActorId(actor_id: ?[]const u8) ![]const u8 {
     return actor;
 }
 
+pub fn normalizeSessionId(session_id: ?[]const u8) ?[]const u8 {
+    const sid = session_id orelse return null;
+    if (sid.len == 0) return null;
+    return sid;
+}
+
 pub fn agentMemoryScope(allocator: std.mem.Allocator, actor_id: []const u8, session_id: ?[]const u8, requested_scope: ?[]const u8) ![]const u8 {
     if (requested_scope) |scope| {
         if (scope.len > 0) return allocator.dupe(u8, scope);
     }
-    if (session_id) |sid| return std.fmt.allocPrint(allocator, "session:{s}", .{sid});
+    if (normalizeSessionId(session_id)) |sid| return std.fmt.allocPrint(allocator, "session:{s}", .{sid});
     return domain.defaultAgentMemoryScope(allocator, actor_id);
 }
 
@@ -177,6 +183,12 @@ test "access session scopes require explicit session visibility" {
     try std.testing.expect(sessionVisibleForScopes(alloc, "sess_a", "[\"session:sess_a\"]"));
     try std.testing.expect(sessionVisibleForScopes(alloc, "sess_a", "[\"session:*\"]"));
     try std.testing.expect(!sessionVisibleForScopes(alloc, "sess_a", "[\"public\"]"));
+}
+
+test "access normalizes empty session ids to global memory" {
+    try std.testing.expect(normalizeSessionId(null) == null);
+    try std.testing.expect(normalizeSessionId("") == null);
+    try std.testing.expectEqualStrings("sess", normalizeSessionId("sess").?);
 }
 
 test "access acl coverage prevents publishing narrower source content wider" {

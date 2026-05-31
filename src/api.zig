@@ -11064,6 +11064,27 @@ test "api native agent memory is actor isolated" {
     try std.testing.expect(std.mem.indexOf(u8, search_with_sessions.body, "Agent B session API value") == null);
 }
 
+test "api agent memory normalizes empty session to global memory" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Context{ .allocator = alloc, .store = &store, .actor_id = "agent:empty" };
+
+    const put = handleRequest(&ctx, "PUT", "/v1/agent-memory/empty.session.pref", "{\"content\":\"empty session is global\",\"session_id\":\"\"}", "");
+    try std.testing.expectEqualStrings("200 OK", put.status);
+    try std.testing.expect(std.mem.indexOf(u8, put.body, "\"session_id\":null") != null);
+
+    const get_global = handleRequest(&ctx, "GET", "/v1/agent-memory/empty.session.pref", "", "");
+    try std.testing.expectEqualStrings("200 OK", get_global.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_global.body, "empty session is global") != null);
+
+    const get_empty = handleRequest(&ctx, "GET", "/v1/agent-memory/empty.session.pref?session_id=", "", "");
+    try std.testing.expectEqualStrings("200 OK", get_empty.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_empty.body, "empty session is global") != null);
+}
+
 test "api nullclaw agent adapter matches current nullclaw memory engine contract" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
