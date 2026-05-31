@@ -1,6 +1,7 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const json = @import("json_util.zig");
+const storage_routes = @import("storage_route.zig");
 
 pub fn agentMemoryWriteEventType(store_name: []const u8, operation: domain.AgentMemoryOperation) []const u8 {
     const native = std.mem.eql(u8, store_name, "native");
@@ -169,12 +170,26 @@ pub fn storageRouteDedupePart(allocator: std.mem.Allocator, route: anytype) ![]c
         .named => std.fmt.allocPrint(allocator, "named:{s}", .{route.name orelse "runtime"}),
         .all => allocator.dupe(u8, "all"),
         .subset => blk: {
+            const stores = try allocator.dupe([]const u8, route.stores);
+            defer allocator.free(stores);
+            std.mem.sort([]const u8, stores, {}, struct {
+                fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lessThan);
             var out: std.ArrayListUnmanaged(u8) = .empty;
             errdefer out.deinit(allocator);
             try out.appendSlice(allocator, "subset:");
-            for (route.stores, 0..) |store_name, i| {
-                if (i > 0) try out.append(allocator, ',');
+            var written: usize = 0;
+            var previous: ?[]const u8 = null;
+            for (stores) |store_name| {
+                if (previous) |prev| {
+                    if (std.mem.eql(u8, prev, store_name)) continue;
+                }
+                previous = store_name;
+                if (written > 0) try out.append(allocator, ',');
                 try out.appendSlice(allocator, store_name);
+                written += 1;
             }
             break :blk try out.toOwnedSlice(allocator);
         },
@@ -672,6 +687,16 @@ test "feed payload route injection preserves explicit top-level selectors" {
     defer allocator.free(routed);
 
     try std.testing.expectEqualStrings(payload, routed);
+}
+
+test "feed storage route dedupe part canonicalizes subset store order" {
+    const allocator = std.testing.allocator;
+    const left = try storageRouteDedupePart(allocator, storage_routes.Route{ .target = .subset, .stores = &.{ "scratch", "archive", "scratch" } });
+    defer allocator.free(left);
+    const right = try storageRouteDedupePart(allocator, storage_routes.Route{ .target = .subset, .stores = &.{ "archive", "scratch" } });
+    defer allocator.free(right);
+    try std.testing.expectEqualStrings("subset:archive,scratch", left);
+    try std.testing.expectEqualStrings(left, right);
 }
 
 test "feed object and reference classification is centralized" {

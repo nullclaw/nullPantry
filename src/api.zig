@@ -4711,14 +4711,22 @@ fn feedRouteProjectionName(ctx: *Context, route: store_mod.AgentMemoryStorageRou
         .subset => {
             try out.appendSlice(ctx.allocator, "subset:");
             const stores = try ctx.allocator.dupe([]const u8, route.stores);
+            defer ctx.allocator.free(stores);
             std.mem.sort([]const u8, stores, {}, struct {
                 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
                     return std.mem.lessThan(u8, a, b);
                 }
             }.lessThan);
-            for (stores, 0..) |store_name, i| {
-                if (i > 0) try out.append(ctx.allocator, ',');
+            var written: usize = 0;
+            var previous: ?[]const u8 = null;
+            for (stores) |store_name| {
+                if (previous) |prev| {
+                    if (std.mem.eql(u8, prev, store_name)) continue;
+                }
+                previous = store_name;
+                if (written > 0) try out.append(ctx.allocator, ',');
                 try out.appendSlice(ctx.allocator, store_name);
+                written += 1;
             }
         },
     }

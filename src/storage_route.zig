@@ -114,17 +114,32 @@ fn routeFromOwnedStoreNames(allocator: std.mem.Allocator, stores: [][]const u8, 
         allocator.free(stores);
         return .{};
     }
-    if (used == 1) {
+
+    var unique: usize = 0;
+    for (stores[0..used]) |store_name| {
+        if (storeNameSeen(stores[0..unique], store_name)) continue;
+        stores[unique] = store_name;
+        unique += 1;
+    }
+
+    if (unique == 1) {
         const route = Route.parse(stores[0]);
         allocator.free(stores);
         return route;
     }
-    if (used == stores.len) return Route.fromStores(stores);
+    if (unique == stores.len) return Route.fromStores(stores);
 
     errdefer allocator.free(stores);
-    const compact = try allocator.dupe([]const u8, stores[0..used]);
+    const compact = try allocator.dupe([]const u8, stores[0..unique]);
     allocator.free(stores);
     return Route.fromStores(compact);
+}
+
+fn storeNameSeen(stores: []const []const u8, name: []const u8) bool {
+    for (stores) |store_name| {
+        if (std.mem.eql(u8, store_name, name)) return true;
+    }
+    return false;
 }
 
 pub fn fromAliasedObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap, names: []const []const u8) !?Route {
@@ -214,14 +229,14 @@ test "storage route parses object and query selectors consistently" {
 test "storage route compacts sparse store selectors before ownership transfer" {
     const allocator = std.testing.allocator;
 
-    const csv_route = try fromQuery(allocator, "stores=scratch,,archive,");
+    const csv_route = try fromQuery(allocator, "stores=scratch,,archive,scratch,");
     defer csv_route.deinit(allocator);
     try std.testing.expectEqual(Target.subset, csv_route.target);
     try std.testing.expectEqual(@as(usize, 2), csv_route.stores.len);
     try std.testing.expectEqualStrings("scratch", csv_route.stores[0]);
     try std.testing.expectEqualStrings("archive", csv_route.stores[1]);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"stores\":[\"scratch\",false,\"archive\",42]}", .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"stores\":[\"scratch\",false,\"archive\",\"scratch\",42]}", .{});
     defer parsed.deinit();
     const json_route = try fromObject(allocator, parsed.value.object);
     defer json_route.deinit(allocator);
