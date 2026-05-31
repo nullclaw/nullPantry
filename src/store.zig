@@ -10769,29 +10769,69 @@ pub const PostgresStore = struct {
         const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, if (existing) |entry| entry.content else null, input.content);
         defer allocator.free(reduced_content);
         const source_title = try std.fmt.allocPrint(allocator, "Agent memory: {s}", .{input.key});
+        defer allocator.free(source_title);
         const source_id = try ids.make(allocator, "src_");
+        defer allocator.free(source_id);
         const atom_id = try ids.make(allocator, "mem_");
+        defer allocator.free(atom_id);
         const item_id = try ids.make(allocator, "agm_");
+        defer allocator.free(item_id);
         const source_ids = try singleJsonString(allocator, source_id);
+        defer allocator.free(source_ids);
         const evidence = try evidenceRangeJson(allocator, source_id, reduced_content.len, "agent_memory");
+        defer allocator.free(evidence);
         const now = ids.nowMs();
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        defer allocator.free(now_text);
         const scope = try agentMemoryScope(allocator, owner_actor_id, input.session_id, input.scope);
+        defer allocator.free(scope);
         const effective_permissions = try agentMemoryPermissions(allocator, owner_actor_id, input.scope, input.permissions_json);
+        defer allocator.free(effective_permissions);
         const status = domain.defaultMemoryStatus("agent", scope);
-        const session_filter = try pgAgentMemorySessionFilterQualified(allocator, "agent_memory_items.", input.session_id, owner_actor_id);
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
-        defer sql.deinit(allocator);
-        try sql.appendSlice(allocator, "BEGIN; ");
-        try sql.print(allocator, "UPDATE memory_atoms SET status = 'deprecated' WHERE id IN (SELECT memory_atom_id FROM agent_memory_items WHERE key = {s} AND {s}); ", .{ try sqlString(allocator, input.key), session_filter });
-        try sql.print(allocator, "DELETE FROM agent_memory_items WHERE key = {s} AND {s}; ", .{ try sqlString(allocator, input.key), session_filter });
-        try sql.print(allocator, "INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json) VALUES ({s},'agent_observation',{s},NULL,{s},NULL,'[]'::jsonb,{s},{s},{d},{d},NULL,NULL,'[]'::jsonb,'{{\"native\":\"agent_memory\"}}'::jsonb); ", .{ try sqlString(allocator, source_id), try sqlString(allocator, source_title), try sqlString(allocator, reduced_content), try sqlJsonb(allocator, effective_permissions), try sqlString(allocator, scope), now, now });
-        try sql.print(allocator, "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) VALUES ({s},NULL,'agent.memory',{s},{s},{s},0.8,{s},{s},{s},'agent',{d},NULL,NULL,NULL,NULL,{s},'[\"agent_memory\"]'::jsonb); ", .{ try sqlString(allocator, atom_id), try sqlString(allocator, input.key), try sqlString(allocator, reduced_content), try sqlString(allocator, scope), try sqlString(allocator, status), try sqlJsonb(allocator, source_ids), try sqlJsonb(allocator, evidence), now, try sqlJsonb(allocator, effective_permissions) });
-        try sql.print(allocator, "INSERT INTO agent_memory_items (id,key,session_id,actor_id,writer_actor_id,scope,permissions_json,memory_atom_id,category,timestamp_ms,metadata_json) VALUES ({s},{s},{s},{s},{s},{s},{s},{s},{s},{d},{s}); ", .{ try sqlString(allocator, item_id), try sqlString(allocator, input.key), try sqlNullableString(allocator, input.session_id), try sqlString(allocator, owner_actor_id), try sqlString(allocator, writer_actor_id), try sqlString(allocator, scope), try sqlJsonb(allocator, effective_permissions), try sqlString(allocator, atom_id), try sqlString(allocator, input.category), now, try sqlJsonb(allocator, input.metadata_json) });
-        try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('source.created',{s},'source',{s},'{{}}'::jsonb,{d}); ", .{ try sqlString(allocator, writer_actor_id), try sqlString(allocator, source_id), now });
-        try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_atom.created',{s},'memory_atom',{s},'{{}}'::jsonb,{d}); ", .{ try sqlString(allocator, writer_actor_id), try sqlString(allocator, atom_id), now });
-        try sql.print(allocator, "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('agent_memory.upserted',{s},'agent_memory',{s},'{{}}'::jsonb,{d}); ", .{ try sqlString(allocator, writer_actor_id), try sqlString(allocator, item_id), now });
-        try sql.appendSlice(allocator, "COMMIT;");
-        try self.runSql(sql.items);
+        try self.runParams(
+            allocator,
+            "WITH matching_items AS (" ++
+                "SELECT memory_atom_id FROM agent_memory_items WHERE key = $1 AND (($2::text IS NULL AND session_id IS NULL) OR session_id = $2) AND actor_id = $3" ++
+                "), deprecated_atoms AS (" ++
+                "UPDATE memory_atoms SET status = 'deprecated' WHERE id IN (SELECT memory_atom_id FROM matching_items) RETURNING 1" ++
+                "), inserted_source AS (" ++
+                "INSERT INTO sources (id,type,title,raw_content_uri,content,author,participants_json,permissions_json,scope,created_at_ms,imported_at_ms,checksum,language,related_entities_json,metadata_json) " ++
+                "VALUES ($4,'agent_observation',$5,NULL,$6,NULL,'[]'::jsonb,$7::jsonb,$8,$9::bigint,$9::bigint,NULL,NULL,'[]'::jsonb,'{\"native\":\"agent_memory\"}'::jsonb) RETURNING id" ++
+                "), inserted_atom AS (" ++
+                "INSERT INTO memory_atoms (id,subject_entity_id,predicate,object,text,scope,confidence,status,source_ids_json,evidence_ranges_json,created_by,created_at_ms,valid_from_ms,valid_until_ms,last_verified_at_ms,owner,permissions_json,tags_json) " ++
+                "VALUES ($10,NULL,'agent.memory',$1,$6,$8,0.8,$11,$12::jsonb,$13::jsonb,'agent',$9::bigint,NULL,NULL,NULL,NULL,$7::jsonb,'[\"agent_memory\"]'::jsonb) RETURNING id" ++
+                "), inserted_item AS (" ++
+                "INSERT INTO agent_memory_items (id,key,session_id,actor_id,writer_actor_id,scope,permissions_json,memory_atom_id,category,timestamp_ms,metadata_json) " ++
+                "VALUES ($14,$1,$2,$3,$15,$8,$7::jsonb,$10,$16,$9::bigint,$17::jsonb) " ++
+                "ON CONFLICT (key, (coalesce(session_id, '')), actor_id) DO UPDATE SET " ++
+                "id = EXCLUDED.id, writer_actor_id = EXCLUDED.writer_actor_id, scope = EXCLUDED.scope, permissions_json = EXCLUDED.permissions_json, memory_atom_id = EXCLUDED.memory_atom_id, category = EXCLUDED.category, timestamp_ms = EXCLUDED.timestamp_ms, metadata_json = EXCLUDED.metadata_json RETURNING id" ++
+                "), audit_source AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'source.created',$15,'source',id,'{}'::jsonb,$9::bigint FROM inserted_source RETURNING 1" ++
+                "), audit_atom AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'memory_atom.created',$15,'memory_atom',id,'{}'::jsonb,$9::bigint FROM inserted_atom RETURNING 1" ++
+                "), audit_item AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'agent_memory.upserted',$15,'agent_memory',id,'{}'::jsonb,$9::bigint FROM inserted_item RETURNING 1" ++
+                ") SELECT ((SELECT count(*) FROM inserted_item) + (SELECT count(*) FROM audit_source) + (SELECT count(*) FROM audit_atom) + (SELECT count(*) FROM audit_item))::text",
+            &.{
+                input.key,
+                input.session_id,
+                owner_actor_id,
+                source_id,
+                source_title,
+                reduced_content,
+                effective_permissions,
+                scope,
+                now_text,
+                atom_id,
+                status,
+                source_ids,
+                evidence,
+                item_id,
+                writer_actor_id,
+                input.category,
+                input.metadata_json,
+            },
+        );
         return (try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id)).?;
     }
 
@@ -10867,9 +10907,17 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const session_filter = try pgAgentMemorySessionFilter(allocator, session_id, actor_id);
-        const sql = try std.fmt.allocPrint(allocator, "WITH rows AS (DELETE FROM agent_memory_items WHERE key = {s} AND {s} RETURNING memory_atom_id), upd AS (UPDATE memory_atoms SET status='deprecated' WHERE id IN (SELECT memory_atom_id FROM rows) RETURNING 1), audit AS (INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'agent_memory.deleted',{s},'agent_memory',{s},'{{}}'::jsonb,(extract(epoch from clock_timestamp()) * 1000)::bigint WHERE EXISTS (SELECT 1 FROM rows) RETURNING 1) SELECT count(*)::text FROM rows", .{ try sqlString(allocator, key), session_filter, try sqlNullableString(allocator, writer_actor_id orelse actor_id), try sqlString(allocator, key) });
-        const text = try self.queryText(allocator, sql);
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH rows AS (" ++
+                "DELETE FROM agent_memory_items WHERE key = $1 AND (($2::text IS NULL AND session_id IS NULL) OR session_id = $2) AND actor_id = $3 RETURNING memory_atom_id" ++
+                "), upd AS (" ++
+                "UPDATE memory_atoms SET status='deprecated' WHERE id IN (SELECT memory_atom_id FROM rows) RETURNING 1" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'agent_memory.deleted',$4,'agent_memory',$1,'{}'::jsonb,(extract(epoch from clock_timestamp()) * 1000)::bigint WHERE EXISTS (SELECT 1 FROM rows) RETURNING 1" ++
+                ") SELECT count(*)::text FROM rows",
+            &.{ key, session_id, actor_id, writer_actor_id orelse actor_id },
+        );
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
