@@ -188,6 +188,44 @@ pub fn expandQuery(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
     return @constCast(expansion.expanded_query);
 }
 
+pub fn buildFts5Query(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var token_count: usize = 0;
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        seen.deinit();
+    }
+
+    var it = std.mem.tokenizeAny(u8, query, " \t\r\n.,;:/\\-_*\"'()[]{}<>!?");
+    while (it.next()) |raw| {
+        var token: std.ArrayListUnmanaged(u8) = .empty;
+        defer token.deinit(allocator);
+        for (raw) |ch| {
+            if (ch < 0x80) {
+                if (std.ascii.isAlphanumeric(ch)) try token.append(allocator, std.ascii.toLower(ch));
+            } else {
+                try token.append(allocator, ch);
+            }
+        }
+        if (token.items.len == 0) continue;
+        if (isFtsStopword(token.items)) continue;
+        if (seen.contains(token.items)) continue;
+
+        const owned_seen = try allocator.dupe(u8, token.items);
+        errdefer allocator.free(owned_seen);
+        try seen.put(owned_seen, {});
+
+        if (token_count > 0) try out.appendSlice(allocator, " OR ");
+        try out.appendSlice(allocator, token.items);
+        try out.append(allocator, '*');
+        token_count += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn buildPlan(allocator: std.mem.Allocator, query: []const u8, has_vector_index: bool, allow_reranker: bool) !RetrievalPlan {
     return buildPlanWithAdaptive(allocator, query, has_vector_index, allow_reranker, .{});
 }
@@ -547,6 +585,41 @@ fn containsAny(haystack: []const u8, needles: []const []const u8) bool {
     return false;
 }
 
+fn isFtsStopword(token: []const u8) bool {
+    return fts_stopwords.has(token);
+}
+
+const fts_stopwords = std.StaticStringMap(void).initComptime(.{
+    .{"a"},     .{"an"},    .{"and"},  .{"are"},   .{"as"},   .{"at"},
+    .{"be"},    .{"by"},    .{"can"},  .{"could"}, .{"do"},   .{"does"},
+    .{"for"},   .{"from"},  .{"get"},  .{"give"},  .{"has"},  .{"have"},
+    .{"help"},  .{"how"},   .{"i"},    .{"in"},    .{"is"},   .{"it"},
+    .{"its"},   .{"me"},    .{"my"},   .{"not"},   .{"of"},   .{"on"},
+    .{"or"},    .{"our"},   .{"show"}, .{"that"},  .{"the"},  .{"this"},
+    .{"to"},    .{"was"},   .{"we"},   .{"were"},  .{"what"}, .{"when"},
+    .{"where"}, .{"which"}, .{"who"},  .{"why"},   .{"with"}, .{"would"},
+    .{"you"},   .{"your"},
+    .{"как"},
+    .{"где"},
+    .{"для"},
+    .{"зачем"},
+    .{"или"},
+    .{"и"},
+    .{"когда"},
+    .{"кто"},
+    .{"на"},
+    .{"не"},
+    .{"о"},
+    .{"об"},
+    .{"от"},
+    .{"по"},
+    .{"почему"},
+    .{"про"},
+    .{"с"},
+    .{"что"},
+    .{"это"},
+});
+
 fn has_vectorIndexWorthy(query: []const u8) bool {
     return query.len > 8;
 }
@@ -667,6 +740,32 @@ test "retrieval query expansion and plan expose stages" {
     try std.testing.expect(std.mem.indexOf(u8, plan.expansion_reasons_json, "\"reason\":\"decision\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.intent_hints_json, "\"decision\"") != null);
     try std.testing.expect(plan.query_expanded);
+}
+
+test "retrieval fts5 query builder filters stopwords operators and duplicates" {
+    const fts = try buildFts5Query(std.testing.allocator, "What is the API API decision OR ticket?");
+    defer std.testing.allocator.free(fts);
+
+    try std.testing.expect(std.mem.indexOf(u8, fts, "api*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fts, "decision*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fts, "ticket*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fts, "what*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fts, " or*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fts, "api* OR api*") == null);
+}
+
+test "retrieval fts5 query builder preserves unicode terms and strips syntax" {
+    const fts = try buildFts5Query(std.testing.allocator, "scope:project/NullPantry почему решение устарело");
+    defer std.testing.allocator.free(fts);
+
+    try std.testing.expect(std.mem.indexOf(u8, fts, "scope*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fts, "project*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fts, "nullpantry*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fts, "почему*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fts, "решение*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fts, "устарело*") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, fts, ':') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, fts, '/') == null);
 }
 
 test "retrieval adaptive strategy selects keyword vector and hybrid modes" {

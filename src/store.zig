@@ -6101,9 +6101,9 @@ pub const SQLiteStore = struct {
         defer plan.deinit(allocator);
         var keyword_input = input;
         keyword_input.query = plan.keyword_query;
-        const fts_query = try buildFtsQuery(allocator, keyword_input.query);
+        const fts_query = try retrieval_mod.buildFts5Query(allocator, keyword_input.query);
         defer allocator.free(fts_query);
-        const original_fts_query = try buildFtsQuery(allocator, input.query);
+        const original_fts_query = try retrieval_mod.buildFts5Query(allocator, input.query);
         defer allocator.free(original_fts_query);
         const use_fts = fts_query.len > 0;
         const use_original_fts = original_fts_query.len > 0;
@@ -7200,29 +7200,6 @@ pub const SQLiteStore = struct {
             }
             if (best != i) std.mem.swap(domain.SearchResult, &items[i], &items[best]);
         }
-    }
-
-    fn buildFtsQuery(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        var token_count: usize = 0;
-        var it = std.mem.tokenizeAny(u8, query, " \t\r\n.,;:/\\-_*\"'()[]{}<>!?");
-        while (it.next()) |raw| {
-            var token: std.ArrayListUnmanaged(u8) = .empty;
-            defer token.deinit(allocator);
-            for (raw) |ch| {
-                if (ch < 0x80) {
-                    if (std.ascii.isAlphanumeric(ch)) try token.append(allocator, std.ascii.toLower(ch));
-                } else {
-                    try token.append(allocator, ch);
-                }
-            }
-            if (token.items.len == 0) continue;
-            if (token_count > 0) try out.appendSlice(allocator, " OR ");
-            try out.appendSlice(allocator, token.items);
-            try out.append(allocator, '*');
-            token_count += 1;
-        }
-        return out.toOwnedSlice(allocator);
     }
 
     fn scoreText(query: []const u8, text: []const u8) f64 {
@@ -8482,7 +8459,8 @@ pub const SQLiteStore = struct {
         const request_actor = actor_id orelse return try allocator.alloc(domain.AgentMemory, 0);
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
         errdefer out.deinit(allocator);
-        const fts_query = try buildFtsQuery(allocator, query);
+        const fts_query = try retrieval_mod.buildFts5Query(allocator, query);
+        defer allocator.free(fts_query);
         if (fts_query.len > 0) {
             const stmt = try self.prepare(
                 "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json, bm25(agent_memory_fts) " ++
