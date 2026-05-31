@@ -4824,6 +4824,7 @@ fn detachAgentMemoryResult(entry: *domain.AgentMemory) void {
     entry.writer_actor_id = "";
     entry.scope = "";
     entry.permissions_json = "";
+    entry.status = "";
     entry.store = "";
 }
 
@@ -8147,7 +8148,7 @@ pub const SQLiteStore = struct {
 
     fn agentMemoryById(self: *Self, allocator: std.mem.Allocator, id: []const u8) !?domain.AgentMemory {
         const stmt = try self.prepare(
-            "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
+            "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json, ma.status " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.id = ?1 LIMIT 1",
         );
         defer _ = c.sqlite3_finalize(stmt);
@@ -9225,7 +9226,7 @@ pub const SQLiteStore = struct {
 
     pub fn agentMemoryGetAnyVisible(self: *Self, allocator: std.mem.Allocator, key: []const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
         const stmt = try self.prepare(
-            "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
+            "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json, ma.status " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
                 "WHERE ami.key = ?1 AND ma.status NOT IN ('rejected','deprecated','superseded') " ++
                 "ORDER BY CASE WHEN ami.actor_id = ?2 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC",
@@ -9278,12 +9279,12 @@ pub const SQLiteStore = struct {
 
     pub fn agentMemoryListAnyVisible(self: *Self, allocator: std.mem.Allocator, category: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
         const sql = if (category != null)
-            "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
+            "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json, ma.status " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
                 "WHERE ma.status NOT IN ('rejected','deprecated','superseded') AND ami.category = ?1 " ++
                 "ORDER BY CASE WHEN ami.actor_id = ?2 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC"
         else
-            "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
+            "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json, ma.status " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
                 "WHERE ma.status NOT IN ('rejected','deprecated','superseded') " ++
                 "ORDER BY CASE WHEN ami.actor_id = ?1 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC";
@@ -9316,7 +9317,7 @@ pub const SQLiteStore = struct {
         defer allocator.free(fts_query);
         if (fts_query.len > 0) {
             const stmt = try self.prepare(
-                "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json, bm25(agent_memory_fts) " ++
+                "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json, bm25(agent_memory_fts), ma.status " ++
                     "FROM agent_memory_fts JOIN agent_memory_items ami ON ami.id = agent_memory_fts.id JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
                     "WHERE agent_memory_fts MATCH ?1 " ++
                     "ORDER BY bm25(agent_memory_fts)",
@@ -9481,13 +9482,13 @@ pub const SQLiteStore = struct {
     }
 
     fn agentMemorySelectSql(comptime extra_where: []const u8, comptime tail: []const u8) [*:0]const u8 {
-        return "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
+        return "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json, ma.status " ++
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
             "WHERE ma.status NOT IN ('rejected','deprecated','superseded') AND " ++ sqlite_agent_session_actor_where_ami ++ " " ++ extra_where ++ " " ++ tail;
     }
 
     fn agentMemoryVisibleSelectSql(comptime extra_where: []const u8, comptime tail: []const u8) [*:0]const u8 {
-        return "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json " ++
+        return "SELECT ami.id, ami.key, ma.text, ami.category, ami.timestamp_ms, ami.session_id, ma.confidence, ami.actor_id, ami.writer_actor_id, ami.scope, ami.permissions_json, ma.status " ++
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
             "WHERE ma.status NOT IN ('rejected','deprecated','superseded') AND " ++ sqlite_agent_session_where_ami ++ " " ++ extra_where ++ " " ++ tail;
     }
@@ -9518,7 +9519,15 @@ pub const SQLiteStore = struct {
             .writer_actor_id = try columnText(allocator, stmt, 8),
             .scope = try columnText(allocator, stmt, 9),
             .permissions_json = try columnText(allocator, stmt, 10),
+            .status = try readAgentMemoryStatusColumn(allocator, stmt),
         };
+    }
+
+    fn readAgentMemoryStatusColumn(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) ![]u8 {
+        const count = c.sqlite3_column_count(stmt);
+        if (count > 11 and c.sqlite3_column_type(stmt, 11) == c.SQLITE_TEXT) return try columnText(allocator, stmt, 11);
+        if (count > 12 and c.sqlite3_column_type(stmt, 12) == c.SQLITE_TEXT) return try columnText(allocator, stmt, 12);
+        return try allocator.dupe(u8, "proposed");
     }
 
     pub fn saveMessage(self: *Self, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
@@ -11660,7 +11669,7 @@ pub const PostgresStore = struct {
     fn agentMemoryById(self: *PostgresStore, allocator: std.mem.Allocator, id: []const u8) !?domain.AgentMemory {
         const parsed = try self.queryRowParamsJson(
             allocator,
-            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score,ma.status " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.id = $1 LIMIT 1",
             &.{id},
         );
@@ -12551,7 +12560,7 @@ pub const PostgresStore = struct {
     pub fn agentMemoryGetAnyVisible(self: *PostgresStore, allocator: std.mem.Allocator, key: []const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
         const parsed = try self.queryArrayParamsJson(
             allocator,
-            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score,ma.status " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
                 "WHERE ami.key = $1 AND ma.status NOT IN ('rejected','deprecated','superseded') " ++
                 "ORDER BY CASE WHEN ami.actor_id = $2 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC",
@@ -12581,7 +12590,7 @@ pub const PostgresStore = struct {
     pub fn agentMemoryListAnyVisible(self: *PostgresStore, allocator: std.mem.Allocator, category: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
         const parsed = try self.queryArrayParamsJson(
             allocator,
-            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score,ma.status " ++
                 "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
                 "WHERE ma.status NOT IN ('rejected','deprecated','superseded') AND ($1::text IS NULL OR ami.category = $1) " ++
                 "ORDER BY CASE WHEN ami.actor_id = $2 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC",
@@ -12607,7 +12616,7 @@ pub const PostgresStore = struct {
 
     fn agentMemoryListInner(self: *PostgresStore, allocator: std.mem.Allocator, key: ?[]const u8, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8, limit: ?usize) ![]domain.AgentMemory {
         const sql_with_limit =
-            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score,ma.status " ++
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
             "WHERE ($1::text IS NULL OR ami.key = $1) " ++
             "AND ($2::text IS NULL OR ami.category = $2) " ++
@@ -12615,7 +12624,7 @@ pub const PostgresStore = struct {
             "AND (($3::text IS NULL AND ami.session_id IS NULL AND $4::text IS NOT NULL AND ami.actor_id = $4) OR ($3::text IS NOT NULL AND ami.session_id = $3 AND $4::text IS NOT NULL AND ami.actor_id = $4)) " ++
             "ORDER BY ami.timestamp_ms DESC LIMIT $5::bigint";
         const sql_all =
-            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score,ma.status " ++
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
             "WHERE ($1::text IS NULL OR ami.key = $1) " ++
             "AND ($2::text IS NULL OR ami.category = $2) " ++
@@ -12638,7 +12647,7 @@ pub const PostgresStore = struct {
 
     fn agentMemoryListVisibleInner(self: *PostgresStore, allocator: std.mem.Allocator, key: ?[]const u8, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, limit: ?usize) ![]domain.AgentMemory {
         const sql_with_limit =
-            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score,ma.status " ++
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
             "WHERE ($1::text IS NULL OR ami.key = $1) " ++
             "AND ($2::text IS NULL OR ami.category = $2) " ++
@@ -12646,7 +12655,7 @@ pub const PostgresStore = struct {
             "AND (($3::text IS NULL AND ami.session_id IS NULL) OR ($3::text IS NOT NULL AND ami.session_id = $3)) " ++
             "ORDER BY CASE WHEN ami.actor_id = $4 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC LIMIT $5::bigint";
         const sql_all =
-            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score,ma.status " ++
             "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
             "WHERE ($1::text IS NULL OR ami.key = $1) " ++
             "AND ($2::text IS NULL OR ami.category = $2) " ++
@@ -14182,6 +14191,7 @@ fn readPgAgentMemory(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !dom
         .writer_actor_id = try dupStringField(allocator, obj, "writer_actor_id", json.stringField(obj, "actor_id") orelse ""),
         .scope = try dupStringField(allocator, obj, "scope", "personal"),
         .permissions_json = try rawJsonField(allocator, obj, "permissions_json", "[]"),
+        .status = try dupStringField(allocator, obj, "status", "proposed"),
         .score = json.floatField(obj, "score"),
     };
 }

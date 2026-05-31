@@ -303,6 +303,7 @@ pub const AgentMemory = struct {
     writer_actor_id: []const u8 = "",
     scope: []const u8,
     permissions_json: []const u8 = "[]",
+    status: []const u8 = "",
     store: []const u8 = "",
     score: ?f64 = null,
 
@@ -329,6 +330,8 @@ pub const AgentMemory = struct {
         try json.appendString(out, allocator, self.scope);
         try out.appendSlice(allocator, ",\"permissions\":");
         try json.appendRawJsonOr(out, allocator, self.permissions_json, "[]");
+        try out.appendSlice(allocator, ",\"status\":");
+        try json.appendString(out, allocator, if (self.status.len > 0) self.status else "proposed");
         if (self.store.len > 0) {
             try out.appendSlice(allocator, ",\"store\":");
             try json.appendString(out, allocator, self.store);

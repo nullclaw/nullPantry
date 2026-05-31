@@ -14521,12 +14521,18 @@ test "api memory apply supports agent memory lifecycle reducers" {
 
     const native_stale = handleRequest(&ctx, "POST", "/v1/memory/apply?storage=native", "{\"event_type\":\"agent_memory.mark_stale\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"native.lifecycle.pref\",\"scope\":\"public\"}}", "");
     try std.testing.expectEqualStrings("200 OK", native_stale.status);
+    const stale_direct = handleRequest(&ctx, "GET", "/v1/agent-memory/native.lifecycle.pref?storage=native&scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", stale_direct.status);
+    try std.testing.expect(std.mem.indexOf(u8, stale_direct.body, "\"status\":\"stale\"") != null);
     const stale_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Native lifecycle agent memory\",\"use_vector\":false}", "");
     try std.testing.expectEqualStrings("200 OK", stale_search.status);
     try std.testing.expect(std.mem.indexOf(u8, stale_search.body, "\"status\":\"stale\"") != null);
 
     const native_verify = handleRequest(&ctx, "POST", "/v1/memory/apply?storage=native", "{\"event_type\":\"agent_memory.verify\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"native.lifecycle.pref\",\"scope\":\"public\"}}", "");
     try std.testing.expectEqualStrings("200 OK", native_verify.status);
+    const verified_direct = handleRequest(&ctx, "GET", "/v1/agent-memory/native.lifecycle.pref?storage=native&scope=public", "", "");
+    try std.testing.expectEqualStrings("200 OK", verified_direct.status);
+    try std.testing.expect(std.mem.indexOf(u8, verified_direct.body, "\"status\":\"verified\"") != null);
     const verified_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Native lifecycle agent memory\",\"use_vector\":false}", "");
     try std.testing.expect(std.mem.indexOf(u8, verified_search.body, "\"status\":\"verified\"") != null);
 
@@ -14542,6 +14548,7 @@ test "api memory apply supports agent memory lifecycle reducers" {
     try std.testing.expectEqualStrings("200 OK", scratch_put.status);
     const scratch_before = handleRequest(&ctx, "GET", "/v1/agent-memory/scratch.lifecycle.pref?store=scratch&scope=public", "", "");
     try std.testing.expectEqualStrings("200 OK", scratch_before.status);
+    try std.testing.expect(std.mem.indexOf(u8, scratch_before.body, "\"status\":\"proposed\"") != null);
 
     const scratch_supersede = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.supersede\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"scratch.lifecycle.pref\",\"scope\":\"public\"}}", "");
     try std.testing.expectEqualStrings("200 OK", scratch_supersede.status);

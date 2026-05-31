@@ -573,6 +573,7 @@ fn noopAgentMemory(allocator: std.mem.Allocator, input: Input) !domain.AgentMemo
     defer allocator.free(scope);
     const permissions = try access.agentMemoryPermissions(allocator, owner_actor, input.scope, input.permissions_json);
     defer allocator.free(permissions);
+    const status = domain.defaultMemoryStatus("agent", scope);
     const content = try agent_memory_reducer.reduceContent(allocator, input.operation, null, input.content);
     defer allocator.free(content);
 
@@ -587,6 +588,7 @@ fn noopAgentMemory(allocator: std.mem.Allocator, input: Input) !domain.AgentMemo
         .writer_actor_id = try allocator.dupe(u8, writer_actor),
         .scope = try allocator.dupe(u8, scope),
         .permissions_json = try allocator.dupe(u8, permissions),
+        .status = try allocator.dupe(u8, status),
         .store = try allocator.dupe(u8, "none"),
     };
 }
@@ -621,6 +623,7 @@ pub const MemoryAgentMemory = struct {
         defer allocator.free(scope);
         const permissions = try access.agentMemoryPermissions(allocator, owner_actor, input.scope, input.permissions_json);
         defer allocator.free(permissions);
+        const status = domain.defaultMemoryStatus("agent", scope);
         const existing_idx = self.findEntryIndex(owner_actor, input.session_id, input.key);
         const existing_content = if (existing_idx) |idx| self.entries.items[idx].entry.content else null;
         const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, existing_content, input.content);
@@ -645,6 +648,7 @@ pub const MemoryAgentMemory = struct {
             .writer_actor_id = try self.allocator.dupe(u8, writer_actor),
             .scope = try self.allocator.dupe(u8, scope),
             .permissions_json = try self.allocator.dupe(u8, permissions),
+            .status = try self.allocator.dupe(u8, status),
         };
         timestamp_owned = false;
         entry_id_owned = false;
@@ -1196,6 +1200,7 @@ pub const RedisAgentMemory = struct {
         defer allocator.free(scope);
         const permissions = try access.agentMemoryPermissions(allocator, owner_actor, input.scope, input.permissions_json);
         defer allocator.free(permissions);
+        const status = domain.defaultMemoryStatus("agent", scope);
         const timestamp = ids.nowMs();
         const timestamp_text = try std.fmt.allocPrint(allocator, "{d}", .{timestamp});
         defer allocator.free(timestamp_text);
@@ -1236,6 +1241,7 @@ pub const RedisAgentMemory = struct {
             "writer_actor_id",  writer_actor,
             "scope",            scope,
             "permissions_json", permissions,
+            "status",           status,
         });
         try self.queueCommand(&.{ "SADD", global, entry_key });
         try self.queueCommand(&.{ "SADD", owner, entry_key });
@@ -1880,6 +1886,7 @@ pub const RedisAgentMemory = struct {
         const writer = hashField(fields, "writer_actor_id") orelse owner;
         const scope = hashField(fields, "scope") orelse "";
         const permissions = hashField(fields, "permissions_json") orelse "[]";
+        const status = hashField(fields, "status") orelse "proposed";
         const store_name = hashField(fields, "store") orelse "";
         const out_id = try allocator.dupe(u8, id_value);
         errdefer allocator.free(out_id);
@@ -1901,6 +1908,8 @@ pub const RedisAgentMemory = struct {
         errdefer allocator.free(out_scope);
         const out_permissions = try allocator.dupe(u8, permissions);
         errdefer allocator.free(out_permissions);
+        const out_status = try allocator.dupe(u8, status);
+        errdefer allocator.free(out_status);
         const out_store = try allocator.dupe(u8, store_name);
         errdefer allocator.free(out_store);
         return .{
@@ -1914,6 +1923,7 @@ pub const RedisAgentMemory = struct {
             .writer_actor_id = out_writer,
             .scope = out_scope,
             .permissions_json = out_permissions,
+            .status = out_status,
             .store = out_store,
         };
     }
@@ -2786,6 +2796,8 @@ fn agentMemoryFromJsonValue(allocator: std.mem.Allocator, value: std.json.Value)
     errdefer allocator.free(scope);
     const permissions = try jsonRawField(allocator, obj, &.{ "permissions", "permissions_json" }, "[]");
     errdefer allocator.free(permissions);
+    const status = try allocator.dupe(u8, jsonStringishField(obj, &.{"status"}) orelse "proposed");
+    errdefer allocator.free(status);
     const store = try allocator.dupe(u8, jsonStringishField(obj, &.{ "store", "storage" }) orelse "");
     errdefer allocator.free(store);
     return .{
@@ -2799,6 +2811,7 @@ fn agentMemoryFromJsonValue(allocator: std.mem.Allocator, value: std.json.Value)
         .writer_actor_id = writer,
         .scope = scope,
         .permissions_json = permissions,
+        .status = status,
         .store = store,
         .score = json.floatField(obj, "score"),
     };
@@ -3180,6 +3193,7 @@ fn detachAgentMemory(entry: *domain.AgentMemory) void {
     entry.writer_actor_id = "";
     entry.scope = "";
     entry.permissions_json = "";
+    entry.status = "";
     entry.store = "";
 }
 
@@ -3195,6 +3209,7 @@ pub fn freeAgentMemory(allocator: std.mem.Allocator, entry: *domain.AgentMemory)
     if (entry.writer_actor_id.len > 0) allocator.free(entry.writer_actor_id);
     if (entry.scope.len > 0) allocator.free(entry.scope);
     if (entry.permissions_json.len > 0) allocator.free(entry.permissions_json);
+    if (entry.status.len > 0) allocator.free(entry.status);
     if (entry.store.len > 0) allocator.free(entry.store);
     detachAgentMemory(entry);
 }
@@ -3235,6 +3250,7 @@ fn cloneAgentMemory(allocator: std.mem.Allocator, entry: domain.AgentMemory) !do
         .writer_actor_id = try allocator.dupe(u8, if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id),
         .scope = try allocator.dupe(u8, entry.scope),
         .permissions_json = try allocator.dupe(u8, entry.permissions_json),
+        .status = try allocator.dupe(u8, entry.status),
         .store = try allocator.dupe(u8, entry.store),
         .score = entry.score,
     };
