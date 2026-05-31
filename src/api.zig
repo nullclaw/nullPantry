@@ -8337,6 +8337,32 @@ test "api native agent memory is actor isolated" {
     try std.testing.expect(std.mem.indexOf(u8, session_get.body, "Agent A session API value") != null);
 }
 
+test "api native agent memory list paginates past native prefilter window" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const principals =
+        \\{"agent-page":{"actor_id":"agent:page","scopes":["public"],"capabilities":["read","write"]}}
+    ;
+    var ctx = Context{ .allocator = alloc, .store = &store, .token_principals_json = principals };
+
+    for (0..505) |i| {
+        const key = try std.fmt.allocPrint(alloc, "paged.{d}", .{i});
+        const content = try std.fmt.allocPrint(alloc, "Paged memory {d}", .{i});
+        var entry = try store.agentMemoryStore(alloc, .{ .key = key, .content = content, .actor_id = "agent:page" });
+        agent_memory_runtime.freeAgentMemory(alloc, &entry);
+    }
+
+    const page = handleRequest(&ctx, "GET", "/v1/agent-memory?limit=10&offset=500", "", "GET /v1/agent-memory?limit=10&offset=500 HTTP/1.1\r\nAuthorization: Bearer agent-page\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", page.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, page.body, .{});
+    defer parsed.deinit();
+    const memories = parsed.value.object.get("memories").?.array.items;
+    try std.testing.expectEqual(@as(usize, 5), memories.len);
+}
+
 test "api agent memory supports explicit storage routing" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();

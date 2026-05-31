@@ -8572,7 +8572,7 @@ pub const SQLiteStore = struct {
     }
 
     pub fn agentMemoryGetVisible(self: *Self, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
-        const stmt = try self.prepare(agentMemoryVisibleSelectSql("AND ami.key = ?1", "ORDER BY CASE WHEN ami.actor_id = ?3 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC LIMIT 100"));
+        const stmt = try self.prepare(agentMemoryVisibleSelectSql("AND ami.key = ?1", "ORDER BY CASE WHEN ami.actor_id = ?3 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC"));
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, key);
         bindNullableText(stmt, 2, session_id);
@@ -8604,9 +8604,9 @@ pub const SQLiteStore = struct {
 
     pub fn agentMemoryListVisible(self: *Self, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
         const sql = if (category != null)
-            agentMemoryVisibleSelectSql("AND ami.category = ?1", "ORDER BY CASE WHEN ami.actor_id = ?3 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC LIMIT 500")
+            agentMemoryVisibleSelectSql("AND ami.category = ?1", "ORDER BY CASE WHEN ami.actor_id = ?3 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC")
         else
-            agentMemoryVisibleSelectSql("", "ORDER BY CASE WHEN ami.actor_id = ?3 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC LIMIT 500");
+            agentMemoryVisibleSelectSql("", "ORDER BY CASE WHEN ami.actor_id = ?3 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC");
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
         if (category) |cat| bindText(stmt, 1, cat);
@@ -11572,14 +11572,25 @@ pub const PostgresStore = struct {
 
     pub fn agentMemoryGet(self: *PostgresStore, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
         const entries = try self.agentMemoryListInner(allocator, key, null, session_id, actor_id, 1);
-        if (entries.len == 0) return null;
-        return entries[0];
+        if (entries.len == 0) {
+            allocator.free(entries);
+            return null;
+        }
+        const result = entries[0];
+        allocator.free(entries);
+        return result;
     }
 
     pub fn agentMemoryGetVisible(self: *PostgresStore, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) !?domain.AgentMemory {
-        const entries = try self.agentMemoryListVisibleInner(allocator, key, null, session_id, actor_id, scopes_json, 100);
-        if (entries.len == 0) return null;
-        return entries[0];
+        const entries = try self.agentMemoryListVisibleInner(allocator, key, null, session_id, actor_id, scopes_json, null);
+        if (entries.len == 0) {
+            allocator.free(entries);
+            return null;
+        }
+        const result = entries[0];
+        for (entries[1..]) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+        allocator.free(entries);
+        return result;
     }
 
     pub fn agentMemoryList(self: *PostgresStore, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
@@ -11587,7 +11598,7 @@ pub const PostgresStore = struct {
     }
 
     pub fn agentMemoryListVisible(self: *PostgresStore, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
-        return self.agentMemoryListVisibleInner(allocator, null, category, session_id, actor_id, scopes_json, 500);
+        return self.agentMemoryListVisibleInner(allocator, null, category, session_id, actor_id, scopes_json, null);
     }
 
     fn agentMemoryListInner(self: *PostgresStore, allocator: std.mem.Allocator, key: ?[]const u8, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8, limit: usize) ![]domain.AgentMemory {
@@ -11612,25 +11623,35 @@ pub const PostgresStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    fn agentMemoryListVisibleInner(self: *PostgresStore, allocator: std.mem.Allocator, key: ?[]const u8, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, limit: usize) ![]domain.AgentMemory {
-        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{limit});
-        defer allocator.free(limit_text);
-        const parsed = try self.queryArrayParamsJson(
-            allocator,
+    fn agentMemoryListVisibleInner(self: *PostgresStore, allocator: std.mem.Allocator, key: ?[]const u8, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, limit: ?usize) ![]domain.AgentMemory {
+        const sql_with_limit =
             "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
-                "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
-                "WHERE ($1::text IS NULL OR ami.key = $1) " ++
-                "AND ($2::text IS NULL OR ami.category = $2) " ++
-                "AND (($3::text IS NULL AND ami.session_id IS NULL) OR ($3::text IS NOT NULL AND ami.session_id = $3)) " ++
-                "ORDER BY CASE WHEN ami.actor_id = $4 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC LIMIT $5::bigint",
-            &.{ key, category, session_id, actor_id, limit_text },
-        );
+            "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
+            "WHERE ($1::text IS NULL OR ami.key = $1) " ++
+            "AND ($2::text IS NULL OR ami.category = $2) " ++
+            "AND (($3::text IS NULL AND ami.session_id IS NULL) OR ($3::text IS NOT NULL AND ami.session_id = $3)) " ++
+            "ORDER BY CASE WHEN ami.actor_id = $4 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC LIMIT $5::bigint";
+        const sql_all =
+            "SELECT ami.id,ami.key,ma.text AS content,ami.category,ami.timestamp_ms,ami.session_id,ami.actor_id,ami.writer_actor_id,ami.scope,ami.permissions_json,ma.confidence AS score " ++
+            "FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id " ++
+            "WHERE ($1::text IS NULL OR ami.key = $1) " ++
+            "AND ($2::text IS NULL OR ami.category = $2) " ++
+            "AND (($3::text IS NULL AND ami.session_id IS NULL) OR ($3::text IS NOT NULL AND ami.session_id = $3)) " ++
+            "ORDER BY CASE WHEN ami.actor_id = $4 THEN 0 WHEN ami.actor_id LIKE 'shared:%' THEN 1 ELSE 2 END, ami.timestamp_ms DESC";
+        const parsed = if (limit) |max_rows| blk: {
+            const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{max_rows});
+            defer allocator.free(limit_text);
+            break :blk try self.queryArrayParamsJson(allocator, sql_with_limit, &.{ key, category, session_id, actor_id, limit_text });
+        } else try self.queryArrayParamsJson(allocator, sql_all, &.{ key, category, session_id, actor_id });
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
             if (item != .object) continue;
-            const entry = try readPgAgentMemory(allocator, item.object);
-            if (!try self.pgAgentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, scopes_json, actor_id)) continue;
+            var entry = try readPgAgentMemory(allocator, item.object);
+            if (!try self.pgAgentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, scopes_json, actor_id)) {
+                agent_memory_runtime.freeAgentMemory(allocator, &entry);
+                continue;
+            }
             try out.append(allocator, entry);
         };
         return out.toOwnedSlice(allocator);
@@ -15423,6 +15444,37 @@ test "native agent memory exposes shared scoped owner by ACL" {
     }
     try std.testing.expect(saw_shared);
     try std.testing.expectEqual(@as(usize, 1), try store.agentMemoryCount("agent:b", "[\"team:alpha\"]"));
+}
+
+test "native agent memory visible get scans past inaccessible rows" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.agentMemoryStore(alloc, .{
+        .key = "crowded.pref",
+        .content = "Visible crowded memory",
+        .scope = "team:visible",
+        .actor_id = "shared:team:visible",
+        .writer_actor_id = "agent:writer",
+    });
+    for (0..101) |i| {
+        const scope = try std.fmt.allocPrint(alloc, "project:hidden-{d}", .{i});
+        const owner = try std.fmt.allocPrint(alloc, "shared:{s}", .{scope});
+        const content = try std.fmt.allocPrint(alloc, "Hidden crowded memory {d}", .{i});
+        _ = try store.agentMemoryStore(alloc, .{
+            .key = "crowded.pref",
+            .content = content,
+            .scope = scope,
+            .actor_id = owner,
+            .writer_actor_id = "agent:writer",
+        });
+    }
+
+    const visible = (try store.agentMemoryGetVisible(alloc, "crowded.pref", null, "agent:reader", "[\"team:visible\"]")).?;
+    try std.testing.expectEqualStrings("Visible crowded memory", visible.content);
 }
 
 test "native agent memory creates proposed atoms by default" {
