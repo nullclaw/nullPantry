@@ -4146,12 +4146,61 @@ fn lifecycleRollout(ctx: *Context, body: []const u8) HttpResponse {
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
-    const key = json.stringField(obj, "key") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing key");
-    const percent_raw = json.intField(obj, "percent") orelse 0;
-    const percent: u8 = @intCast(@max(@as(i64, 0), @min(@as(i64, 100), percent_raw)));
-    const enabled = lifecycle.rolloutEnabled(key, percent);
-    const response = std.fmt.allocPrint(ctx.allocator, "{{\"enabled\":{s},\"percent\":{d}}}", .{ if (enabled) "true" else "false", percent }) catch return serverError(ctx);
+    const percent_raw = json.intField(obj, "percent") orelse json.intField(obj, "canary_percent");
+    const shadow_percent_raw = json.intField(obj, "shadow_percent") orelse json.intField(obj, "shadow_hybrid_percent");
+    const feature = json.stringField(obj, "feature") orelse json.stringField(obj, "name") orelse "memory";
+    const key = json.stringField(obj, "key") orelse json.stringField(obj, "rollout_key") orelse feature;
+    const session_id = json.nullableStringField(obj, "session_id");
+    const percent: u8 = clampPercent(percent_raw orelse 0);
+    const shadow_percent: u8 = clampPercent(shadow_percent_raw orelse 100);
+    const mode = lifecycle.RolloutMode.parse(json.stringField(obj, "mode"), percent_raw != null);
+    const policy = lifecycle.RolloutPolicy{
+        .mode = mode,
+        .percent = percent,
+        .shadow_percent = shadow_percent,
+        .salt = json.stringField(obj, "salt") orelse feature,
+        .disabled = (json.boolField(obj, "disabled") orelse false) or (json.boolField(obj, "kill_switch") orelse false),
+        .required_scopes_json = rawField(ctx.allocator, obj, "required_scopes", "[]") catch return badJson(ctx),
+        .blocked_scopes_json = rawField(ctx.allocator, obj, "blocked_scopes", "[]") catch return badJson(ctx),
+        .target_scopes_json = rawField(ctx.allocator, obj, "target_scopes", "[]") catch return badJson(ctx),
+        .required_capabilities_json = rawField(ctx.allocator, obj, "required_capabilities", "[]") catch return badJson(ctx),
+        .blocked_capabilities_json = rawField(ctx.allocator, obj, "blocked_capabilities", "[]") catch return badJson(ctx),
+    };
+    const result = lifecycle.evaluateRollout(policy, .{
+        .key = key,
+        .actor_id = ctx.actor_id,
+        .session_id = session_id,
+        .actor_scopes_json = ctx.actor_scopes_json,
+        .actor_capabilities_json = ctx.actor_capabilities_json,
+    });
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(ctx.allocator, "{\"rollout\":{\"feature\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, feature) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"key\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, key) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"actor_id\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, ctx.actor_id) catch return serverError(ctx);
+    if (session_id) |sid| {
+        out.appendSlice(ctx.allocator, ",\"session_id\":") catch return serverError(ctx);
+        json.appendString(&out, ctx.allocator, sid) catch return serverError(ctx);
+    }
+    out.appendSlice(ctx.allocator, ",\"mode\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, result.mode.name()) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"decision\":") catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, result.decision.name()) catch return serverError(ctx);
+    out.print(
+        ctx.allocator,
+        ",\"enabled\":{s},\"shadow\":{s},\"percent\":{d},\"shadow_percent\":{d},\"bucket\":{d},\"reason\":",
+        .{ if (result.enabled) "true" else "false", if (result.shadow) "true" else "false", result.percent, result.shadow_percent, result.bucket },
+    ) catch return serverError(ctx);
+    json.appendString(&out, ctx.allocator, result.reason) catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
+    const response = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
+}
+
+fn clampPercent(value: i64) u8 {
+    return @intCast(@max(@as(i64, 0), @min(@as(i64, 100), value)));
 }
 
 fn ask(ctx: *Context, body: []const u8) HttpResponse {
@@ -7504,6 +7553,22 @@ test "api lifecycle cache semantic cache summarize rollout and hygiene endpoints
     const rollout = handleRequest(&ctx, "POST", "/v1/lifecycle/rollout", "{\"key\":\"agent:a\",\"percent\":100}", "");
     try std.testing.expectEqualStrings("200 OK", rollout.status);
     try std.testing.expect(std.mem.indexOf(u8, rollout.body, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rollout.body, "\"mode\":\"canary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rollout.body, "\"decision\":\"enabled\"") != null);
+
+    const shadow_rollout = handleRequest(&ctx, "POST", "/v1/lifecycle/rollout", "{\"feature\":\"hybrid-retrieval\",\"mode\":\"shadow\",\"shadow_percent\":100,\"session_id\":\"s1\"}", "");
+    try std.testing.expectEqualStrings("200 OK", shadow_rollout.status);
+    try std.testing.expect(std.mem.indexOf(u8, shadow_rollout.body, "\"decision\":\"shadow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shadow_rollout.body, "\"shadow\":true") != null);
+
+    var scoped_ctx = Context{ .allocator = arena.allocator(), .store = &store, .actor_id = "agent:rollout", .actor_scopes_json = "[\"project:nullpantry\"]", .actor_capabilities_json = "[\"read\"]" };
+    const gated_rollout = handleRequest(&scoped_ctx, "POST", "/v1/lifecycle/rollout", "{\"feature\":\"team-memory\",\"mode\":\"on\",\"required_scopes\":[\"project:nullpantry\"],\"required_capabilities\":[\"read\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", gated_rollout.status);
+    try std.testing.expect(std.mem.indexOf(u8, gated_rollout.body, "\"decision\":\"enabled\"") != null);
+    const blocked_rollout = handleRequest(&scoped_ctx, "POST", "/v1/lifecycle/rollout", "{\"feature\":\"team-memory\",\"mode\":\"on\",\"blocked_scopes\":[\"project:nullpantry\"]}", "");
+    try std.testing.expectEqualStrings("200 OK", blocked_rollout.status);
+    try std.testing.expect(std.mem.indexOf(u8, blocked_rollout.body, "\"decision\":\"disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocked_rollout.body, "\"reason\":\"blocked_scope\"") != null);
 
     const hygiene = handleRequest(&ctx, "POST", "/v1/lifecycle/hygiene", "{\"stale_after_ms\":1,\"archive_after_ms\":2}", "");
     try std.testing.expectEqualStrings("200 OK", hygiene.status);
