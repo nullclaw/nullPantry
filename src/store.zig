@@ -1731,6 +1731,20 @@ pub const Store = struct {
         };
     }
 
+    pub fn feedProjectionCursorFloor(self: *Store, allocator: std.mem.Allocator, name: []const u8) !i64 {
+        return switch (self.backend) {
+            .sqlite => |*s| s.feedProjectionCursorFloor(name),
+            .postgres => |*p| p.feedProjectionCursorFloor(allocator, name),
+        };
+    }
+
+    pub fn compactFeedProjection(self: *Store, name: []const u8, object_type: []const u8, before_id: i64, actor_id: ?[]const u8) !FeedCompactResult {
+        return switch (self.backend) {
+            .sqlite => |*s| s.compactFeedProjection(name, object_type, before_id, actor_id),
+            .postgres => |*p| p.compactFeedProjection(name, object_type, before_id, actor_id),
+        };
+    }
+
     pub fn compactFeed(self: *Store, before_id: i64, actor_id: ?[]const u8) !FeedCompactResult {
         return switch (self.backend) {
             .sqlite => |*s| s.compactFeed(before_id, actor_id),
@@ -2047,14 +2061,28 @@ pub const Store = struct {
         };
     }
 
+    pub fn effectiveAgentMemoryEventRoute(self: *Store, route: AgentMemoryStorageRoute) AgentMemoryStorageRoute {
+        if (route.target == .primary and self.agent_memory.isExternal()) return .{ .target = .runtime };
+        return route;
+    }
+
     pub fn applyFeedAgentMemoryRouted(self: *Store, allocator: std.mem.Allocator, input: FeedAgentMemoryApplyInput, route: AgentMemoryStorageRoute) !FeedAgentMemoryApplyResult {
-        return switch (route.target) {
+        const effective_route = self.effectiveAgentMemoryEventRoute(route);
+        return switch (effective_route.target) {
             .primary, .native => self.applyFeedAgentMemoryAtomic(allocator, input),
-            .runtime, .named, .subset, .all => self.applyFeedAgentMemoryRuntime(allocator, input, route),
+            .runtime, .named, .subset, .all => self.applyFeedAgentMemoryRuntime(allocator, input, effective_route),
         };
     }
 
     fn applyFeedAgentMemoryRuntime(self: *Store, allocator: std.mem.Allocator, input: FeedAgentMemoryApplyInput, route: AgentMemoryStorageRoute) !FeedAgentMemoryApplyResult {
+        const effective_route = self.effectiveAgentMemoryEventRoute(route);
+        return switch (effective_route.target) {
+            .primary, .native => self.applyFeedAgentMemoryAtomic(allocator, input),
+            .runtime, .named, .subset, .all => self.applyFeedAgentMemoryRuntimeInner(allocator, input, effective_route),
+        };
+    }
+
+    fn applyFeedAgentMemoryRuntimeInner(self: *Store, allocator: std.mem.Allocator, input: FeedAgentMemoryApplyInput, route: AgentMemoryStorageRoute) !FeedAgentMemoryApplyResult {
         var object_id: []const u8 = input.delete_key orelse "agent_memory";
         var entry: ?domain.AgentMemory = null;
         var deleted = false;
@@ -3466,12 +3494,13 @@ pub const Store = struct {
     }
 
     fn saveMessageRoutedAtInner(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, created_at_ms: i64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !void {
-        try switch (route.target) {
+        const effective_route = self.effectiveAgentMemoryEventRoute(route);
+        try switch (effective_route.target) {
             .primary => self.saveMessageAt(session_id, role, content, created_at_ms, actor_id),
             .native => self.saveMessageNativeAt(session_id, role, content, created_at_ms, actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.saveMessageAt(session_id, role, content, created_at_ms, actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).saveMessageAt(session_id, role, content, created_at_ms, actor_id),
-            .subset => self.saveMessageSubsetAt(session_id, role, content, created_at_ms, actor_id, route),
+            .named => (try self.namedAgentMemoryRuntime(effective_route)).saveMessageAt(session_id, role, content, created_at_ms, actor_id),
+            .subset => self.saveMessageSubsetAt(session_id, role, content, created_at_ms, actor_id, effective_route),
             .all => {
                 try self.saveMessageNativeAt(session_id, role, content, created_at_ms, actor_id);
                 if (self.agent_memory.isExternal()) try self.agent_memory.saveMessageAt(session_id, role, content, created_at_ms, actor_id);
@@ -3480,7 +3509,7 @@ pub const Store = struct {
                 }
             },
         };
-        if (!suppress_feed) try self.appendAgentSessionMessagePutFeedEvent(self.allocator, session_id, role, content, created_at_ms, actor_id, route);
+        if (!suppress_feed) try self.appendAgentSessionMessagePutFeedEvent(self.allocator, session_id, role, content, created_at_ms, actor_id, effective_route);
     }
 
     fn saveMessageNative(self: *Store, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
@@ -3554,12 +3583,13 @@ pub const Store = struct {
     }
 
     fn clearMessagesRoutedInner(self: *Store, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !void {
-        try switch (route.target) {
+        const effective_route = self.effectiveAgentMemoryEventRoute(route);
+        try switch (effective_route.target) {
             .primary => self.clearMessages(session_id, actor_id),
             .native => self.clearMessagesNative(session_id, actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.clearMessages(session_id, actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).clearMessages(session_id, actor_id),
-            .subset => self.clearMessagesSubset(session_id, actor_id, route),
+            .named => (try self.namedAgentMemoryRuntime(effective_route)).clearMessages(session_id, actor_id),
+            .subset => self.clearMessagesSubset(session_id, actor_id, effective_route),
             .all => {
                 try self.clearMessagesNative(session_id, actor_id);
                 if (self.agent_memory.isExternal()) try self.agent_memory.clearMessages(session_id, actor_id);
@@ -3568,7 +3598,7 @@ pub const Store = struct {
                 }
             },
         };
-        if (!suppress_feed) try self.appendAgentSessionMessageDeleteFeedEvent(self.allocator, session_id, actor_id, route);
+        if (!suppress_feed) try self.appendAgentSessionMessageDeleteFeedEvent(self.allocator, session_id, actor_id, effective_route);
     }
 
     fn clearMessagesNative(self: *Store, session_id: []const u8, actor_id: ?[]const u8) !void {
@@ -3592,12 +3622,13 @@ pub const Store = struct {
     }
 
     fn clearAutoSavedRoutedInner(self: *Store, session_id: ?[]const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !void {
-        try switch (route.target) {
+        const effective_route = self.effectiveAgentMemoryEventRoute(route);
+        try switch (effective_route.target) {
             .primary => self.clearAutoSaved(session_id, actor_id),
             .native => self.clearAutoSavedNative(session_id, actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.clearAutoSaved(session_id, actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).clearAutoSaved(session_id, actor_id),
-            .subset => self.clearAutoSavedSubset(session_id, actor_id, route),
+            .named => (try self.namedAgentMemoryRuntime(effective_route)).clearAutoSaved(session_id, actor_id),
+            .subset => self.clearAutoSavedSubset(session_id, actor_id, effective_route),
             .all => {
                 try self.clearAutoSavedNative(session_id, actor_id);
                 if (self.agent_memory.isExternal()) try self.agent_memory.clearAutoSaved(session_id, actor_id);
@@ -3606,7 +3637,7 @@ pub const Store = struct {
                 }
             },
         };
-        if (!suppress_feed) try self.appendAgentSessionAutosaveDeleteFeedEvent(self.allocator, session_id, actor_id, route);
+        if (!suppress_feed) try self.appendAgentSessionAutosaveDeleteFeedEvent(self.allocator, session_id, actor_id, effective_route);
     }
 
     fn clearAutoSavedNative(self: *Store, session_id: ?[]const u8, actor_id: ?[]const u8) !void {
@@ -3630,12 +3661,13 @@ pub const Store = struct {
     }
 
     fn saveUsageRoutedInner(self: *Store, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !void {
-        try switch (route.target) {
+        const effective_route = self.effectiveAgentMemoryEventRoute(route);
+        try switch (effective_route.target) {
             .primary => self.saveUsage(session_id, total_tokens, actor_id),
             .native => self.saveUsageNative(session_id, total_tokens, actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.saveUsage(session_id, total_tokens, actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).saveUsage(session_id, total_tokens, actor_id),
-            .subset => self.saveUsageSubset(session_id, total_tokens, actor_id, route),
+            .named => (try self.namedAgentMemoryRuntime(effective_route)).saveUsage(session_id, total_tokens, actor_id),
+            .subset => self.saveUsageSubset(session_id, total_tokens, actor_id, effective_route),
             .all => {
                 try self.saveUsageNative(session_id, total_tokens, actor_id);
                 if (self.agent_memory.isExternal()) try self.agent_memory.saveUsage(session_id, total_tokens, actor_id);
@@ -3644,7 +3676,7 @@ pub const Store = struct {
                 }
             },
         };
-        if (!suppress_feed) try self.appendAgentSessionUsagePutFeedEvent(self.allocator, session_id, total_tokens, actor_id, route);
+        if (!suppress_feed) try self.appendAgentSessionUsagePutFeedEvent(self.allocator, session_id, total_tokens, actor_id, effective_route);
     }
 
     fn saveUsageNative(self: *Store, session_id: []const u8, total_tokens: u64, actor_id: ?[]const u8) !void {
@@ -3668,12 +3700,13 @@ pub const Store = struct {
     }
 
     fn deleteUsageRoutedInner(self: *Store, session_id: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !bool {
-        const deleted = try switch (route.target) {
+        const effective_route = self.effectiveAgentMemoryEventRoute(route);
+        const deleted = try switch (effective_route.target) {
             .primary => self.deleteUsage(session_id, actor_id),
             .native => self.deleteUsageNative(session_id, actor_id),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.deleteUsage(session_id, actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).deleteUsage(session_id, actor_id),
-            .subset => self.deleteUsageSubset(session_id, actor_id, route),
+            .named => (try self.namedAgentMemoryRuntime(effective_route)).deleteUsage(session_id, actor_id),
+            .subset => self.deleteUsageSubset(session_id, actor_id, effective_route),
             .all => blk: {
                 var deleted = try self.deleteUsageNative(session_id, actor_id);
                 if (self.agent_memory.isExternal()) deleted = (try self.agent_memory.deleteUsage(session_id, actor_id)) or deleted;
@@ -3683,7 +3716,7 @@ pub const Store = struct {
                 break :blk deleted;
             },
         };
-        if (deleted and !suppress_feed) try self.appendAgentSessionUsageDeleteFeedEvent(self.allocator, session_id, actor_id, route);
+        if (deleted and !suppress_feed) try self.appendAgentSessionUsageDeleteFeedEvent(self.allocator, session_id, actor_id, effective_route);
         return deleted;
     }
 
@@ -5263,6 +5296,7 @@ pub const SQLiteStore = struct {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_vector_outbox_status_locked ON vector_outbox(status, locked_until_ms)");
         try self.exec("CREATE TABLE IF NOT EXISTS memory_feed_state (id INTEGER PRIMARY KEY CHECK (id = 1), cursor_floor INTEGER NOT NULL DEFAULT 0, updated_at_ms INTEGER NOT NULL)");
         try self.exec("INSERT OR IGNORE INTO memory_feed_state (id, cursor_floor, updated_at_ms) VALUES (1, 0, strftime('%s','now') * 1000)");
+        try self.exec("CREATE TABLE IF NOT EXISTS memory_feed_cursors (name TEXT PRIMARY KEY, cursor_floor INTEGER NOT NULL DEFAULT 0, updated_at_ms INTEGER NOT NULL)");
         try self.exec("CREATE TABLE IF NOT EXISTS primitive_lifecycle (object_type TEXT NOT NULL, object_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', actor_id TEXT, payload_json TEXT NOT NULL DEFAULT '{}', updated_at_ms INTEGER NOT NULL, PRIMARY KEY (object_type, object_id))");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_primitive_lifecycle_type_status ON primitive_lifecycle(object_type, status)");
         if (!try self.columnExists("response_cache", "response_json")) {
@@ -5429,6 +5463,8 @@ pub const SQLiteStore = struct {
         try self.exec("UPDATE schema_migrations SET name = 'expanded_vector_primitives', checksum = 'np-022-expanded-vector-primitives' WHERE version = 22");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (23, 'vector_chunk_heading_paths', 'np-023-vector-chunk-heading-paths', strftime('%s','now') * 1000)");
         try self.exec("UPDATE schema_migrations SET name = 'vector_chunk_heading_paths', checksum = 'np-023-vector-chunk-heading-paths' WHERE version = 23");
+        try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (24, 'feed_projection_cursors', 'np-024-feed-projection-cursors', strftime('%s','now') * 1000)");
+        try self.exec("UPDATE schema_migrations SET name = 'feed_projection_cursors', checksum = 'np-024-feed-projection-cursors' WHERE version = 24");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (8, 'agent_actor_isolation', 'np-008-agent-actor-isolation', strftime('%s','now') * 1000)");
         try self.exec("UPDATE schema_migrations SET name = 'agent_actor_isolation', checksum = 'np-008-agent-actor-isolation' WHERE version = 8");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (9, 'strict_actor_memory', 'np-009-strict-actor-memory', strftime('%s','now') * 1000)");
@@ -8463,6 +8499,14 @@ pub const SQLiteStore = struct {
         return c.sqlite3_column_int64(stmt, 0);
     }
 
+    pub fn feedProjectionCursorFloor(self: *Self, name: []const u8) !i64 {
+        const stmt = try self.prepare("SELECT cursor_floor FROM memory_feed_cursors WHERE name = ?1 LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, name);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        return c.sqlite3_column_int64(stmt, 0);
+    }
+
     pub fn feedStatus(self: *Self, allocator: std.mem.Allocator, input: FeedStatusInput) !FeedStatus {
         const floor = try self.feedCursorFloor();
         const max_id: i64 = @intCast(try self.countSql("SELECT coalesce(max(id), 0) FROM memory_feed_events"));
@@ -8501,6 +8545,27 @@ pub const SQLiteStore = struct {
         if (c.sqlite3_step(state) != c.SQLITE_DONE) return error.UpdateFailed;
         try self.insertAuditActor("memory_feed.compacted", actor_id, "memory_feed", "cursor_floor");
         return .{ .cursor_floor = try self.feedCursorFloor(), .max_event_id = max_id, .compacted_events = changed };
+    }
+
+    pub fn compactFeedProjection(self: *Self, name: []const u8, object_type: []const u8, before_id: i64, actor_id: ?[]const u8) !FeedCompactResult {
+        const max_id: i64 = @intCast(try self.countSql("SELECT coalesce(max(id), 0) FROM memory_feed_events"));
+        const old_floor = try self.feedProjectionCursorFloor(name);
+        const floor = @max(@as(i64, 0), @min(before_id, max_id));
+        const count_stmt = try self.prepare("SELECT count(*) FROM memory_feed_events WHERE id > ?1 AND id <= ?2 AND object_type = ?3");
+        defer _ = c.sqlite3_finalize(count_stmt);
+        _ = c.sqlite3_bind_int64(count_stmt, 1, old_floor);
+        _ = c.sqlite3_bind_int64(count_stmt, 2, floor);
+        bindText(count_stmt, 3, object_type);
+        const changed: usize = if (c.sqlite3_step(count_stmt) == c.SQLITE_ROW) @intCast(c.sqlite3_column_int64(count_stmt, 0)) else 0;
+        const now = ids.nowMs();
+        const state = try self.prepare("INSERT INTO memory_feed_cursors (name, cursor_floor, updated_at_ms) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET cursor_floor = CASE WHEN cursor_floor < excluded.cursor_floor THEN excluded.cursor_floor ELSE cursor_floor END, updated_at_ms = excluded.updated_at_ms");
+        defer _ = c.sqlite3_finalize(state);
+        bindText(state, 1, name);
+        _ = c.sqlite3_bind_int64(state, 2, floor);
+        _ = c.sqlite3_bind_int64(state, 3, now);
+        if (c.sqlite3_step(state) != c.SQLITE_DONE) return error.UpdateFailed;
+        try self.insertAuditActor("memory_feed_projection.compacted", actor_id, "memory_feed_projection", name);
+        return .{ .cursor_floor = try self.feedProjectionCursorFloor(name), .max_event_id = max_id, .compacted_events = changed };
     }
 
     fn readFeedEvent(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !FeedEvent {
@@ -9989,6 +10054,7 @@ pub const PostgresStore = struct {
             \\CREATE INDEX IF NOT EXISTS agent_memory_writer_idx ON agent_memory_items(writer_actor_id, timestamp_ms);
             \\CREATE TABLE IF NOT EXISTS memory_feed_state (id integer PRIMARY KEY CHECK (id = 1), cursor_floor bigint NOT NULL DEFAULT 0, updated_at_ms bigint NOT NULL);
             \\INSERT INTO memory_feed_state (id, cursor_floor, updated_at_ms) VALUES (1, 0, (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (id) DO NOTHING;
+            \\CREATE TABLE IF NOT EXISTS memory_feed_cursors (name text PRIMARY KEY, cursor_floor bigint NOT NULL DEFAULT 0, updated_at_ms bigint NOT NULL);
             \\CREATE TABLE IF NOT EXISTS primitive_lifecycle (
             \\  object_type text NOT NULL,
             \\  object_id text NOT NULL,
@@ -10104,6 +10170,8 @@ pub const PostgresStore = struct {
             \\UPDATE schema_migrations SET name = 'expanded_vector_primitives', checksum = 'np-022-expanded-vector-primitives' WHERE version = 22;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (23, 'vector_chunk_heading_paths', 'np-023-vector-chunk-heading-paths', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
             \\UPDATE schema_migrations SET name = 'vector_chunk_heading_paths', checksum = 'np-023-vector-chunk-heading-paths' WHERE version = 23;
+            \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (24, 'feed_projection_cursors', 'np-024-feed-projection-cursors', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+            \\UPDATE schema_migrations SET name = 'feed_projection_cursors', checksum = 'np-024-feed-projection-cursors' WHERE version = 24;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (8, 'agent_actor_isolation', 'np-008-agent-actor-isolation', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
             \\UPDATE schema_migrations SET name = 'agent_actor_isolation', checksum = 'np-008-agent-actor-isolation' WHERE version = 8;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (9, 'strict_actor_memory', 'np-009-strict-actor-memory', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
@@ -11757,6 +11825,12 @@ pub const PostgresStore = struct {
         return std.fmt.parseInt(i64, text, 10) catch 0;
     }
 
+    pub fn feedProjectionCursorFloor(self: *PostgresStore, allocator: std.mem.Allocator, name: []const u8) !i64 {
+        const text = try self.queryParamsText(allocator, "SELECT coalesce((SELECT cursor_floor FROM memory_feed_cursors WHERE name = $1 LIMIT 1), 0)::text", &.{name});
+        defer allocator.free(text);
+        return std.fmt.parseInt(i64, text, 10) catch 0;
+    }
+
     pub fn feedStatus(self: *PostgresStore, allocator: std.mem.Allocator, input: FeedStatusInput) !FeedStatus {
         const floor = try self.feedCursorFloor(allocator);
         const max_text = try self.queryText(allocator, "SELECT coalesce(max(id), 0)::text FROM memory_feed_events");
@@ -11811,6 +11885,41 @@ pub const PostgresStore = struct {
             &.{ now_text, floor_text, actor_id, payload },
         );
         return .{ .cursor_floor = try self.feedCursorFloor(allocator), .max_event_id = max_id, .compacted_events = compacted };
+    }
+
+    pub fn compactFeedProjection(self: *PostgresStore, name: []const u8, object_type: []const u8, before_id: i64, actor_id: ?[]const u8) !FeedCompactResult {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const max_text = try self.queryText(allocator, "SELECT coalesce(max(id), 0)::text FROM memory_feed_events");
+        const max_id = std.fmt.parseInt(i64, max_text, 10) catch 0;
+        const old_floor = try self.feedProjectionCursorFloor(allocator, name);
+        const floor = @max(@as(i64, 0), @min(before_id, max_id));
+        const old_floor_text = try std.fmt.allocPrint(allocator, "{d}", .{old_floor});
+        const floor_text = try std.fmt.allocPrint(allocator, "{d}", .{floor});
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
+        const compacted_text = try self.queryParamsText(
+            allocator,
+            "SELECT count(*)::text FROM memory_feed_events WHERE id > $1::bigint AND id <= $2::bigint AND object_type = $3",
+            &.{ old_floor_text, floor_text, object_type },
+        );
+        const compacted = std.fmt.parseInt(usize, compacted_text, 10) catch 0;
+        var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+        try payload_buf.appendSlice(allocator, "{\"projection\":");
+        try json.appendString(&payload_buf, allocator, name);
+        try payload_buf.print(allocator, ",\"compacted_events\":{d}}}", .{compacted});
+        const payload = try payload_buf.toOwnedSlice(allocator);
+        _ = try self.queryParamsText(
+            allocator,
+            "WITH updated_state AS (" ++
+                "INSERT INTO memory_feed_cursors (name,cursor_floor,updated_at_ms) VALUES ($1,$2::bigint,$3::bigint) " ++
+                "ON CONFLICT(name) DO UPDATE SET cursor_floor = greatest(memory_feed_cursors.cursor_floor, excluded.cursor_floor), updated_at_ms = excluded.updated_at_ms RETURNING cursor_floor" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) VALUES ('memory_feed_projection.compacted',$4,'memory_feed_projection',$1,$5::jsonb,$3::bigint) RETURNING 1" ++
+                ") SELECT coalesce((SELECT cursor_floor::text FROM updated_state), '0')",
+            &.{ name, floor_text, now_text, actor_id, payload },
+        );
+        return .{ .cursor_floor = try self.feedProjectionCursorFloor(allocator, name), .max_event_id = max_id, .compacted_events = compacted };
     }
 
     pub fn createLifecycleSnapshot(self: *PostgresStore, allocator: std.mem.Allocator, snapshot_type: []const u8, summary_json: []const u8) !LifecycleSnapshot {
@@ -15935,6 +16044,42 @@ test "sqlite memory feed visibility is actor-aware at store layer" {
 
     const hidden_status = try store.feedStatus(alloc, .{ .scopes_json = "[]", .actor_id = other_actor });
     try std.testing.expectEqual(@as(usize, 0), hidden_status.visible_events);
+}
+
+test "sqlite memory feed projection compaction is isolated from global and other actors" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const first = try store.appendFeedEvent(.{
+        .event_type = "agent_memory.put",
+        .operation = "put",
+        .object_type = "agent_memory",
+        .object_id = "ami_one",
+        .scope = "public",
+        .payload_json = "{\"key\":\"one\",\"content\":\"one\"}",
+        .status = "applied",
+    });
+    _ = try store.appendFeedEvent(.{
+        .event_type = "memory_atom.put",
+        .operation = "put",
+        .object_type = "memory_atom",
+        .object_id = "mem_one",
+        .scope = "public",
+        .payload_json = "{\"text\":\"knowledge\"}",
+        .status = "applied",
+    });
+
+    const compacted = try store.compactFeedProjection("agent_memory:actor:agent-a", "agent_memory", first, "agent:a");
+    try std.testing.expectEqual(first, compacted.cursor_floor);
+    try std.testing.expectEqual(@as(i64, 0), try store.feedProjectionCursorFloor(alloc, "agent_memory:actor:agent-b"));
+
+    const global_status = try store.feedStatus(alloc, .{ .scopes_json = "[\"public\"]" });
+    try std.testing.expectEqual(@as(i64, 0), global_status.cursor_floor);
+    const global_events = try store.listFeedEvents(alloc, .{ .since_id = 0, .scopes_json = "[\"public\"]", .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 2), global_events.len);
 }
 
 test "sqlite direct primitive writes append applied feed events" {

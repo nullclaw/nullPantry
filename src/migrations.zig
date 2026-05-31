@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const expected_schema_version: i64 = 23;
+pub const expected_schema_version: i64 = 24;
 
 pub const Migration = struct {
     version: i64,
@@ -32,6 +32,7 @@ pub const migration_manifest = [_]Migration{
     .{ .version = 21, .name = "postgres_full_text_coverage", .checksum = "np-021-postgres-full-text-coverage" },
     .{ .version = 22, .name = "expanded_vector_primitives", .checksum = "np-022-expanded-vector-primitives" },
     .{ .version = 23, .name = "vector_chunk_heading_paths", .checksum = "np-023-vector-chunk-heading-paths" },
+    .{ .version = 24, .name = "feed_projection_cursors", .checksum = "np-024-feed-projection-cursors" },
 };
 
 pub fn expectedMigration(version: i64) ?Migration {
@@ -285,6 +286,11 @@ pub const sqlite_schema =
     \\  updated_at_ms INTEGER NOT NULL
     \\);
     \\INSERT OR IGNORE INTO memory_feed_state (id, cursor_floor, updated_at_ms) VALUES (1, 0, strftime('%s','now') * 1000);
+    \\CREATE TABLE IF NOT EXISTS memory_feed_cursors (
+    \\  name TEXT PRIMARY KEY,
+    \\  cursor_floor INTEGER NOT NULL DEFAULT 0,
+    \\  updated_at_ms INTEGER NOT NULL
+    \\);
     \\CREATE TABLE IF NOT EXISTS primitive_lifecycle (
     \\  object_type TEXT NOT NULL,
     \\  object_id TEXT NOT NULL,
@@ -391,6 +397,7 @@ pub const sqlite_schema =
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (21, 'postgres_full_text_coverage', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (22, 'expanded_vector_primitives', strftime('%s','now') * 1000);
     \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (23, 'vector_chunk_heading_paths', strftime('%s','now') * 1000);
+    \\INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (24, 'feed_projection_cursors', strftime('%s','now') * 1000);
 ;
 
 pub const postgres_schema =
@@ -652,6 +659,11 @@ pub const postgres_schema =
     \\  updated_at_ms bigint NOT NULL
     \\);
     \\INSERT INTO memory_feed_state (id, cursor_floor, updated_at_ms) VALUES (1, 0, (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (id) DO NOTHING;
+    \\CREATE TABLE IF NOT EXISTS memory_feed_cursors (
+    \\  name text PRIMARY KEY,
+    \\  cursor_floor bigint NOT NULL DEFAULT 0,
+    \\  updated_at_ms bigint NOT NULL
+    \\);
     \\CREATE TABLE IF NOT EXISTS primitive_lifecycle (
     \\  object_type text NOT NULL,
     \\  object_id text NOT NULL,
@@ -759,6 +771,7 @@ pub const postgres_schema =
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (21, 'postgres_full_text_coverage', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (22, 'expanded_vector_primitives', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
     \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (23, 'vector_chunk_heading_paths', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
+    \\INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (24, 'feed_projection_cursors', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
 ;
 
 test "sqlite migration includes core primitive tables and indexes" {
@@ -795,6 +808,7 @@ test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS memory_feed_events") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE VIRTUAL TABLE IF NOT EXISTS memory_feed_events_fts USING fts5") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "idx_memory_feed_events_dedupe_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS memory_feed_cursors") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS primitive_lifecycle") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "idx_primitive_lifecycle_type_status") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "CREATE TABLE IF NOT EXISTS response_cache") != null);
@@ -811,6 +825,7 @@ test "sqlite migration includes core primitive tables and indexes" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'cache_actor_isolation'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'native_agent_memory'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'agent_memory_writer_identity'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'feed_projection_cursors'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'primitive_lifecycle_overlay'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'sqlite_full_text_coverage'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sqlite_schema, "'context_pack_acl'") != null);
@@ -847,6 +862,7 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "vector_outbox_status_locked_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS memory_feed_events") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "memory_feed_events_dedupe_key_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS memory_feed_cursors") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS primitive_lifecycle") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "primitive_lifecycle_type_status_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "CREATE TABLE IF NOT EXISTS response_cache") != null);
@@ -863,6 +879,7 @@ test "postgres migration includes fts vector and expression indexes" {
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'cache_actor_isolation'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'native_agent_memory'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'agent_memory_writer_identity'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'feed_projection_cursors'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'primitive_lifecycle_overlay'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'sqlite_full_text_coverage'") != null);
     try std.testing.expect(std.mem.indexOf(u8, postgres_schema, "'context_pack_acl'") != null);
