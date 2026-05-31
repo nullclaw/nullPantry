@@ -14,6 +14,7 @@ pub const Route = struct {
     target: Target = .primary,
     name: ?[]const u8 = null,
     stores: []const []const u8 = &.{},
+    owned_backing: ?[]const u8 = null,
 
     pub fn parse(raw: ?[]const u8) Route {
         const value = raw orelse return .{};
@@ -39,6 +40,7 @@ pub const Route = struct {
 
     pub fn deinit(self: Route, allocator: std.mem.Allocator) void {
         if (self.target == .subset and self.stores.len > 0) allocator.free(self.stores);
+        if (self.owned_backing) |value| allocator.free(value);
     }
 };
 
@@ -68,11 +70,32 @@ pub fn fromObjectOrQuery(allocator: std.mem.Allocator, obj: std.json.ObjectMap, 
 }
 
 pub fn fromQuery(allocator: std.mem.Allocator, query: []const u8) !Route {
-    if (json.queryParam(query, "storage")) |value| return Route.parse(value);
-    if (json.queryParam(query, "store")) |value| return Route.parse(value);
-    if (json.queryParam(query, "target_store")) |value| return Route.parse(value);
-    if (json.queryParam(query, "stores")) |value| return fromCsv(allocator, value);
+    if (try json.queryParamDecoded(allocator, query, "storage")) |value| return routeFromOwnedSelector(allocator, value);
+    if (try json.queryParamDecoded(allocator, query, "store")) |value| return routeFromOwnedSelector(allocator, value);
+    if (try json.queryParamDecoded(allocator, query, "target_store")) |value| return routeFromOwnedSelector(allocator, value);
+    if (try json.queryParamDecoded(allocator, query, "stores")) |value| return fromOwnedCsv(allocator, value);
     return .{};
+}
+
+fn routeFromOwnedSelector(allocator: std.mem.Allocator, value: []const u8) Route {
+    var route = Route.parse(value);
+    if (route.target == .named) {
+        route.owned_backing = value;
+    } else {
+        allocator.free(value);
+    }
+    return route;
+}
+
+fn fromOwnedCsv(allocator: std.mem.Allocator, value: []const u8) !Route {
+    errdefer allocator.free(value);
+    var route = try fromCsv(allocator, value);
+    if (route.target == .named or route.target == .subset) {
+        route.owned_backing = value;
+    } else {
+        allocator.free(value);
+    }
+    return route;
 }
 
 pub fn fromCsv(allocator: std.mem.Allocator, value: []const u8) !Route {
@@ -280,6 +303,26 @@ test "storage route collapses alias-equivalent subset selectors" {
     const all_route = try fromCsv(allocator, "scratch,all,archive");
     defer all_route.deinit(allocator);
     try std.testing.expectEqual(Target.all, all_route.target);
+}
+
+test "storage route decodes query selectors before routing" {
+    const allocator = std.testing.allocator;
+
+    const named = try fromQuery(allocator, "store=team%3Aalpha");
+    defer named.deinit(allocator);
+    try std.testing.expectEqual(Target.named, named.target);
+    try std.testing.expectEqualStrings("team:alpha", named.name.?);
+
+    const subset = try fromQuery(allocator, "stores=team%3Aalpha,archive%2Dold");
+    defer subset.deinit(allocator);
+    try std.testing.expectEqual(Target.subset, subset.target);
+    try std.testing.expectEqualStrings("team:alpha", subset.stores[0]);
+    try std.testing.expectEqualStrings("archive-old", subset.stores[1]);
+
+    const alias = try fromQuery(allocator, "storage=postgres");
+    defer alias.deinit(allocator);
+    try std.testing.expectEqual(Target.native, alias.target);
+    try std.testing.expect(alias.owned_backing == null);
 }
 
 test "storage route renders API and extraction JSON" {
