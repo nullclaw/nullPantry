@@ -7785,40 +7785,7 @@ pub const SQLiteStore = struct {
 
     fn fuseSearchResults(self: *Self, allocator: std.mem.Allocator, input: SearchInput, keyword_results: []const domain.SearchResult, vector_results: []const domain.SearchResult, limit: usize) ![]domain.SearchResult {
         _ = self;
-        if (vector_results.len == 0) {
-            return finalizeSearchResults(allocator, input, keyword_results, limit);
-        }
-        const keyword_ranked = try allocator.alloc(retrieval_mod.RankedItem, keyword_results.len);
-        defer allocator.free(keyword_ranked);
-        for (keyword_results, 0..) |result, i| {
-            keyword_ranked[i] = .{ .id = result.id, .score = result.score, .created_at_ms = result.created_at_ms, .confidence = result.confidence };
-        }
-        const vector_ranked = try allocator.alloc(retrieval_mod.RankedItem, vector_results.len);
-        defer allocator.free(vector_ranked);
-        for (vector_results, 0..) |result, i| {
-            vector_ranked[i] = .{ .id = result.id, .score = result.score, .created_at_ms = result.created_at_ms, .confidence = result.confidence };
-        }
-        const lists = [_][]const retrieval_mod.RankedItem{ keyword_ranked, vector_ranked };
-        const fused = try retrieval_mod.reciprocalRankFusion(allocator, &lists, 60, @max(limit * 4, @as(usize, 20)));
-        defer allocator.free(fused);
-        var out: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
-        for (fused) |ranked| {
-            const keyword_result = findSearchResultById(keyword_results, ranked.id);
-            const vector_result = findSearchResultById(vector_results, ranked.id);
-            if (chooseFusedSearchResult(keyword_result, vector_result)) |result| {
-                var copy = result;
-                copy.score += ranked.score;
-                try out.append(allocator, copy);
-            }
-        }
-        return finalizeSearchResults(allocator, input, out.items, limit);
-    }
-
-    fn findSearchResultById(results: []const domain.SearchResult, id_text: []const u8) ?domain.SearchResult {
-        for (results) |result| {
-            if (std.mem.eql(u8, result.id, id_text)) return result;
-        }
-        return null;
+        return fuseRankedSearchResultLists(allocator, input, keyword_results, vector_results, limit);
     }
 
     fn sanitizeSourceIds(self: *Self, allocator: std.mem.Allocator, source_ids_json: []const u8, scopes_json: []const u8) ![]const u8 {
@@ -11299,33 +11266,7 @@ pub const PostgresStore = struct {
 
     fn fusePgSearchResults(self: *PostgresStore, allocator: std.mem.Allocator, input: SearchInput, keyword_results: []const domain.SearchResult, vector_results: []const domain.SearchResult, limit: usize) ![]domain.SearchResult {
         _ = self;
-        if (vector_results.len == 0) {
-            return finalizeSearchResults(allocator, input, keyword_results, limit);
-        }
-        const keyword_ranked = try allocator.alloc(retrieval_mod.RankedItem, keyword_results.len);
-        defer allocator.free(keyword_ranked);
-        for (keyword_results, 0..) |result, i| {
-            keyword_ranked[i] = .{ .id = result.id, .score = result.score, .created_at_ms = result.created_at_ms, .confidence = result.confidence };
-        }
-        const vector_ranked = try allocator.alloc(retrieval_mod.RankedItem, vector_results.len);
-        defer allocator.free(vector_ranked);
-        for (vector_results, 0..) |result, i| {
-            vector_ranked[i] = .{ .id = result.id, .score = result.score, .created_at_ms = result.created_at_ms, .confidence = result.confidence };
-        }
-        const lists = [_][]const retrieval_mod.RankedItem{ keyword_ranked, vector_ranked };
-        const fused = try retrieval_mod.reciprocalRankFusion(allocator, &lists, 60, @max(limit * 4, @as(usize, 20)));
-        defer allocator.free(fused);
-        var out: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
-        for (fused) |ranked| {
-            const keyword_result = findSearchResultByIdGlobal(keyword_results, ranked.id);
-            const vector_result = findSearchResultByIdGlobal(vector_results, ranked.id);
-            if (chooseFusedSearchResult(keyword_result, vector_result)) |result| {
-                var copy = result;
-                copy.score += ranked.score;
-                try out.append(allocator, copy);
-            }
-        }
-        return finalizeSearchResults(allocator, input, out.items, limit);
+        return fuseRankedSearchResultLists(allocator, input, keyword_results, vector_results, limit);
     }
 
     fn recordVisibleWithPolicy(self: *PostgresStore, allocator: std.mem.Allocator, scope: []const u8, permissions_json: []const u8, scopes_json: []const u8) !bool {
@@ -14431,6 +14372,82 @@ fn pgSortSearchResults(items: []domain.SearchResult) void {
     }
 }
 
+const RankedSearchResults = struct {
+    ranked: []retrieval_mod.RankedItem,
+    keys: [][]u8,
+
+    fn deinit(self: *RankedSearchResults, allocator: std.mem.Allocator) void {
+        for (self.keys) |key| allocator.free(key);
+        allocator.free(self.keys);
+        allocator.free(self.ranked);
+        self.* = undefined;
+    }
+};
+
+fn rankSearchResultsByIdentity(allocator: std.mem.Allocator, results: []const domain.SearchResult) !RankedSearchResults {
+    const ranked = try allocator.alloc(retrieval_mod.RankedItem, results.len);
+    errdefer allocator.free(ranked);
+    const keys = try allocator.alloc([]u8, results.len);
+    errdefer allocator.free(keys);
+    var initialized: usize = 0;
+    errdefer for (keys[0..initialized]) |key| allocator.free(key);
+
+    for (results, 0..) |result, i| {
+        const key = try searchResultIdentityKey(allocator, result);
+        keys[i] = key;
+        initialized += 1;
+        ranked[i] = .{
+            .id = key,
+            .score = result.score,
+            .created_at_ms = result.created_at_ms,
+            .confidence = result.confidence,
+        };
+    }
+
+    return .{ .ranked = ranked, .keys = keys };
+}
+
+fn searchResultIdentityKey(allocator: std.mem.Allocator, result: domain.SearchResult) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{d}:{s}:{d}:{s}:{d}:{s}",
+        .{ result.result_type.len, result.result_type, result.store.len, result.store, result.id.len, result.id },
+    );
+}
+
+fn findSearchResultByRankKey(results: []const domain.SearchResult, keys: []const []const u8, rank_key: []const u8) ?domain.SearchResult {
+    for (keys, 0..) |key, i| {
+        if (std.mem.eql(u8, key, rank_key)) return results[i];
+    }
+    return null;
+}
+
+fn fuseRankedSearchResultLists(allocator: std.mem.Allocator, input: SearchInput, keyword_results: []const domain.SearchResult, vector_results: []const domain.SearchResult, limit: usize) ![]domain.SearchResult {
+    if (vector_results.len == 0) return finalizeSearchResults(allocator, input, keyword_results, limit);
+
+    var keyword_ranked = try rankSearchResultsByIdentity(allocator, keyword_results);
+    defer keyword_ranked.deinit(allocator);
+    var vector_ranked = try rankSearchResultsByIdentity(allocator, vector_results);
+    defer vector_ranked.deinit(allocator);
+
+    const lists = [_][]const retrieval_mod.RankedItem{ keyword_ranked.ranked, vector_ranked.ranked };
+    const fused = try retrieval_mod.reciprocalRankFusion(allocator, &lists, 60, @max(limit * 4, @as(usize, 20)));
+    defer allocator.free(fused);
+
+    var out: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
+    defer out.deinit(allocator);
+    for (fused) |ranked| {
+        const keyword_result = findSearchResultByRankKey(keyword_results, keyword_ranked.keys, ranked.id);
+        const vector_result = findSearchResultByRankKey(vector_results, vector_ranked.keys, ranked.id);
+        if (chooseFusedSearchResult(keyword_result, vector_result)) |result| {
+            var copy = result;
+            copy.score += ranked.score;
+            try out.append(allocator, copy);
+        }
+    }
+    return finalizeSearchResults(allocator, input, out.items, limit);
+}
+
 fn finalizeSearchResults(allocator: std.mem.Allocator, input: SearchInput, candidates: []const domain.SearchResult, limit_raw: usize) ![]domain.SearchResult {
     const limit = @max(@as(usize, 1), @min(limit_raw, 100));
     if (candidates.len == 0) return allocator.alloc(domain.SearchResult, 0);
@@ -14450,22 +14467,14 @@ fn finalizeSearchResults(allocator: std.mem.Allocator, input: SearchInput, candi
     ordered = try filterSearchResultsByMinRelevance(allocator, ordered, input.min_relevance);
     if (ordered.len == 0) return ordered;
     if (input.use_temporal_decay or input.allow_reranker) {
-        var ranked = try allocator.alloc(retrieval_mod.RankedItem, ordered.len);
-        defer allocator.free(ranked);
-        for (ordered, 0..) |result, i| {
-            ranked[i] = .{
-                .id = result.id,
-                .score = result.score,
-                .created_at_ms = result.created_at_ms,
-                .confidence = result.confidence,
-            };
-        }
-        const quality = try retrieval_mod.rerankByQuality(allocator, ranked, ids.nowMs(), input.half_life_days, ordered.len);
+        var ranked = try rankSearchResultsByIdentity(allocator, ordered);
+        defer ranked.deinit(allocator);
+        const quality = try retrieval_mod.rerankByQuality(allocator, ranked.ranked, ids.nowMs(), input.half_life_days, ordered.len);
         defer allocator.free(quality);
         var reranked: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         errdefer reranked.deinit(allocator);
         for (quality) |item| {
-            if (findSearchResultByIdGlobal(ordered, item.id)) |result| {
+            if (findSearchResultByRankKey(ordered, ranked.keys, item.id)) |result| {
                 var copy = result;
                 copy.score = item.score;
                 try reranked.append(allocator, copy);
@@ -14536,13 +14545,6 @@ fn sameSearchResultIdentity(a: domain.SearchResult, b: domain.SearchResult) bool
     return true;
 }
 
-fn findSearchResultByIdGlobal(results: []const domain.SearchResult, id_text: []const u8) ?domain.SearchResult {
-    for (results) |result| {
-        if (std.mem.eql(u8, result.id, id_text)) return result;
-    }
-    return null;
-}
-
 fn chooseFusedSearchResult(keyword_result: ?domain.SearchResult, vector_result: ?domain.SearchResult) ?domain.SearchResult {
     const vector = vector_result orelse return keyword_result;
     const keyword = keyword_result orelse return vector;
@@ -14561,6 +14563,8 @@ fn diversifySearchResultsWithMmr(allocator: std.mem.Allocator, input: SearchInpu
     defer allocator.free(query_embedding);
     if (query_embedding.len == 0) return error.MissingQueryEmbedding;
 
+    var ranked = try rankSearchResultsByIdentity(allocator, ordered);
+    defer ranked.deinit(allocator);
     const candidates = try allocator.alloc(retrieval_mod.MmrCandidate, ordered.len);
     defer allocator.free(candidates);
     const embeddings = try allocator.alloc(?[]f32, ordered.len);
@@ -14573,7 +14577,7 @@ fn diversifySearchResultsWithMmr(allocator: std.mem.Allocator, input: SearchInpu
     for (ordered, 0..) |result, i| {
         embeddings[i] = try vector_mod.deterministicEmbedding(allocator, result.text, query_embedding.len);
         candidates[i] = .{
-            .id = result.id,
+            .id = ranked.keys[i],
             .score = result.score,
             .embedding = embeddings[i].?,
         };
@@ -14584,7 +14588,7 @@ fn diversifySearchResultsWithMmr(allocator: std.mem.Allocator, input: SearchInpu
     var out: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
     errdefer out.deinit(allocator);
     for (selected) |item| {
-        if (findSearchResultByIdGlobal(ordered, item.id)) |result| {
+        if (findSearchResultByRankKey(ordered, ranked.keys, item.id)) |result| {
             var copy = result;
             copy.score = item.score;
             try out.append(allocator, copy);
@@ -15131,6 +15135,118 @@ test "sqlite retrieval applies minimum relevance before final limit" {
         .min_relevance = 999,
     });
     try std.testing.expectEqual(@as(usize, 0), filtered.len);
+}
+
+test "retrieval ranking preserves primitive identity when ids collide" {
+    const alloc = std.testing.allocator;
+    const source = domain.SearchResult{
+        .id = "shared-result-id",
+        .result_type = "source",
+        .title = "Shared Source",
+        .text = "keyword source evidence",
+        .scope = "public",
+        .status = "active",
+        .score = 0.8,
+        .source_ids_json = "[]",
+        .created_at_ms = 10,
+        .confidence = 0.6,
+    };
+    const artifact = domain.SearchResult{
+        .id = "shared-result-id",
+        .result_type = "artifact",
+        .title = "Shared Artifact",
+        .text = "vector artifact evidence",
+        .scope = "public",
+        .status = "active",
+        .score = 0.7,
+        .source_ids_json = "[]",
+        .heading_path_json = "[\"Decision\"]",
+        .created_at_ms = 20,
+        .confidence = 0.7,
+    };
+
+    const keyword_results = [_]domain.SearchResult{source};
+    const vector_results = [_]domain.SearchResult{artifact};
+    const fused = try fuseRankedSearchResultLists(alloc, .{
+        .query = "shared",
+        .scopes_json = "[\"public\"]",
+        .limit = 10,
+        .use_temporal_decay = false,
+        .use_mmr = false,
+    }, &keyword_results, &vector_results, 10);
+    defer alloc.free(fused);
+    try std.testing.expectEqual(@as(usize, 2), fused.len);
+    var saw_source = false;
+    var saw_artifact = false;
+    for (fused) |result| {
+        if (std.mem.eql(u8, result.result_type, "source")) saw_source = true;
+        if (std.mem.eql(u8, result.result_type, "artifact")) saw_artifact = true;
+    }
+    try std.testing.expect(saw_source);
+    try std.testing.expect(saw_artifact);
+
+    const candidates = [_]domain.SearchResult{ source, artifact };
+    const quality_ranked = try finalizeSearchResults(alloc, .{
+        .query = "shared",
+        .scopes_json = "[\"public\"]",
+        .limit = 10,
+        .use_temporal_decay = true,
+        .use_mmr = false,
+    }, &candidates, 10);
+    defer alloc.free(quality_ranked);
+    try std.testing.expectEqual(@as(usize, 2), quality_ranked.len);
+    saw_source = false;
+    saw_artifact = false;
+    for (quality_ranked) |result| {
+        if (std.mem.eql(u8, result.result_type, "source")) saw_source = true;
+        if (std.mem.eql(u8, result.result_type, "artifact")) saw_artifact = true;
+    }
+    try std.testing.expect(saw_source);
+    try std.testing.expect(saw_artifact);
+}
+
+test "retrieval ranking preserves runtime store identity when ids collide" {
+    const alloc = std.testing.allocator;
+    const scratch = domain.SearchResult{
+        .id = "agent-entry",
+        .result_type = "agent_memory",
+        .title = "scratch memory",
+        .text = "scratch scoped memory",
+        .scope = "team:alpha",
+        .status = "active",
+        .score = 0.9,
+        .source_ids_json = "[]",
+        .store = "scratch",
+    };
+    const archive = domain.SearchResult{
+        .id = "agent-entry",
+        .result_type = "agent_memory",
+        .title = "archive memory",
+        .text = "archive scoped memory",
+        .scope = "team:alpha",
+        .status = "active",
+        .score = 0.8,
+        .source_ids_json = "[]",
+        .store = "archive",
+    };
+    const candidates = [_]domain.SearchResult{ scratch, archive };
+    const results = try finalizeSearchResults(alloc, .{
+        .query = "memory",
+        .scopes_json = "[\"team:alpha\"]",
+        .limit = 10,
+        .use_temporal_decay = true,
+        .use_mmr = false,
+    }, &candidates, 10);
+    defer alloc.free(results);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    var saw_scratch = false;
+    var saw_archive = false;
+    for (results) |result| {
+        if (std.mem.eql(u8, result.store, "scratch")) saw_scratch = true;
+        if (std.mem.eql(u8, result.store, "archive")) saw_archive = true;
+    }
+    try std.testing.expect(saw_scratch);
+    try std.testing.expect(saw_archive);
 }
 
 test "sqlite vector layer stores chunks searches and enqueues outbox" {
