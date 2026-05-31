@@ -525,19 +525,18 @@ pub const MemoryAgentMemory = struct {
             for (out.items) |*entry| freeAgentMemory(allocator, entry);
             out.deinit(allocator);
         }
-        const access_time = ids.nowMs();
         for (all) |*entry| {
-            if (out.items.len >= @max(@as(usize, 1), limit)) break;
             const score = scoreText(query, entry.key) + scoreText(query, entry.content);
             if (score <= 0 and query.len > 0) continue;
             var copy = entry.*;
             copy.score = score + 0.5;
             try out.append(allocator, copy);
-            self.touchEntryById(entry.id, access_time);
             detachAgentMemory(entry);
         }
         sortAgentMemory(out.items);
-        if (out.items.len > limit) out.shrinkRetainingCapacity(limit);
+        trimAgentMemorySearchResults(allocator, &out, limit);
+        const access_time = ids.nowMs();
+        for (out.items) |entry| self.touchEntryById(entry.id, access_time);
         return out.toOwnedSlice(allocator);
     }
 
@@ -1061,11 +1060,16 @@ pub const RedisAgentMemory = struct {
         const actor = actor_id orelse return allocator.alloc(domain.AgentMemory, 0);
         if (limit == 0) return allocator.alloc(domain.AgentMemory, 0);
         const all = try self.listVisible(allocator, null, session_id, actor, scopes_json);
-        defer allocator.free(all);
+        defer {
+            for (all) |*entry| freeAgentMemory(allocator, entry);
+            allocator.free(all);
+        }
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer {
+            for (out.items) |*entry| freeAgentMemory(allocator, entry);
+            out.deinit(allocator);
+        }
         for (all) |*entry| {
-            if (out.items.len >= @max(@as(usize, 1), limit)) break;
             const score = scoreText(query, entry.key) + scoreText(query, entry.content);
             if (score <= 0 and query.len > 0) continue;
             var copy = entry.*;
@@ -1073,9 +1077,8 @@ pub const RedisAgentMemory = struct {
             try out.append(allocator, copy);
             detachAgentMemory(entry);
         }
-        for (all) |*entry| freeAgentMemory(allocator, entry);
         sortAgentMemory(out.items);
-        if (out.items.len > limit) out.shrinkRetainingCapacity(limit);
+        trimAgentMemorySearchResults(allocator, &out, limit);
         return out.toOwnedSlice(allocator);
     }
 
@@ -2473,6 +2476,12 @@ fn sortAgentMemory(items: []domain.AgentMemory) void {
     }.lessThan);
 }
 
+fn trimAgentMemorySearchResults(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), limit: usize) void {
+    if (out.items.len <= limit) return;
+    for (out.items[limit..]) |*entry| freeAgentMemory(allocator, entry);
+    out.shrinkRetainingCapacity(limit);
+}
+
 fn sortSessions(items: []SessionInfo) void {
     std.mem.sort(SessionInfo, items, {}, struct {
         fn lessThan(_: void, a: SessionInfo, b: SessionInfo) bool {
@@ -2844,6 +2853,38 @@ test "memory_lru evicts least recently used agent memory entries" {
     var three = (try runtime.get(std.testing.allocator, "three", null, "agent:lru")).?;
     defer freeAgentMemory(std.testing.allocator, &three);
     try std.testing.expectEqualStrings("third", three.content);
+}
+
+test "memory_lru search ranks before applying limit" {
+    var runtime = try Runtime.init(std.testing.allocator, .{ .backend = .memory_lru });
+    defer runtime.deinit();
+
+    var high = try runtime.store(std.testing.allocator, .{ .key = "rank.high", .content = "alpha beta gamma", .actor_id = "agent:rank" });
+    defer freeAgentMemory(std.testing.allocator, &high);
+    var low = try runtime.store(std.testing.allocator, .{ .key = "rank.low", .content = "alpha", .actor_id = "agent:rank" });
+    defer freeAgentMemory(std.testing.allocator, &low);
+
+    switch (runtime) {
+        .memory_lru => |*engine| {
+            const high_idx = engine.findEntryIndex("agent:rank", null, "rank.high").?;
+            const low_idx = engine.findEntryIndex("agent:rank", null, "rank.low").?;
+            engine.allocator.free(engine.entries.items[high_idx].entry.timestamp);
+            engine.entries.items[high_idx].entry.timestamp = try engine.allocator.dupe(u8, "1000");
+            engine.entries.items[high_idx].last_access_ms = 1000;
+            engine.allocator.free(engine.entries.items[low_idx].entry.timestamp);
+            engine.entries.items[low_idx].entry.timestamp = try engine.allocator.dupe(u8, "2000");
+            engine.entries.items[low_idx].last_access_ms = 2000;
+        },
+        else => unreachable,
+    }
+
+    const ranked = try runtime.search(std.testing.allocator, "alpha beta gamma", 1, null, "[]", "agent:rank");
+    defer {
+        for (ranked) |*entry| freeAgentMemory(std.testing.allocator, entry);
+        std.testing.allocator.free(ranked);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ranked.len);
+    try std.testing.expectEqualStrings("rank.high", ranked[0].key);
 }
 
 test "memory_lru expires entries messages and usage by ttl" {
