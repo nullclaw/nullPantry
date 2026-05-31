@@ -409,6 +409,7 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
             const heading_path_json = try vector.chunkHeadingPathJson(allocator, text, chunk);
             const payload = try store_mod.vectorEmbedPayloadJson(allocator, @intCast(count), chunk_text, scope, permissions_json, heading_path_json, options.embedding_model, options.embedding_dimensions);
             const outbox_id = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
+            if (!try store.claimVectorOutboxAs(outbox_id, options.actor_id)) return count;
             const embedding_result = providers.embedText(allocator, .{
                 .provider = options.embedding_provider,
                 .base_url = options.embedding_base_url,
@@ -419,7 +420,10 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
                 .allow_insecure_http = options.embedding_allow_insecure_http,
                 .fallbacks = options.embedding_fallbacks,
                 .runtime = options.provider_runtime,
-            }, chunk_text, options.embedding_dimensions) catch return count;
+            }, chunk_text, options.embedding_dimensions) catch {
+                _ = try store.finishVectorOutboxAs(outbox_id, "pending", options.actor_id);
+                return count;
+            };
             const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
             _ = try store.upsertVectorChunk(allocator, .{
                 .object_type = object_type,
@@ -434,7 +438,7 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
                 .dimensions = @intCast(embedding_result.embedding.len),
                 .actor_id = options.actor_id,
             });
-            _ = try store.finishVectorOutbox(outbox_id, "embedded");
+            _ = try store.finishVectorOutboxAs(outbox_id, "embedded", options.actor_id);
             count += 1;
         }
     }
@@ -624,6 +628,10 @@ test "worker persists embed outbox before provider call and replays locally" {
 
     const pending = try store.listVectorOutbox(alloc, .{ .action = "embed", .status = "pending", .limit = 20 });
     try std.testing.expect(pending.len > 0);
+    for (pending) |entry| {
+        try std.testing.expect(entry.worker_id == null);
+        try std.testing.expect(entry.locked_until_ms == null);
+    }
 
     const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]", .outbox_limit = 50 });
     try std.testing.expect(result.vector_outbox_processed >= pending.len);

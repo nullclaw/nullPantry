@@ -2468,6 +2468,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
             const heading_path_json = try vector_mod.chunkHeadingPathJson(ctx.allocator, text, chunk);
             const payload = try store_mod.vectorEmbedPayloadJson(ctx.allocator, @intCast(count), chunk_text, scope, permissions_json, heading_path_json, ctx.embedding_model, ctx.embedding_dimensions);
             const outbox_id = try ctx.store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
+            if (!try ctx.store.claimVectorOutboxAs(outbox_id, ctx.actor_id)) return count;
             const embedding_result = providers.embedText(ctx.allocator, .{
                 .provider = ctx.embedding_provider,
                 .base_url = ctx.embedding_base_url,
@@ -2478,7 +2479,10 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
                 .allow_insecure_http = ctx.embedding_allow_insecure_http,
                 .fallbacks = ctx.embedding_fallbacks,
                 .runtime = ctx.provider_runtime,
-            }, chunk_text, ctx.embedding_dimensions) catch return count;
+            }, chunk_text, ctx.embedding_dimensions) catch {
+                _ = try ctx.store.finishVectorOutboxAs(outbox_id, "pending", ctx.actor_id);
+                return count;
+            };
             const embedding_json = try vector_mod.embeddingToJson(ctx.allocator, embedding_result.embedding);
             _ = try ctx.store.upsertVectorChunk(ctx.allocator, .{
                 .object_type = object_type,
@@ -2493,7 +2497,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
                 .dimensions = @intCast(embedding_result.embedding.len),
                 .actor_id = ctx.actor_id,
             });
-            _ = try ctx.store.finishVectorOutbox(outbox_id, "embedded");
+            _ = try ctx.store.finishVectorOutboxAs(outbox_id, "embedded", ctx.actor_id);
             count += 1;
         }
     }
