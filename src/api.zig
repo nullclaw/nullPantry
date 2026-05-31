@@ -802,6 +802,7 @@ fn nullClawAgentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     }
     const include_global = queryBool(query, "include_global", false);
     const include_internal = queryBool(query, "include_internal", false);
+    const include_content = queryBool(query, "include_content", true);
     const limit = parseLimit(json.queryParam(query, "limit"), std.math.maxInt(usize));
     const offset = parseLimit(json.queryParam(query, "offset"), 0);
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
@@ -835,7 +836,7 @@ fn nullClawAgentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
         appendMissingAgentMemoryEntries(ctx.allocator, &entries, global) catch return serverError(ctx);
     }
     dedupeAgentMemoryEntries(ctx.allocator, &entries);
-    return nullClawAgentMemoryEntriesResponse(ctx, entries.items, include_internal, limit, offset);
+    return nullClawAgentMemoryEntriesResponseWithContent(ctx, entries.items, include_internal, include_content, limit, offset);
 }
 
 fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
@@ -852,12 +853,13 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     const limit = positiveLimit(json.intField(obj, "limit"), 10);
     const include_global = json.boolField(obj, "include_global") orelse false;
     const include_internal = json.boolField(obj, "include_internal") orelse false;
+    const include_content = json.boolField(obj, "include_content") orelse true;
     const graph_entries = graphCommandAgentMemoryEntriesFromObject(ctx, obj, query, limit) catch |err| switch (err) {
         error.InvalidGraphCommand, error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
         else => return serverError(ctx),
     };
     if (graph_entries) |entries| {
-        return nullClawAgentMemoryEntriesResponse(ctx, entries, include_internal, limit, 0);
+        return nullClawAgentMemoryEntriesResponseWithContent(ctx, entries, include_internal, include_content, limit, 0);
     }
     const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
@@ -880,13 +882,17 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
         appendMissingAgentMemoryEntries(ctx.allocator, &entries, global) catch return serverError(ctx);
     }
     dedupeAgentMemoryEntries(ctx.allocator, &entries);
-    return nullClawAgentMemoryEntriesResponse(ctx, entries.items, include_internal, limit, 0);
+    return nullClawAgentMemoryEntriesResponseWithContent(ctx, entries.items, include_internal, include_content, limit, 0);
 }
 
 fn nullClawAgentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "delete")) return forbidden(ctx);
+    if (!queryDeleteAll(query)) return agentMemoryDelete(ctx, key, query);
+
     const session_id = queryParamDecodedAlias(ctx, query, "session_id", "session") catch return serverError(ctx);
-    if (session_id != null) return agentMemoryDelete(ctx, key, query);
+    if (session_id) |sid| {
+        if (!agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+    }
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
     if (requested_scope) |scope| {
         if (!domain.scopeDeletable(scope, ctx.actor_scopes_json)) return forbidden(ctx);
@@ -967,7 +973,7 @@ fn memoryCommandDeleteKey(ctx: *Context, key: []const u8, query: []const u8) Htt
     const session_id = queryParamDecodedAlias(ctx, query, "session_id", "session") catch return serverError(ctx);
     const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return agentMemoryStorageUnavailable(ctx);
-    return memoryCommandDeleteParsed(ctx, key, session_id, requested_scope, storage_target);
+    return memoryCommandDeleteParsed(ctx, key, session_id, requested_scope, storage_target, queryDeleteAll(query));
 }
 
 fn memoryCommandDeleteBody(ctx: *Context, body: []const u8) HttpResponse {
@@ -978,10 +984,11 @@ fn memoryCommandDeleteBody(ctx: *Context, body: []const u8) HttpResponse {
     const session_id = json.nullableStringField(obj, "session_id") orelse json.nullableStringField(obj, "session");
     const requested_scope = json.nullableStringField(obj, "scope");
     const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx);
-    return memoryCommandDeleteParsed(ctx, key, session_id, requested_scope, storage_target);
+    const delete_all = (json.boolField(obj, "all_sessions") orelse false) or (json.boolField(obj, "delete_all") orelse false);
+    return memoryCommandDeleteParsed(ctx, key, session_id, requested_scope, storage_target, delete_all);
 }
 
-fn memoryCommandDeleteParsed(ctx: *Context, key: []const u8, session_id: ?[]const u8, requested_scope: ?[]const u8, storage_target: store_mod.AgentMemoryStorageRoute) HttpResponse {
+fn memoryCommandDeleteParsed(ctx: *Context, key: []const u8, session_id: ?[]const u8, requested_scope: ?[]const u8, storage_target: store_mod.AgentMemoryStorageRoute, delete_all: bool) HttpResponse {
     if (!hasCapability(ctx, "delete")) return forbidden(ctx);
     if (session_id) |sid| {
         if (!agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
@@ -992,7 +999,7 @@ fn memoryCommandDeleteParsed(ctx: *Context, key: []const u8, session_id: ?[]cons
         ctx.actor_id;
     defer if (requested_scope != null) ctx.allocator.free(owner_actor_id);
 
-    if (session_id) |_| {
+    if (!delete_all) {
         const entry = ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
@@ -1127,6 +1134,10 @@ fn nullClawAgentMemoryEntryResponse(ctx: *Context, entry: domain.AgentMemory) Ht
 }
 
 fn nullClawAgentMemoryEntriesResponse(ctx: *Context, entries: []domain.AgentMemory, include_internal: bool, limit: usize, offset: usize) HttpResponse {
+    return nullClawAgentMemoryEntriesResponseWithContent(ctx, entries, include_internal, true, limit, offset);
+}
+
+fn nullClawAgentMemoryEntriesResponseWithContent(ctx: *Context, entries: []domain.AgentMemory, include_internal: bool, include_content: bool, limit: usize, offset: usize) HttpResponse {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"entries\":[") catch return serverError(ctx);
     var visible_seen: usize = 0;
@@ -1141,7 +1152,7 @@ fn nullClawAgentMemoryEntriesResponse(ctx: *Context, entries: []domain.AgentMemo
         visible_seen += 1;
         if (written >= limit) continue;
         if (written > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
-        appendNullClawAgentMemoryEntry(ctx, &out, entry) catch return serverError(ctx);
+        appendNullClawAgentMemoryEntryWithContent(ctx, &out, entry, include_content) catch return serverError(ctx);
         written += 1;
     }
     out.appendSlice(ctx.allocator, "]}") catch return serverError(ctx);
@@ -1149,12 +1160,18 @@ fn nullClawAgentMemoryEntriesResponse(ctx: *Context, entries: []domain.AgentMemo
 }
 
 fn appendNullClawAgentMemoryEntry(ctx: *Context, out: *std.ArrayListUnmanaged(u8), entry: domain.AgentMemory) !void {
+    return appendNullClawAgentMemoryEntryWithContent(ctx, out, entry, true);
+}
+
+fn appendNullClawAgentMemoryEntryWithContent(ctx: *Context, out: *std.ArrayListUnmanaged(u8), entry: domain.AgentMemory, include_content: bool) !void {
     try out.appendSlice(ctx.allocator, "{\"id\":");
     try json.appendString(out, ctx.allocator, entry.id);
     try out.appendSlice(ctx.allocator, ",\"key\":");
     try json.appendString(out, ctx.allocator, entry.key);
-    try out.appendSlice(ctx.allocator, ",\"content\":");
-    try json.appendString(out, ctx.allocator, entry.content);
+    if (include_content) {
+        try out.appendSlice(ctx.allocator, ",\"content\":");
+        try json.appendString(out, ctx.allocator, entry.content);
+    }
     try out.appendSlice(ctx.allocator, ",\"category\":");
     try json.appendString(out, ctx.allocator, entry.category);
     try out.appendSlice(ctx.allocator, ",\"timestamp\":");
@@ -8641,6 +8658,7 @@ fn agentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     const include_global = queryBool(query, "include_global", false);
     const include_sessions = queryBool(query, "include_sessions", false);
     const include_internal = queryBool(query, "include_internal", false);
+    const include_content = queryBool(query, "include_content", true);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const offset = parseLimit(json.queryParam(query, "offset"), 0);
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
@@ -8674,7 +8692,7 @@ fn agentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
         appendMissingAgentMemoryEntries(ctx.allocator, &entries, global) catch return serverError(ctx);
     }
     dedupeAgentMemoryEntries(ctx.allocator, &entries);
-    return agentMemoryEntriesResponseFiltered(ctx, entries.items, include_internal, limit, offset);
+    return agentMemoryEntriesResponseFilteredWithContent(ctx, entries.items, include_internal, include_content, limit, offset);
 }
 
 fn agentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
@@ -8692,12 +8710,13 @@ fn agentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     const include_global = json.boolField(obj, "include_global") orelse false;
     const include_sessions = json.boolField(obj, "include_sessions") orelse false;
     const include_internal = json.boolField(obj, "include_internal") orelse false;
+    const include_content = json.boolField(obj, "include_content") orelse true;
     const graph_entries = graphCommandAgentMemoryEntriesFromObject(ctx, obj, query, limit) catch |err| switch (err) {
         error.InvalidGraphCommand, error.InvalidGraphDirection, error.InvalidGraphFilter => return badJson(ctx),
         else => return serverError(ctx),
     };
     if (graph_entries) |entries| {
-        return agentMemoryEntriesResponseFiltered(ctx, entries, include_internal, limit, 0);
+        return agentMemoryEntriesResponseFilteredWithContent(ctx, entries, include_internal, include_content, limit, 0);
     }
     const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
@@ -8720,7 +8739,7 @@ fn agentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
         appendMissingAgentMemoryEntries(ctx.allocator, &entries, global) catch return serverError(ctx);
     }
     dedupeAgentMemoryEntries(ctx.allocator, &entries);
-    return agentMemoryEntriesResponseFiltered(ctx, entries.items, include_internal, limit, 0);
+    return agentMemoryEntriesResponseFilteredWithContent(ctx, entries.items, include_internal, include_content, limit, 0);
 }
 
 fn agentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResponse {
@@ -9299,6 +9318,10 @@ fn agentMemoryEntriesResponse(ctx: *Context, entries: []domain.AgentMemory) Http
 }
 
 fn agentMemoryEntriesResponseFiltered(ctx: *Context, entries: []domain.AgentMemory, include_internal: bool, limit: usize, offset: usize) HttpResponse {
+    return agentMemoryEntriesResponseFilteredWithContent(ctx, entries, include_internal, true, limit, offset);
+}
+
+fn agentMemoryEntriesResponseFilteredWithContent(ctx: *Context, entries: []domain.AgentMemory, include_internal: bool, include_content: bool, limit: usize, offset: usize) HttpResponse {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"memories\":[") catch return serverError(ctx);
     var visible_seen: usize = 0;
@@ -9313,11 +9336,45 @@ fn agentMemoryEntriesResponseFiltered(ctx: *Context, entries: []domain.AgentMemo
         visible_seen += 1;
         if (written >= limit) continue;
         if (written > 0) out.append(ctx.allocator, ',') catch return serverError(ctx);
-        entry.writeJson(ctx.allocator, &out) catch return serverError(ctx);
+        appendAgentMemoryEntryJsonWithContent(ctx.allocator, &out, entry, include_content) catch return serverError(ctx);
         written += 1;
     }
     out.appendSlice(ctx.allocator, "]}") catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn appendAgentMemoryEntryJsonWithContent(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: domain.AgentMemory, include_content: bool) !void {
+    if (include_content) return entry.writeJson(allocator, out);
+
+    try out.appendSlice(allocator, "{\"id\":");
+    try json.appendString(out, allocator, entry.id);
+    try out.appendSlice(allocator, ",\"key\":");
+    try json.appendString(out, allocator, entry.key);
+    try out.appendSlice(allocator, ",\"category\":");
+    try json.appendString(out, allocator, entry.category);
+    try out.appendSlice(allocator, ",\"timestamp\":");
+    try json.appendString(out, allocator, entry.timestamp);
+    try out.appendSlice(allocator, ",\"session_id\":");
+    try json.appendNullableString(out, allocator, entry.session_id);
+    try out.appendSlice(allocator, ",\"actor_id\":");
+    try json.appendString(out, allocator, entry.actor_id);
+    try out.appendSlice(allocator, ",\"owner_id\":");
+    try json.appendString(out, allocator, entry.actor_id);
+    try out.appendSlice(allocator, ",\"created_by_actor_id\":");
+    try json.appendString(out, allocator, if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id);
+    try out.appendSlice(allocator, ",\"scope\":");
+    try json.appendString(out, allocator, entry.scope);
+    try out.appendSlice(allocator, ",\"permissions\":");
+    try json.appendRawJsonOr(out, allocator, entry.permissions_json, "[]");
+    if (entry.store.len > 0) {
+        try out.appendSlice(allocator, ",\"store\":");
+        try json.appendString(out, allocator, entry.store);
+        try out.appendSlice(allocator, ",\"storage\":");
+        try json.appendString(out, allocator, entry.store);
+    }
+    try out.appendSlice(allocator, ",\"score\":");
+    if (entry.score) |s| try out.print(allocator, "{d}", .{s}) else try out.appendSlice(allocator, "null");
+    try out.append(allocator, '}');
 }
 
 fn feedEventsResponse(ctx: *Context, events: []store_mod.FeedEvent) HttpResponse {
@@ -10653,6 +10710,10 @@ fn queryBool(query: []const u8, name: []const u8, default_value: bool) bool {
         std.ascii.eqlIgnoreCase(raw, "on");
 }
 
+fn queryDeleteAll(query: []const u8) bool {
+    return queryBool(query, "all_sessions", false) or queryBool(query, "delete_all", false);
+}
+
 fn ok(ctx: *Context, body: []const u8) HttpResponse {
     return .{ .status = "200 OK", .body = ctx.allocator.dupe(u8, body) catch body };
 }
@@ -10889,7 +10950,11 @@ test "api nullclaw agent adapter matches current nullclaw memory engine contract
     try std.testing.expectEqualStrings("200 OK", search_session_a_without_sid.status);
     try std.testing.expect(std.mem.indexOf(u8, search_session_a_without_sid.body, "Agent A session adapter value") != null);
     try std.testing.expect(std.mem.indexOf(u8, search_session_a_without_sid.body, "Agent B session adapter value") == null);
-    const delete_session_a = handleRequest(&ctx, "DELETE", "/v1/agent/memories/pref.session", "", "DELETE /v1/agent/memories/pref.session HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    const delete_session_a_without_scope = handleRequest(&ctx, "DELETE", "/v1/agent/memories/pref.session", "", "DELETE /v1/agent/memories/pref.session HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("404 Not Found", delete_session_a_without_scope.status);
+    const still_session_a_after_global_delete = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.session?session_id=sid-1", "", "GET /v1/agent/memories/pref.session?session_id=sid-1 HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
+    try std.testing.expectEqualStrings("200 OK", still_session_a_after_global_delete.status);
+    const delete_session_a = handleRequest(&ctx, "DELETE", "/v1/agent/memories/pref.session?all_sessions=true", "", "DELETE /v1/agent/memories/pref.session?all_sessions=true HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", delete_session_a.status);
     const missing_session_a = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.session?session_id=sid-1", "", "GET /v1/agent/memories/pref.session?session_id=sid-1 HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
     try std.testing.expectEqualStrings("404 Not Found", missing_session_a.status);
@@ -12203,6 +12268,12 @@ test "api native agent memory supports session plus global recall and filters in
     const list_internal = handleRequest(&ctx, "GET", "/v1/agent-memory?limit=10&include_internal=true", "", "GET /v1/agent-memory HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", list_internal.status);
     try std.testing.expect(std.mem.indexOf(u8, list_internal.body, "autosave_user_1") != null);
+
+    const list_metadata_only = handleRequest(&ctx, "GET", "/v1/agent-memory?limit=10&include_content=false", "", "GET /v1/agent-memory HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", list_metadata_only.status);
+    try std.testing.expect(std.mem.indexOf(u8, list_metadata_only.body, "global.pref") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_metadata_only.body, "Global recall value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, list_metadata_only.body, "\"content\"") == null);
 }
 
 test "api memory command surface covers nullclaw cli-shaped operations" {
@@ -12210,7 +12281,8 @@ test "api memory command surface covers nullclaw cli-shaped operations" {
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var ctx = Context{ .allocator = arena.allocator(), .store = &store };
+    const alloc = arena.allocator();
+    var ctx = Context{ .allocator = alloc, .store = &store };
 
     const missing_update = handleRequest(&ctx, "POST", "/v1/memory/update/missing.pref", "{\"content\":\"must not create\",\"session\":\"cmd-session\"}", "");
     try std.testing.expectEqualStrings("404 Not Found", missing_update.status);
@@ -12235,15 +12307,47 @@ test "api memory command surface covers nullclaw cli-shaped operations" {
     try std.testing.expectEqualStrings("200 OK", got.status);
     try std.testing.expect(std.mem.indexOf(u8, got.body, "Command Surface Updated") != null);
 
+    const global_delete_seed = handleRequest(&ctx, "POST", "/v1/memory/store/delete.scope", "{\"content\":\"Global Exact Delete\"}", "");
+    try std.testing.expectEqualStrings("200 OK", global_delete_seed.status);
+    const session_delete_seed = handleRequest(&ctx, "POST", "/v1/memory/store/delete.scope", "{\"content\":\"Session Preserve Delete\",\"session\":\"cmd-session\"}", "");
+    try std.testing.expectEqualStrings("200 OK", session_delete_seed.status);
+    const exact_global_delete = handleRequest(&ctx, "DELETE", "/v1/memory/delete/delete.scope", "", "");
+    try std.testing.expectEqualStrings("200 OK", exact_global_delete.status);
+    try std.testing.expect(std.mem.indexOf(u8, exact_global_delete.body, "\"deleted\":true") != null);
+    const deleted_global = try store.agentMemoryGet(alloc, "delete.scope", null, ctx.actor_id);
+    try std.testing.expect(deleted_global == null);
+    const preserved_session = handleRequest(&ctx, "GET", "/v1/memory/get/delete.scope?session=cmd-session", "", "");
+    try std.testing.expectEqualStrings("200 OK", preserved_session.status);
+    try std.testing.expect(std.mem.indexOf(u8, preserved_session.body, "Session Preserve Delete") != null);
+    const explicit_all_delete = handleRequest(&ctx, "DELETE", "/v1/memory/delete/delete.scope?all_sessions=true", "", "");
+    try std.testing.expectEqualStrings("200 OK", explicit_all_delete.status);
+    try std.testing.expect(std.mem.indexOf(u8, explicit_all_delete.body, "\"deleted\":true") != null);
+    const removed_session = handleRequest(&ctx, "GET", "/v1/memory/get/delete.scope?session=cmd-session", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", removed_session.status);
+
     const listed = handleRequest(&ctx, "GET", "/v1/memory/list?session=cmd-session&category=conversation", "", "");
     try std.testing.expectEqualStrings("200 OK", listed.status);
     try std.testing.expect(std.mem.indexOf(u8, listed.body, "\"entries\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed.body, "cmd.pref") != null);
 
+    const listed_metadata_only = handleRequest(&ctx, "GET", "/v1/memory/list?session=cmd-session&category=conversation&include_content=false", "", "");
+    try std.testing.expectEqualStrings("200 OK", listed_metadata_only.status);
+    try std.testing.expect(std.mem.indexOf(u8, listed_metadata_only.body, "\"entries\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed_metadata_only.body, "cmd.pref") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed_metadata_only.body, "Command Surface Updated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed_metadata_only.body, "\"content\"") == null);
+
     const searched = handleRequest(&ctx, "POST", "/v1/memory/search", "{\"query\":\"Surface Updated\",\"session\":\"cmd-session\",\"limit\":5}", "");
     try std.testing.expectEqualStrings("200 OK", searched.status);
     try std.testing.expect(std.mem.indexOf(u8, searched.body, "\"entries\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, searched.body, "Command Surface Updated") != null);
+
+    const searched_metadata_only = handleRequest(&ctx, "POST", "/v1/memory/search", "{\"query\":\"Surface Updated\",\"session\":\"cmd-session\",\"limit\":5,\"include_content\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", searched_metadata_only.status);
+    try std.testing.expect(std.mem.indexOf(u8, searched_metadata_only.body, "\"entries\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, searched_metadata_only.body, "cmd.pref") != null);
+    try std.testing.expect(std.mem.indexOf(u8, searched_metadata_only.body, "Command Surface Updated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, searched_metadata_only.body, "\"content\"") == null);
 
     const exported = handleRequest(&ctx, "POST", "/v1/memory/export-jsonl", "{\"session\":\"cmd-session\",\"include_pii\":true}", "");
     try std.testing.expectEqualStrings("200 OK", exported.status);
