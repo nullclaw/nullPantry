@@ -3771,12 +3771,18 @@ pub const JobListInput = struct {
     scopes_json: []const u8 = "[]",
     status: ?[]const u8 = null,
     limit: usize = 100,
+    include_expired_running: bool = false,
 };
 
 const default_job_lease_ms: i64 = 5 * 60 * 1000;
 const default_job_worker_id = "system:worker";
 const default_vector_outbox_lease_ms: i64 = 5 * 60 * 1000;
 const default_vector_outbox_worker_id = "system:vector-worker";
+
+fn jobListIncludesExpiredRunning(input: JobListInput) bool {
+    const status = input.status orelse return false;
+    return input.include_expired_running and std.mem.eql(u8, status, "queued");
+}
 
 fn artifactTextWithFields(allocator: std.mem.Allocator, body: []const u8, fields_json: []const u8) ![]const u8 {
     if (fields_json.len == 0 or std.mem.eql(u8, fields_json, "{}")) return allocator.dupe(u8, body);
@@ -7984,12 +7990,18 @@ pub const SQLiteStore = struct {
 
     pub fn listJobs(self: *Self, allocator: std.mem.Allocator, input: JobListInput) ![]Job {
         const visible_limit = @max(@as(usize, 1), @min(input.limit, 500));
-        const stmt = if (input.status) |_|
+        const include_expired_running = jobListIncludesExpiredRunning(input);
+        const stmt = if (include_expired_running)
+            try self.prepare("SELECT id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms,locked_until_ms,worker_id FROM jobs WHERE (status = ?1 OR (status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= ?2)) ORDER BY created_at_ms DESC")
+        else if (input.status) |_|
             try self.prepare("SELECT id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms,locked_until_ms,worker_id FROM jobs WHERE status = ?1 ORDER BY created_at_ms DESC")
         else
             try self.prepare("SELECT id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms,locked_until_ms,worker_id FROM jobs ORDER BY created_at_ms DESC");
         defer _ = c.sqlite3_finalize(stmt);
-        if (input.status) |status| bindText(stmt, 1, status);
+        if (include_expired_running) {
+            bindText(stmt, 1, input.status.?);
+            _ = c.sqlite3_bind_int64(stmt, 2, ids.nowMs());
+        } else if (input.status) |status| bindText(stmt, 1, status);
         var out: std.ArrayListUnmanaged(Job) = .empty;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const scope = try columnText(allocator, stmt, 3);
@@ -10612,9 +10624,19 @@ pub const PostgresStore = struct {
 
     pub fn listJobs(self: *PostgresStore, allocator: std.mem.Allocator, input: JobListInput) ![]Job {
         const visible_limit = @max(@as(usize, 1), @min(input.limit, 500));
-        const status_filter = if (input.status) |status| try std.fmt.allocPrint(allocator, "WHERE status = {s}", .{try sqlString(allocator, status)}) else "";
-        const inner = try std.fmt.allocPrint(allocator, "SELECT id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms,locked_until_ms,worker_id FROM jobs {s} ORDER BY created_at_ms DESC", .{status_filter});
-        const parsed = try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        const include_expired_running = jobListIncludesExpiredRunning(input);
+        const base_sql = "SELECT id,job_type,status,scope,permissions_json,object_type,object_id,input_json,result_json,error_text,attempts,created_at_ms,updated_at_ms,locked_until_ms,worker_id FROM jobs";
+        const parsed = if (include_expired_running) parsed: {
+            const now_text = try std.fmt.allocPrint(allocator, "{d}", .{ids.nowMs()});
+            const inner = base_sql ++ " WHERE (status = $1 OR (status = 'running' AND locked_until_ms IS NOT NULL AND locked_until_ms <= $2::bigint)) ORDER BY created_at_ms DESC";
+            break :parsed try self.queryParamsJson(allocator, try arrayJsonSql(allocator, inner), &.{ input.status.?, now_text });
+        } else if (input.status) |status| parsed: {
+            const inner = base_sql ++ " WHERE status = $1 ORDER BY created_at_ms DESC";
+            break :parsed try self.queryParamsJson(allocator, try arrayJsonSql(allocator, inner), &.{status});
+        } else parsed: {
+            const inner = base_sql ++ " ORDER BY created_at_ms DESC";
+            break :parsed try self.queryJson(allocator, try arrayJsonSql(allocator, inner));
+        };
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(Job) = .empty;
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
@@ -13709,6 +13731,14 @@ test "sqlite jobs persist status transitions with scoped listing" {
     const expire_sql_text = try std.fmt.allocPrint(alloc, "UPDATE jobs SET locked_until_ms = 1 WHERE id = '{s}'", .{expired.id});
     const expire_sql = try alloc.dupeZ(u8, expire_sql_text);
     try testingSqliteExec(&store, expire_sql);
+
+    const queued_only = try store.listJobs(alloc, .{ .scopes_json = "[\"project:nullpantry\"]", .status = "queued" });
+    try std.testing.expectEqual(@as(usize, 0), queued_only.len);
+    const runnable = try store.listJobs(alloc, .{ .scopes_json = "[\"project:nullpantry\"]", .status = "queued", .include_expired_running = true });
+    try std.testing.expectEqual(@as(usize, 1), runnable.len);
+    try std.testing.expectEqualStrings(expired.id, runnable[0].id);
+    try std.testing.expectEqualStrings("running", runnable[0].status);
+
     try std.testing.expect(try store.claimJob(expired.id));
 
     const visible = try store.listJobs(alloc, .{ .scopes_json = "[\"project:nullpantry\"]", .status = "succeeded" });
@@ -14363,4 +14393,31 @@ test "postgres storage contract covers primitives when configured" {
     try std.testing.expect(try store.claimJob(job.id));
     try std.testing.expect(!(try store.claimJob(job.id)));
     try std.testing.expect(try store.finishJob(job.id, "succeeded", "{\"done\":true}", null));
+
+    const expired_job = try store.createJob(alloc, .{
+        .job_type = "postgres-contract-expired",
+        .scope = "team:pg",
+        .permissions_json = "[\"team:pg\"]",
+        .object_type = "memory_atom",
+        .object_id = atom.id,
+        .input_json = "{\"contract\":true}",
+        .actor_id = "agent:pg-a",
+    });
+    try std.testing.expect(try store.claimJob(expired_job.id));
+    switch (store.backend) {
+        .postgres => |*pg| try pg.runSql(try std.fmt.allocPrint(alloc, "UPDATE jobs SET locked_until_ms = 1 WHERE id = '{s}'", .{expired_job.id})),
+        else => unreachable,
+    }
+    const queued_only = try store.listJobs(alloc, .{ .scopes_json = "[\"team:pg\"]", .status = "queued" });
+    for (queued_only) |queued_job| try std.testing.expect(!std.mem.eql(u8, queued_job.id, expired_job.id));
+    const runnable = try store.listJobs(alloc, .{ .scopes_json = "[\"team:pg\"]", .status = "queued", .include_expired_running = true });
+    var saw_expired = false;
+    for (runnable) |runnable_job| {
+        if (std.mem.eql(u8, runnable_job.id, expired_job.id)) {
+            saw_expired = true;
+            try std.testing.expectEqualStrings("running", runnable_job.status);
+        }
+    }
+    try std.testing.expect(saw_expired);
+    try std.testing.expect(try store.claimJob(expired_job.id));
 }

@@ -50,6 +50,7 @@ pub fn runOnce(allocator: std.mem.Allocator, store: *store_mod.Store, options: R
         .status = "queued",
         .scopes_json = options.scopes_json,
         .limit = options.job_limit,
+        .include_expired_running = true,
     });
     result.jobs_checked = jobs.len;
     for (jobs) |job| {
