@@ -106,6 +106,70 @@ pub const HistoryShow = struct {
     messages: []Message,
 };
 
+pub const FeedEvent = struct {
+    id: i64,
+    sequence: i64,
+    event_type: []const u8,
+    origin_instance_id: []const u8,
+    origin_sequence: i64,
+    operation: []const u8,
+    object_type: []const u8,
+    object_id: []const u8,
+    scope: []const u8,
+    permissions_json: []const u8,
+    actor_id: ?[]const u8,
+    dedupe_key: ?[]const u8,
+    causality_json: []const u8,
+    payload_json: []const u8,
+    status: []const u8,
+    created_at_ms: i64,
+    applied_at_ms: ?i64,
+    compacted_at_ms: ?i64,
+
+    pub fn deinit(self: *FeedEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.event_type);
+        allocator.free(self.origin_instance_id);
+        allocator.free(self.operation);
+        allocator.free(self.object_type);
+        allocator.free(self.object_id);
+        allocator.free(self.scope);
+        allocator.free(self.permissions_json);
+        if (self.actor_id) |value| allocator.free(value);
+        if (self.dedupe_key) |value| allocator.free(value);
+        allocator.free(self.causality_json);
+        allocator.free(self.payload_json);
+        allocator.free(self.status);
+    }
+};
+
+pub const FeedStatus = struct {
+    instance_id: []const u8,
+    storage_kind: []const u8,
+    supports_compaction: bool,
+    cursor_floor: i64,
+    compacted_through_sequence: i64,
+    oldest_available_sequence: i64,
+    max_event_id: i64,
+    last_sequence: i64,
+    next_local_origin_sequence: i64,
+    visible_events: usize,
+    pending_events: usize,
+    applying_events: usize,
+    applied_events: usize,
+
+    pub fn deinit(self: *FeedStatus, allocator: std.mem.Allocator) void {
+        allocator.free(self.instance_id);
+        allocator.free(self.storage_kind);
+    }
+};
+
+pub const FeedCompactResult = struct {
+    cursor_floor: i64,
+    compacted_through_sequence: i64,
+    max_event_id: i64,
+    compacted_events: usize,
+};
+
 pub const Runtime = union(BackendKind) {
     none,
     native,
@@ -328,6 +392,48 @@ pub const Runtime = union(BackendKind) {
             .memory_lru => |*engine| engine.history(allocator, session_id, limit, offset, actor_id),
             .redis => |*engine| engine.history(allocator, session_id, limit, offset, actor_id),
             .api => |*engine| engine.history(allocator, session_id, limit, offset, actor_id),
+        };
+    }
+
+    pub fn listFeedEvents(self: *Runtime, allocator: std.mem.Allocator, since_id: i64, limit: usize, actor_id: ?[]const u8, scopes_json: []const u8) ![]FeedEvent {
+        return switch (self.*) {
+            .api => |*engine| engine.listFeedEvents(allocator, since_id, limit, actor_id, scopes_json),
+            else => error.NotSupported,
+        };
+    }
+
+    pub fn feedStatus(self: *Runtime, allocator: std.mem.Allocator, actor_id: ?[]const u8, scopes_json: []const u8) !FeedStatus {
+        return switch (self.*) {
+            .api => |*engine| engine.feedStatus(allocator, actor_id, scopes_json),
+            else => error.NotSupported,
+        };
+    }
+
+    pub fn compactFeed(self: *Runtime, allocator: std.mem.Allocator, actor_id: ?[]const u8, scopes_json: []const u8) !FeedCompactResult {
+        return switch (self.*) {
+            .api => |*engine| engine.compactFeed(allocator, actor_id, scopes_json),
+            else => error.NotSupported,
+        };
+    }
+
+    pub fn exportFeedCheckpoint(self: *Runtime, allocator: std.mem.Allocator, since_id: ?i64, limit: ?usize, actor_id: ?[]const u8, scopes_json: []const u8) ![]u8 {
+        return switch (self.*) {
+            .api => |*engine| engine.exportFeedCheckpoint(allocator, since_id, limit, actor_id, scopes_json),
+            else => error.NotSupported,
+        };
+    }
+
+    pub fn restoreFeedCheckpoint(self: *Runtime, allocator: std.mem.Allocator, checkpoint_json: []const u8, actor_id: ?[]const u8, scopes_json: []const u8) !void {
+        return switch (self.*) {
+            .api => |*engine| engine.restoreFeedCheckpoint(allocator, checkpoint_json, actor_id, scopes_json),
+            else => error.NotSupported,
+        };
+    }
+
+    pub fn applyFeedEventJson(self: *Runtime, allocator: std.mem.Allocator, event_json: []const u8, actor_id: ?[]const u8, scopes_json: []const u8) !void {
+        return switch (self.*) {
+            .api => |*engine| engine.applyFeedEventJson(allocator, event_json, actor_id, scopes_json),
+            else => error.NotSupported,
         };
     }
 };
@@ -2046,6 +2152,53 @@ pub const ApiAgentMemory = struct {
         return parseHistoryShow(allocator, response.body);
     }
 
+    pub fn listFeedEvents(self: *ApiAgentMemory, allocator: std.mem.Allocator, since_id: i64, limit: usize, actor_id: ?[]const u8, scopes_json: []const u8) ![]FeedEvent {
+        const query = try feedEventsQuery(allocator, since_id, limit);
+        defer allocator.free(query);
+        const response = try self.request(allocator, .GET, "/memory/events", query, actor_id, scopes_json, "");
+        defer allocator.free(response.body);
+        if (response.status == .gone) return error.CursorExpired;
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return parseFeedEventsWrapper(allocator, response.body);
+    }
+
+    pub fn feedStatus(self: *ApiAgentMemory, allocator: std.mem.Allocator, actor_id: ?[]const u8, scopes_json: []const u8) !FeedStatus {
+        const response = try self.request(allocator, .GET, "/memory/status", "", actor_id, scopes_json, "");
+        defer allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return parseFeedStatus(allocator, response.body);
+    }
+
+    pub fn compactFeed(self: *ApiAgentMemory, allocator: std.mem.Allocator, actor_id: ?[]const u8, scopes_json: []const u8) !FeedCompactResult {
+        const response = try self.request(allocator, .POST, "/memory/compact", "", actor_id, scopes_json, "{}");
+        defer allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return parseFeedCompactResult(response.body);
+    }
+
+    pub fn exportFeedCheckpoint(self: *ApiAgentMemory, allocator: std.mem.Allocator, since_id: ?i64, limit: ?usize, actor_id: ?[]const u8, scopes_json: []const u8) ![]u8 {
+        const query = try feedCheckpointQuery(allocator, since_id, limit);
+        defer allocator.free(query);
+        const response = try self.request(allocator, .GET, "/memory/checkpoint", query, actor_id, scopes_json, "");
+        if (response.status != .ok) {
+            allocator.free(response.body);
+            return error.AgentMemoryStorageUnavailable;
+        }
+        return response.body;
+    }
+
+    pub fn restoreFeedCheckpoint(self: *ApiAgentMemory, allocator: std.mem.Allocator, checkpoint_json: []const u8, actor_id: ?[]const u8, scopes_json: []const u8) !void {
+        const response = try self.request(allocator, .POST, "/memory/checkpoint", "", actor_id, scopes_json, checkpoint_json);
+        defer allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+    }
+
+    pub fn applyFeedEventJson(self: *ApiAgentMemory, allocator: std.mem.Allocator, event_json: []const u8, actor_id: ?[]const u8, scopes_json: []const u8) !void {
+        const response = try self.request(allocator, .POST, "/memory/apply", "", actor_id, scopes_json, event_json);
+        defer allocator.free(response.body);
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+    }
+
     fn getWithScopes(self: *ApiAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, explicit_scope: ?[]const u8) !?domain.AgentMemory {
         const encoded_key = try percentEncode(allocator, key);
         defer allocator.free(encoded_key);
@@ -2206,6 +2359,26 @@ fn agentMemoryExactQuery(allocator: std.mem.Allocator, session_id: ?[]const u8, 
     return out.toOwnedSlice(allocator);
 }
 
+fn feedEventsQuery(allocator: std.mem.Allocator, since_id: i64, limit: usize) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var first = true;
+    if (since_id > 0) try appendQueryI64(allocator, &out, &first, "after", since_id);
+    try appendQueryUsize(allocator, &out, &first, "limit", limit);
+    return out.toOwnedSlice(allocator);
+}
+
+fn feedCheckpointQuery(allocator: std.mem.Allocator, since_id: ?i64, limit: ?usize) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var first = true;
+    if (since_id) |value| {
+        if (value > 0) try appendQueryI64(allocator, &out, &first, "since_id", value);
+    }
+    if (limit) |value| try appendQueryUsize(allocator, &out, &first, "limit", value);
+    return out.toOwnedSlice(allocator);
+}
+
 fn sessionPath(allocator: std.mem.Allocator, session_id: []const u8, suffix: []const u8) ![]u8 {
     const encoded = try percentEncode(allocator, session_id);
     defer allocator.free(encoded);
@@ -2244,6 +2417,12 @@ fn allocatorSessionAllScopesJson(allocator: std.mem.Allocator, write: bool) ![]u
 }
 
 fn appendQueryUsize(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: usize) !void {
+    if (!first.*) try out.append(allocator, '&');
+    first.* = false;
+    try out.print(allocator, "{s}={d}", .{ name, value });
+}
+
+fn appendQueryI64(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: i64) !void {
     if (!first.*) try out.append(allocator, '&');
     first.* = false;
     try out.print(allocator, "{s}={d}", .{ name, value });
@@ -2463,6 +2642,100 @@ fn parseHistoryShow(allocator: std.mem.Allocator, body: []const u8) !HistoryShow
     return .{ .total = jsonU64Field(obj, "total", messages.len), .messages = messages };
 }
 
+fn parseFeedEventsWrapper(allocator: std.mem.Allocator, body: []const u8) ![]FeedEvent {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.AgentMemoryStorageUnavailable;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.AgentMemoryStorageUnavailable;
+    const events_value = parsed.value.object.get("events") orelse return error.AgentMemoryStorageUnavailable;
+    if (events_value != .array) return error.AgentMemoryStorageUnavailable;
+
+    var out: std.ArrayListUnmanaged(FeedEvent) = .empty;
+    errdefer {
+        for (out.items) |*event| event.deinit(allocator);
+        out.deinit(allocator);
+    }
+    for (events_value.array.items) |item| {
+        if (item != .object) return error.AgentMemoryStorageUnavailable;
+        try out.ensureUnusedCapacity(allocator, 1);
+        out.appendAssumeCapacity(try parseFeedEventValue(allocator, item.object));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseFeedEventValue(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !FeedEvent {
+    const event_type = jsonStringishField(obj, &.{"event_type"}) orelse return error.AgentMemoryStorageUnavailable;
+    const origin_instance_id = jsonStringishField(obj, &.{"origin_instance_id"}) orelse return error.AgentMemoryStorageUnavailable;
+    const operation = jsonStringishField(obj, &.{"operation"}) orelse return error.AgentMemoryStorageUnavailable;
+    const object_type = jsonStringishField(obj, &.{"object_type"}) orelse return error.AgentMemoryStorageUnavailable;
+    const object_id = jsonStringishField(obj, &.{"object_id"}) orelse return error.AgentMemoryStorageUnavailable;
+    const scope = jsonStringishField(obj, &.{"scope"}) orelse "";
+    const status = jsonStringishField(obj, &.{"status"}) orelse "applied";
+
+    var event = FeedEvent{
+        .id = jsonI64Field(obj, "id", jsonI64Field(obj, "sequence", 0)),
+        .sequence = jsonI64Field(obj, "sequence", jsonI64Field(obj, "id", 0)),
+        .event_type = try allocator.dupe(u8, event_type),
+        .origin_instance_id = try allocator.dupe(u8, origin_instance_id),
+        .origin_sequence = jsonI64Field(obj, "origin_sequence", jsonI64Field(obj, "sequence", 0)),
+        .operation = try allocator.dupe(u8, operation),
+        .object_type = try allocator.dupe(u8, object_type),
+        .object_id = try allocator.dupe(u8, object_id),
+        .scope = try allocator.dupe(u8, scope),
+        .permissions_json = try jsonRawField(allocator, obj, &.{ "permissions", "permissions_json" }, "[]"),
+        .actor_id = try jsonNullableStringishField(allocator, obj, &.{"actor_id"}),
+        .dedupe_key = try jsonNullableStringishField(allocator, obj, &.{"dedupe_key"}),
+        .causality_json = try jsonRawField(allocator, obj, &.{ "causality", "causality_json" }, "{}"),
+        .payload_json = try jsonRawField(allocator, obj, &.{ "payload", "payload_json" }, "{}"),
+        .status = try allocator.dupe(u8, status),
+        .created_at_ms = jsonI64Field(obj, "created_at_ms", 0),
+        .applied_at_ms = jsonOptionalI64Field(obj, "applied_at_ms"),
+        .compacted_at_ms = jsonOptionalI64Field(obj, "compacted_at_ms"),
+    };
+    errdefer event.deinit(allocator);
+    return event;
+}
+
+fn parseFeedStatus(allocator: std.mem.Allocator, body: []const u8) !FeedStatus {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.AgentMemoryStorageUnavailable;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.AgentMemoryStorageUnavailable;
+    const obj = parsed.value.object;
+    const instance_id = jsonStringishField(obj, &.{"instance_id"}) orelse return error.AgentMemoryStorageUnavailable;
+    const storage_kind = jsonStringishField(obj, &.{"storage_kind"}) orelse "native";
+    const last_sequence = jsonI64Field(obj, "last_sequence", jsonI64Field(obj, "max_event_id", 0));
+    const cursor_floor = jsonI64Field(obj, "cursor_floor", jsonI64Field(obj, "compacted_through_sequence", 0));
+    const compacted = jsonI64Field(obj, "compacted_through_sequence", cursor_floor);
+    return .{
+        .instance_id = try allocator.dupe(u8, instance_id),
+        .storage_kind = try allocator.dupe(u8, storage_kind),
+        .supports_compaction = jsonBoolField(obj, "supports_compaction", true),
+        .cursor_floor = cursor_floor,
+        .compacted_through_sequence = compacted,
+        .oldest_available_sequence = jsonI64Field(obj, "oldest_available_sequence", cursor_floor + 1),
+        .max_event_id = jsonI64Field(obj, "max_event_id", last_sequence),
+        .last_sequence = last_sequence,
+        .next_local_origin_sequence = jsonI64Field(obj, "next_local_origin_sequence", last_sequence + 1),
+        .visible_events = @intCast(jsonU64Field(obj, "visible_events", 0)),
+        .pending_events = @intCast(jsonU64Field(obj, "pending_events", 0)),
+        .applying_events = @intCast(jsonU64Field(obj, "applying_events", 0)),
+        .applied_events = @intCast(jsonU64Field(obj, "applied_events", 0)),
+    };
+}
+
+fn parseFeedCompactResult(body: []const u8) !FeedCompactResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return error.AgentMemoryStorageUnavailable;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.AgentMemoryStorageUnavailable;
+    const obj = parsed.value.object;
+    const cursor_floor = jsonI64Field(obj, "cursor_floor", jsonI64Field(obj, "compacted_through_sequence", 0));
+    return .{
+        .cursor_floor = cursor_floor,
+        .compacted_through_sequence = jsonI64Field(obj, "compacted_through_sequence", cursor_floor),
+        .max_event_id = jsonI64Field(obj, "max_event_id", cursor_floor),
+        .compacted_events = @intCast(jsonU64Field(obj, "compacted_events", 0)),
+    };
+}
+
 fn parseMessagesArray(allocator: std.mem.Allocator, value: std.json.Value) ![]Message {
     if (value != .array) return allocator.alloc(Message, 0);
     var out: std.ArrayListUnmanaged(Message) = .empty;
@@ -2539,6 +2812,26 @@ fn jsonI64Field(obj: std.json.ObjectMap, name: []const u8, fallback: i64) i64 {
         .integer => |n| n,
         .float => |f| @intFromFloat(f),
         .string => |s| std.fmt.parseInt(i64, s, 10) catch fallback,
+        else => fallback,
+    };
+}
+
+fn jsonOptionalI64Field(obj: std.json.ObjectMap, name: []const u8) ?i64 {
+    const value = obj.get(name) orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |n| n,
+        .float => |f| @intFromFloat(f),
+        .string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+        else => null,
+    };
+}
+
+fn jsonBoolField(obj: std.json.ObjectMap, name: []const u8, fallback: bool) bool {
+    const value = obj.get(name) orelse return fallback;
+    return switch (value) {
+        .bool => |b| b,
+        .string => |s| std.ascii.eqlIgnoreCase(s, "true"),
         else => fallback,
     };
 }
@@ -2906,6 +3199,44 @@ test "agent memory api backend builds urls and parses memory responses" {
     const scoped_list_query = try agentMemoryListQuery(std.testing.allocator, "prefs", "sess", "team:alpha", 25, 50);
     defer std.testing.allocator.free(scoped_list_query);
     try std.testing.expectEqualStrings("limit=25&offset=50&category=prefs&session_id=sess&scope=team%3Aalpha", scoped_list_query);
+
+    const feed_query = try feedEventsQuery(std.testing.allocator, 12, 50);
+    defer std.testing.allocator.free(feed_query);
+    try std.testing.expectEqualStrings("after=12&limit=50", feed_query);
+
+    const checkpoint_query = try feedCheckpointQuery(std.testing.allocator, 12, 50);
+    defer std.testing.allocator.free(checkpoint_query);
+    try std.testing.expectEqualStrings("since_id=12&limit=50", checkpoint_query);
+
+    const feed_url = try apiBackendUrl(std.testing.allocator, "https://pantry.example/v1", "/memory/events", feed_query);
+    defer std.testing.allocator.free(feed_url);
+    try std.testing.expectEqualStrings("https://pantry.example/v1/memory/events?after=12&limit=50", feed_url);
+
+    const feed_events = try parseFeedEventsWrapper(std.testing.allocator,
+        \\{"events":[{"id":3,"sequence":3,"event_type":"agent_memory.merge_string_set","origin_instance_id":"pantry-a","origin_sequence":7,"operation":"merge_string_set","object_type":"agent_memory","object_id":"agm_1","scope":"team:alpha","permissions":["team:alpha"],"actor_id":"agent:a","dedupe_key":"origin:pantry-a:7","causality":{"source":"checkpoint"},"payload":{"key":"traits.tags","values":["friendly"]},"status":"applied","created_at_ms":100,"applied_at_ms":101,"compacted_at_ms":null}]}
+    );
+    defer {
+        for (feed_events) |*event| event.deinit(std.testing.allocator);
+        std.testing.allocator.free(feed_events);
+    }
+    try std.testing.expectEqual(@as(usize, 1), feed_events.len);
+    try std.testing.expectEqualStrings("pantry-a", feed_events[0].origin_instance_id);
+    try std.testing.expectEqualStrings("[\"team:alpha\"]", feed_events[0].permissions_json);
+    try std.testing.expect(std.mem.indexOf(u8, feed_events[0].payload_json, "\"traits.tags\"") != null);
+    try std.testing.expectEqual(@as(?i64, 101), feed_events[0].applied_at_ms);
+
+    var feed_status = try parseFeedStatus(std.testing.allocator,
+        \\{"instance_id":"pantry-a","storage_kind":"native","supports_compaction":true,"cursor_floor":2,"compacted_through_sequence":2,"oldest_available_sequence":3,"max_event_id":8,"last_sequence":8,"next_local_origin_sequence":9,"visible_events":6,"pending_events":1,"applying_events":0,"applied_events":5}
+    );
+    defer feed_status.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("pantry-a", feed_status.instance_id);
+    try std.testing.expect(feed_status.supports_compaction);
+    try std.testing.expectEqual(@as(i64, 8), feed_status.last_sequence);
+    try std.testing.expectEqual(@as(usize, 1), feed_status.pending_events);
+
+    const compact = try parseFeedCompactResult("{\"cursor_floor\":4,\"compacted_through_sequence\":4,\"max_event_id\":9,\"compacted_events\":3}");
+    try std.testing.expectEqual(@as(i64, 4), compact.cursor_floor);
+    try std.testing.expectEqual(@as(usize, 3), compact.compacted_events);
 }
 
 test "named runtime registry rejects reserved duplicate and native stores" {
