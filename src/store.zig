@@ -1936,6 +1936,7 @@ pub const Store = struct {
     }
 
     fn materializeRuntimeAgentMemory(self: *Store, allocator: std.mem.Allocator, entry: domain.AgentMemory, store_name: []const u8) !void {
+        try self.deprecateRuntimeAgentMemoryMirrors(allocator, store_name, entry.key, entry.session_id, entry.actor_id, if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id);
         const source_title = try std.fmt.allocPrint(allocator, "Runtime agent memory: {s}:{s}", .{ store_name, entry.key });
         const metadata = try agentMemoryRuntimeMetadataJson(allocator, store_name, entry);
         const source = try self.createRuntimeAgentMemorySource(allocator, .{
@@ -1963,6 +1964,33 @@ pub const Store = struct {
             .tags_json = "[\"agent_memory\",\"runtime\"]",
             .actor_id = if (entry.writer_actor_id.len > 0) entry.writer_actor_id else entry.actor_id,
         });
+    }
+
+    fn deprecateRuntimeAgentMemoryMirrors(self: *Store, allocator: std.mem.Allocator, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, writer_actor_id: ?[]const u8) !void {
+        return switch (self.backend) {
+            .sqlite => |*s| s.deprecateRuntimeAgentMemoryMirrors(store_name, key, session_id, owner_actor_id, writer_actor_id),
+            .postgres => |*p| p.deprecateRuntimeAgentMemoryMirrors(allocator, store_name, key, session_id, owner_actor_id, writer_actor_id),
+        };
+    }
+
+    fn deprecateRuntimeAgentMemoryMirrorsForDelete(self: *Store, key: []const u8, session_id: ?[]const u8, owner_actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !void {
+        const owner = owner_actor_id orelse return;
+        switch (route.target) {
+            .primary => if (self.agent_memory.isExternal()) try self.deprecateRuntimeAgentMemoryMirrors(self.allocator, "runtime", key, session_id, owner, writer_actor_id),
+            .native => {},
+            .runtime => if (self.agent_memory.isExternal()) try self.deprecateRuntimeAgentMemoryMirrors(self.allocator, "runtime", key, session_id, owner, writer_actor_id),
+            .named => try self.deprecateRuntimeAgentMemoryMirrors(self.allocator, route.name orelse "named", key, session_id, owner, writer_actor_id),
+            .subset => {
+                const stores = try requireSubsetStores(route);
+                for (stores) |store_name| try self.deprecateRuntimeAgentMemoryMirrorsForDelete(key, session_id, owner, writer_actor_id, routeForSubsetStoreName(store_name));
+            },
+            .all => {
+                if (self.agent_memory.isExternal()) try self.deprecateRuntimeAgentMemoryMirrors(self.allocator, "runtime", key, session_id, owner, writer_actor_id);
+                for (self.agent_memory_stores.stores.items) |named| {
+                    try self.deprecateRuntimeAgentMemoryMirrors(self.allocator, named.name, key, session_id, owner, writer_actor_id);
+                }
+            },
+        }
     }
 
     fn createRuntimeAgentMemorySource(self: *Store, allocator: std.mem.Allocator, input: SourceInput) !domain.Source {
@@ -2523,6 +2551,7 @@ pub const Store = struct {
             },
         };
         if (deleted) {
+            try self.deprecateRuntimeAgentMemoryMirrorsForDelete(key, session_id, actor_id, writer_actor_id, route);
             if (existing) |entry| {
                 const owner_actor_id: ?[]const u8 = if (actor_id) |owner| owner else entry.actor_id;
                 try self.enqueueAgentMemoryLucidDelete(self.allocator, key, session_id, owner_actor_id, entry.scope, entry.permissions_json, writer_actor_id);
@@ -7899,6 +7928,31 @@ pub const SQLiteStore = struct {
         if (c.sqlite3_step(del) != c.SQLITE_DONE) return error.DeleteFailed;
     }
 
+    fn deprecateRuntimeAgentMemoryMirrors(self: *Self, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, writer_actor_id: ?[]const u8) !void {
+        const stmt = try self.prepare(
+            "UPDATE memory_atoms SET status = 'deprecated' " ++
+                "WHERE predicate = 'agent.memory' AND object = ?1 AND status NOT IN ('deprecated','superseded','rejected') " ++
+                "AND EXISTS (" ++
+                "SELECT 1 FROM json_each(memory_atoms.source_ids_json) sid " ++
+                "JOIN sources s ON s.id = sid.value " ++
+                "WHERE json_extract(s.metadata_json, '$.native') = 'agent_memory_runtime' " ++
+                "AND json_extract(s.metadata_json, '$.store') = ?2 " ++
+                "AND json_extract(s.metadata_json, '$.key') = ?1 " ++
+                "AND ((?3 IS NULL AND (json_type(s.metadata_json, '$.session_id') IS NULL OR json_type(s.metadata_json, '$.session_id') = 'null')) OR json_extract(s.metadata_json, '$.session_id') = ?3) " ++
+                "AND json_extract(s.metadata_json, '$.owner_id') = ?4" ++
+                ")",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key);
+        bindText(stmt, 2, store_name);
+        bindNullableText(stmt, 3, session_id);
+        bindText(stmt, 4, owner_actor_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+        if (c.sqlite3_changes(self.db) > 0) {
+            try self.insertAuditActor("agent_memory.runtime_mirrors_deprecated", writer_actor_id, "agent_memory", key);
+        }
+    }
+
     pub fn agentMemoryGet(self: *Self, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
         const stmt = try self.prepare(agentMemorySelectSql("AND ami.key = ?1", "ORDER BY ami.timestamp_ms DESC LIMIT 1"));
         defer _ = c.sqlite3_finalize(stmt);
@@ -10956,6 +11010,29 @@ pub const PostgresStore = struct {
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
+    fn deprecateRuntimeAgentMemoryMirrors(self: *PostgresStore, allocator: std.mem.Allocator, store_name: []const u8, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, writer_actor_id: ?[]const u8) !void {
+        const text = try self.queryParamsText(
+            allocator,
+            "WITH updated AS (" ++
+                "UPDATE memory_atoms ma SET status = 'deprecated' " ++
+                "WHERE ma.predicate = 'agent.memory' AND ma.object = $1 AND ma.status NOT IN ('deprecated','superseded','rejected') " ++
+                "AND EXISTS (" ++
+                "SELECT 1 FROM jsonb_array_elements_text(ma.source_ids_json) sid(id) " ++
+                "JOIN sources s ON s.id = sid.id " ++
+                "WHERE s.metadata_json->>'native' = 'agent_memory_runtime' " ++
+                "AND s.metadata_json->>'store' = $2 " ++
+                "AND s.metadata_json->>'key' = $1 " ++
+                "AND (($3::text IS NULL AND s.metadata_json->>'session_id' IS NULL) OR s.metadata_json->>'session_id' = $3) " ++
+                "AND s.metadata_json->>'owner_id' = $4" ++
+                ") RETURNING ma.id" ++
+                "), audit AS (" ++
+                "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'agent_memory.runtime_mirrors_deprecated',$5,'agent_memory',$1,'{}'::jsonb,(extract(epoch from clock_timestamp()) * 1000)::bigint WHERE EXISTS (SELECT 1 FROM updated) RETURNING 1" ++
+                ") SELECT count(*)::text FROM updated",
+            &.{ key, store_name, session_id, owner_actor_id, writer_actor_id },
+        );
+        allocator.free(text);
+    }
+
     pub fn agentMemoryCount(self: *PostgresStore, actor_id: ?[]const u8, scopes_json: []const u8) !usize {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -14010,6 +14087,92 @@ test "sqlite context pack preview does not persist durable records" {
     try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store, "SELECT COUNT(*) FROM context_packs"));
     const persisted_mirrors = try store.agentMemoryListVisibleRouted(alloc, "primitive:context_pack", null, "agent:preview", "[\"public\"]", route);
     try std.testing.expectEqual(@as(usize, 1), persisted_mirrors.len);
+}
+
+test "sqlite runtime agent memory mirrors deprecate stale versions per named store" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "archive", .config = .{ .backend = .memory_lru } },
+        },
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const scratch = AgentMemoryStorageRoute.parse("scratch");
+    const archive = AgentMemoryStorageRoute.parse("archive");
+
+    _ = try store.agentMemoryStoreRouted(alloc, .{ .key = "pref.lifecycle", .content = "scratch-v1", .actor_id = "agent:lifecycle" }, scratch);
+    _ = try store.agentMemoryStoreRouted(alloc, .{ .key = "pref.lifecycle", .content = "archive-v1", .actor_id = "agent:lifecycle" }, archive);
+    try std.testing.expectEqual(@as(i64, 2), try testingSqliteCount(&store,
+        \\SELECT COUNT(*) FROM memory_atoms ma
+        \\WHERE ma.predicate = 'agent.memory' AND ma.object = 'pref.lifecycle' AND ma.status <> 'deprecated'
+        \\AND EXISTS (
+        \\  SELECT 1 FROM json_each(ma.source_ids_json) sid
+        \\  JOIN sources s ON s.id = sid.value
+        \\  WHERE json_extract(s.metadata_json, '$.native') = 'agent_memory_runtime'
+        \\    AND json_extract(s.metadata_json, '$.owner_id') = 'agent:lifecycle'
+        \\)
+    ));
+
+    _ = try store.agentMemoryStoreRouted(alloc, .{ .key = "pref.lifecycle", .content = "scratch-v2", .actor_id = "agent:lifecycle" }, scratch);
+    try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store,
+        \\SELECT COUNT(*) FROM memory_atoms ma
+        \\WHERE ma.predicate = 'agent.memory' AND ma.object = 'pref.lifecycle' AND ma.status <> 'deprecated'
+        \\AND EXISTS (
+        \\  SELECT 1 FROM json_each(ma.source_ids_json) sid
+        \\  JOIN sources s ON s.id = sid.value
+        \\  WHERE json_extract(s.metadata_json, '$.native') = 'agent_memory_runtime'
+        \\    AND json_extract(s.metadata_json, '$.store') = 'scratch'
+        \\    AND json_extract(s.metadata_json, '$.owner_id') = 'agent:lifecycle'
+        \\)
+    ));
+    try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store,
+        \\SELECT COUNT(*) FROM memory_atoms ma
+        \\WHERE ma.predicate = 'agent.memory' AND ma.object = 'pref.lifecycle' AND ma.status <> 'deprecated'
+        \\AND EXISTS (
+        \\  SELECT 1 FROM json_each(ma.source_ids_json) sid
+        \\  JOIN sources s ON s.id = sid.value
+        \\  WHERE json_extract(s.metadata_json, '$.native') = 'agent_memory_runtime'
+        \\    AND json_extract(s.metadata_json, '$.store') = 'archive'
+        \\    AND json_extract(s.metadata_json, '$.owner_id') = 'agent:lifecycle'
+        \\)
+    ));
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store,
+        \\SELECT COUNT(*) FROM memory_atoms ma
+        \\WHERE ma.predicate = 'agent.memory' AND ma.object = 'pref.lifecycle' AND ma.text = 'scratch-v1' AND ma.status <> 'deprecated'
+        \\AND EXISTS (
+        \\  SELECT 1 FROM json_each(ma.source_ids_json) sid
+        \\  JOIN sources s ON s.id = sid.value
+        \\  WHERE json_extract(s.metadata_json, '$.native') = 'agent_memory_runtime'
+        \\    AND json_extract(s.metadata_json, '$.store') = 'scratch'
+        \\)
+    ));
+
+    try std.testing.expect(try store.agentMemoryDeleteRouted("pref.lifecycle", null, "agent:lifecycle", "agent:lifecycle", scratch));
+    try std.testing.expectEqual(@as(i64, 0), try testingSqliteCount(&store,
+        \\SELECT COUNT(*) FROM memory_atoms ma
+        \\WHERE ma.predicate = 'agent.memory' AND ma.object = 'pref.lifecycle' AND ma.status <> 'deprecated'
+        \\AND EXISTS (
+        \\  SELECT 1 FROM json_each(ma.source_ids_json) sid
+        \\  JOIN sources s ON s.id = sid.value
+        \\  WHERE json_extract(s.metadata_json, '$.native') = 'agent_memory_runtime'
+        \\    AND json_extract(s.metadata_json, '$.store') = 'scratch'
+        \\    AND json_extract(s.metadata_json, '$.owner_id') = 'agent:lifecycle'
+        \\)
+    ));
+    try std.testing.expectEqual(@as(i64, 1), try testingSqliteCount(&store,
+        \\SELECT COUNT(*) FROM memory_atoms ma
+        \\WHERE ma.predicate = 'agent.memory' AND ma.object = 'pref.lifecycle' AND ma.status <> 'deprecated'
+        \\AND EXISTS (
+        \\  SELECT 1 FROM json_each(ma.source_ids_json) sid
+        \\  JOIN sources s ON s.id = sid.value
+        \\  WHERE json_extract(s.metadata_json, '$.native') = 'agent_memory_runtime'
+        \\    AND json_extract(s.metadata_json, '$.store') = 'archive'
+        \\    AND json_extract(s.metadata_json, '$.owner_id') = 'agent:lifecycle'
+        \\)
+    ));
 }
 
 test "sqlite context pack can include guarded session history when requested" {
