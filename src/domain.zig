@@ -241,6 +241,7 @@ pub const SearchResult = struct {
     status: []const u8,
     score: f64,
     source_ids_json: []const u8,
+    heading_path_json: []const u8 = "[]",
     required_scopes_json: []const u8 = "",
     actor_isolated: bool = false,
     created_at_ms: i64 = 0,
@@ -263,6 +264,8 @@ pub const SearchResult = struct {
         try json.appendRawJsonOr(out, allocator, self.required_scopes_json, "[]");
         try out.appendSlice(allocator, ",\"citations\":");
         try json.appendRawJsonOr(out, allocator, self.source_ids_json, "[]");
+        try out.appendSlice(allocator, ",\"heading_path\":");
+        try json.appendRawJsonOr(out, allocator, self.heading_path_json, "[]");
         try out.append(allocator, '}');
     }
 };

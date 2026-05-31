@@ -108,6 +108,10 @@ pub fn resultRefsJson(allocator: std.mem.Allocator, results: []const domain.Sear
         try out.append(allocator, ':');
         try json.appendString(&out, allocator, result.id);
         try out.append(allocator, ',');
+        try json.appendString(&out, allocator, "heading_path");
+        try out.append(allocator, ':');
+        try json.appendRawJsonOr(&out, allocator, result.heading_path_json, "[]");
+        try out.append(allocator, ',');
         try json.appendString(&out, allocator, "required_scopes");
         try out.append(allocator, ':');
         try json.appendRawJsonOr(&out, allocator, result.required_scopes_json, "[]");
@@ -151,7 +155,7 @@ pub fn budgetResults(allocator: std.mem.Allocator, results: []const domain.Searc
     var out: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
     errdefer out.deinit(allocator);
     for (results) |result| {
-        const metadata_cost = result.id.len + result.result_type.len + result.title.len + result.scope.len + result.status.len + result.source_ids_json.len + result.required_scopes_json.len + 192;
+        const metadata_cost = result.id.len + result.result_type.len + result.title.len + result.scope.len + result.status.len + result.source_ids_json.len + result.heading_path_json.len + result.required_scopes_json.len + 192;
         const cost = metadata_cost + result.text.len;
         if (used_chars + cost <= max_chars) {
             used_chars += cost;
@@ -254,11 +258,26 @@ fn appendSectionText(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(
         if (!sectionIncludes(result, result_type, contains)) continue;
         if (std.mem.eql(u8, title, "Verified decisions") and !verifiedOrAccepted(result)) continue;
         try out.appendSlice(allocator, "- ");
+        try appendHeadingPathPrefix(allocator, out, result);
         try out.appendSlice(allocator, result.text);
         try out.append(allocator, '\n');
         count += 1;
     }
     if (count == 0) try out.appendSlice(allocator, "- None found.\n");
+}
+
+fn appendHeadingPathPrefix(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), result: domain.SearchResult) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result.heading_path_json, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .array) return;
+    var count: usize = 0;
+    for (parsed.value.array.items) |item| {
+        if (item != .string or item.string.len == 0) continue;
+        if (count == 0) try out.append(allocator, '[') else try out.appendSlice(allocator, " > ");
+        try out.appendSlice(allocator, item.string);
+        count += 1;
+    }
+    if (count > 0) try out.appendSlice(allocator, "] ");
 }
 
 fn sectionIncludes(result: domain.SearchResult, result_type: []const u8, contains: []const u8) bool {
@@ -482,6 +501,7 @@ test "context pack result refs preserve non-primitive acl metadata" {
             .status = "verified",
             .score = 1,
             .source_ids_json = "[]",
+            .heading_path_json = "[\"# Agent\",\"## Memory\"]",
             .required_scopes_json = "[\"agent:agent:a\"]",
             .actor_isolated = true,
         },
@@ -489,6 +509,7 @@ test "context pack result refs preserve non-primitive acl metadata" {
     const refs = try resultRefsJson(std.testing.allocator, &items);
     defer std.testing.allocator.free(refs);
     try std.testing.expect(std.mem.indexOf(u8, refs, "\"type\":\"agent_memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refs, "\"heading_path\":[\"# Agent\",\"## Memory\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, refs, "\"required_scopes\":[\"agent:agent:a\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, refs, "\"actor_isolated\":true") != null);
 }

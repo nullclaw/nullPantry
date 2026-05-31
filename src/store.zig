@@ -3209,6 +3209,10 @@ fn vectorIdFromOutboxPayload(allocator: std.mem.Allocator, payload_json: []const
     return allocator.dupe(u8, vector_id);
 }
 
+fn vectorMatchedText(match: vector_mod.VectorMatch, fallback: []const u8) []const u8 {
+    return if (match.text.len > 0) match.text else fallback;
+}
+
 fn vectorChunkUpsertInput(chunk: VectorChunk) vector_runtime.UpsertInput {
     return .{
         .id = chunk.id,
@@ -6105,11 +6109,12 @@ pub const SQLiteStore = struct {
                 .id = atom.id,
                 .result_type = "memory_atom",
                 .title = atom.id,
-                .text = atom.text,
+                .text = vectorMatchedText(match, atom.text),
                 .scope = atom.scope,
                 .status = atom.status,
                 .score = @as(f64, match.score) + atom.confidence,
                 .source_ids_json = try self.sanitizeSourceIds(allocator, atom.source_ids_json, input.scopes_json),
+                .heading_path_json = match.heading_path_json,
                 .required_scopes_json = try requiredAccessJsonGlobal(allocator, atom.scope, atom.permissions_json, input.actor_id),
                 .actor_isolated = resultActorIsolatedGlobal(allocator, "memory_atom", atom.scope, atom.permissions_json, input.actor_id),
                 .created_at_ms = atom.created_at_ms,
@@ -6126,11 +6131,12 @@ pub const SQLiteStore = struct {
                 .id = source.id,
                 .result_type = "source",
                 .title = source.title,
-                .text = source.content,
+                .text = vectorMatchedText(match, source.content),
                 .scope = source.scope,
                 .status = status,
                 .score = match.score,
                 .source_ids_json = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{source.id}),
+                .heading_path_json = match.heading_path_json,
                 .required_scopes_json = try requiredAccessJsonGlobal(allocator, source.scope, source.permissions_json, input.actor_id),
                 .actor_isolated = resultActorIsolatedGlobal(allocator, "source", source.scope, source.permissions_json, input.actor_id),
                 .created_at_ms = source.imported_at_ms,
@@ -6145,11 +6151,12 @@ pub const SQLiteStore = struct {
                 .id = artifact.id,
                 .result_type = "artifact",
                 .title = artifact.title,
-                .text = try artifactTextWithFields(allocator, artifact.body, artifact.fields_json),
+                .text = if (match.text.len > 0) match.text else try artifactTextWithFields(allocator, artifact.body, artifact.fields_json),
                 .scope = artifact.scope,
                 .status = artifact.status,
                 .score = match.score,
                 .source_ids_json = try self.sanitizeSourceIds(allocator, artifact.source_ids_json, input.scopes_json),
+                .heading_path_json = match.heading_path_json,
                 .required_scopes_json = try requiredAccessJsonGlobal(allocator, artifact.scope, artifact.permissions_json, input.actor_id),
                 .actor_isolated = resultActorIsolatedGlobal(allocator, "artifact", artifact.scope, artifact.permissions_json, input.actor_id),
                 .created_at_ms = artifact.updated_at_ms,
@@ -6166,11 +6173,12 @@ pub const SQLiteStore = struct {
                 .id = entity.id,
                 .result_type = "entity",
                 .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ entity.entity_type, entity.name }),
-                .text = text,
+                .text = vectorMatchedText(match, text),
                 .scope = entity.scope,
                 .status = status,
                 .score = match.score + 0.25,
                 .source_ids_json = "[]",
+                .heading_path_json = match.heading_path_json,
                 .required_scopes_json = try requiredAccessJsonGlobal(allocator, entity.scope, entity.permissions_json, input.actor_id),
                 .actor_isolated = resultActorIsolatedGlobal(allocator, "entity", entity.scope, entity.permissions_json, input.actor_id),
                 .created_at_ms = entity.updated_at_ms,
@@ -6189,11 +6197,12 @@ pub const SQLiteStore = struct {
                 .id = relation.id,
                 .result_type = "relation",
                 .title = relation.relation_type,
-                .text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ from_entity.name, relation.relation_type, to_entity.name }),
+                .text = if (match.text.len > 0) match.text else try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ from_entity.name, relation.relation_type, to_entity.name }),
                 .scope = relation.scope,
                 .status = relation.status,
                 .score = match.score + relation.confidence,
                 .source_ids_json = try self.sanitizeSourceIds(allocator, relation.source_ids_json, input.scopes_json),
+                .heading_path_json = match.heading_path_json,
                 .required_scopes_json = try requiredAccessJsonGlobal(allocator, relation.scope, relation.permissions_json, input.actor_id),
                 .actor_isolated = resultActorIsolatedGlobal(allocator, "relation", relation.scope, relation.permissions_json, input.actor_id),
                 .created_at_ms = relation.created_at_ms,
@@ -6211,11 +6220,12 @@ pub const SQLiteStore = struct {
                 .id = entry.id,
                 .result_type = "agent_memory",
                 .title = entry.key,
-                .text = entry.content,
+                .text = vectorMatchedText(match, entry.content),
                 .scope = entry.scope,
                 .status = "active",
                 .score = match.score + (entry.score orelse 0.5),
                 .source_ids_json = "[]",
+                .heading_path_json = match.heading_path_json,
                 .required_scopes_json = try requiredAccessJsonGlobal(allocator, entry.scope, entry.permissions_json, input.actor_id),
                 .actor_isolated = !isSharedAgentMemoryOwner(entry.actor_id),
                 .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0,
@@ -6233,11 +6243,12 @@ pub const SQLiteStore = struct {
                 .id = space.id,
                 .result_type = "space",
                 .title = space.title,
-                .text = text,
+                .text = vectorMatchedText(match, text),
                 .scope = space.scope,
                 .status = "active",
                 .score = match.score + 0.2,
                 .source_ids_json = "[]",
+                .heading_path_json = match.heading_path_json,
                 .required_scopes_json = try requiredAccessJsonGlobal(allocator, space.scope, space.permissions_json, input.actor_id),
                 .actor_isolated = resultActorIsolatedGlobal(allocator, "space", space.scope, space.permissions_json, input.actor_id),
                 .created_at_ms = space.updated_at_ms,
@@ -6255,11 +6266,12 @@ pub const SQLiteStore = struct {
                 .id = policy.scope,
                 .result_type = "policy_scope",
                 .title = policy.scope,
-                .text = text,
+                .text = vectorMatchedText(match, text),
                 .scope = policy.scope,
                 .status = policy.visibility,
                 .score = match.score + 0.2,
                 .source_ids_json = "[]",
+                .heading_path_json = match.heading_path_json,
                 .required_scopes_json = try requiredAccessJsonGlobal(allocator, policy.scope, policy.permissions_json, input.actor_id),
                 .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", policy.scope, policy.permissions_json, input.actor_id),
                 .created_at_ms = policy.updated_at_ms,
@@ -6293,11 +6305,12 @@ pub const SQLiteStore = struct {
             .id = id_text,
             .result_type = "context_pack",
             .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ purpose, target }),
-            .text = summary,
+            .text = vectorMatchedText(match, summary),
             .scope = "context",
             .status = status,
             .score = match.score + 0.4,
             .source_ids_json = try self.sanitizeSourceIds(allocator, source_ids, input.scopes_json),
+            .heading_path_json = match.heading_path_json,
             .required_scopes_json = required_scopes,
             .actor_isolated = actor_isolated,
             .created_at_ms = created_at_ms,
@@ -6398,11 +6411,9 @@ pub const SQLiteStore = struct {
         defer allocator.free(fused);
         var out: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         for (fused) |ranked| {
-            if (findSearchResultById(keyword_results, ranked.id)) |result| {
-                var copy = result;
-                copy.score += ranked.score;
-                try out.append(allocator, copy);
-            } else if (findSearchResultById(vector_results, ranked.id)) |result| {
+            const keyword_result = findSearchResultById(keyword_results, ranked.id);
+            const vector_result = findSearchResultById(vector_results, ranked.id);
+            if (chooseFusedSearchResult(keyword_result, vector_result)) |result| {
                 var copy = result;
                 copy.score += ranked.score;
                 try out.append(allocator, copy);
@@ -9443,11 +9454,9 @@ pub const PostgresStore = struct {
         defer allocator.free(fused);
         var out: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         for (fused) |ranked| {
-            if (findSearchResultByIdGlobal(keyword_results, ranked.id)) |result| {
-                var copy = result;
-                copy.score += ranked.score;
-                try out.append(allocator, copy);
-            } else if (findSearchResultByIdGlobal(vector_results, ranked.id)) |result| {
+            const keyword_result = findSearchResultByIdGlobal(keyword_results, ranked.id);
+            const vector_result = findSearchResultByIdGlobal(vector_results, ranked.id);
+            if (chooseFusedSearchResult(keyword_result, vector_result)) |result| {
                 var copy = result;
                 copy.score += ranked.score;
                 try out.append(allocator, copy);
@@ -11170,7 +11179,7 @@ pub const PostgresStore = struct {
             if (std.mem.eql(u8, atom.predicate, "agent.memory")) return null;
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(atom.status)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, atom.scope, atom.permissions_json, input.scopes_json, input.actor_id)) return null;
-            return .{ .id = atom.id, .result_type = "memory_atom", .title = atom.id, .text = atom.text, .scope = atom.scope, .status = atom.status, .score = match.score + atom.confidence, .source_ids_json = try self.sanitizeSourceIds(allocator, atom.source_ids_json, input.scopes_json), .required_scopes_json = try requiredAccessJsonGlobal(allocator, atom.scope, atom.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "memory_atom", atom.scope, atom.permissions_json, input.actor_id), .created_at_ms = atom.created_at_ms, .confidence = atom.confidence };
+            return .{ .id = atom.id, .result_type = "memory_atom", .title = atom.id, .text = vectorMatchedText(match, atom.text), .scope = atom.scope, .status = atom.status, .score = match.score + atom.confidence, .source_ids_json = try self.sanitizeSourceIds(allocator, atom.source_ids_json, input.scopes_json), .heading_path_json = match.heading_path_json, .required_scopes_json = try requiredAccessJsonGlobal(allocator, atom.scope, atom.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "memory_atom", atom.scope, atom.permissions_json, input.actor_id), .created_at_ms = atom.created_at_ms, .confidence = atom.confidence };
         }
         if (std.mem.eql(u8, match.object_type, "source")) {
             const source = (try self.getSource(allocator, match.object_id)) orelse return null;
@@ -11178,13 +11187,13 @@ pub const PostgresStore = struct {
             const status = try self.primitiveLifecycleStatus(allocator, "source", source.id);
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, source.scope, source.permissions_json, input.scopes_json, input.actor_id)) return null;
-            return .{ .id = source.id, .result_type = "source", .title = source.title, .text = source.content, .scope = source.scope, .status = status, .score = match.score, .source_ids_json = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{source.id}), .required_scopes_json = try requiredAccessJsonGlobal(allocator, source.scope, source.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "source", source.scope, source.permissions_json, input.actor_id), .created_at_ms = source.imported_at_ms, .confidence = 0.7 };
+            return .{ .id = source.id, .result_type = "source", .title = source.title, .text = vectorMatchedText(match, source.content), .scope = source.scope, .status = status, .score = match.score, .source_ids_json = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{source.id}), .heading_path_json = match.heading_path_json, .required_scopes_json = try requiredAccessJsonGlobal(allocator, source.scope, source.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "source", source.scope, source.permissions_json, input.actor_id), .created_at_ms = source.imported_at_ms, .confidence = 0.7 };
         }
         if (std.mem.eql(u8, match.object_type, "artifact")) {
             const artifact = (try self.getArtifact(allocator, match.object_id)) orelse return null;
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(artifact.status)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, artifact.scope, artifact.permissions_json, input.scopes_json, input.actor_id)) return null;
-            return .{ .id = artifact.id, .result_type = "artifact", .title = artifact.title, .text = try artifactTextWithFields(allocator, artifact.body, artifact.fields_json), .scope = artifact.scope, .status = artifact.status, .score = match.score, .source_ids_json = try self.sanitizeSourceIds(allocator, artifact.source_ids_json, input.scopes_json), .required_scopes_json = try requiredAccessJsonGlobal(allocator, artifact.scope, artifact.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "artifact", artifact.scope, artifact.permissions_json, input.actor_id), .created_at_ms = artifact.updated_at_ms, .confidence = if (std.mem.eql(u8, artifact.status, "accepted") or std.mem.eql(u8, artifact.status, "verified")) 0.85 else 0.55 };
+            return .{ .id = artifact.id, .result_type = "artifact", .title = artifact.title, .text = if (match.text.len > 0) match.text else try artifactTextWithFields(allocator, artifact.body, artifact.fields_json), .scope = artifact.scope, .status = artifact.status, .score = match.score, .source_ids_json = try self.sanitizeSourceIds(allocator, artifact.source_ids_json, input.scopes_json), .heading_path_json = match.heading_path_json, .required_scopes_json = try requiredAccessJsonGlobal(allocator, artifact.scope, artifact.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "artifact", artifact.scope, artifact.permissions_json, input.actor_id), .created_at_ms = artifact.updated_at_ms, .confidence = if (std.mem.eql(u8, artifact.status, "accepted") or std.mem.eql(u8, artifact.status, "verified")) 0.85 else 0.55 };
         }
         if (std.mem.eql(u8, match.object_type, "entity")) {
             const entity = (try self.getEntity(allocator, match.object_id)) orelse return null;
@@ -11192,7 +11201,7 @@ pub const PostgresStore = struct {
             if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, entity.scope, entity.permissions_json, input.scopes_json, input.actor_id)) return null;
             const text = entity.description orelse entity.name;
-            return .{ .id = entity.id, .result_type = "entity", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ entity.entity_type, entity.name }), .text = text, .scope = entity.scope, .status = status, .score = match.score + 0.25, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, entity.scope, entity.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "entity", entity.scope, entity.permissions_json, input.actor_id), .created_at_ms = entity.updated_at_ms, .confidence = 0.6 };
+            return .{ .id = entity.id, .result_type = "entity", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ entity.entity_type, entity.name }), .text = vectorMatchedText(match, text), .scope = entity.scope, .status = status, .score = match.score + 0.25, .source_ids_json = "[]", .heading_path_json = match.heading_path_json, .required_scopes_json = try requiredAccessJsonGlobal(allocator, entity.scope, entity.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "entity", entity.scope, entity.permissions_json, input.actor_id), .created_at_ms = entity.updated_at_ms, .confidence = 0.6 };
         }
         if (std.mem.eql(u8, match.object_type, "relation")) {
             const relation = (try self.getRelation(allocator, match.object_id)) orelse return null;
@@ -11202,7 +11211,7 @@ pub const PostgresStore = struct {
             const to_entity = (try self.getEntity(allocator, relation.to_entity_id)) orelse return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, from_entity.scope, from_entity.permissions_json, input.scopes_json, input.actor_id)) return null;
             if (!try self.recordVisibleWithPolicyForActor(allocator, to_entity.scope, to_entity.permissions_json, input.scopes_json, input.actor_id)) return null;
-            return .{ .id = relation.id, .result_type = "relation", .title = relation.relation_type, .text = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ from_entity.name, relation.relation_type, to_entity.name }), .scope = relation.scope, .status = relation.status, .score = match.score + relation.confidence, .source_ids_json = try self.sanitizeSourceIds(allocator, relation.source_ids_json, input.scopes_json), .required_scopes_json = try requiredAccessJsonGlobal(allocator, relation.scope, relation.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "relation", relation.scope, relation.permissions_json, input.actor_id), .created_at_ms = relation.created_at_ms, .confidence = relation.confidence };
+            return .{ .id = relation.id, .result_type = "relation", .title = relation.relation_type, .text = if (match.text.len > 0) match.text else try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ from_entity.name, relation.relation_type, to_entity.name }), .scope = relation.scope, .status = relation.status, .score = match.score + relation.confidence, .source_ids_json = try self.sanitizeSourceIds(allocator, relation.source_ids_json, input.scopes_json), .heading_path_json = match.heading_path_json, .required_scopes_json = try requiredAccessJsonGlobal(allocator, relation.scope, relation.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "relation", relation.scope, relation.permissions_json, input.actor_id), .created_at_ms = relation.created_at_ms, .confidence = relation.confidence };
         }
         if (std.mem.eql(u8, match.object_type, "context_pack")) {
             return try self.contextPackSearchResultForVector(allocator, match, input);
@@ -11211,7 +11220,7 @@ pub const PostgresStore = struct {
             const entry = (try self.agentMemoryById(allocator, match.object_id)) orelse return null;
             if (!try self.agentMemoryResultVisible(allocator, entry.actor_id, entry.scope, entry.permissions_json, entry.session_id, input.scopes_json, input.actor_id)) return null;
             if (domain.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) return null;
-            return .{ .id = entry.id, .result_type = "agent_memory", .title = entry.key, .text = entry.content, .scope = entry.scope, .status = "active", .score = match.score + (entry.score orelse 0.5), .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, entry.scope, entry.permissions_json, input.actor_id), .actor_isolated = !isSharedAgentMemoryOwner(entry.actor_id), .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0, .confidence = entry.score orelse 0.7 };
+            return .{ .id = entry.id, .result_type = "agent_memory", .title = entry.key, .text = vectorMatchedText(match, entry.content), .scope = entry.scope, .status = "active", .score = match.score + (entry.score orelse 0.5), .source_ids_json = "[]", .heading_path_json = match.heading_path_json, .required_scopes_json = try requiredAccessJsonGlobal(allocator, entry.scope, entry.permissions_json, input.actor_id), .actor_isolated = !isSharedAgentMemoryOwner(entry.actor_id), .created_at_ms = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0, .confidence = entry.score orelse 0.7 };
         }
         if (std.mem.eql(u8, match.object_type, "space")) {
             const space = (try self.getSpace(allocator, match.object_id)) orelse return null;
@@ -11220,7 +11229,7 @@ pub const PostgresStore = struct {
                 try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ space.name, space.title, description, space.metadata_json })
             else
                 try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ space.name, space.title, space.metadata_json });
-            return .{ .id = space.id, .result_type = "space", .title = space.title, .text = text, .scope = space.scope, .status = "active", .score = match.score + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, space.scope, space.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "space", space.scope, space.permissions_json, input.actor_id), .created_at_ms = space.updated_at_ms, .confidence = 0.7 };
+            return .{ .id = space.id, .result_type = "space", .title = space.title, .text = vectorMatchedText(match, text), .scope = space.scope, .status = "active", .score = match.score + 0.2, .source_ids_json = "[]", .heading_path_json = match.heading_path_json, .required_scopes_json = try requiredAccessJsonGlobal(allocator, space.scope, space.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "space", space.scope, space.permissions_json, input.actor_id), .created_at_ms = space.updated_at_ms, .confidence = 0.7 };
         }
         if (std.mem.eql(u8, match.object_type, "policy_scope")) {
             const policy = (try self.getPolicyScope(allocator, match.object_id)) orelse return null;
@@ -11229,7 +11238,7 @@ pub const PostgresStore = struct {
                 try std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ policy.scope, policy.visibility, owner, policy.metadata_json })
             else
                 try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ policy.scope, policy.visibility, policy.metadata_json });
-            return .{ .id = policy.scope, .result_type = "policy_scope", .title = policy.scope, .text = text, .scope = policy.scope, .status = policy.visibility, .score = match.score + 0.2, .source_ids_json = "[]", .required_scopes_json = try requiredAccessJsonGlobal(allocator, policy.scope, policy.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", policy.scope, policy.permissions_json, input.actor_id), .created_at_ms = policy.updated_at_ms, .confidence = 0.7 };
+            return .{ .id = policy.scope, .result_type = "policy_scope", .title = policy.scope, .text = vectorMatchedText(match, text), .scope = policy.scope, .status = policy.visibility, .score = match.score + 0.2, .source_ids_json = "[]", .heading_path_json = match.heading_path_json, .required_scopes_json = try requiredAccessJsonGlobal(allocator, policy.scope, policy.permissions_json, input.actor_id), .actor_isolated = resultActorIsolatedGlobal(allocator, "policy_scope", policy.scope, policy.permissions_json, input.actor_id), .created_at_ms = policy.updated_at_ms, .confidence = 0.7 };
         }
         return null;
     }
@@ -11255,7 +11264,7 @@ pub const PostgresStore = struct {
         if (!try self.contextPackVisible(allocator, source_ids, artifact_ids, atom_ids, result_refs, required_scopes, row_actor, actor_isolated, input.scopes_json, input.actor_id, input.include_deprecated)) return null;
         const status = try self.primitiveLifecycleStatus(allocator, "context_pack", id_text);
         if (!input.include_deprecated and !domain.isDefaultVisibleStatus(status)) return null;
-        return .{ .id = id_text, .result_type = "context_pack", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ purpose, target }), .text = summary, .scope = "context", .status = status, .score = match.score + 0.4, .source_ids_json = try self.sanitizeSourceIds(allocator, source_ids, input.scopes_json), .required_scopes_json = required_scopes, .actor_isolated = actor_isolated, .created_at_ms = created_at_ms, .confidence = 0.65 };
+        return .{ .id = id_text, .result_type = "context_pack", .title = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ purpose, target }), .text = vectorMatchedText(match, summary), .scope = "context", .status = status, .score = match.score + 0.4, .source_ids_json = try self.sanitizeSourceIds(allocator, source_ids, input.scopes_json), .heading_path_json = match.heading_path_json, .required_scopes_json = required_scopes, .actor_isolated = actor_isolated, .created_at_ms = created_at_ms, .confidence = 0.65 };
     }
 
     fn sanitizeSourceIds(self: *PostgresStore, allocator: std.mem.Allocator, source_ids_json: []const u8, scopes_json: []const u8) ![]const u8 {
@@ -11803,6 +11812,18 @@ fn findSearchResultByIdGlobal(results: []const domain.SearchResult, id_text: []c
         if (std.mem.eql(u8, result.id, id_text)) return result;
     }
     return null;
+}
+
+fn chooseFusedSearchResult(keyword_result: ?domain.SearchResult, vector_result: ?domain.SearchResult) ?domain.SearchResult {
+    const vector = vector_result orelse return keyword_result;
+    const keyword = keyword_result orelse return vector;
+    if (headingPathJsonHasItems(vector.heading_path_json)) return vector;
+    if (vector.score > keyword.score) return vector;
+    return keyword;
+}
+
+fn headingPathJsonHasItems(raw: []const u8) bool {
+    return std.mem.indexOfScalar(u8, raw, '"') != null;
 }
 
 fn diversifySearchResultsWithMmr(allocator: std.mem.Allocator, input: SearchInput, ordered: []const domain.SearchResult, limit: usize) ![]domain.SearchResult {
@@ -12488,6 +12509,64 @@ test "sqlite vector chunks preserve heading path metadata" {
     const matches = try store.vectorSearch(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .limit = 5 });
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqualStrings("[\"# NullPantry\",\"## Storage\"]", matches[0].heading_path_json);
+}
+
+test "sqlite search and context packs expose matched vector section metadata" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    const artifact = try store.createArtifact(alloc, .{
+        .title = "Sectioned Product Spec",
+        .body = "# Product\nLarge unrelated intro that should not replace the matched vector chunk.\n## Storage\nCanonical storage section.",
+        .scope = "public",
+        .status = "published",
+    });
+    _ = try store.upsertVectorChunk(alloc, .{
+        .object_type = "artifact",
+        .object_id = artifact.id,
+        .text = "## Storage\nMatched vector chunk only.",
+        .scope = artifact.scope,
+        .permissions_json = artifact.permissions_json,
+        .heading_path_json = "[\"# Product\",\"## Storage\"]",
+        .embedding_json = embedding,
+        .dimensions = 2,
+    });
+
+    const results = try store.search(alloc, .{
+        .query = "vector section metadata",
+        .query_embedding_json = embedding,
+        .scopes_json = "[\"public\"]",
+        .limit = 5,
+        .use_temporal_decay = false,
+        .use_mmr = false,
+    });
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("artifact", results[0].result_type);
+    try std.testing.expectEqualStrings("## Storage\nMatched vector chunk only.", results[0].text);
+    try std.testing.expectEqualStrings("[\"# Product\",\"## Storage\"]", results[0].heading_path_json);
+
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    try results[0].writeJson(alloc, &encoded);
+    const result_json = try encoded.toOwnedSlice(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, result_json, "\"heading_path\":[\"# Product\",\"## Storage\"]") != null);
+
+    const pack = try store.createContextPack(alloc, .{
+        .query = "vector section metadata",
+        .query_embedding_json = embedding,
+        .scopes_json = "[\"public\"]",
+        .retrieval_limit = 5,
+        .persist = false,
+        .use_temporal_decay = false,
+        .use_mmr = false,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, pack.sections_json, "\"heading_path\":[\"# Product\",\"## Storage\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.included_result_refs_json, "\"heading_path\":[\"# Product\",\"## Storage\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "[# Product > ## Storage] ## Storage\nMatched vector chunk only.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.generated_summary, "Large unrelated intro") == null);
 }
 
 test "lancedb external vector plane runs through canonical outbox and ACL hydration" {
