@@ -845,6 +845,7 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     defer parsed.deinit();
     const obj = parsed.value.object;
     const session_id = nullableStringFieldAlias(obj, "session_id", "session");
+    const session_field_present = fieldAliasPresent(obj, "session_id", "session");
     if (session_id) |sid| {
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
@@ -863,7 +864,7 @@ fn nullClawAgentMemorySearch(ctx: *Context, body: []const u8) HttpResponse {
     }
     const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-    const primary = if (session_id == null)
+    const primary = if (session_id == null and !session_field_present)
         ctx.store.agentMemorySearchAnyVisibleRouted(ctx.allocator, query, limit, scopes_json, ctx.actor_id, storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
             else => return serverError(ctx),
@@ -10707,6 +10708,10 @@ fn nullableStringFieldAlias(obj: std.json.ObjectMap, primary: []const u8, alias:
     return json.nullableStringField(obj, primary) orelse json.nullableStringField(obj, alias);
 }
 
+fn fieldAliasPresent(obj: std.json.ObjectMap, primary: []const u8, alias: []const u8) bool {
+    return obj.get(primary) != null or obj.get(alias) != null;
+}
+
 fn queryBool(query: []const u8, name: []const u8, default_value: bool) bool {
     const raw = json.queryParam(query, name) orelse return default_value;
     return std.ascii.eqlIgnoreCase(raw, "true") or
@@ -10965,6 +10970,14 @@ test "api nullclaw agent adapter matches current nullclaw memory engine contract
     try std.testing.expectEqualStrings("200 OK", search_session_a_without_sid.status);
     try std.testing.expect(std.mem.indexOf(u8, search_session_a_without_sid.body, "Agent A session adapter value") != null);
     try std.testing.expect(std.mem.indexOf(u8, search_session_a_without_sid.body, "Agent B session adapter value") == null);
+    const search_explicit_null_session = handleRequest(&ctx, "POST", "/v1/agent/memories/search", "{\"query\":\"session adapter value\",\"limit\":10,\"session_id\":null}", "POST /v1/agent/memories/search HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", search_explicit_null_session.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_explicit_null_session.body, "Agent A session adapter value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, search_explicit_null_session.body, "Agent B session adapter value") == null);
+    const search_global_explicit_null_session = handleRequest(&ctx, "POST", "/v1/agent/memories/search", "{\"query\":\"Agent A adapter value\",\"limit\":10,\"session_id\":null}", "POST /v1/agent/memories/search HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n{}");
+    try std.testing.expectEqualStrings("200 OK", search_global_explicit_null_session.status);
+    try std.testing.expect(std.mem.indexOf(u8, search_global_explicit_null_session.body, "Agent A adapter value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_global_explicit_null_session.body, "Agent B adapter value") == null);
     const delete_session_a_without_scope = handleRequest(&ctx, "DELETE", "/v1/agent/memories/pref.session", "", "DELETE /v1/agent/memories/pref.session HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
     try std.testing.expectEqualStrings("404 Not Found", delete_session_a_without_scope.status);
     const still_session_a_after_global_delete = handleRequest(&ctx, "GET", "/v1/agent/memories/pref.session?session_id=sid-1", "", "GET /v1/agent/memories/pref.session?session_id=sid-1 HTTP/1.1\r\nAuthorization: Bearer agent-a\r\n\r\n");
