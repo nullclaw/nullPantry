@@ -12571,9 +12571,14 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expectEqualStrings("200 OK", engines_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"none\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"hybrid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"nullclaw_engine_token\":\"sqlite\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"memory_lru\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"nullclaw_engine_token\":\"memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"aliases\":[\"memory\",\"in_memory\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"aliases\":[\"sqlite_markdown\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"auto_save_default\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"capabilities\":{\"keyword_rank\":true,\"session_store\":true,\"transactions\":true,\"outbox\":true}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"requirements\":{\"db_path\":true,\"workspace\":true}") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"pgvector\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"qdrant\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, engines_resp.body, "\"name\":\"lancedb\"") != null);
