@@ -117,8 +117,13 @@ fn routeFromOwnedStoreNames(allocator: std.mem.Allocator, stores: [][]const u8, 
 
     var unique: usize = 0;
     for (stores[0..used]) |store_name| {
-        if (storeNameSeen(stores[0..unique], store_name)) continue;
-        stores[unique] = store_name;
+        const canonical = canonicalStoreSelectorName(store_name);
+        if (std.mem.eql(u8, canonical, "all")) {
+            allocator.free(stores);
+            return .{ .target = .all };
+        }
+        if (storeNameSeen(stores[0..unique], canonical)) continue;
+        stores[unique] = canonical;
         unique += 1;
     }
 
@@ -140,6 +145,18 @@ fn storeNameSeen(stores: []const []const u8, name: []const u8) bool {
         if (std.mem.eql(u8, store_name, name)) return true;
     }
     return false;
+}
+
+fn canonicalStoreSelectorName(name: []const u8) []const u8 {
+    const route = Route.parse(name);
+    return switch (route.target) {
+        .primary => "primary",
+        .native => "native",
+        .runtime => "runtime",
+        .named => route.name orelse name,
+        .all => "all",
+        .subset => name,
+    };
 }
 
 pub fn fromAliasedObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap, names: []const []const u8) !?Route {
@@ -244,6 +261,25 @@ test "storage route compacts sparse store selectors before ownership transfer" {
     try std.testing.expectEqual(@as(usize, 2), json_route.stores.len);
     try std.testing.expectEqualStrings("scratch", json_route.stores[0]);
     try std.testing.expectEqualStrings("archive", json_route.stores[1]);
+}
+
+test "storage route collapses alias-equivalent subset selectors" {
+    const allocator = std.testing.allocator;
+
+    const runtime_route = try fromQuery(allocator, "stores=redis,runtime,external");
+    defer runtime_route.deinit(allocator);
+    try std.testing.expectEqual(Target.runtime, runtime_route.target);
+
+    const mixed_route = try fromCsv(allocator, "postgres,native,sqlite,scratch");
+    defer mixed_route.deinit(allocator);
+    try std.testing.expectEqual(Target.subset, mixed_route.target);
+    try std.testing.expectEqual(@as(usize, 2), mixed_route.stores.len);
+    try std.testing.expectEqualStrings("native", mixed_route.stores[0]);
+    try std.testing.expectEqualStrings("scratch", mixed_route.stores[1]);
+
+    const all_route = try fromCsv(allocator, "scratch,all,archive");
+    defer all_route.deinit(allocator);
+    try std.testing.expectEqual(Target.all, all_route.target);
 }
 
 test "storage route renders API and extraction JSON" {
