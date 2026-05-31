@@ -3902,7 +3902,7 @@ fn lifecycleSnapshotExport(ctx: *Context, body: []const u8) HttpResponse {
     out.print(ctx.allocator, ",\"persisted\":{s},\"created_at_ms\":{d},\"object_count\":{d},\"summary\":", .{ if (persist_snapshot) "true" else "false", snapshot.created_at_ms, results.len }) catch return serverError(ctx);
     json.appendRawJsonOr(&out, ctx.allocator, summary_json, "{}") catch return serverError(ctx);
     out.appendSlice(ctx.allocator, ",\"objects\":") catch return serverError(ctx);
-    appendSearchArray(ctx, &out, results) catch return serverError(ctx);
+    appendSnapshotObjects(ctx, &out, results) catch return serverError(ctx);
     out.appendSlice(ctx.allocator, "}}") catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
 }
@@ -3924,6 +3924,29 @@ fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
         (json.boolField(obj, "preflight") orelse false) or
         (json.boolField(obj, "preflight_only") orelse false);
 
+    var memory_only = true;
+    for (objects.items) |item| {
+        if (item != .object) {
+            continue;
+        }
+        const flat = snapshotRecordObject(item.object);
+        const kind = snapshotObjectType(item.object, flat) orelse {
+            memory_only = false;
+            break;
+        };
+        if (!std.mem.eql(u8, kind, "memory_atom")) {
+            memory_only = false;
+            break;
+        }
+    }
+    if (!memory_only) return lifecycleSnapshotImportStructured(ctx, objects.items, .{
+        .default_scope = default_scope,
+        .default_permissions_json = default_permissions,
+        .created_by = created_by,
+        .dry_run = dry_run,
+        .preserve_ids = json.boolField(obj, "preserve_ids") orelse true,
+    });
+
     var prepared: std.ArrayListUnmanaged(store_mod.PreparedMemoryImport) = .empty;
     errdefer prepared.deinit(ctx.allocator);
     var skipped: usize = 0;
@@ -3932,7 +3955,7 @@ fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
             skipped += 1;
             continue;
         }
-        const source_obj = item.object;
+        const source_obj = snapshotRecordObject(item.object);
         const text = json.stringField(source_obj, "text") orelse {
             skipped += 1;
             continue;
@@ -3980,7 +4003,7 @@ fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
         prepared.append(ctx.allocator, .{ .atom = input, .generated_source = generated_source }) catch return serverError(ctx);
     }
     if (dry_run) {
-        return snapshotHydrateResponse(ctx, 0, prepared.items.len, skipped, true, "[]");
+        return snapshotHydrateResponse(ctx, 0, prepared.items.len, skipped, true, true, "[]", "[]", "{}");
     }
     const atoms = ctx.store.importMemoryAtomsAtomic(ctx.allocator, prepared.items) catch return serverError(ctx);
     var imported_ids: std.ArrayListUnmanaged(u8) = .empty;
@@ -3990,7 +4013,65 @@ fn lifecycleSnapshotImport(ctx: *Context, body: []const u8) HttpResponse {
         json.appendString(&imported_ids, ctx.allocator, atom.id) catch return serverError(ctx);
     }
     imported_ids.append(ctx.allocator, ']') catch return serverError(ctx);
-    return snapshotHydrateResponse(ctx, atoms.len, prepared.items.len, skipped, false, imported_ids.items);
+    return snapshotHydrateResponse(ctx, atoms.len, prepared.items.len, skipped, false, true, imported_ids.items, "[]", "{}");
+}
+
+const SnapshotImportOptions = struct {
+    default_scope: []const u8,
+    default_permissions_json: []const u8,
+    created_by: []const u8,
+    dry_run: bool,
+    preserve_ids: bool = true,
+};
+
+const SnapshotHydratedObject = struct {
+    object_type: []const u8,
+    id: []const u8,
+};
+
+fn lifecycleSnapshotImportStructured(ctx: *Context, items: []const std.json.Value, options: SnapshotImportOptions) HttpResponse {
+    var validated: usize = 0;
+    var skipped: usize = 0;
+    var imported: usize = 0;
+    var ids_out: std.ArrayListUnmanaged(u8) = .empty;
+    ids_out.append(ctx.allocator, '[') catch return serverError(ctx);
+    var first_id = true;
+    var counts = SnapshotTypeCounts{};
+
+    const phases = [_][]const u8{ "source", "entity", "artifact", "memory_atom", "relation", "agent_memory", "context_pack" };
+    for (phases) |phase| {
+        for (items) |item| {
+            if (item != .object) {
+                if (std.mem.eql(u8, phase, phases[0])) skipped += 1;
+                continue;
+            }
+            const outer = item.object;
+            const record = snapshotRecordObject(outer);
+            const kind = snapshotObjectType(outer, record) orelse {
+                if (std.mem.eql(u8, phase, phases[0])) skipped += 1;
+                continue;
+            };
+            if (!std.mem.eql(u8, kind, phase)) continue;
+            validated += 1;
+            const hydrated = snapshotHydrateStructuredObject(ctx, kind, record, options) catch |err| switch (err) {
+                error.Forbidden => return forbidden(ctx),
+                error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
+                error.Skipped => {
+                    skipped += 1;
+                    continue;
+                },
+                else => return serverError(ctx),
+            };
+            if (!options.dry_run) imported += 1;
+            counts.add(kind);
+            if (!first_id) ids_out.append(ctx.allocator, ',') catch return serverError(ctx);
+            first_id = false;
+            appendSnapshotHydratedObjectJson(ctx, &ids_out, hydrated) catch return serverError(ctx);
+        }
+    }
+    ids_out.append(ctx.allocator, ']') catch return serverError(ctx);
+    const counts_json = counts.toJson(ctx.allocator) catch return serverError(ctx);
+    return snapshotHydrateResponse(ctx, imported, validated, skipped, options.dry_run, false, "[]", ids_out.items, counts_json);
 }
 
 fn snapshotObjectsValue(obj: std.json.ObjectMap) ?std.json.Value {
@@ -4001,12 +4082,320 @@ fn snapshotObjectsValue(obj: std.json.ObjectMap) ?std.json.Value {
     return null;
 }
 
-fn snapshotHydrateResponse(ctx: *Context, imported: usize, validated: usize, skipped: usize, dry_run: bool, memory_atom_ids_json: []const u8) HttpResponse {
+fn snapshotHydrateResponse(ctx: *Context, imported: usize, validated: usize, skipped: usize, dry_run: bool, atomic: bool, memory_atom_ids_json: []const u8, object_ids_json: []const u8, counts_json: []const u8) HttpResponse {
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    out.print(ctx.allocator, "{{\"imported\":{d},\"hydrated\":{d},\"validated\":{d},\"skipped\":{d},\"dry_run\":{s},\"atomic\":true,\"memory_atom_ids\":", .{ imported, imported, validated, skipped, if (dry_run) "true" else "false" }) catch return serverError(ctx);
+    out.print(ctx.allocator, "{{\"imported\":{d},\"hydrated\":{d},\"validated\":{d},\"skipped\":{d},\"dry_run\":{s},\"atomic\":{s},\"memory_atom_ids\":", .{ imported, imported, validated, skipped, if (dry_run) "true" else "false", if (atomic) "true" else "false" }) catch return serverError(ctx);
     json.appendRawJsonOr(&out, ctx.allocator, memory_atom_ids_json, "[]") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"object_ids\":") catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, object_ids_json, "[]") catch return serverError(ctx);
+    out.appendSlice(ctx.allocator, ",\"counts\":") catch return serverError(ctx);
+    json.appendRawJsonOr(&out, ctx.allocator, counts_json, "{}") catch return serverError(ctx);
     out.append(ctx.allocator, '}') catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn snapshotRecordObject(outer: std.json.ObjectMap) std.json.ObjectMap {
+    if (outer.get("record")) |record| {
+        if (record == .object) return record.object;
+    }
+    if (outer.get("search_result")) |search_result| {
+        if (search_result == .object) return search_result.object;
+    }
+    return outer;
+}
+
+fn snapshotObjectType(outer: std.json.ObjectMap, record: std.json.ObjectMap) ?[]const u8 {
+    if (json.stringField(outer, "object_type")) |value| return value;
+    if (json.stringField(outer, "snapshot_object_type")) |value| return value;
+    if (json.stringField(record, "object_type")) |value| return value;
+    if (json.stringField(record, "result_type")) |value| return value;
+    const type_value = json.stringField(record, "type") orelse return null;
+    if (snapshotPrimitiveSupported(type_value)) return type_value;
+    return null;
+}
+
+fn snapshotPrimitiveSupported(value: []const u8) bool {
+    return std.mem.eql(u8, value, "source") or
+        std.mem.eql(u8, value, "artifact") or
+        std.mem.eql(u8, value, "memory_atom") or
+        std.mem.eql(u8, value, "entity") or
+        std.mem.eql(u8, value, "relation") or
+        std.mem.eql(u8, value, "context_pack") or
+        std.mem.eql(u8, value, "agent_memory");
+}
+
+const SnapshotTypeCounts = struct {
+    source: usize = 0,
+    artifact: usize = 0,
+    memory_atom: usize = 0,
+    entity: usize = 0,
+    relation: usize = 0,
+    context_pack: usize = 0,
+    agent_memory: usize = 0,
+
+    fn add(self: *SnapshotTypeCounts, object_type: []const u8) void {
+        if (std.mem.eql(u8, object_type, "source")) self.source += 1 else if (std.mem.eql(u8, object_type, "artifact")) self.artifact += 1 else if (std.mem.eql(u8, object_type, "memory_atom")) self.memory_atom += 1 else if (std.mem.eql(u8, object_type, "entity")) self.entity += 1 else if (std.mem.eql(u8, object_type, "relation")) self.relation += 1 else if (std.mem.eql(u8, object_type, "context_pack")) self.context_pack += 1 else if (std.mem.eql(u8, object_type, "agent_memory")) self.agent_memory += 1;
+    }
+
+    fn toJson(self: SnapshotTypeCounts, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fmt.allocPrint(allocator, "{{\"source\":{d},\"artifact\":{d},\"memory_atom\":{d},\"entity\":{d},\"relation\":{d},\"context_pack\":{d},\"agent_memory\":{d}}}", .{ self.source, self.artifact, self.memory_atom, self.entity, self.relation, self.context_pack, self.agent_memory });
+    }
+};
+
+fn appendSnapshotHydratedObjectJson(ctx: *Context, out: *std.ArrayListUnmanaged(u8), hydrated: SnapshotHydratedObject) !void {
+    try out.appendSlice(ctx.allocator, "{\"type\":");
+    try json.appendString(out, ctx.allocator, hydrated.object_type);
+    try out.appendSlice(ctx.allocator, ",\"id\":");
+    try json.appendString(out, ctx.allocator, hydrated.id);
+    try out.append(ctx.allocator, '}');
+}
+
+fn snapshotHydrateStructuredObject(ctx: *Context, object_type: []const u8, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    if (std.mem.eql(u8, object_type, "source")) return try snapshotHydrateSource(ctx, obj, options);
+    if (std.mem.eql(u8, object_type, "artifact")) return try snapshotHydrateArtifact(ctx, obj, options);
+    if (std.mem.eql(u8, object_type, "entity")) return try snapshotHydrateEntity(ctx, obj, options);
+    if (std.mem.eql(u8, object_type, "relation")) return try snapshotHydrateRelation(ctx, obj, options);
+    if (std.mem.eql(u8, object_type, "memory_atom")) return try snapshotHydrateMemoryAtom(ctx, obj, options);
+    if (std.mem.eql(u8, object_type, "agent_memory")) return try snapshotHydrateAgentMemory(ctx, obj, options);
+    if (std.mem.eql(u8, object_type, "context_pack")) return try snapshotHydrateContextPack(ctx, obj, options);
+    return error.Skipped;
+}
+
+fn snapshotHydrateSource(ctx: *Context, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    const title = json.stringField(obj, "title") orelse json.stringField(obj, "id") orelse return error.Skipped;
+    const scope = json.stringField(obj, "scope") orelse options.default_scope;
+    const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
+    if (!canWriteRecord(ctx, scope, permissions)) return error.Forbidden;
+    if (options.dry_run) return .{ .object_type = "source", .id = json.stringField(obj, "id") orelse title };
+    const source_type = json.stringField(obj, "source_type") orelse blk: {
+        const raw_type = json.stringField(obj, "type") orelse "manual";
+        break :blk if (std.mem.eql(u8, raw_type, "source")) "manual" else raw_type;
+    };
+    const source = try ctx.store.createSource(ctx.allocator, .{
+        .id = if (options.preserve_ids) json.nullableStringField(obj, "id") else null,
+        .source_type = source_type,
+        .title = title,
+        .raw_content_uri = json.nullableStringField(obj, "raw_content_uri"),
+        .content = json.stringField(obj, "content") orelse json.stringField(obj, "text") orelse "",
+        .author = json.nullableStringField(obj, "author"),
+        .participants_json = try rawField(ctx.allocator, obj, "participants", try rawField(ctx.allocator, obj, "participants_json", "[]")),
+        .permissions_json = permissions,
+        .scope = scope,
+        .checksum = json.nullableStringField(obj, "checksum"),
+        .language = json.nullableStringField(obj, "language"),
+        .related_entities_json = try rawField(ctx.allocator, obj, "related_entities", try rawField(ctx.allocator, obj, "related_entities_json", "[]")),
+        .metadata_json = try rawField(ctx.allocator, obj, "metadata", try rawField(ctx.allocator, obj, "metadata_json", "{\"snapshot_import\":true}")),
+        .actor_id = ctx.actor_id,
+    });
+    return .{ .object_type = "source", .id = source.id };
+}
+
+fn snapshotHydrateArtifact(ctx: *Context, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    const title = json.stringField(obj, "title") orelse json.stringField(obj, "id") orelse return error.Skipped;
+    const scope = json.stringField(obj, "scope") orelse options.default_scope;
+    const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
+    const status = json.stringField(obj, "status") orelse "draft";
+    if (!canChangeGraphPrimitiveStatus(ctx, scope, permissions, status)) return error.Forbidden;
+    if (options.dry_run) return .{ .object_type = "artifact", .id = json.stringField(obj, "id") orelse title };
+    var source_ids = try rawField(ctx.allocator, obj, "source_ids", try rawField(ctx.allocator, obj, "citations", "[]"));
+    if (!sourceIdsCanBackRecord(ctx, source_ids, scope, permissions)) source_ids = "[]";
+    const artifact_type = json.stringField(obj, "artifact_type") orelse blk: {
+        const raw_type = json.stringField(obj, "type") orelse "page";
+        break :blk if (std.mem.eql(u8, raw_type, "artifact")) "page" else raw_type;
+    };
+    const artifact = try ctx.store.createArtifact(ctx.allocator, .{
+        .id = if (options.preserve_ids) json.nullableStringField(obj, "id") else null,
+        .artifact_type = artifact_type,
+        .title = title,
+        .body = json.stringField(obj, "body") orelse json.stringField(obj, "text") orelse "",
+        .status = status,
+        .owner = json.nullableStringField(obj, "owner"),
+        .space_id = json.nullableStringField(obj, "space_id"),
+        .scope = scope,
+        .source_ids_json = source_ids,
+        .related_entities_json = try rawField(ctx.allocator, obj, "related_entities", try rawField(ctx.allocator, obj, "related_entities_json", "[]")),
+        .permissions_json = permissions,
+        .fields_json = try rawField(ctx.allocator, obj, "fields", try rawField(ctx.allocator, obj, "fields_json", "{}")),
+        .summary = json.nullableStringField(obj, "summary"),
+        .agent_summary = json.nullableStringField(obj, "agent_summary"),
+        .actor_id = ctx.actor_id,
+    });
+    return .{ .object_type = "artifact", .id = artifact.id };
+}
+
+fn snapshotHydrateEntity(ctx: *Context, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    const title = json.stringField(obj, "name") orelse json.stringField(obj, "title") orelse json.stringField(obj, "id") orelse return error.Skipped;
+    const name = snapshotEntityName(ctx.allocator, title) catch return error.OutOfMemory;
+    const entity_type = json.stringField(obj, "entity_type") orelse snapshotEntityType(title);
+    const scope = json.stringField(obj, "scope") orelse options.default_scope;
+    const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
+    if (!canWriteRecord(ctx, scope, permissions)) return error.Forbidden;
+    if (options.dry_run) return .{ .object_type = "entity", .id = json.stringField(obj, "id") orelse name };
+    const entity = try ctx.store.resolveEntity(ctx.allocator, .{
+        .id = if (options.preserve_ids) json.nullableStringField(obj, "id") else null,
+        .entity_type = entity_type,
+        .name = name,
+        .aliases_json = try rawField(ctx.allocator, obj, "aliases", try rawField(ctx.allocator, obj, "aliases_json", "[]")),
+        .description = json.nullableStringField(obj, "description") orelse json.nullableStringField(obj, "text"),
+        .canonical_artifact_id = json.nullableStringField(obj, "canonical_artifact_id"),
+        .scope = scope,
+        .permissions_json = permissions,
+        .metadata_json = try rawField(ctx.allocator, obj, "metadata", try rawField(ctx.allocator, obj, "metadata_json", "{}")),
+        .actor_id = ctx.actor_id,
+    });
+    return .{ .object_type = "entity", .id = entity.id };
+}
+
+fn snapshotHydrateRelation(ctx: *Context, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    const from_entity_id = json.stringField(obj, "from_entity_id") orelse return error.Skipped;
+    const to_entity_id = json.stringField(obj, "to_entity_id") orelse return error.Skipped;
+    const relation_type = json.stringField(obj, "relation_type") orelse json.stringField(obj, "title") orelse "related_to";
+    const scope = json.stringField(obj, "scope") orelse options.default_scope;
+    const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
+    const status = json.stringField(obj, "status") orelse "proposed";
+    if (!canChangeGraphPrimitiveStatus(ctx, scope, permissions, status)) return error.Forbidden;
+    if (options.dry_run) return .{ .object_type = "relation", .id = json.stringField(obj, "id") orelse relation_type };
+    var source_ids = try rawField(ctx.allocator, obj, "source_ids", try rawField(ctx.allocator, obj, "citations", "[]"));
+    if (!sourceIdsCanBackRecord(ctx, source_ids, scope, permissions)) source_ids = "[]";
+    const relation = ctx.store.createRelation(ctx.allocator, .{
+        .id = if (options.preserve_ids) json.nullableStringField(obj, "id") else null,
+        .from_entity_id = from_entity_id,
+        .relation_type = relation_type,
+        .to_entity_id = to_entity_id,
+        .source_ids_json = source_ids,
+        .scope = scope,
+        .permissions_json = permissions,
+        .confidence = json.floatField(obj, "confidence") orelse 0.5,
+        .status = status,
+        .actor_id = ctx.actor_id,
+    }) catch |err| switch (err) {
+        error.EntityNotFound => return error.Skipped,
+        else => return err,
+    };
+    return .{ .object_type = "relation", .id = relation.id };
+}
+
+fn snapshotHydrateMemoryAtom(ctx: *Context, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    const text = json.stringField(obj, "text") orelse json.stringField(obj, "content") orelse return error.Skipped;
+    const scope = json.stringField(obj, "scope") orelse options.default_scope;
+    const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
+    var source_ids = try rawField(ctx.allocator, obj, "source_ids", try rawField(ctx.allocator, obj, "citations", "[]"));
+    if (!sourceIdsCanBackRecord(ctx, source_ids, scope, permissions)) source_ids = "[]";
+    const input = store_mod.MemoryAtomInput{
+        .id = if (options.preserve_ids) json.nullableStringField(obj, "id") else null,
+        .subject_entity_id = json.nullableStringField(obj, "subject_entity_id"),
+        .predicate = json.stringField(obj, "predicate") orelse "imported:snapshot",
+        .object = json.stringField(obj, "object") orelse json.stringField(obj, "title") orelse "",
+        .text = text,
+        .scope = scope,
+        .confidence = json.floatField(obj, "confidence") orelse 0.55,
+        .status = normalizedImportedMemoryStatus(json.stringField(obj, "status")),
+        .source_ids_json = source_ids,
+        .evidence_ranges_json = try rawField(ctx.allocator, obj, "evidence_ranges", try rawField(ctx.allocator, obj, "evidence_ranges_json", "[]")),
+        .created_by = json.stringField(obj, "created_by") orelse options.created_by,
+        .valid_from_ms = json.intField(obj, "valid_from_ms"),
+        .valid_until_ms = json.intField(obj, "valid_until_ms"),
+        .owner = json.nullableStringField(obj, "owner"),
+        .permissions_json = permissions,
+        .tags_json = try rawField(ctx.allocator, obj, "tags", try rawField(ctx.allocator, obj, "tags_json", "[\"snapshot_import\"]")),
+        .actor_id = ctx.actor_id,
+    };
+    if (!canCreateMemoryAtom(ctx, input)) return error.Forbidden;
+    if (options.dry_run) return .{ .object_type = "memory_atom", .id = json.stringField(obj, "id") orelse text };
+    const atom = try ctx.store.createMemoryAtom(ctx.allocator, input);
+    return .{ .object_type = "memory_atom", .id = atom.id };
+}
+
+fn snapshotHydrateAgentMemory(ctx: *Context, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    const category = json.stringField(obj, "category") orelse snapshotAgentMemoryCategory(obj);
+    const key = json.stringField(obj, "key") orelse try snapshotAgentMemoryKey(ctx.allocator, json.stringField(obj, "title") orelse json.stringField(obj, "id") orelse return error.Skipped, category);
+    const content = json.stringField(obj, "content") orelse json.stringField(obj, "text") orelse return error.Skipped;
+    const session_id = json.nullableStringField(obj, "session_id");
+    if (session_id) |sid| {
+        if (!agentSessionWriteAllowed(ctx, sid)) return error.Forbidden;
+    }
+    const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
+    const scope = json.nullableStringField(obj, "scope");
+    if (scope) |requested_scope| {
+        if (!canCreateMemoryAtom(ctx, .{ .text = content, .scope = requested_scope, .permissions_json = permissions, .created_by = "agent", .actor_id = ctx.actor_id })) return error.Forbidden;
+    } else if (!domain.permissionsAreOpen(permissions) and !domain.permissionsWritable(permissions, ctx.actor_scopes_json)) {
+        return error.Forbidden;
+    }
+    if (options.dry_run) return .{ .object_type = "agent_memory", .id = json.stringField(obj, "id") orelse key };
+    const owner_actor_id = json.stringField(obj, "owner_id") orelse json.stringField(obj, "actor_id") orelse (try access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope));
+    const route = try agentMemoryStorageTargetFromObject(ctx.allocator, obj);
+    const entry = try ctx.store.agentMemoryStoreRouted(ctx.allocator, .{
+        .key = key,
+        .content = content,
+        .category = category,
+        .session_id = session_id,
+        .scope = scope,
+        .permissions_json = permissions,
+        .metadata_json = try rawField(ctx.allocator, obj, "metadata", try rawField(ctx.allocator, obj, "metadata_json", "{\"snapshot_import\":true}")),
+        .actor_id = owner_actor_id,
+        .writer_actor_id = ctx.actor_id,
+    }, route);
+    return .{ .object_type = "agent_memory", .id = entry.id };
+}
+
+fn snapshotHydrateContextPack(ctx: *Context, obj: std.json.ObjectMap, options: SnapshotImportOptions) !SnapshotHydratedObject {
+    const query = json.stringField(obj, "query") orelse json.stringField(obj, "task") orelse json.stringField(obj, "title") orelse json.stringField(obj, "text") orelse return error.Skipped;
+    const scope = json.stringField(obj, "scope") orelse options.default_scope;
+    const permissions = try rawField(ctx.allocator, obj, "permissions", options.default_permissions_json);
+    if (!canWriteRecord(ctx, scope, permissions)) return error.Forbidden;
+    if (options.dry_run) return .{ .object_type = "context_pack", .id = json.stringField(obj, "id") orelse query };
+    const scopes_json = try rawField(ctx.allocator, obj, "scopes", try rawField(ctx.allocator, obj, "required_scopes", try singleStringArrayJson(ctx.allocator, scope)));
+    const pack = try ctx.store.createContextPack(ctx.allocator, .{
+        .id = if (options.preserve_ids) json.nullableStringField(obj, "id") else null,
+        .purpose = json.stringField(obj, "purpose") orelse "snapshot_hydrate",
+        .target = json.stringField(obj, "target") orelse "agent",
+        .query = query,
+        .token_budget = json.intField(obj, "token_budget") orelse 12000,
+        .scopes_json = scopes_json,
+        .persist = true,
+        .include_deprecated = true,
+        .use_vector = false,
+        .actor_id = ctx.actor_id,
+    });
+    return .{ .object_type = "context_pack", .id = pack.id };
+}
+
+fn snapshotEntityType(title: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, title, ':')) |idx| {
+        if (idx > 0) return title[0..idx];
+    }
+    return "concept";
+}
+
+fn snapshotEntityName(allocator: std.mem.Allocator, title: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, title, ':')) |idx| {
+        if (idx + 1 < title.len) return allocator.dupe(u8, title[idx + 1 ..]);
+    }
+    return allocator.dupe(u8, title);
+}
+
+fn snapshotAgentMemoryCategory(obj: std.json.ObjectMap) []const u8 {
+    const title = json.stringField(obj, "title") orelse return "core";
+    if (std.mem.indexOfScalar(u8, title, ':')) |idx| {
+        if (idx > 0 and !std.mem.eql(u8, title[0..idx], "agent_memory")) return title[0..idx];
+    }
+    return "core";
+}
+
+fn snapshotAgentMemoryKey(allocator: std.mem.Allocator, title: []const u8, category: []const u8) ![]const u8 {
+    const prefixes = [_][]const u8{ "agent_memory:", category };
+    for (prefixes) |prefix| {
+        if (prefix.len == 0) continue;
+        if (std.mem.startsWith(u8, title, prefix)) {
+            const offset = prefix.len + if (std.mem.endsWith(u8, prefix, ":")) @as(usize, 0) else @as(usize, 1);
+            if (offset < title.len and title[prefix.len] == ':') return allocator.dupe(u8, title[offset..]);
+            if (std.mem.endsWith(u8, prefix, ":") and prefix.len < title.len) return allocator.dupe(u8, title[prefix.len..]);
+        }
+    }
+    if (std.mem.indexOfScalar(u8, title, ':')) |idx| {
+        if (idx + 1 < title.len) return allocator.dupe(u8, title[idx + 1 ..]);
+    }
+    return allocator.dupe(u8, title);
 }
 
 fn normalizedImportedMemoryStatus(status: ?[]const u8) ?[]const u8 {
@@ -5144,6 +5533,63 @@ fn appendSearchArray(ctx: *Context, out: *std.ArrayListUnmanaged(u8), results: [
         try result.writeJson(ctx.allocator, out);
     }
     try out.append(ctx.allocator, ']');
+}
+
+fn appendSnapshotObjects(ctx: *Context, out: *std.ArrayListUnmanaged(u8), results: []domain.SearchResult) !void {
+    try out.append(ctx.allocator, '[');
+    for (results, 0..) |result, i| {
+        if (i > 0) try out.append(ctx.allocator, ',');
+        try appendSnapshotObject(ctx, out, result);
+    }
+    try out.append(ctx.allocator, ']');
+}
+
+fn appendSnapshotObject(ctx: *Context, out: *std.ArrayListUnmanaged(u8), result: domain.SearchResult) !void {
+    try out.appendSlice(ctx.allocator, "{\"object_type\":");
+    try json.appendString(out, ctx.allocator, result.result_type);
+    try out.appendSlice(ctx.allocator, ",\"record\":");
+    const wrote_record = try appendSnapshotFullRecord(ctx, out, result);
+    if (!wrote_record) try result.writeJson(ctx.allocator, out);
+    try out.appendSlice(ctx.allocator, ",\"search_result\":");
+    try result.writeJson(ctx.allocator, out);
+    try out.append(ctx.allocator, '}');
+}
+
+fn appendSnapshotFullRecord(ctx: *Context, out: *std.ArrayListUnmanaged(u8), result: domain.SearchResult) !bool {
+    if (std.mem.eql(u8, result.result_type, "source")) {
+        const source = (try ctx.store.getSource(ctx.allocator, result.id)) orelse return false;
+        if (!recordVisibleToActor(ctx, source.scope, source.permissions_json)) return false;
+        try source.writeJson(ctx.allocator, out);
+        return true;
+    }
+    if (std.mem.eql(u8, result.result_type, "artifact")) {
+        var artifact = (try ctx.store.getArtifact(ctx.allocator, result.id)) orelse return false;
+        if (!recordVisibleToActor(ctx, artifact.scope, artifact.permissions_json)) return false;
+        artifact.source_ids_json = try sanitizeSourceIdsForActor(ctx, artifact.source_ids_json);
+        try artifact.writeJson(ctx.allocator, out);
+        return true;
+    }
+    if (std.mem.eql(u8, result.result_type, "memory_atom")) {
+        var atom = (try ctx.store.getMemoryAtom(ctx.allocator, result.id)) orelse return false;
+        if (!recordVisibleToActor(ctx, atom.scope, atom.permissions_json)) return false;
+        atom.source_ids_json = try sanitizeSourceIdsForActor(ctx, atom.source_ids_json);
+        try atom.writeJson(ctx.allocator, out);
+        return true;
+    }
+    if (std.mem.eql(u8, result.result_type, "entity")) {
+        const entity = (try ctx.store.getEntity(ctx.allocator, result.id)) orelse return false;
+        if (!recordVisibleToActor(ctx, entity.scope, entity.permissions_json)) return false;
+        try entity.writeJson(ctx.allocator, out);
+        return true;
+    }
+    if (std.mem.eql(u8, result.result_type, "relation")) {
+        var relation = (try ctx.store.getRelation(ctx.allocator, result.id)) orelse return false;
+        if (!recordVisibleToActor(ctx, relation.scope, relation.permissions_json)) return false;
+        relation.source_ids_json = try sanitizeSourceIdsForActor(ctx, relation.source_ids_json);
+        try relation.writeJson(ctx.allocator, out);
+        return true;
+    }
+    return false;
 }
 
 fn appendSearchGroups(ctx: *Context, out: *std.ArrayListUnmanaged(u8), results: []domain.SearchResult) !void {
@@ -7505,6 +7951,58 @@ test "api lifecycle snapshot export and import are permission aware" {
     const hydrate_search = handleRequest(&writer_ctx, "POST", "/v1/search", "{\"query\":\"hydrated snapshot memory\",\"scopes\":[\"public\"]}", "");
     try std.testing.expectEqualStrings("200 OK", hydrate_search.status);
     try std.testing.expect(std.mem.indexOf(u8, hydrate_search.body, "hydrated snapshot memory") != null);
+}
+
+test "api lifecycle snapshot hydrate preserves typed primitives" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_scopes_json = "[\"public\",\"write:public\",\"verify:public\",\"session:*\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"propose\",\"verify\",\"export\"]",
+    };
+
+    const body =
+        \\{"objects":[
+        \\  {"object_type":"source","record":{"id":"src_snapshot_typed","type":"transcript","title":"Typed Snapshot Transcript","content":"typed snapshot transcript evidence","scope":"public","permissions":[]}},
+        \\  {"object_type":"entity","record":{"id":"ent_snapshot_from","type":"service","name":"SnapshotSourceService","description":"source entity","scope":"public","permissions":[]}},
+        \\  {"object_type":"entity","record":{"id":"ent_snapshot_to","type":"service","name":"SnapshotTargetService","description":"target entity","scope":"public","permissions":[]}},
+        \\  {"object_type":"artifact","record":{"id":"art_snapshot_typed","artifact_type":"decision","title":"Typed Snapshot ADR","body":"Decision: typed snapshots preserve artifacts.","status":"accepted","scope":"public","permissions":[],"source_ids":["src_snapshot_typed"]}},
+        \\  {"object_type":"memory_atom","record":{"id":"mem_snapshot_typed","predicate":"decision","object":"typed snapshots","text":"Typed snapshot memory atom survives as atom.","status":"verified","scope":"public","permissions":[],"source_ids":["src_snapshot_typed"]}},
+        \\  {"object_type":"relation","record":{"id":"rel_snapshot_typed","from_entity_id":"ent_snapshot_from","relation_type":"depends_on","to_entity_id":"ent_snapshot_to","status":"verified","scope":"public","permissions":[],"source_ids":["src_snapshot_typed"]}},
+        \\  {"object_type":"agent_memory","record":{"key":"typed_snapshot_pref","content":"typed agent memory survives hydrate","category":"preference","scope":"public","permissions":[]}}
+        \\]}
+    ;
+    const hydrated = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot/hydrate", body, "");
+    try std.testing.expectEqualStrings("200 OK", hydrated.status);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"atomic\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"source\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"artifact\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"memory_atom\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"entity\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"relation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hydrated.body, "\"agent_memory\":1") != null);
+
+    try std.testing.expect((try store.getSource(alloc, "src_snapshot_typed")) != null);
+    try std.testing.expect((try store.getArtifact(alloc, "art_snapshot_typed")) != null);
+    try std.testing.expect((try store.getMemoryAtom(alloc, "mem_snapshot_typed")) != null);
+    try std.testing.expect((try store.getEntity(alloc, "ent_snapshot_from")) != null);
+    try std.testing.expect((try store.getRelation(alloc, "rel_snapshot_typed")) != null);
+
+    const agent_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"typed agent memory\",\"scopes\":[\"public\"],\"include_deprecated\":true}", "");
+    try std.testing.expectEqualStrings("200 OK", agent_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, agent_search.body, "typed agent memory survives hydrate") != null);
+
+    const exported = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot/export", "{\"query\":\"typed snapshot transcript\",\"scopes\":[\"public\"],\"limit\":5,\"persist\":false}", "");
+    try std.testing.expectEqualStrings("200 OK", exported.status);
+    try std.testing.expect(std.mem.indexOf(u8, exported.body, "\"object_type\":\"source\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported.body, "\"record\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported.body, "\"search_result\"") != null);
 }
 
 test "api retrieval search fuses keyword and vector results" {
