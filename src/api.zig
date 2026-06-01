@@ -4258,7 +4258,7 @@ fn search(ctx: *Context, body: []const u8) HttpResponse {
     results = maybeLlmRerankResults(ctx, query, results, input.allow_reranker) catch results;
     const response = searchResponse(ctx, results);
     if (cache_ttl_ms > 0 and hasCapability(ctx, "write")) {
-        ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response.body, .scopes_json = input.scopes_json, .actor_id = ctx.actor_id, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
+        ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response.body, .scopes_json = input.scopes_json, .actor_id = ctx.actor_id, .ttl_ms = cache_ttl_ms, .token_count = estimateCacheTokenCount(response.body), .max_entries = cacheMaxEntries(obj, "cache_max_entries") }) catch return serverError(ctx);
     }
     return response;
 }
@@ -8297,6 +8297,8 @@ fn responseCachePut(ctx: *Context, body: []const u8) HttpResponse {
         .scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx),
         .actor_id = ctx.actor_id,
         .ttl_ms = json.intField(obj, "ttl_ms") orelse 0,
+        .token_count = cacheTokenCount(obj, response_json),
+        .max_entries = cacheMaxEntries(obj, "max_entries"),
     }) catch return serverError(ctx);
     return ok(ctx, "{\"ok\":true,\"cached\":true}");
 }
@@ -8317,7 +8319,7 @@ fn responseCacheGet(ctx: *Context, body: []const u8) HttpResponse {
         json.appendRawJsonOr(&out, ctx.allocator, hit.scopes_json, "[]") catch return serverError(ctx);
         out.appendSlice(ctx.allocator, ",\"response\":") catch return serverError(ctx);
         json.appendRawJsonOr(&out, ctx.allocator, hit.response_json, "{}") catch return serverError(ctx);
-        out.print(ctx.allocator, ",\"created_at_ms\":{d},\"expires_at_ms\":{d}", .{ hit.created_at_ms, hit.expires_at_ms }) catch return serverError(ctx);
+        out.print(ctx.allocator, ",\"created_at_ms\":{d},\"accessed_at_ms\":{d},\"expires_at_ms\":{d},\"hit_count\":{d},\"token_count\":{d}", .{ hit.created_at_ms, hit.accessed_at_ms, hit.expires_at_ms, hit.hit_count, hit.token_count }) catch return serverError(ctx);
     } else {
         out.appendSlice(ctx.allocator, "false") catch return serverError(ctx);
     }
@@ -8368,6 +8370,8 @@ fn semanticCachePut(ctx: *Context, body: []const u8) HttpResponse {
         .scopes_json = effectiveScopes(ctx, obj) catch return serverError(ctx),
         .actor_id = ctx.actor_id,
         .ttl_ms = json.intField(obj, "ttl_ms") orelse 0,
+        .token_count = cacheTokenCount(obj, response_json),
+        .max_entries = cacheMaxEntries(obj, "max_entries"),
     }) catch return serverError(ctx);
     return ok(ctx, "{\"ok\":true,\"cached\":true}");
 }
@@ -8401,7 +8405,7 @@ fn semanticCacheSearch(ctx: *Context, body: []const u8) HttpResponse {
         json.appendRawJsonOr(&out, ctx.allocator, hit.scopes_json, "[]") catch return serverError(ctx);
         out.appendSlice(ctx.allocator, ",\"response\":") catch return serverError(ctx);
         json.appendRawJsonOr(&out, ctx.allocator, hit.response_json, "{}") catch return serverError(ctx);
-        out.print(ctx.allocator, ",\"score\":{d},\"created_at_ms\":{d},\"expires_at_ms\":{d}", .{ hit.score, hit.created_at_ms, hit.expires_at_ms }) catch return serverError(ctx);
+        out.print(ctx.allocator, ",\"score\":{d},\"created_at_ms\":{d},\"accessed_at_ms\":{d},\"expires_at_ms\":{d},\"hit_count\":{d},\"token_count\":{d}", .{ hit.score, hit.created_at_ms, hit.accessed_at_ms, hit.expires_at_ms, hit.hit_count, hit.token_count }) catch return serverError(ctx);
     } else {
         out.appendSlice(ctx.allocator, "false") catch return serverError(ctx);
     }
@@ -8434,10 +8438,28 @@ fn cacheStatsJson(ctx: *Context, cache_name: []const u8, stats: store_mod.CacheE
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"cache\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, cache_name) catch return serverError(ctx);
-    out.print(ctx.allocator, ",\"entries\":{d},\"expired_entries\":{d},\"actor_id\":", .{ stats.entries, stats.expired_entries }) catch return serverError(ctx);
+    out.print(ctx.allocator, ",\"entries\":{d},\"expired_entries\":{d},\"hits\":{d},\"tokens_saved\":{d},\"embedding_entries\":{d},\"actor_id\":", .{ stats.entries, stats.expired_entries, stats.hits, stats.tokens_saved, stats.embedding_entries }) catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, ctx.actor_id) catch return serverError(ctx);
     out.append(ctx.allocator, '}') catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn cacheTokenCount(obj: std.json.ObjectMap, fallback_text: []const u8) i64 {
+    if (json.intField(obj, "token_count")) |value| return @max(value, 0);
+    return estimateCacheTokenCount(fallback_text);
+}
+
+fn cacheMaxEntries(obj: std.json.ObjectMap, field_name: []const u8) usize {
+    const raw = json.intField(obj, field_name) orelse return 0;
+    if (raw <= 0) return 0;
+    return @intCast(@min(raw, 1_000_000));
+}
+
+fn estimateCacheTokenCount(text: []const u8) i64 {
+    var count: i64 = 0;
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n,.;:()[]{}<>!?\"'");
+    while (tokens.next()) |_| count += 1;
+    return count;
 }
 
 fn cacheClearJson(ctx: *Context, cache_name: []const u8, cleared: usize) HttpResponse {
@@ -8813,10 +8835,10 @@ fn ask(ctx: *Context, body: []const u8) HttpResponse {
     out.append(ctx.allocator, '}') catch return serverError(ctx);
     const response_body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx);
     if (cache_ttl_ms > 0 and hasCapability(ctx, "write") and !scan_conflicts) {
-        ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response_body, .scopes_json = scopes_json, .actor_id = ctx.actor_id, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
+        ctx.store.putResponseCache(.{ .cache_key = cache_key, .response_json = response_body, .scopes_json = scopes_json, .actor_id = ctx.actor_id, .ttl_ms = cache_ttl_ms, .token_count = estimateCacheTokenCount(response_body), .max_entries = cacheMaxEntries(obj, "cache_max_entries") }) catch return serverError(ctx);
         if (use_semantic_cache) {
             if (input.query_embedding_json) |embedding_json| {
-                ctx.store.putSemanticCache(.{ .cache_key = cache_key, .query = query, .response_json = response_body, .embedding_json = embedding_json, .scopes_json = scopes_json, .actor_id = ctx.actor_id, .ttl_ms = cache_ttl_ms }) catch return serverError(ctx);
+                ctx.store.putSemanticCache(.{ .cache_key = cache_key, .query = query, .response_json = response_body, .embedding_json = embedding_json, .scopes_json = scopes_json, .actor_id = ctx.actor_id, .ttl_ms = cache_ttl_ms, .token_count = estimateCacheTokenCount(response_body), .max_entries = cacheMaxEntries(obj, "cache_max_entries") }) catch return serverError(ctx);
             }
         }
     }
@@ -14261,7 +14283,7 @@ test "api lifecycle cache semantic cache summarize rollout and hygiene endpoints
     defer arena.deinit();
     var ctx = Context{ .allocator = arena.allocator(), .store = &store };
 
-    const put_cache = handleRequest(&ctx, "POST", "/v1/lifecycle/cache/put", "{\"key\":\"prompt:a\",\"response\":{\"answer\":\"cached\"},\"ttl_ms\":10000}", "");
+    const put_cache = handleRequest(&ctx, "POST", "/v1/lifecycle/cache/put", "{\"key\":\"prompt:a\",\"response\":{\"answer\":\"cached\"},\"ttl_ms\":10000,\"token_count\":25,\"max_entries\":10}", "");
     try std.testing.expectEqualStrings("200 OK", put_cache.status);
     const get_cache = handleRequest(&ctx, "POST", "/v1/lifecycle/cache/get", "{\"key\":\"prompt:a\"}", "");
     try std.testing.expectEqualStrings("200 OK", get_cache.status);
@@ -14271,6 +14293,8 @@ test "api lifecycle cache semantic cache summarize rollout and hygiene endpoints
     try std.testing.expectEqualStrings("200 OK", cache_stats.status);
     try std.testing.expect(std.mem.indexOf(u8, cache_stats.body, "\"cache\":\"response\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_stats.body, "\"entries\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_stats.body, "\"hits\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_stats.body, "\"tokens_saved\":25") != null);
     const clear_cache = handleRequest(&ctx, "POST", "/v1/lifecycle/cache/clear", "{\"key\":\"prompt:a\"}", "");
     try std.testing.expectEqualStrings("200 OK", clear_cache.status);
     try std.testing.expect(std.mem.indexOf(u8, clear_cache.body, "\"cleared\":1") != null);
@@ -14278,7 +14302,7 @@ test "api lifecycle cache semantic cache summarize rollout and hygiene endpoints
     try std.testing.expectEqualStrings("200 OK", get_cache_after_clear.status);
     try std.testing.expect(std.mem.indexOf(u8, get_cache_after_clear.body, "\"hit\":false") != null);
 
-    const put_semantic = handleRequest(&ctx, "POST", "/v1/lifecycle/semantic-cache/put", "{\"key\":\"semantic:a\",\"query\":\"release checklist\",\"response\":{\"answer\":\"semantic cached\"},\"ttl_ms\":10000}", "");
+    const put_semantic = handleRequest(&ctx, "POST", "/v1/lifecycle/semantic-cache/put", "{\"key\":\"semantic:a\",\"query\":\"release checklist\",\"response\":{\"answer\":\"semantic cached\"},\"ttl_ms\":10000,\"token_count\":33,\"max_entries\":10}", "");
     try std.testing.expectEqualStrings("200 OK", put_semantic.status);
     const search_semantic = handleRequest(&ctx, "POST", "/v1/lifecycle/semantic-cache/search", "{\"query\":\"release checklist\",\"min_score\":0.8}", "");
     try std.testing.expectEqualStrings("200 OK", search_semantic.status);
@@ -14288,6 +14312,9 @@ test "api lifecycle cache semantic cache summarize rollout and hygiene endpoints
     try std.testing.expectEqualStrings("200 OK", semantic_stats.status);
     try std.testing.expect(std.mem.indexOf(u8, semantic_stats.body, "\"cache\":\"semantic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, semantic_stats.body, "\"entries\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, semantic_stats.body, "\"hits\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, semantic_stats.body, "\"tokens_saved\":33") != null);
+    try std.testing.expect(std.mem.indexOf(u8, semantic_stats.body, "\"embedding_entries\":1") != null);
     const clear_semantic = handleRequest(&ctx, "POST", "/v1/lifecycle/semantic-cache/clear", "{\"key\":\"semantic:a\"}", "");
     try std.testing.expectEqualStrings("200 OK", clear_semantic.status);
     try std.testing.expect(std.mem.indexOf(u8, clear_semantic.body, "\"cleared\":1") != null);

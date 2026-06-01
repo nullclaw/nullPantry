@@ -4751,6 +4751,8 @@ pub const ResponseCacheInput = struct {
     actor_id: []const u8 = "",
     ttl_ms: i64 = 0,
     now_ms: ?i64 = null,
+    token_count: i64 = 0,
+    max_entries: usize = 0,
 };
 
 pub const ResponseCacheEntry = struct {
@@ -4759,7 +4761,10 @@ pub const ResponseCacheEntry = struct {
     scopes_json: []const u8,
     actor_id: []const u8,
     created_at_ms: i64,
+    accessed_at_ms: i64,
     expires_at_ms: i64,
+    hit_count: i64 = 0,
+    token_count: i64 = 0,
 };
 
 pub const CacheStatsInput = struct {
@@ -4777,6 +4782,9 @@ pub const CacheClearInput = struct {
 pub const CacheEntryStats = struct {
     entries: usize = 0,
     expired_entries: usize = 0,
+    hits: i64 = 0,
+    tokens_saved: i64 = 0,
+    embedding_entries: usize = 0,
 };
 
 pub const SemanticCacheInput = struct {
@@ -4788,6 +4796,8 @@ pub const SemanticCacheInput = struct {
     actor_id: []const u8 = "",
     ttl_ms: i64 = 0,
     now_ms: ?i64 = null,
+    token_count: i64 = 0,
+    max_entries: usize = 0,
 };
 
 pub const SemanticCacheSearchInput = struct {
@@ -4806,7 +4816,10 @@ pub const SemanticCacheMatch = struct {
     actor_id: []const u8,
     score: f32,
     created_at_ms: i64,
+    accessed_at_ms: i64,
     expires_at_ms: i64,
+    hit_count: i64 = 0,
+    token_count: i64 = 0,
 };
 
 pub const HygieneRunInput = struct {
@@ -5522,6 +5535,16 @@ pub const SQLiteStore = struct {
         if (!try self.columnExists("response_cache", "actor_id")) {
             try self.exec("ALTER TABLE response_cache ADD COLUMN actor_id TEXT NOT NULL DEFAULT ''");
         }
+        if (!try self.columnExists("response_cache", "accessed_at_ms")) {
+            try self.exec("ALTER TABLE response_cache ADD COLUMN accessed_at_ms INTEGER NOT NULL DEFAULT 0");
+            try self.exec("UPDATE response_cache SET accessed_at_ms = created_at_ms WHERE accessed_at_ms = 0");
+        }
+        if (!try self.columnExists("response_cache", "hit_count")) {
+            try self.exec("ALTER TABLE response_cache ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!try self.columnExists("response_cache", "token_count")) {
+            try self.exec("ALTER TABLE response_cache ADD COLUMN token_count INTEGER NOT NULL DEFAULT 0");
+        }
         if (!try self.columnExists("semantic_cache", "query")) {
             try self.exec("ALTER TABLE semantic_cache ADD COLUMN query TEXT NOT NULL DEFAULT ''");
         }
@@ -5536,6 +5559,16 @@ pub const SQLiteStore = struct {
         }
         if (!try self.columnExists("semantic_cache", "actor_id")) {
             try self.exec("ALTER TABLE semantic_cache ADD COLUMN actor_id TEXT NOT NULL DEFAULT ''");
+        }
+        if (!try self.columnExists("semantic_cache", "accessed_at_ms")) {
+            try self.exec("ALTER TABLE semantic_cache ADD COLUMN accessed_at_ms INTEGER NOT NULL DEFAULT 0");
+            try self.exec("UPDATE semantic_cache SET accessed_at_ms = created_at_ms WHERE accessed_at_ms = 0");
+        }
+        if (!try self.columnExists("semantic_cache", "hit_count")) {
+            try self.exec("ALTER TABLE semantic_cache ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!try self.columnExists("semantic_cache", "token_count")) {
+            try self.exec("ALTER TABLE semantic_cache ADD COLUMN token_count INTEGER NOT NULL DEFAULT 0");
         }
         if (try self.tableExists("compat_memories")) {
             try self.exec("DELETE FROM memory_atoms_fts WHERE id IN (SELECT memory_atom_id FROM compat_memories)");
@@ -5683,6 +5716,8 @@ pub const SQLiteStore = struct {
         if (!try self.cacheActorPrimaryKeyPresent("response_cache") or !try self.cacheActorPrimaryKeyPresent("semantic_cache")) {
             try self.applyCacheActorIsolationMigration();
         }
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_response_cache_actor_accessed ON response_cache(actor_id, accessed_at_ms)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_semantic_cache_actor_accessed ON semantic_cache(actor_id, accessed_at_ms)");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (10, 'cache_actor_isolation', 'np-010-cache-actor-isolation', strftime('%s','now') * 1000)");
         try self.exec("UPDATE schema_migrations SET name = 'cache_actor_isolation', checksum = 'np-010-cache-actor-isolation' WHERE version = 10");
         try self.exec("CREATE TABLE IF NOT EXISTS agent_memory_items (id TEXT PRIMARY KEY, key TEXT NOT NULL, session_id TEXT, actor_id TEXT NOT NULL, writer_actor_id TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT 'personal', permissions_json TEXT NOT NULL DEFAULT '[]', memory_atom_id TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'core', timestamp_ms INTEGER NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}')");
@@ -5774,13 +5809,17 @@ pub const SQLiteStore = struct {
             \\  scopes_json TEXT NOT NULL DEFAULT '[]',
             \\  actor_id TEXT NOT NULL DEFAULT '',
             \\  created_at_ms INTEGER NOT NULL,
+            \\  accessed_at_ms INTEGER NOT NULL DEFAULT 0,
             \\  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+            \\  hit_count INTEGER NOT NULL DEFAULT 0,
+            \\  token_count INTEGER NOT NULL DEFAULT 0,
             \\  PRIMARY KEY (actor_id, cache_key)
             \\);
-            \\INSERT OR REPLACE INTO response_cache_v10 (cache_key,response_json,scopes_json,actor_id,created_at_ms,expires_at_ms)
-            \\  SELECT cache_key,response_json,scopes_json,coalesce(actor_id,''),created_at_ms,expires_at_ms FROM response_cache;
+            \\INSERT OR REPLACE INTO response_cache_v10 (cache_key,response_json,scopes_json,actor_id,created_at_ms,accessed_at_ms,expires_at_ms,hit_count,token_count)
+            \\  SELECT cache_key,response_json,scopes_json,coalesce(actor_id,''),created_at_ms,coalesce(nullif(accessed_at_ms,0),created_at_ms),expires_at_ms,hit_count,token_count FROM response_cache;
             \\DROP TABLE response_cache;
             \\ALTER TABLE response_cache_v10 RENAME TO response_cache;
+            \\CREATE INDEX IF NOT EXISTS idx_response_cache_actor_accessed ON response_cache(actor_id, accessed_at_ms);
             \\DROP TABLE IF EXISTS semantic_cache_v10;
             \\CREATE TABLE IF NOT EXISTS semantic_cache_v10 (
             \\  cache_key TEXT NOT NULL,
@@ -5790,13 +5829,17 @@ pub const SQLiteStore = struct {
             \\  scopes_json TEXT NOT NULL DEFAULT '[]',
             \\  actor_id TEXT NOT NULL DEFAULT '',
             \\  created_at_ms INTEGER NOT NULL,
+            \\  accessed_at_ms INTEGER NOT NULL DEFAULT 0,
             \\  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+            \\  hit_count INTEGER NOT NULL DEFAULT 0,
+            \\  token_count INTEGER NOT NULL DEFAULT 0,
             \\  PRIMARY KEY (actor_id, cache_key)
             \\);
-            \\INSERT OR REPLACE INTO semantic_cache_v10 (cache_key,query,response_json,embedding_json,scopes_json,actor_id,created_at_ms,expires_at_ms)
-            \\  SELECT cache_key,query,response_json,embedding_json,scopes_json,coalesce(actor_id,''),created_at_ms,expires_at_ms FROM semantic_cache;
+            \\INSERT OR REPLACE INTO semantic_cache_v10 (cache_key,query,response_json,embedding_json,scopes_json,actor_id,created_at_ms,accessed_at_ms,expires_at_ms,hit_count,token_count)
+            \\  SELECT cache_key,query,response_json,embedding_json,scopes_json,coalesce(actor_id,''),created_at_ms,coalesce(nullif(accessed_at_ms,0),created_at_ms),expires_at_ms,hit_count,token_count FROM semantic_cache;
             \\DROP TABLE semantic_cache;
             \\ALTER TABLE semantic_cache_v10 RENAME TO semantic_cache;
+            \\CREATE INDEX IF NOT EXISTS idx_semantic_cache_actor_accessed ON semantic_cache(actor_id, accessed_at_ms);
         );
     }
 
@@ -8978,7 +9021,8 @@ pub const SQLiteStore = struct {
     pub fn putResponseCache(self: *Self, input: ResponseCacheInput) !void {
         const now = input.now_ms orelse ids.nowMs();
         const expires_at = if (input.ttl_ms > 0) now + input.ttl_ms else 0;
-        const stmt = try self.prepare("INSERT INTO response_cache (cache_key,response_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(actor_id,cache_key) DO UPDATE SET response_json=excluded.response_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms");
+        const token_count = @max(input.token_count, 0);
+        const stmt = try self.prepare("INSERT INTO response_cache (cache_key,response_json,scopes_json,actor_id,created_at_ms,accessed_at_ms,expires_at_ms,hit_count,token_count) VALUES (?1,?2,?3,?4,?5,?5,?6,0,?7) ON CONFLICT(actor_id,cache_key) DO UPDATE SET response_json=excluded.response_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, accessed_at_ms=excluded.accessed_at_ms, expires_at_ms=excluded.expires_at_ms, hit_count=0, token_count=excluded.token_count");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, input.cache_key);
         bindText(stmt, 2, input.response_json);
@@ -8986,32 +9030,38 @@ pub const SQLiteStore = struct {
         bindText(stmt, 4, input.actor_id);
         _ = c.sqlite3_bind_int64(stmt, 5, now);
         _ = c.sqlite3_bind_int64(stmt, 6, expires_at);
+        _ = c.sqlite3_bind_int64(stmt, 7, token_count);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+        try self.evictResponseCacheLru(input.actor_id, input.max_entries);
         try self.insertAudit("cache.response.put", "response_cache", input.cache_key);
     }
 
     pub fn getResponseCache(self: *Self, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64, scopes_json: []const u8, actor_id: []const u8) !?ResponseCacheEntry {
-        const stmt = try self.prepare("SELECT cache_key,response_json,created_at_ms,expires_at_ms,scopes_json,actor_id FROM response_cache WHERE cache_key = ?1 AND actor_id = ?2 LIMIT 1");
+        const stmt = try self.prepare("SELECT cache_key,response_json,created_at_ms,accessed_at_ms,expires_at_ms,scopes_json,actor_id,hit_count,token_count FROM response_cache WHERE cache_key = ?1 AND actor_id = ?2 LIMIT 1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, cache_key);
         bindText(stmt, 2, actor_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
-        const expires = c.sqlite3_column_int64(stmt, 3);
+        const expires = c.sqlite3_column_int64(stmt, 4);
         if (expires > 0 and expires <= now_ms) {
             try self.deleteResponseCache(cache_key, actor_id);
             return null;
         }
-        const entry_scopes = try columnText(allocator, stmt, 4);
+        const entry_scopes = try columnText(allocator, stmt, 5);
         if (!domain.scopeListVisible(entry_scopes, scopes_json)) return null;
-        const entry_actor = try columnText(allocator, stmt, 5);
+        const entry_actor = try columnText(allocator, stmt, 6);
         if (!cacheActorVisible(actor_id, entry_actor)) return null;
+        try self.touchResponseCache(cache_key, actor_id, now_ms);
         return .{
             .cache_key = try columnText(allocator, stmt, 0),
             .response_json = try columnText(allocator, stmt, 1),
             .scopes_json = entry_scopes,
             .actor_id = entry_actor,
             .created_at_ms = c.sqlite3_column_int64(stmt, 2),
+            .accessed_at_ms = now_ms,
             .expires_at_ms = expires,
+            .hit_count = c.sqlite3_column_int64(stmt, 7) + 1,
+            .token_count = c.sqlite3_column_int64(stmt, 8),
         };
     }
 
@@ -9023,19 +9073,55 @@ pub const SQLiteStore = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
     }
 
+    fn touchResponseCache(self: *Self, cache_key: []const u8, actor_id: []const u8, now_ms: i64) !void {
+        const stmt = try self.prepare("UPDATE response_cache SET accessed_at_ms = ?3, hit_count = hit_count + 1 WHERE cache_key = ?1 AND actor_id = ?2");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, cache_key);
+        bindText(stmt, 2, actor_id);
+        _ = c.sqlite3_bind_int64(stmt, 3, now_ms);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+    }
+
+    fn evictResponseCacheLru(self: *Self, actor_id: []const u8, max_entries: usize) !void {
+        if (max_entries == 0) return;
+        const total = try self.countCacheEntries("response_cache", actor_id);
+        if (total <= max_entries) return;
+        const remove_count = total - max_entries;
+        const stmt = try self.prepare("DELETE FROM response_cache WHERE actor_id = ?1 AND cache_key IN (SELECT cache_key FROM response_cache WHERE actor_id = ?1 ORDER BY accessed_at_ms ASC, created_at_ms ASC, cache_key ASC LIMIT ?2)");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, actor_id);
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(remove_count));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
+    }
+
+    fn countCacheEntries(self: *Self, comptime table: []const u8, actor_id: []const u8) !usize {
+        const stmt = try self.prepare("SELECT COUNT(*) FROM " ++ table ++ " WHERE actor_id = ?1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, actor_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        return @intCast(c.sqlite3_column_int64(stmt, 0));
+    }
+
     pub fn responseCacheStats(self: *Self, input: CacheStatsInput) !CacheEntryStats {
         const now = input.now_ms orelse ids.nowMs();
-        const entries_stmt = try self.prepare("SELECT COUNT(*) FROM response_cache WHERE actor_id = ?1");
+        const entries_stmt = try self.prepare("SELECT COUNT(*), COALESCE(SUM(hit_count),0), COALESCE(SUM(hit_count * token_count),0) FROM response_cache WHERE actor_id = ?1");
         defer _ = c.sqlite3_finalize(entries_stmt);
         bindText(entries_stmt, 1, input.actor_id);
-        const entries = if (c.sqlite3_step(entries_stmt) == c.SQLITE_ROW) c.sqlite3_column_int64(entries_stmt, 0) else 0;
+        var entries: i64 = 0;
+        var hits: i64 = 0;
+        var tokens_saved: i64 = 0;
+        if (c.sqlite3_step(entries_stmt) == c.SQLITE_ROW) {
+            entries = c.sqlite3_column_int64(entries_stmt, 0);
+            hits = c.sqlite3_column_int64(entries_stmt, 1);
+            tokens_saved = c.sqlite3_column_int64(entries_stmt, 2);
+        }
 
         const expired_stmt = try self.prepare("SELECT COUNT(*) FROM response_cache WHERE actor_id = ?1 AND expires_at_ms > 0 AND expires_at_ms <= ?2");
         defer _ = c.sqlite3_finalize(expired_stmt);
         bindText(expired_stmt, 1, input.actor_id);
         _ = c.sqlite3_bind_int64(expired_stmt, 2, now);
         const expired = if (c.sqlite3_step(expired_stmt) == c.SQLITE_ROW) c.sqlite3_column_int64(expired_stmt, 0) else 0;
-        return .{ .entries = @intCast(entries), .expired_entries = @intCast(expired) };
+        return .{ .entries = @intCast(entries), .expired_entries = @intCast(expired), .hits = hits, .tokens_saved = tokens_saved };
     }
 
     pub fn clearResponseCache(self: *Self, input: CacheClearInput) !usize {
@@ -9068,7 +9154,8 @@ pub const SQLiteStore = struct {
         defer self.allocator.free(parsed_embedding);
         const now = input.now_ms orelse ids.nowMs();
         const expires_at = if (input.ttl_ms > 0) now + input.ttl_ms else 0;
-        const stmt = try self.prepare("INSERT INTO semantic_cache (cache_key,query,response_json,embedding_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(actor_id,cache_key) DO UPDATE SET query=excluded.query, response_json=excluded.response_json, embedding_json=excluded.embedding_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms");
+        const token_count = @max(input.token_count, 0);
+        const stmt = try self.prepare("INSERT INTO semantic_cache (cache_key,query,response_json,embedding_json,scopes_json,actor_id,created_at_ms,accessed_at_ms,expires_at_ms,hit_count,token_count) VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8,0,?9) ON CONFLICT(actor_id,cache_key) DO UPDATE SET query=excluded.query, response_json=excluded.response_json, embedding_json=excluded.embedding_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, accessed_at_ms=excluded.accessed_at_ms, expires_at_ms=excluded.expires_at_ms, hit_count=0, token_count=excluded.token_count");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, input.cache_key);
         bindText(stmt, 2, input.query);
@@ -9078,7 +9165,9 @@ pub const SQLiteStore = struct {
         bindText(stmt, 6, input.actor_id);
         _ = c.sqlite3_bind_int64(stmt, 7, now);
         _ = c.sqlite3_bind_int64(stmt, 8, expires_at);
+        _ = c.sqlite3_bind_int64(stmt, 9, token_count);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+        try self.evictSemanticCacheLru(input.actor_id, input.max_entries);
         try self.insertAudit("cache.semantic.put", "semantic_cache", input.cache_key);
     }
 
@@ -9086,17 +9175,17 @@ pub const SQLiteStore = struct {
         const query = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
         defer allocator.free(query);
         const now = input.now_ms orelse ids.nowMs();
-        const stmt = try self.prepare("SELECT cache_key,query,response_json,embedding_json,created_at_ms,expires_at_ms,scopes_json,actor_id FROM semantic_cache WHERE actor_id = ?1 ORDER BY created_at_ms DESC LIMIT 1000");
+        const stmt = try self.prepare("SELECT cache_key,query,response_json,embedding_json,created_at_ms,accessed_at_ms,expires_at_ms,scopes_json,actor_id,hit_count,token_count FROM semantic_cache WHERE actor_id = ?1 ORDER BY accessed_at_ms DESC, created_at_ms DESC LIMIT 1000");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, input.actor_id);
         var best: ?SemanticCacheMatch = null;
         var best_score = input.min_score;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-            const expires = c.sqlite3_column_int64(stmt, 5);
+            const expires = c.sqlite3_column_int64(stmt, 6);
             if (expires > 0 and expires <= now) continue;
-            const scopes_json = try columnText(allocator, stmt, 6);
+            const scopes_json = try columnText(allocator, stmt, 7);
             if (!domain.scopeListVisible(scopes_json, input.scopes_json)) continue;
-            const entry_actor = try columnText(allocator, stmt, 7);
+            const entry_actor = try columnText(allocator, stmt, 8);
             if (!cacheActorVisible(input.actor_id, entry_actor)) continue;
             const embedding_json = try columnText(allocator, stmt, 3);
             defer allocator.free(embedding_json);
@@ -9113,25 +9202,59 @@ pub const SQLiteStore = struct {
                 .actor_id = entry_actor,
                 .score = score,
                 .created_at_ms = c.sqlite3_column_int64(stmt, 4),
+                .accessed_at_ms = now,
                 .expires_at_ms = expires,
+                .hit_count = c.sqlite3_column_int64(stmt, 9) + 1,
+                .token_count = c.sqlite3_column_int64(stmt, 10),
             };
         }
+        if (best) |hit| try self.touchSemanticCache(hit.cache_key, input.actor_id, now);
         return best;
     }
 
     pub fn semanticCacheStats(self: *Self, input: CacheStatsInput) !CacheEntryStats {
         const now = input.now_ms orelse ids.nowMs();
-        const entries_stmt = try self.prepare("SELECT COUNT(*) FROM semantic_cache WHERE actor_id = ?1");
+        const entries_stmt = try self.prepare("SELECT COUNT(*), COALESCE(SUM(hit_count),0), COALESCE(SUM(hit_count * token_count),0), COUNT(NULLIF(embedding_json,'[]')) FROM semantic_cache WHERE actor_id = ?1");
         defer _ = c.sqlite3_finalize(entries_stmt);
         bindText(entries_stmt, 1, input.actor_id);
-        const entries = if (c.sqlite3_step(entries_stmt) == c.SQLITE_ROW) c.sqlite3_column_int64(entries_stmt, 0) else 0;
+        var entries: i64 = 0;
+        var hits: i64 = 0;
+        var tokens_saved: i64 = 0;
+        var embedding_entries: i64 = 0;
+        if (c.sqlite3_step(entries_stmt) == c.SQLITE_ROW) {
+            entries = c.sqlite3_column_int64(entries_stmt, 0);
+            hits = c.sqlite3_column_int64(entries_stmt, 1);
+            tokens_saved = c.sqlite3_column_int64(entries_stmt, 2);
+            embedding_entries = c.sqlite3_column_int64(entries_stmt, 3);
+        }
 
         const expired_stmt = try self.prepare("SELECT COUNT(*) FROM semantic_cache WHERE actor_id = ?1 AND expires_at_ms > 0 AND expires_at_ms <= ?2");
         defer _ = c.sqlite3_finalize(expired_stmt);
         bindText(expired_stmt, 1, input.actor_id);
         _ = c.sqlite3_bind_int64(expired_stmt, 2, now);
         const expired = if (c.sqlite3_step(expired_stmt) == c.SQLITE_ROW) c.sqlite3_column_int64(expired_stmt, 0) else 0;
-        return .{ .entries = @intCast(entries), .expired_entries = @intCast(expired) };
+        return .{ .entries = @intCast(entries), .expired_entries = @intCast(expired), .hits = hits, .tokens_saved = tokens_saved, .embedding_entries = @intCast(embedding_entries) };
+    }
+
+    fn touchSemanticCache(self: *Self, cache_key: []const u8, actor_id: []const u8, now_ms: i64) !void {
+        const stmt = try self.prepare("UPDATE semantic_cache SET accessed_at_ms = ?3, hit_count = hit_count + 1 WHERE cache_key = ?1 AND actor_id = ?2");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, cache_key);
+        bindText(stmt, 2, actor_id);
+        _ = c.sqlite3_bind_int64(stmt, 3, now_ms);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+    }
+
+    fn evictSemanticCacheLru(self: *Self, actor_id: []const u8, max_entries: usize) !void {
+        if (max_entries == 0) return;
+        const total = try self.countCacheEntries("semantic_cache", actor_id);
+        if (total <= max_entries) return;
+        const remove_count = total - max_entries;
+        const stmt = try self.prepare("DELETE FROM semantic_cache WHERE actor_id = ?1 AND cache_key IN (SELECT cache_key FROM semantic_cache WHERE actor_id = ?1 ORDER BY accessed_at_ms ASC, created_at_ms ASC, cache_key ASC LIMIT ?2)");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, actor_id);
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(remove_count));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
     }
 
     pub fn clearSemanticCache(self: *Self, input: CacheClearInput) !usize {
@@ -10643,10 +10766,18 @@ pub const PostgresStore = struct {
             \\CREATE INDEX IF NOT EXISTS primitive_lifecycle_type_status_idx ON primitive_lifecycle(object_type, status);
             \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS actor_id text NOT NULL DEFAULT '';
+            \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS accessed_at_ms bigint NOT NULL DEFAULT 0;
+            \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS hit_count bigint NOT NULL DEFAULT 0;
+            \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS token_count bigint NOT NULL DEFAULT 0;
             \\ALTER TABLE semantic_cache ADD COLUMN IF NOT EXISTS scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE semantic_cache ADD COLUMN IF NOT EXISTS actor_id text NOT NULL DEFAULT '';
+            \\ALTER TABLE semantic_cache ADD COLUMN IF NOT EXISTS accessed_at_ms bigint NOT NULL DEFAULT 0;
+            \\ALTER TABLE semantic_cache ADD COLUMN IF NOT EXISTS hit_count bigint NOT NULL DEFAULT 0;
+            \\ALTER TABLE semantic_cache ADD COLUMN IF NOT EXISTS token_count bigint NOT NULL DEFAULT 0;
             \\UPDATE response_cache SET actor_id = '' WHERE actor_id IS NULL;
             \\UPDATE semantic_cache SET actor_id = '' WHERE actor_id IS NULL;
+            \\UPDATE response_cache SET accessed_at_ms = created_at_ms WHERE accessed_at_ms = 0;
+            \\UPDATE semantic_cache SET accessed_at_ms = created_at_ms WHERE accessed_at_ms = 0;
             \\ALTER TABLE response_cache ALTER COLUMN actor_id SET NOT NULL;
             \\ALTER TABLE semantic_cache ALTER COLUMN actor_id SET NOT NULL;
             \\ALTER TABLE response_cache ALTER COLUMN cache_key SET NOT NULL;
@@ -10677,6 +10808,8 @@ pub const PostgresStore = struct {
             \\    ALTER TABLE semantic_cache ADD PRIMARY KEY (actor_id, cache_key);
             \\  END IF;
             \\END $$;
+            \\CREATE INDEX IF NOT EXISTS response_cache_actor_accessed_idx ON response_cache(actor_id, accessed_at_ms);
+            \\CREATE INDEX IF NOT EXISTS semantic_cache_actor_accessed_idx ON semantic_cache(actor_id, accessed_at_ms);
             \\ALTER TABLE session_messages ADD COLUMN IF NOT EXISTS actor_id text;
             \\ALTER TABLE session_usage ADD COLUMN IF NOT EXISTS actor_id text;
             \\DELETE FROM session_messages WHERE actor_id IS NULL OR actor_id = '';
@@ -12722,20 +12855,22 @@ pub const PostgresStore = struct {
         const expires = if (input.ttl_ms > 0) now + input.ttl_ms else 0;
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
         const expires_text = try std.fmt.allocPrint(allocator, "{d}", .{expires});
+        const token_text = try std.fmt.allocPrint(allocator, "{d}", .{@max(input.token_count, 0)});
         _ = try self.queryParamsText(
             allocator,
             "WITH upserted AS (" ++
-                "INSERT INTO response_cache (cache_key,response_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES ($1,$2::jsonb,$3::jsonb,$4,$5::bigint,$6::bigint) " ++
-                "ON CONFLICT(actor_id,cache_key) DO UPDATE SET response_json=excluded.response_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms RETURNING cache_key" ++
+                "INSERT INTO response_cache (cache_key,response_json,scopes_json,actor_id,created_at_ms,accessed_at_ms,expires_at_ms,hit_count,token_count) VALUES ($1,$2::jsonb,$3::jsonb,$4,$5::bigint,$5::bigint,$6::bigint,0,$7::bigint) " ++
+                "ON CONFLICT(actor_id,cache_key) DO UPDATE SET response_json=excluded.response_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, accessed_at_ms=excluded.accessed_at_ms, expires_at_ms=excluded.expires_at_ms, hit_count=0, token_count=excluded.token_count RETURNING cache_key" ++
                 "), audit AS (" ++
                 "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'cache.response.put',$4,'response_cache',cache_key,'{}'::jsonb,$5::bigint FROM upserted RETURNING 1" ++
                 ") SELECT count(*)::text FROM upserted",
-            &.{ input.cache_key, input.response_json, input.scopes_json, input.actor_id, now_text, expires_text },
+            &.{ input.cache_key, input.response_json, input.scopes_json, input.actor_id, now_text, expires_text, token_text },
         );
+        try self.evictResponseCacheLru(input.actor_id, input.max_entries);
     }
 
     pub fn getResponseCache(self: *PostgresStore, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64, scopes_json: []const u8, actor_id: []const u8) !?ResponseCacheEntry {
-        const inner = "SELECT cache_key,response_json,created_at_ms,expires_at_ms,scopes_json,actor_id FROM response_cache WHERE cache_key = $1 AND actor_id = $2 LIMIT 1";
+        const inner = "SELECT cache_key,response_json,created_at_ms,accessed_at_ms,expires_at_ms,scopes_json,actor_id,hit_count,token_count FROM response_cache WHERE cache_key = $1 AND actor_id = $2 LIMIT 1";
         const parsed = try self.queryRowParamsJson(allocator, inner, &.{ cache_key, actor_id });
         defer parsed.deinit();
         if (parsed.value == .null) return null;
@@ -12749,7 +12884,8 @@ pub const PostgresStore = struct {
         if (!domain.scopeListVisible(entry_scopes, scopes_json)) return null;
         const entry_actor = try dupStringField(allocator, obj, "actor_id", "");
         if (!cacheActorVisible(actor_id, entry_actor)) return null;
-        return .{ .cache_key = try dupStringField(allocator, obj, "cache_key", ""), .response_json = try rawJsonField(allocator, obj, "response_json", "{}"), .scopes_json = entry_scopes, .actor_id = entry_actor, .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .expires_at_ms = expires };
+        try self.touchResponseCache(cache_key, actor_id, now_ms);
+        return .{ .cache_key = try dupStringField(allocator, obj, "cache_key", ""), .response_json = try rawJsonField(allocator, obj, "response_json", "{}"), .scopes_json = entry_scopes, .actor_id = entry_actor, .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .accessed_at_ms = now_ms, .expires_at_ms = expires, .hit_count = (json.intField(obj, "hit_count") orelse 0) + 1, .token_count = json.intField(obj, "token_count") orelse 0 };
     }
 
     pub fn responseCacheStats(self: *PostgresStore, input: CacheStatsInput) !CacheEntryStats {
@@ -12760,7 +12896,7 @@ pub const PostgresStore = struct {
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
         const parsed = try self.queryRowParamsJson(
             allocator,
-            "SELECT count(*)::bigint AS entries, count(*) FILTER (WHERE expires_at_ms > 0 AND expires_at_ms <= $2::bigint)::bigint AS expired_entries FROM response_cache WHERE actor_id = $1",
+            "SELECT count(*)::bigint AS entries, count(*) FILTER (WHERE expires_at_ms > 0 AND expires_at_ms <= $2::bigint)::bigint AS expired_entries, COALESCE(SUM(hit_count),0)::bigint AS hits, COALESCE(SUM(hit_count * token_count),0)::bigint AS tokens_saved FROM response_cache WHERE actor_id = $1",
             &.{ input.actor_id, now_text },
         );
         defer parsed.deinit();
@@ -12769,7 +12905,30 @@ pub const PostgresStore = struct {
         return .{
             .entries = @intCast(json.intField(obj, "entries") orelse 0),
             .expired_entries = @intCast(json.intField(obj, "expired_entries") orelse 0),
+            .hits = json.intField(obj, "hits") orelse 0,
+            .tokens_saved = json.intField(obj, "tokens_saved") orelse 0,
         };
+    }
+
+    fn touchResponseCache(self: *PostgresStore, cache_key: []const u8, actor_id: []const u8, now_ms: i64) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now_ms});
+        try self.runParams(allocator, "UPDATE response_cache SET accessed_at_ms = $3::bigint, hit_count = hit_count + 1 WHERE cache_key = $1 AND actor_id = $2", &.{ cache_key, actor_id, now_text });
+    }
+
+    fn evictResponseCacheLru(self: *PostgresStore, actor_id: []const u8, max_entries: usize) !void {
+        if (max_entries == 0) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const max_text = try std.fmt.allocPrint(allocator, "{d}", .{max_entries});
+        _ = try self.queryParamsText(
+            allocator,
+            "WITH ranked AS (SELECT cache_key, row_number() OVER (ORDER BY accessed_at_ms DESC, created_at_ms DESC, cache_key DESC) AS rn FROM response_cache WHERE actor_id = $1), deleted AS (DELETE FROM response_cache rc USING ranked r WHERE rc.actor_id = $1 AND rc.cache_key = r.cache_key AND r.rn > $2::bigint RETURNING 1) SELECT count(*)::text FROM deleted",
+            &.{ actor_id, max_text },
+        );
     }
 
     pub fn clearResponseCache(self: *PostgresStore, input: CacheClearInput) !usize {
@@ -12809,23 +12968,25 @@ pub const PostgresStore = struct {
         const expires = if (input.ttl_ms > 0) now + input.ttl_ms else 0;
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
         const expires_text = try std.fmt.allocPrint(allocator, "{d}", .{expires});
+        const token_text = try std.fmt.allocPrint(allocator, "{d}", .{@max(input.token_count, 0)});
         _ = try self.queryParamsText(
             allocator,
             "WITH upserted AS (" ++
-                "INSERT INTO semantic_cache (cache_key,query,response_json,embedding_json,scopes_json,actor_id,created_at_ms,expires_at_ms) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6,$7::bigint,$8::bigint) " ++
-                "ON CONFLICT(actor_id,cache_key) DO UPDATE SET query=excluded.query, response_json=excluded.response_json, embedding_json=excluded.embedding_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms RETURNING cache_key" ++
+                "INSERT INTO semantic_cache (cache_key,query,response_json,embedding_json,scopes_json,actor_id,created_at_ms,accessed_at_ms,expires_at_ms,hit_count,token_count) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6,$7::bigint,$7::bigint,$8::bigint,0,$9::bigint) " ++
+                "ON CONFLICT(actor_id,cache_key) DO UPDATE SET query=excluded.query, response_json=excluded.response_json, embedding_json=excluded.embedding_json, scopes_json=excluded.scopes_json, created_at_ms=excluded.created_at_ms, accessed_at_ms=excluded.accessed_at_ms, expires_at_ms=excluded.expires_at_ms, hit_count=0, token_count=excluded.token_count RETURNING cache_key" ++
                 "), audit AS (" ++
                 "INSERT INTO audit_events (event_type,actor,object_type,object_id,payload_json,created_at_ms) SELECT 'cache.semantic.put',$6,'semantic_cache',cache_key,'{}'::jsonb,$7::bigint FROM upserted RETURNING 1" ++
                 ") SELECT count(*)::text FROM upserted",
-            &.{ input.cache_key, input.query, input.response_json, input.embedding_json, input.scopes_json, input.actor_id, now_text, expires_text },
+            &.{ input.cache_key, input.query, input.response_json, input.embedding_json, input.scopes_json, input.actor_id, now_text, expires_text, token_text },
         );
+        try self.evictSemanticCacheLru(input.actor_id, input.max_entries);
     }
 
     pub fn searchSemanticCache(self: *PostgresStore, allocator: std.mem.Allocator, input: SemanticCacheSearchInput) !?SemanticCacheMatch {
         const query = try vector_mod.embeddingFromJson(allocator, input.embedding_json);
         defer allocator.free(query);
         const now = input.now_ms orelse ids.nowMs();
-        const parsed = try self.queryArrayParamsJson(allocator, "SELECT cache_key,query,response_json,embedding_json,created_at_ms,expires_at_ms,scopes_json,actor_id FROM semantic_cache WHERE actor_id = $1 ORDER BY created_at_ms DESC LIMIT 1000", &.{input.actor_id});
+        const parsed = try self.queryArrayParamsJson(allocator, "SELECT cache_key,query,response_json,embedding_json,created_at_ms,accessed_at_ms,expires_at_ms,scopes_json,actor_id,hit_count,token_count FROM semantic_cache WHERE actor_id = $1 ORDER BY accessed_at_ms DESC, created_at_ms DESC LIMIT 1000", &.{input.actor_id});
         defer parsed.deinit();
         var best: ?SemanticCacheMatch = null;
         var best_score = input.min_score;
@@ -12845,8 +13006,9 @@ pub const PostgresStore = struct {
             const score = vector_mod.cosine(query, embedding);
             if (score < best_score) continue;
             best_score = score;
-            best = .{ .cache_key = try dupStringField(allocator, obj, "cache_key", ""), .query = try dupStringField(allocator, obj, "query", ""), .response_json = try rawJsonField(allocator, obj, "response_json", "{}"), .scopes_json = scopes_json, .actor_id = entry_actor, .score = score, .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .expires_at_ms = expires };
+            best = .{ .cache_key = try dupStringField(allocator, obj, "cache_key", ""), .query = try dupStringField(allocator, obj, "query", ""), .response_json = try rawJsonField(allocator, obj, "response_json", "{}"), .scopes_json = scopes_json, .actor_id = entry_actor, .score = score, .created_at_ms = json.intField(obj, "created_at_ms") orelse 0, .accessed_at_ms = now, .expires_at_ms = expires, .hit_count = (json.intField(obj, "hit_count") orelse 0) + 1, .token_count = json.intField(obj, "token_count") orelse 0 };
         };
+        if (best) |hit| try self.touchSemanticCache(hit.cache_key, input.actor_id, now);
         return best;
     }
 
@@ -12858,7 +13020,7 @@ pub const PostgresStore = struct {
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
         const parsed = try self.queryRowParamsJson(
             allocator,
-            "SELECT count(*)::bigint AS entries, count(*) FILTER (WHERE expires_at_ms > 0 AND expires_at_ms <= $2::bigint)::bigint AS expired_entries FROM semantic_cache WHERE actor_id = $1",
+            "SELECT count(*)::bigint AS entries, count(*) FILTER (WHERE expires_at_ms > 0 AND expires_at_ms <= $2::bigint)::bigint AS expired_entries, COALESCE(SUM(hit_count),0)::bigint AS hits, COALESCE(SUM(hit_count * token_count),0)::bigint AS tokens_saved, count(*) FILTER (WHERE embedding_json <> '[]'::jsonb)::bigint AS embedding_entries FROM semantic_cache WHERE actor_id = $1",
             &.{ input.actor_id, now_text },
         );
         defer parsed.deinit();
@@ -12867,7 +13029,31 @@ pub const PostgresStore = struct {
         return .{
             .entries = @intCast(json.intField(obj, "entries") orelse 0),
             .expired_entries = @intCast(json.intField(obj, "expired_entries") orelse 0),
+            .hits = json.intField(obj, "hits") orelse 0,
+            .tokens_saved = json.intField(obj, "tokens_saved") orelse 0,
+            .embedding_entries = @intCast(json.intField(obj, "embedding_entries") orelse 0),
         };
+    }
+
+    fn touchSemanticCache(self: *PostgresStore, cache_key: []const u8, actor_id: []const u8, now_ms: i64) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now_ms});
+        try self.runParams(allocator, "UPDATE semantic_cache SET accessed_at_ms = $3::bigint, hit_count = hit_count + 1 WHERE cache_key = $1 AND actor_id = $2", &.{ cache_key, actor_id, now_text });
+    }
+
+    fn evictSemanticCacheLru(self: *PostgresStore, actor_id: []const u8, max_entries: usize) !void {
+        if (max_entries == 0) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const max_text = try std.fmt.allocPrint(allocator, "{d}", .{max_entries});
+        _ = try self.queryParamsText(
+            allocator,
+            "WITH ranked AS (SELECT cache_key, row_number() OVER (ORDER BY accessed_at_ms DESC, created_at_ms DESC, cache_key DESC) AS rn FROM semantic_cache WHERE actor_id = $1), deleted AS (DELETE FROM semantic_cache sc USING ranked r WHERE sc.actor_id = $1 AND sc.cache_key = r.cache_key AND r.rn > $2::bigint RETURNING 1) SELECT count(*)::text FROM deleted",
+            &.{ actor_id, max_text },
+        );
     }
 
     pub fn clearSemanticCache(self: *PostgresStore, input: CacheClearInput) !usize {
@@ -17772,23 +17958,37 @@ test "sqlite lifecycle cache semantic cache and hygiene are persistent" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    try store.putResponseCache(.{ .cache_key = "prompt:a", .response_json = "{\"answer\":\"cached\"}", .ttl_ms = 1000, .now_ms = 100 });
+    try store.putResponseCache(.{ .cache_key = "prompt:a", .response_json = "{\"answer\":\"cached\"}", .ttl_ms = 1000, .now_ms = 100, .token_count = 50 });
     const response_stats = try store.responseCacheStats(.{ .actor_id = "", .now_ms = 200 });
     try std.testing.expectEqual(@as(usize, 1), response_stats.entries);
     try std.testing.expectEqual(@as(usize, 0), response_stats.expired_entries);
+    try std.testing.expectEqual(@as(i64, 0), response_stats.hits);
     const response_expired_stats = try store.responseCacheStats(.{ .actor_id = "", .now_ms = 1200 });
     try std.testing.expectEqual(@as(usize, 1), response_expired_stats.expired_entries);
     const cache_hit = (try store.getResponseCache(alloc, "prompt:a", 200)).?;
     try std.testing.expectEqualStrings("{\"answer\":\"cached\"}", cache_hit.response_json);
+    try std.testing.expectEqual(@as(i64, 1), cache_hit.hit_count);
+    try std.testing.expectEqual(@as(i64, 50), cache_hit.token_count);
+    try std.testing.expectEqual(@as(i64, 200), cache_hit.accessed_at_ms);
+    const response_hit_stats = try store.responseCacheStats(.{ .actor_id = "", .now_ms = 200 });
+    try std.testing.expectEqual(@as(i64, 1), response_hit_stats.hits);
+    try std.testing.expectEqual(@as(i64, 50), response_hit_stats.tokens_saved);
     try std.testing.expect((try store.getResponseCache(alloc, "prompt:a", 1200)) == null);
 
     const embedding = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
-    try store.putSemanticCache(.{ .cache_key = "semantic:a", .query = "release", .response_json = "{\"answer\":\"semantic\"}", .embedding_json = embedding, .ttl_ms = 1000, .now_ms = 100 });
+    try store.putSemanticCache(.{ .cache_key = "semantic:a", .query = "release", .response_json = "{\"answer\":\"semantic\"}", .embedding_json = embedding, .ttl_ms = 1000, .now_ms = 100, .token_count = 40 });
     const semantic_stats = try store.semanticCacheStats(.{ .actor_id = "", .now_ms = 200 });
     try std.testing.expectEqual(@as(usize, 1), semantic_stats.entries);
     try std.testing.expectEqual(@as(usize, 0), semantic_stats.expired_entries);
+    try std.testing.expectEqual(@as(usize, 1), semantic_stats.embedding_entries);
     const semantic_hit = (try store.searchSemanticCache(alloc, .{ .embedding_json = embedding, .min_score = 0.9, .now_ms = 200 })).?;
     try std.testing.expectEqualStrings("semantic:a", semantic_hit.cache_key);
+    try std.testing.expectEqual(@as(i64, 1), semantic_hit.hit_count);
+    try std.testing.expectEqual(@as(i64, 40), semantic_hit.token_count);
+    try std.testing.expectEqual(@as(i64, 200), semantic_hit.accessed_at_ms);
+    const semantic_hit_stats = try store.semanticCacheStats(.{ .actor_id = "", .now_ms = 200 });
+    try std.testing.expectEqual(@as(i64, 1), semantic_hit_stats.hits);
+    try std.testing.expectEqual(@as(i64, 40), semantic_hit_stats.tokens_saved);
     try std.testing.expectEqual(@as(usize, 1), try store.clearSemanticCache(.{ .actor_id = "", .cache_key = "semantic:a" }));
     try std.testing.expect((try store.searchSemanticCache(alloc, .{ .embedding_json = embedding, .min_score = 0.9, .now_ms = 200 })) == null);
 
@@ -17847,6 +18047,40 @@ test "sqlite lifecycle caches are isolated by actor id" {
     try std.testing.expectEqual(@as(usize, 1), try store.clearSemanticCache(.{ .actor_id = "agent:a", .cache_key = "shared:semantic" }));
     try std.testing.expect((try store.searchSemanticCache(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .actor_id = "agent:a", .min_score = 0.9, .now_ms = 200 })) == null);
     try std.testing.expect((try store.searchSemanticCache(alloc, .{ .embedding_json = embedding, .scopes_json = "[\"public\"]", .actor_id = "agent:b", .min_score = 0.9, .now_ms = 200 })) != null);
+}
+
+test "sqlite lifecycle cache lru eviction is actor scoped" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try store.putResponseCache(.{ .cache_key = "r:old", .response_json = "{\"answer\":\"old\"}", .scopes_json = "[\"public\"]", .actor_id = "agent:a", .now_ms = 100, .max_entries = 2 });
+    try store.putResponseCache(.{ .cache_key = "r:middle", .response_json = "{\"answer\":\"middle\"}", .scopes_json = "[\"public\"]", .actor_id = "agent:a", .now_ms = 200, .max_entries = 2 });
+    try store.putResponseCache(.{ .cache_key = "r:other", .response_json = "{\"answer\":\"other\"}", .scopes_json = "[\"public\"]", .actor_id = "agent:b", .now_ms = 200, .max_entries = 2 });
+    _ = (try store.getResponseCacheForScopes(alloc, "r:old", 300, "[\"public\"]", "agent:a")).?;
+    try store.putResponseCache(.{ .cache_key = "r:new", .response_json = "{\"answer\":\"new\"}", .scopes_json = "[\"public\"]", .actor_id = "agent:a", .now_ms = 400, .max_entries = 2 });
+
+    try std.testing.expect((try store.getResponseCacheForScopes(alloc, "r:old", 500, "[\"public\"]", "agent:a")) != null);
+    try std.testing.expect((try store.getResponseCacheForScopes(alloc, "r:middle", 500, "[\"public\"]", "agent:a")) == null);
+    try std.testing.expect((try store.getResponseCacheForScopes(alloc, "r:new", 500, "[\"public\"]", "agent:a")) != null);
+    try std.testing.expect((try store.getResponseCacheForScopes(alloc, "r:other", 500, "[\"public\"]", "agent:b")) != null);
+    const response_stats = try store.responseCacheStats(.{ .actor_id = "agent:a", .now_ms = 500 });
+    try std.testing.expectEqual(@as(usize, 2), response_stats.entries);
+
+    const e_old = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    const e_new = try vector_mod.embeddingToJson(alloc, &[_]f32{ 0, 1 });
+    try store.putSemanticCache(.{ .cache_key = "s:old", .query = "old", .response_json = "{\"answer\":\"old\"}", .embedding_json = e_old, .scopes_json = "[\"public\"]", .actor_id = "agent:a", .now_ms = 100, .max_entries = 2 });
+    try store.putSemanticCache(.{ .cache_key = "s:middle", .query = "middle", .response_json = "{\"answer\":\"middle\"}", .embedding_json = e_new, .scopes_json = "[\"public\"]", .actor_id = "agent:a", .now_ms = 200, .max_entries = 2 });
+    try store.putSemanticCache(.{ .cache_key = "s:other", .query = "other", .response_json = "{\"answer\":\"other\"}", .embedding_json = e_old, .scopes_json = "[\"public\"]", .actor_id = "agent:b", .now_ms = 200, .max_entries = 2 });
+    _ = (try store.searchSemanticCache(alloc, .{ .embedding_json = e_old, .scopes_json = "[\"public\"]", .actor_id = "agent:a", .min_score = 0.99, .now_ms = 300 })).?;
+    try store.putSemanticCache(.{ .cache_key = "s:new", .query = "new", .response_json = "{\"answer\":\"new\"}", .embedding_json = e_new, .scopes_json = "[\"public\"]", .actor_id = "agent:a", .now_ms = 400, .max_entries = 2 });
+
+    try std.testing.expectEqual(@as(usize, 0), try store.clearSemanticCache(.{ .actor_id = "agent:a", .cache_key = "s:middle" }));
+    try std.testing.expectEqual(@as(usize, 1), try store.clearSemanticCache(.{ .actor_id = "agent:a", .cache_key = "s:old" }));
+    try std.testing.expectEqual(@as(usize, 1), try store.clearSemanticCache(.{ .actor_id = "agent:a", .cache_key = "s:new" }));
+    try std.testing.expectEqual(@as(usize, 1), try store.clearSemanticCache(.{ .actor_id = "agent:b", .cache_key = "s:other" }));
 }
 
 test "native agent memory maps keyed memory to memory atoms" {

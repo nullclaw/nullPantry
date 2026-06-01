@@ -307,9 +307,13 @@ pub const sqlite_schema =
     \\  scopes_json TEXT NOT NULL DEFAULT '[]',
     \\  actor_id TEXT NOT NULL DEFAULT '',
     \\  created_at_ms INTEGER NOT NULL,
+    \\  accessed_at_ms INTEGER NOT NULL DEFAULT 0,
     \\  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+    \\  hit_count INTEGER NOT NULL DEFAULT 0,
+    \\  token_count INTEGER NOT NULL DEFAULT 0,
     \\  PRIMARY KEY (actor_id, cache_key)
     \\);
+    \\CREATE INDEX IF NOT EXISTS idx_response_cache_actor_accessed ON response_cache(actor_id, accessed_at_ms);
     \\CREATE TABLE IF NOT EXISTS semantic_cache (
     \\  cache_key TEXT NOT NULL,
     \\  query TEXT NOT NULL DEFAULT '',
@@ -318,9 +322,13 @@ pub const sqlite_schema =
     \\  scopes_json TEXT NOT NULL DEFAULT '[]',
     \\  actor_id TEXT NOT NULL DEFAULT '',
     \\  created_at_ms INTEGER NOT NULL,
+    \\  accessed_at_ms INTEGER NOT NULL DEFAULT 0,
     \\  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+    \\  hit_count INTEGER NOT NULL DEFAULT 0,
+    \\  token_count INTEGER NOT NULL DEFAULT 0,
     \\  PRIMARY KEY (actor_id, cache_key)
     \\);
+    \\CREATE INDEX IF NOT EXISTS idx_semantic_cache_actor_accessed ON semantic_cache(actor_id, accessed_at_ms);
     \\CREATE TABLE IF NOT EXISTS lifecycle_snapshots (
     \\  id TEXT PRIMARY KEY,
     \\  snapshot_type TEXT NOT NULL,
@@ -680,9 +688,13 @@ pub const postgres_schema =
     \\  scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb,
     \\  actor_id text NOT NULL DEFAULT '',
     \\  created_at_ms bigint NOT NULL,
+    \\  accessed_at_ms bigint NOT NULL DEFAULT 0,
     \\  expires_at_ms bigint NOT NULL DEFAULT 0,
+    \\  hit_count bigint NOT NULL DEFAULT 0,
+    \\  token_count bigint NOT NULL DEFAULT 0,
     \\  PRIMARY KEY (actor_id, cache_key)
     \\);
+    \\CREATE INDEX IF NOT EXISTS response_cache_actor_accessed_idx ON response_cache(actor_id, accessed_at_ms);
     \\CREATE TABLE IF NOT EXISTS semantic_cache (
     \\  cache_key text NOT NULL,
     \\  query text NOT NULL DEFAULT '',
@@ -692,9 +704,13 @@ pub const postgres_schema =
     \\  actor_id text NOT NULL DEFAULT '',
     \\  embedding vector,
     \\  created_at_ms bigint NOT NULL,
+    \\  accessed_at_ms bigint NOT NULL DEFAULT 0,
     \\  expires_at_ms bigint NOT NULL DEFAULT 0,
+    \\  hit_count bigint NOT NULL DEFAULT 0,
+    \\  token_count bigint NOT NULL DEFAULT 0,
     \\  PRIMARY KEY (actor_id, cache_key)
     \\);
+    \\CREATE INDEX IF NOT EXISTS semantic_cache_actor_accessed_idx ON semantic_cache(actor_id, accessed_at_ms);
     \\CREATE TABLE IF NOT EXISTS lifecycle_snapshots (
     \\  id text PRIMARY KEY,
     \\  snapshot_type text NOT NULL,
