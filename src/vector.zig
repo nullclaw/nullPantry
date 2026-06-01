@@ -242,7 +242,7 @@ pub fn chunkText(allocator: std.mem.Allocator, text: []const u8, max_chars: usiz
 }
 
 pub fn chunkHeadingPathJson(allocator: std.mem.Allocator, text: []const u8, chunk: Chunk) ![]u8 {
-    return headingPathJsonAt(allocator, text, chunk.start);
+    return headingPathJsonAt(allocator, text, chunk.start, chunk.end);
 }
 
 fn headingAt(text: []const u8, pos: usize) ?[]const u8 {
@@ -255,9 +255,10 @@ fn headingAt(text: []const u8, pos: usize) ?[]const u8 {
     return null;
 }
 
-fn headingPathJsonAt(allocator: std.mem.Allocator, text: []const u8, pos: usize) ![]u8 {
+fn headingPathJsonAt(allocator: std.mem.Allocator, text: []const u8, pos: usize, end: usize) ![]u8 {
     var path: [6]?[]const u8 = .{ null, null, null, null, null, null };
     scanHeadingPath(text, pos, &path);
+    const transcript = transcriptMarkerInRange(text, pos, end);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -269,8 +270,23 @@ fn headingPathJsonAt(allocator: std.mem.Allocator, text: []const u8, pos: usize)
         try json.appendString(&out, allocator, heading);
         wrote = true;
     }
+    if (transcript.timestamp) |timestamp| {
+        if (wrote) try out.append(allocator, ',');
+        try appendPrefixedJsonString(allocator, &out, "timestamp:", timestamp);
+        wrote = true;
+    }
+    if (transcript.speaker) |speaker| {
+        if (wrote) try out.append(allocator, ',');
+        try appendPrefixedJsonString(allocator, &out, "speaker:", speaker);
+    }
     try out.append(allocator, ']');
     return out.toOwnedSlice(allocator);
+}
+
+fn appendPrefixedJsonString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), prefix: []const u8, value: []const u8) !void {
+    const tagged = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, value });
+    defer allocator.free(tagged);
+    try json.appendString(out, allocator, tagged);
 }
 
 fn scanHeadingPath(text: []const u8, pos: usize, path: *[6]?[]const u8) void {
@@ -326,6 +342,79 @@ fn markdownHeadingLevelAt(text: []const u8, pos: usize) ?usize {
     if (i >= text.len) return hashes;
     if (text[i] == ' ' or text[i] == '\t') return hashes;
     return null;
+}
+
+const TranscriptMarker = struct {
+    timestamp: ?[]const u8 = null,
+    speaker: ?[]const u8 = null,
+};
+
+fn transcriptMarkerInRange(text: []const u8, start_raw: usize, end_raw: usize) TranscriptMarker {
+    const start = @min(start_raw, text.len);
+    const end = @min(@max(start, end_raw), text.len);
+    var line_start = start;
+    while (line_start < end) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse end;
+        const marker = transcriptMarkerFromLine(text[line_start..@min(line_end, end)]);
+        if (marker.timestamp != null or marker.speaker != null) return marker;
+        if (line_end >= end or line_end == text.len) break;
+        line_start = line_end + 1;
+    }
+    return transcriptMarkerFromLine(lineAtOrBefore(text, start));
+}
+
+fn lineAtOrBefore(text: []const u8, pos: usize) []const u8 {
+    if (text.len == 0) return "";
+    var start = @min(pos, text.len);
+    if (start == text.len and start > 0) start -= 1;
+    while (start > 0 and text[start - 1] != '\n') : (start -= 1) {}
+    var end = @min(pos, text.len);
+    while (end < text.len and text[end] != '\n') : (end += 1) {}
+    return std.mem.trim(u8, text[start..end], " \t\r\n");
+}
+
+fn transcriptMarkerFromLine(line: []const u8) TranscriptMarker {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return .{};
+    if (trimmed[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, trimmed, ']') orelse return .{};
+        const timestamp = std.mem.trim(u8, trimmed[1..close], " \t");
+        if (!looksLikeTimestamp(timestamp)) return .{};
+        const after = std.mem.trim(u8, trimmed[close + 1 ..], " \t-");
+        return .{ .timestamp = timestamp, .speaker = speakerBeforeColon(after) };
+    }
+
+    const first_space = std.mem.indexOfAny(u8, trimmed, " \t") orelse return .{};
+    const timestamp = trimmed[0..first_space];
+    if (!looksLikeTimestamp(timestamp)) return .{};
+    const after = std.mem.trim(u8, trimmed[first_space..], " \t-");
+    return .{ .timestamp = timestamp, .speaker = speakerBeforeColon(after) };
+}
+
+fn looksLikeTimestamp(value: []const u8) bool {
+    if (value.len < 4 or value.len > 16) return false;
+    var saw_digit = false;
+    var saw_colon = false;
+    for (value) |ch| {
+        if (std.ascii.isDigit(ch)) {
+            saw_digit = true;
+            continue;
+        }
+        if (ch == ':') {
+            saw_colon = true;
+            continue;
+        }
+        if (ch == '.' or ch == ',') continue;
+        return false;
+    }
+    return saw_digit and saw_colon;
+}
+
+fn speakerBeforeColon(value: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, value, ':') orelse return null;
+    const speaker = std.mem.trim(u8, value[0..colon], " \t");
+    if (speaker.len == 0 or speaker.len > 80) return null;
+    return speaker;
 }
 
 fn findPreviousParagraphBreak(text: []const u8, min_pos: usize, end: usize) ?usize {
@@ -443,6 +532,28 @@ test "vector chunker serializes heading path metadata" {
     const path = try chunkHeadingPathJson(std.testing.allocator, text, chunks[2]);
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("[\"# Product\",\"## Architecture\",\"### Storage\"]", path);
+}
+
+test "vector chunker serializes transcript timestamp and speaker metadata" {
+    const text = "# Meeting\n[00:01:04] Alice: Decision: Meeting Memory is a pipeline\n[00:02:10] Bob: Action: create transcript ingestion";
+    const chunks = try chunkText(std.testing.allocator, text, 72, 0);
+    defer std.testing.allocator.free(chunks);
+    try std.testing.expect(chunks.len >= 2);
+
+    const first_chunk = for (chunks) |chunk| {
+        if (std.mem.indexOf(u8, chunk.text, "Alice") != null) break chunk;
+    } else return error.MissingTranscriptChunk;
+    const second_chunk = for (chunks) |chunk| {
+        if (std.mem.indexOf(u8, chunk.text, "Bob") != null) break chunk;
+    } else return error.MissingTranscriptChunk;
+
+    const first_transcript_path = try chunkHeadingPathJson(std.testing.allocator, text, first_chunk);
+    defer std.testing.allocator.free(first_transcript_path);
+    try std.testing.expectEqualStrings("[\"# Meeting\",\"timestamp:00:01:04\",\"speaker:Alice\"]", first_transcript_path);
+
+    const second_transcript_path = try chunkHeadingPathJson(std.testing.allocator, text, second_chunk);
+    defer std.testing.allocator.free(second_transcript_path);
+    try std.testing.expectEqualStrings("[\"# Meeting\",\"timestamp:00:02:10\",\"speaker:Bob\"]", second_transcript_path);
 }
 
 test "vector chunker preserves utf8 boundaries" {
