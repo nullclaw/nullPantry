@@ -2297,7 +2297,7 @@ pub const ApiAgentMemory = struct {
         const response = try self.request(self.allocator, .GET, "/agent-memory/count", "", actor, scopes_json, "");
         defer self.allocator.free(response.body);
         if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
-        return @intCast(parseJsonU64(response.body, "count", 0));
+        return @intCast(parseJsonU64(self.allocator, response.body, "count", 0));
     }
 
     pub fn saveMessage(self: *ApiAgentMemory, session_id: []const u8, role: []const u8, content: []const u8, actor_id: ?[]const u8) !void {
@@ -2391,7 +2391,7 @@ pub const ApiAgentMemory = struct {
         defer self.allocator.free(response.body);
         if (response.status == .not_found) return null;
         if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
-        return parseJsonU64(response.body, "total_tokens", 0);
+        return parseJsonU64(self.allocator, response.body, "total_tokens", 0);
     }
 
     pub fn listSessions(self: *ApiAgentMemory, allocator: std.mem.Allocator, limit: usize, offset: usize, actor_id: ?[]const u8) !HistoryList {
@@ -2442,7 +2442,7 @@ pub const ApiAgentMemory = struct {
         const response = try self.request(allocator, .POST, "/memory/compact", "", actor_id, scopes_json, body);
         defer allocator.free(response.body);
         try requireApiFeedOk(response.status);
-        return parseFeedCompactResult(response.body);
+        return parseFeedCompactResult(allocator, response.body);
     }
 
     pub fn exportFeedCheckpoint(self: *ApiAgentMemory, allocator: std.mem.Allocator, since_id: ?i64, limit: ?usize, actor_id: ?[]const u8, scopes_json: []const u8) ![]u8 {
@@ -2965,8 +2965,8 @@ fn parseHistoryList(allocator: std.mem.Allocator, body: []const u8) !HistoryList
     defer parsed.deinit();
     if (parsed.value != .object) return .{ .total = 0, .sessions = try allocator.alloc(SessionInfo, 0) };
     const obj = parsed.value.object;
-    const value = obj.get("sessions") orelse return .{ .total = parseJsonU64(body, "total", 0), .sessions = try allocator.alloc(SessionInfo, 0) };
-    if (value != .array) return .{ .total = parseJsonU64(body, "total", 0), .sessions = try allocator.alloc(SessionInfo, 0) };
+    const value = obj.get("sessions") orelse return .{ .total = parseJsonU64(allocator, body, "total", 0), .sessions = try allocator.alloc(SessionInfo, 0) };
+    if (value != .array) return .{ .total = parseJsonU64(allocator, body, "total", 0), .sessions = try allocator.alloc(SessionInfo, 0) };
     var out: std.ArrayListUnmanaged(SessionInfo) = .empty;
     errdefer {
         for (out.items) |*info| freeSessionInfo(allocator, info);
@@ -3075,8 +3075,8 @@ fn parseFeedStatus(allocator: std.mem.Allocator, body: []const u8) !FeedStatus {
     };
 }
 
-fn parseFeedCompactResult(body: []const u8) !FeedCompactResult {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return error.AgentMemoryStorageUnavailable;
+fn parseFeedCompactResult(allocator: std.mem.Allocator, body: []const u8) !FeedCompactResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.AgentMemoryStorageUnavailable;
     defer parsed.deinit();
     if (parsed.value != .object) return error.AgentMemoryStorageUnavailable;
     const obj = parsed.value.object;
@@ -3189,8 +3189,8 @@ fn jsonBoolField(obj: std.json.ObjectMap, name: []const u8, fallback: bool) bool
     };
 }
 
-fn parseJsonU64(body: []const u8, field: []const u8, fallback: u64) u64 {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return fallback;
+fn parseJsonU64(allocator: std.mem.Allocator, body: []const u8, field: []const u8, fallback: u64) u64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return fallback;
     defer parsed.deinit();
     if (parsed.value != .object) return fallback;
     return jsonU64Field(parsed.value.object, field, fallback);
@@ -3620,9 +3620,12 @@ test "agent memory api backend builds urls and parses memory responses" {
     try std.testing.expectEqual(@as(i64, 8), feed_status.last_sequence);
     try std.testing.expectEqual(@as(usize, 1), feed_status.pending_events);
 
-    const compact = try parseFeedCompactResult("{\"cursor_floor\":4,\"compacted_through_sequence\":4,\"max_event_id\":9,\"compacted_events\":3}");
+    const compact = try parseFeedCompactResult(std.testing.allocator, "{\"cursor_floor\":4,\"compacted_through_sequence\":4,\"max_event_id\":9,\"compacted_events\":3}");
     try std.testing.expectEqual(@as(i64, 4), compact.cursor_floor);
     try std.testing.expectEqual(@as(usize, 3), compact.compacted_events);
+    try std.testing.expectEqual(@as(u64, 42), parseJsonU64(std.testing.allocator, "{\"count\":42}", "count", 0));
+    try std.testing.expectEqual(@as(u64, 7), parseJsonU64(std.testing.allocator, "{\"count\":\"7\"}", "count", 0));
+    try std.testing.expectEqual(@as(u64, 5), parseJsonU64(std.testing.allocator, "{\"other\":1}", "count", 5));
 
     try requireApiFeedOk(.ok);
     try std.testing.expectError(error.CursorExpired, requireApiFeedOk(.gone));

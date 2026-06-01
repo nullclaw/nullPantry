@@ -272,7 +272,7 @@ fn qdrantUpsert(allocator: std.mem.Allocator, cfg: Config, input: UpsertInput) !
     defer allocator.free(payload);
     const response = try requestJson(allocator, .PUT, url, cfg.api_key, cfg.timeout_secs, payload);
     defer allocator.free(response);
-    try ensureBackendOk(response);
+    try ensureBackendOk(allocator, response);
 }
 
 fn qdrantEnsureCollection(allocator: std.mem.Allocator, cfg: Config, dimensions: i64) !void {
@@ -288,7 +288,7 @@ fn qdrantEnsureCollection(allocator: std.mem.Allocator, cfg: Config, dimensions:
         else => return err,
     };
     defer allocator.free(response);
-    try ensureBackendOk(response);
+    try ensureBackendOk(allocator, response);
 }
 
 fn qdrantSearch(allocator: std.mem.Allocator, cfg: Config, embedding_json: []const u8, limit: usize) ![]Candidate {
@@ -312,7 +312,7 @@ fn qdrantDelete(allocator: std.mem.Allocator, cfg: Config, vector_id: []const u8
     defer allocator.free(payload);
     const response = try requestJson(allocator, .POST, url, cfg.api_key, cfg.timeout_secs, payload);
     defer allocator.free(response);
-    try ensureBackendOk(response);
+    try ensureBackendOk(allocator, response);
 }
 
 fn qdrantReset(allocator: std.mem.Allocator, cfg: Config) !void {
@@ -325,7 +325,7 @@ fn qdrantReset(allocator: std.mem.Allocator, cfg: Config) !void {
         else => return err,
     };
     defer allocator.free(response);
-    try ensureBackendOk(response);
+    try ensureBackendOk(allocator, response);
 }
 
 fn lancedbHttpUpsert(allocator: std.mem.Allocator, cfg: Config, input: UpsertInput) !void {
@@ -337,7 +337,7 @@ fn lancedbHttpUpsert(allocator: std.mem.Allocator, cfg: Config, input: UpsertInp
     defer allocator.free(payload);
     const response = try requestJson(allocator, .POST, url, cfg.api_key, cfg.timeout_secs, payload);
     defer allocator.free(response);
-    try ensureBackendOk(response);
+    try ensureBackendOk(allocator, response);
 }
 
 fn lancedbHttpSearch(allocator: std.mem.Allocator, cfg: Config, embedding_json: []const u8, limit: usize) ![]Candidate {
@@ -361,7 +361,7 @@ fn lancedbHttpDelete(allocator: std.mem.Allocator, cfg: Config, vector_id: []con
     defer allocator.free(payload);
     const response = try requestJson(allocator, .POST, url, cfg.api_key, cfg.timeout_secs, payload);
     defer allocator.free(response);
-    try ensureBackendOk(response);
+    try ensureBackendOk(allocator, response);
 }
 
 fn lancedbHttpReset(allocator: std.mem.Allocator, cfg: Config) !void {
@@ -371,7 +371,7 @@ fn lancedbHttpReset(allocator: std.mem.Allocator, cfg: Config) !void {
     defer allocator.free(url);
     const response = try requestJson(allocator, .POST, url, cfg.api_key, cfg.timeout_secs, "{}");
     defer allocator.free(response);
-    try ensureBackendOk(response);
+    try ensureBackendOk(allocator, response);
 }
 
 fn lancedbSdkUpsert(allocator: std.mem.Allocator, cfg: Config, input: UpsertInput) !void {
@@ -379,7 +379,7 @@ fn lancedbSdkUpsert(allocator: std.mem.Allocator, cfg: Config, input: UpsertInpu
     defer allocator.free(payload);
     const response = try runLanceDbCommand(allocator, cfg, "upsert", payload, null);
     defer allocator.free(response);
-    try ensureBackendOk(response);
+    try ensureBackendOk(allocator, response);
 }
 
 fn lancedbSdkSearch(allocator: std.mem.Allocator, cfg: Config, embedding_json: []const u8, limit: usize) ![]Candidate {
@@ -395,13 +395,13 @@ fn lancedbSdkDelete(allocator: std.mem.Allocator, cfg: Config, vector_id: []cons
     defer allocator.free(payload);
     const response = try runLanceDbCommand(allocator, cfg, "delete", payload, null);
     defer allocator.free(response);
-    try ensureBackendOk(response);
+    try ensureBackendOk(allocator, response);
 }
 
 fn lancedbSdkReset(allocator: std.mem.Allocator, cfg: Config) !void {
     const response = try runLanceDbCommand(allocator, cfg, "reset", "{}", null);
     defer allocator.free(response);
-    try ensureBackendOk(response);
+    try ensureBackendOk(allocator, response);
 }
 
 fn runLanceDbCommand(allocator: std.mem.Allocator, cfg: Config, op: []const u8, payload: []const u8, maybe_limit: ?[]const u8) ![]u8 {
@@ -682,8 +682,8 @@ fn candidateScore(obj: std.json.ObjectMap) f32 {
     return 0;
 }
 
-fn ensureBackendOk(body: []const u8) !void {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return;
+fn ensureBackendOk(allocator: std.mem.Allocator, body: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return;
     defer parsed.deinit();
     if (parsed.value != .object) return;
     if (json.stringField(parsed.value.object, "status")) |status| {
@@ -817,6 +817,10 @@ test "vector backend parses qdrant and lancedb candidate shapes" {
     try std.testing.expectEqual(@as(usize, 1), l.len);
     try std.testing.expectEqualStrings("vec_b", l[0].vector_id);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), l[0].score, 0.0001);
+
+    try ensureBackendOk(std.testing.allocator, "{\"status\":\"ok\"}");
+    try ensureBackendOk(std.testing.allocator, "{\"status\":\"success\"}");
+    try std.testing.expectError(error.VectorBackendRejected, ensureBackendOk(std.testing.allocator, "{\"status\":\"error\"}"));
 }
 
 test "vector backend config gates external runtime" {
