@@ -54,9 +54,33 @@ pub const QueryTransport = struct {
         return self.libpq.queryParamsRaw(allocator, sql, params);
     }
 
+    pub fn begin(self: *QueryTransport, allocator: std.mem.Allocator) !Transaction {
+        return .{ .libpq = try self.libpq.begin(allocator) };
+    }
+
     pub fn name(self: *const QueryTransport) []const u8 {
         return self.libpq.name();
     }
+
+    pub const Transaction = struct {
+        libpq: LibpqTransport.Transaction,
+
+        pub fn queryRaw(self: *Transaction, allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+            return self.libpq.queryRaw(allocator, sql);
+        }
+
+        pub fn queryParamsRaw(self: *Transaction, allocator: std.mem.Allocator, sql: []const u8, params: []const ?[]const u8) ![]u8 {
+            return self.libpq.queryParamsRaw(allocator, sql, params);
+        }
+
+        pub fn commit(self: *Transaction) !void {
+            return self.libpq.commit();
+        }
+
+        pub fn rollback(self: *Transaction) void {
+            self.libpq.rollback();
+        }
+    };
 };
 
 const LibpqTransport = if (supports_dynamic_libpq) NativeLibpqTransport else UnsupportedLibpqTransport;
@@ -87,10 +111,42 @@ const UnsupportedLibpqTransport = struct {
         return error.LibpqUnavailable;
     }
 
+    pub fn begin(self: *UnsupportedLibpqTransport, allocator: std.mem.Allocator) !Transaction {
+        _ = self;
+        _ = allocator;
+        return error.LibpqUnavailable;
+    }
+
     pub fn name(self: *const UnsupportedLibpqTransport) []const u8 {
         _ = self;
         return "libpq";
     }
+
+    pub const Transaction = struct {
+        pub fn queryRaw(self: *Transaction, allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+            _ = self;
+            _ = allocator;
+            _ = sql;
+            return error.LibpqUnavailable;
+        }
+
+        pub fn queryParamsRaw(self: *Transaction, allocator: std.mem.Allocator, sql: []const u8, params: []const ?[]const u8) ![]u8 {
+            _ = self;
+            _ = allocator;
+            _ = sql;
+            _ = params;
+            return error.LibpqUnavailable;
+        }
+
+        pub fn commit(self: *Transaction) !void {
+            _ = self;
+            return error.LibpqUnavailable;
+        }
+
+        pub fn rollback(self: *Transaction) void {
+            _ = self;
+        }
+    };
 };
 
 const NativeLibpqTransport = struct {
@@ -132,6 +188,27 @@ const NativeLibpqTransport = struct {
         const conn = try self.acquireConnection();
         defer self.releaseConnection(conn);
 
+        return try self.queryRawOnConnection(allocator, conn, sql);
+    }
+
+    pub fn queryParamsRaw(self: *NativeLibpqTransport, allocator: std.mem.Allocator, sql: []const u8, params: []const ?[]const u8) ![]u8 {
+        const conn = try self.acquireConnection();
+        defer self.releaseConnection(conn);
+
+        try self.execCommandOnConnection(allocator, conn, "SET statement_timeout = '" ++ std.fmt.comptimePrint("{d}", .{statement_timeout_ms}) ++ "ms'");
+        return try self.queryParamsRawOnConnection(allocator, conn, sql, params);
+    }
+
+    pub fn begin(self: *NativeLibpqTransport, allocator: std.mem.Allocator) !Transaction {
+        const conn = try self.acquireConnection();
+        errdefer self.releaseConnection(conn);
+        try self.execCommandOnConnection(allocator, conn, "BEGIN");
+        errdefer self.execCommandOnConnection(allocator, conn, "ROLLBACK") catch {};
+        try self.execCommandOnConnection(allocator, conn, "SET LOCAL statement_timeout = '" ++ std.fmt.comptimePrint("{d}", .{statement_timeout_ms}) ++ "ms'");
+        return .{ .transport = self, .conn = conn };
+    }
+
+    fn queryRawOnConnection(self: *NativeLibpqTransport, allocator: std.mem.Allocator, conn: *PGconn, sql: []const u8) ![]u8 {
         const guarded_sql = try std.fmt.allocPrint(allocator, "SET statement_timeout = '{d}ms';\n{s}", .{ statement_timeout_ms, sql });
         defer allocator.free(guarded_sql);
         const sql_z = try allocator.dupeZ(u8, guarded_sql);
@@ -143,18 +220,7 @@ const NativeLibpqTransport = struct {
         return try self.resultToText(allocator, result);
     }
 
-    pub fn queryParamsRaw(self: *NativeLibpqTransport, allocator: std.mem.Allocator, sql: []const u8, params: []const ?[]const u8) ![]u8 {
-        const conn = try self.acquireConnection();
-        defer self.releaseConnection(conn);
-
-        const timeout_sql = try std.fmt.allocPrint(allocator, "SET statement_timeout = '{d}ms'", .{statement_timeout_ms});
-        defer allocator.free(timeout_sql);
-        const timeout_sql_z = try allocator.dupeZ(u8, timeout_sql);
-        defer allocator.free(timeout_sql_z);
-        const timeout_result = self.lib.PQexec(conn, timeout_sql_z.ptr) orelse return error.PostgresCommandFailed;
-        defer self.lib.PQclear(timeout_result);
-        if (self.lib.PQresultStatus(timeout_result) != pgres_command_ok) return error.PostgresCommandFailed;
-
+    fn queryParamsRawOnConnection(self: *NativeLibpqTransport, allocator: std.mem.Allocator, conn: *PGconn, sql: []const u8, params: []const ?[]const u8) ![]u8 {
         const sql_z = try allocator.dupeZ(u8, sql);
         defer allocator.free(sql_z);
 
@@ -192,6 +258,47 @@ const NativeLibpqTransport = struct {
 
         return try self.resultToText(allocator, result);
     }
+
+    fn execCommandOnConnection(self: *NativeLibpqTransport, allocator: std.mem.Allocator, conn: *PGconn, sql: []const u8) !void {
+        const sql_z = try allocator.dupeZ(u8, sql);
+        defer allocator.free(sql_z);
+        const result = self.lib.PQexec(conn, sql_z.ptr) orelse return error.PostgresCommandFailed;
+        defer self.lib.PQclear(result);
+        if (self.lib.PQresultStatus(result) != pgres_command_ok) return error.PostgresCommandFailed;
+    }
+
+    pub const Transaction = struct {
+        transport: *NativeLibpqTransport,
+        conn: ?*PGconn,
+
+        pub fn queryRaw(self: *Transaction, allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+            const conn = self.conn orelse return error.PostgresTransactionClosed;
+            return self.transport.queryRawOnConnection(allocator, conn, sql);
+        }
+
+        pub fn queryParamsRaw(self: *Transaction, allocator: std.mem.Allocator, sql: []const u8, params: []const ?[]const u8) ![]u8 {
+            const conn = self.conn orelse return error.PostgresTransactionClosed;
+            return self.transport.queryParamsRawOnConnection(allocator, conn, sql, params);
+        }
+
+        pub fn commit(self: *Transaction) !void {
+            const conn = self.conn orelse return error.PostgresTransactionClosed;
+            errdefer {
+                self.transport.lib.PQfinish(conn);
+                self.conn = null;
+            }
+            try self.transport.execCommandOnConnection(self.transport.allocator, conn, "COMMIT");
+            self.transport.releaseConnection(conn);
+            self.conn = null;
+        }
+
+        pub fn rollback(self: *Transaction) void {
+            const conn = self.conn orelse return;
+            self.transport.execCommandOnConnection(self.transport.allocator, conn, "ROLLBACK") catch {};
+            self.transport.releaseConnection(conn);
+            self.conn = null;
+        }
+    };
 
     fn resultToText(self: *NativeLibpqTransport, allocator: std.mem.Allocator, result: *PGresult) ![]u8 {
         const status = self.lib.PQresultStatus(result);

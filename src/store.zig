@@ -10282,6 +10282,9 @@ pub const SQLiteStore = struct {
 pub const PostgresStore = struct {
     allocator: std.mem.Allocator,
     transport: postgres_transport.QueryTransport,
+    tx_mutex: std.Io.Mutex = .init,
+    active_tx: ?postgres_transport.QueryTransport.Transaction = null,
+    active_tx_thread_id: ?std.Thread.Id = null,
 
     pub fn init(allocator: std.mem.Allocator, url: []const u8) !PostgresStore {
         const owned = try postgres_transport.withConnectTimeout(allocator, url);
@@ -10337,6 +10340,50 @@ pub const PostgresStore = struct {
         self.allocator.free(out);
     }
 
+    fn beginTransaction(self: *PostgresStore) !void {
+        if (self.currentThreadOwnsTransaction()) return error.NestedPostgresTransaction;
+        self.tx_mutex.lockUncancelable(compat.io());
+        errdefer self.tx_mutex.unlock(compat.io());
+        if (self.active_tx != null) return error.NestedPostgresTransaction;
+        self.active_tx = try self.transport.begin(self.allocator);
+        self.active_tx_thread_id = std.Thread.getCurrentId();
+    }
+
+    fn commitTransaction(self: *PostgresStore) !void {
+        var tx = self.active_tx orelse return error.PostgresTransactionClosed;
+        self.active_tx = null;
+        self.active_tx_thread_id = null;
+        defer self.tx_mutex.unlock(compat.io());
+        try tx.commit();
+    }
+
+    fn rollbackTransaction(self: *PostgresStore) void {
+        if (self.active_tx) |*tx| {
+            tx.rollback();
+            self.active_tx = null;
+            self.active_tx_thread_id = null;
+            self.tx_mutex.unlock(compat.io());
+            return;
+        }
+        self.active_tx = null;
+        self.active_tx_thread_id = null;
+    }
+
+    fn currentThreadOwnsTransaction(self: *PostgresStore) bool {
+        const owner = self.active_tx_thread_id orelse return false;
+        return owner == std.Thread.getCurrentId();
+    }
+
+    fn waitForForeignTransaction(self: *PostgresStore) void {
+        if (self.currentThreadOwnsTransaction()) return;
+        if (self.tx_mutex.tryLock()) {
+            self.tx_mutex.unlock(compat.io());
+            return;
+        }
+        self.tx_mutex.lockUncancelable(compat.io());
+        self.tx_mutex.unlock(compat.io());
+    }
+
     fn prepareExistingTablesForSchema(self: *PostgresStore) !void {
         try self.runSql(
             \\DO $$ BEGIN
@@ -10353,10 +10400,18 @@ pub const PostgresStore = struct {
     }
 
     fn queryRaw(self: *PostgresStore, allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+        if (self.currentThreadOwnsTransaction()) {
+            if (self.active_tx) |*tx| return tx.queryRaw(allocator, sql);
+        }
+        self.waitForForeignTransaction();
         return self.transport.queryRaw(allocator, sql);
     }
 
     fn queryParamsRaw(self: *PostgresStore, allocator: std.mem.Allocator, sql: []const u8, params: []const ?[]const u8) ![]u8 {
+        if (self.currentThreadOwnsTransaction()) {
+            if (self.active_tx) |*tx| return tx.queryParamsRaw(allocator, sql, params);
+        }
+        self.waitForForeignTransaction();
         return self.transport.queryParamsRaw(allocator, sql, params);
     }
 
@@ -11251,8 +11306,8 @@ pub const PostgresStore = struct {
     }
 
     pub fn importMemoryAtomsAtomic(self: *PostgresStore, allocator: std.mem.Allocator, inputs: []const PreparedMemoryImport) ![]domain.MemoryAtom {
-        try self.runSql("BEGIN");
-        errdefer self.runSql("ROLLBACK") catch {};
+        try self.beginTransaction();
+        errdefer self.rollbackTransaction();
 
         var out: std.ArrayListUnmanaged(domain.MemoryAtom) = .empty;
         errdefer out.deinit(allocator);
@@ -11269,13 +11324,13 @@ pub const PostgresStore = struct {
             try out.append(allocator, atom);
         }
 
-        try self.runSql("COMMIT");
+        try self.commitTransaction();
         return out.toOwnedSlice(allocator);
     }
 
     pub fn applyFeedMemoryAtomAtomic(self: *PostgresStore, allocator: std.mem.Allocator, input: FeedMemoryApplyInput) !FeedMemoryApplyResult {
-        try self.runSql("BEGIN");
-        errdefer self.runSql("ROLLBACK") catch {};
+        try self.beginTransaction();
+        errdefer self.rollbackTransaction();
 
         var atom_input = input.prepared.atom;
         if (input.prepared.generated_source) |source_input| {
@@ -11302,13 +11357,13 @@ pub const PostgresStore = struct {
             .status = "applied",
         });
 
-        try self.runSql("COMMIT");
+        try self.commitTransaction();
         return .{ .event_id = event_id, .atom = atom };
     }
 
     pub fn applyFeedAgentMemoryAtomic(self: *PostgresStore, allocator: std.mem.Allocator, input: FeedAgentMemoryApplyInput) !FeedAgentMemoryApplyResult {
-        try self.runSql("BEGIN");
-        errdefer self.runSql("ROLLBACK") catch {};
+        try self.beginTransaction();
+        errdefer self.rollbackTransaction();
 
         var object_id: []const u8 = input.delete_key orelse "agent_memory";
         var entry: ?domain.AgentMemory = null;
@@ -11344,7 +11399,7 @@ pub const PostgresStore = struct {
             .status = "applied",
         });
 
-        try self.runSql("COMMIT");
+        try self.commitTransaction();
         return .{ .event_id = event_id, .object_id = object_id, .entry = entry, .deleted = deleted };
     }
 
@@ -11355,8 +11410,8 @@ pub const PostgresStore = struct {
             to_entity: domain.Entity,
         };
 
-        try self.runSql("BEGIN");
-        errdefer self.runSql("ROLLBACK") catch {};
+        try self.beginTransaction();
+        errdefer self.rollbackTransaction();
 
         var entity_list: std.ArrayListUnmanaged(domain.Entity) = .empty;
         errdefer entity_list.deinit(allocator);
@@ -11426,7 +11481,7 @@ pub const PostgresStore = struct {
             }));
         }
 
-        try self.runSql("COMMIT");
+        try self.commitTransaction();
         return .{ .artifact = artifact, .entities = entities, .relations = try relations.toOwnedSlice(allocator), .atoms = try atoms.toOwnedSlice(allocator) };
     }
 
@@ -18599,6 +18654,25 @@ test "postgres storage contract covers primitives when configured" {
     const alloc = arena.allocator();
 
     const unique = try ids.make(alloc, "pgcontract");
+    const rollback_source_id = try ids.make(alloc, "pgrollbacksrc");
+    const failing_import = [_]PreparedMemoryImport{.{
+        .atom = .{
+            .text = "postgres atomic import rollback atom",
+            .scope = "public",
+            .created_by = "human",
+            .tags_json = "{not-json",
+        },
+        .generated_source = .{
+            .id = rollback_source_id,
+            .source_type = "manual",
+            .title = "Postgres rollback source",
+            .content = "this generated source must roll back with the failed atom",
+            .scope = "public",
+        },
+    }};
+    try std.testing.expectError(error.PostgresCommandFailed, store.importMemoryAtomsAtomic(alloc, &failing_import));
+    try std.testing.expect((try store.getSource(alloc, rollback_source_id)) == null);
+
     const source = try store.createSource(alloc, .{
         .source_type = "manual",
         .title = unique,
