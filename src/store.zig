@@ -2116,9 +2116,9 @@ pub const Store = struct {
             entry = saved;
         } else if (input.delete_key) |key| {
             deleted = if (input.delete_all)
-                try self.agentMemoryDeleteAllRoutedInner(key, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, route, true)
+                try self.agentMemoryDeleteAllRoutedInner(key, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, route, true, input.event_order)
             else
-                try self.agentMemoryDeleteRoutedInner(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, route, true);
+                try self.agentMemoryDeleteRoutedInner(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, route, true, input.event_order);
             object_id = key;
         }
 
@@ -2216,12 +2216,14 @@ pub const Store = struct {
             .actor_id = normalized.actor_id,
             .writer_actor_id = normalized.writer_actor_id,
             .operation = normalized.operation,
+            .event_order = runtimeAgentMemoryEventOrder(normalized.event_order),
         });
         try tagAgentMemoryStore(allocator, &entry, store_name);
         errdefer {
             var cleanup = entry;
             agent_memory_runtime.freeAgentMemory(allocator, &cleanup);
         }
+        if (std.mem.eql(u8, entry.status, "ignored")) return entry;
         if (runtime.isNoop()) return entry;
         try self.materializeRuntimeAgentMemory(allocator, entry, store_name);
         if (!normalized.suppress_feed) try self.appendAgentMemoryFeedEvent(allocator, entry, store_name, normalized.operation, normalized.content);
@@ -2845,23 +2847,23 @@ pub const Store = struct {
     }
 
     fn agentMemoryDeleteSubset(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror!bool {
-        return self.agentMemoryDeleteSubsetInner(key, session_id, actor_id, writer_actor_id, route, false);
+        return self.agentMemoryDeleteSubsetInner(key, session_id, actor_id, writer_actor_id, route, false, null);
     }
 
-    fn agentMemoryDeleteSubsetInner(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) anyerror!bool {
+    fn agentMemoryDeleteSubsetInner(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool, event_order: ?AgentMemoryEventOrder) anyerror!bool {
         const stores = try requireSubsetStores(route);
         var deleted = false;
         for (stores) |store_name| {
-            deleted = (try self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, routeForSubsetStoreName(store_name), suppress_feed)) or deleted;
+            deleted = (try self.agentMemoryDeleteRoutedInner(key, session_id, actor_id, writer_actor_id, routeForSubsetStoreName(store_name), suppress_feed, event_order)) or deleted;
         }
         return deleted;
     }
 
-    fn agentMemoryDeleteAllSubsetInner(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) anyerror!bool {
+    fn agentMemoryDeleteAllSubsetInner(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool, event_order: ?AgentMemoryEventOrder) anyerror!bool {
         const stores = try requireSubsetStores(route);
         var deleted = false;
         for (stores) |store_name| {
-            deleted = (try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, routeForSubsetStoreName(store_name), suppress_feed)) or deleted;
+            deleted = (try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, routeForSubsetStoreName(store_name), suppress_feed, event_order)) or deleted;
         }
         return deleted;
     }
@@ -3481,23 +3483,23 @@ pub const Store = struct {
     }
 
     pub fn agentMemoryDeleteRouted(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
-        return self.agentMemoryDeleteRoutedInner(key, access.normalizeSessionId(session_id), actor_id, writer_actor_id, route, false);
+        return self.agentMemoryDeleteRoutedInner(key, access.normalizeSessionId(session_id), actor_id, writer_actor_id, route, false, null);
     }
 
     pub fn agentMemoryDeleteAllRouted(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute) !bool {
-        return self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, route, false);
+        return self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, route, false, null);
     }
 
-    fn agentMemoryDeleteAllRoutedInner(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !bool {
+    fn agentMemoryDeleteAllRoutedInner(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool, event_order: ?AgentMemoryEventOrder) !bool {
         switch (route.target) {
-            .subset => return self.agentMemoryDeleteAllSubsetInner(key, actor_id, writer_actor_id, route, suppress_feed),
+            .subset => return self.agentMemoryDeleteAllSubsetInner(key, actor_id, writer_actor_id, route, suppress_feed, event_order),
             .all => {
-                var deleted = try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, .{ .target = .native }, suppress_feed);
+                var deleted = try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, .{ .target = .native }, suppress_feed, event_order);
                 if (self.agent_memory.isExternal()) {
-                    deleted = (try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, .{ .target = .runtime }, suppress_feed)) or deleted;
+                    deleted = (try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, .{ .target = .runtime }, suppress_feed, event_order)) or deleted;
                 }
                 for (self.agent_memory_stores.stores.items) |named| {
-                    deleted = (try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, .{ .target = .named, .name = named.name }, suppress_feed)) or deleted;
+                    deleted = (try self.agentMemoryDeleteAllRoutedInner(key, actor_id, writer_actor_id, .{ .target = .named, .name = named.name }, suppress_feed, event_order)) or deleted;
                 }
                 return deleted;
             },
@@ -3507,8 +3509,8 @@ pub const Store = struct {
         const deleted = try switch (route.target) {
             .primary => self.agentMemoryDeleteAll(key, actor_id, writer_actor_id),
             .native => self.agentMemoryDeleteAllNative(key, actor_id, writer_actor_id),
-            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.deleteAll(key, actor_id, writer_actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).deleteAll(key, actor_id, writer_actor_id),
+            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.deleteAllOrdered(key, actor_id, writer_actor_id, runtimeAgentMemoryEventOrder(event_order)) else error.AgentMemoryStorageUnavailable,
+            .named => (try self.namedAgentMemoryRuntime(route)).deleteAllOrdered(key, actor_id, writer_actor_id, runtimeAgentMemoryEventOrder(event_order)),
             .subset, .all => unreachable,
         };
         if (deleted) {
@@ -3520,17 +3522,17 @@ pub const Store = struct {
         return deleted;
     }
 
-    fn agentMemoryDeleteRoutedInner(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool) !bool {
+    fn agentMemoryDeleteRoutedInner(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, route: AgentMemoryStorageRoute, suppress_feed: bool, event_order: ?AgentMemoryEventOrder) !bool {
         const normalized_session_id = access.normalizeSessionId(session_id);
         switch (route.target) {
-            .subset => return self.agentMemoryDeleteSubsetInner(key, normalized_session_id, actor_id, writer_actor_id, route, suppress_feed),
+            .subset => return self.agentMemoryDeleteSubsetInner(key, normalized_session_id, actor_id, writer_actor_id, route, suppress_feed, event_order),
             .all => {
-                var deleted = try self.agentMemoryDeleteRoutedInner(key, normalized_session_id, actor_id, writer_actor_id, .{ .target = .native }, suppress_feed);
+                var deleted = try self.agentMemoryDeleteRoutedInner(key, normalized_session_id, actor_id, writer_actor_id, .{ .target = .native }, suppress_feed, event_order);
                 if (self.agent_memory.isExternal()) {
-                    deleted = (try self.agentMemoryDeleteRoutedInner(key, normalized_session_id, actor_id, writer_actor_id, .{ .target = .runtime }, suppress_feed)) or deleted;
+                    deleted = (try self.agentMemoryDeleteRoutedInner(key, normalized_session_id, actor_id, writer_actor_id, .{ .target = .runtime }, suppress_feed, event_order)) or deleted;
                 }
                 for (self.agent_memory_stores.stores.items) |named| {
-                    deleted = (try self.agentMemoryDeleteRoutedInner(key, normalized_session_id, actor_id, writer_actor_id, .{ .target = .named, .name = named.name }, suppress_feed)) or deleted;
+                    deleted = (try self.agentMemoryDeleteRoutedInner(key, normalized_session_id, actor_id, writer_actor_id, .{ .target = .named, .name = named.name }, suppress_feed, event_order)) or deleted;
                 }
                 return deleted;
             },
@@ -3542,8 +3544,8 @@ pub const Store = struct {
         const deleted = try switch (route.target) {
             .primary => self.agentMemoryDelete(key, normalized_session_id, actor_id, writer_actor_id),
             .native => self.agentMemoryDeleteNative(key, normalized_session_id, actor_id, writer_actor_id),
-            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.delete(key, normalized_session_id, actor_id, writer_actor_id) else error.AgentMemoryStorageUnavailable,
-            .named => (try self.namedAgentMemoryRuntime(route)).delete(key, normalized_session_id, actor_id, writer_actor_id),
+            .runtime => if (self.agent_memory.isExternal()) self.agent_memory.deleteOrdered(key, normalized_session_id, actor_id, writer_actor_id, runtimeAgentMemoryEventOrder(event_order)) else error.AgentMemoryStorageUnavailable,
+            .named => (try self.namedAgentMemoryRuntime(route)).deleteOrdered(key, normalized_session_id, actor_id, writer_actor_id, runtimeAgentMemoryEventOrder(event_order)),
             .subset, .all => unreachable,
         };
         if (deleted) {
@@ -5111,6 +5113,15 @@ fn normalizeAgentMemoryInput(input: AgentMemoryInput) AgentMemoryInput {
     var out = input;
     out.session_id = access.normalizeSessionId(input.session_id);
     return out;
+}
+
+fn runtimeAgentMemoryEventOrder(event_order: ?AgentMemoryEventOrder) ?agent_memory_runtime.EventOrder {
+    const order = event_order orelse return null;
+    return .{
+        .timestamp_ms = order.timestamp_ms,
+        .origin_instance_id = order.origin_instance_id,
+        .origin_sequence = order.origin_sequence,
+    };
 }
 
 fn agentMemoryStoredMetadataJson(allocator: std.mem.Allocator, input: AgentMemoryInput) ![]u8 {

@@ -12886,6 +12886,47 @@ test "api nullclaw memory apply uses configured primary runtime backend" {
     try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"key\":\"runtime.pref\"") != null);
 }
 
+test "api named runtime feed apply tombstones block stale puts after deletes" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory_stores = &.{.{ .name = "scratch", .config = .{ .backend = .memory_lru } }},
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .store = &store,
+        .actor_id = "agent:runtime-tombstone",
+        .actor_scopes_json = "[\"public\",\"write:public\",\"session:*\",\"write:session:*\",\"actor:agent:runtime-tombstone\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"delete\",\"export\",\"feed_apply\"]",
+    };
+
+    const scoped_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"runtime-tombstone\",\"origin_sequence\":20,\"timestamp_ms\":200,\"payload\":{\"key\":\"runtime.tombstone.scoped\",\"session_id\":\"s1\",\"content\":\"runtime scoped live\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", scoped_put.status);
+    const scoped_delete = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.delete\",\"operation\":\"delete\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"runtime-tombstone\",\"origin_sequence\":21,\"timestamp_ms\":300,\"payload\":{\"key\":\"runtime.tombstone.scoped\",\"session_id\":\"s1\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", scoped_delete.status);
+    const stale_scoped_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"runtime-tombstone\",\"origin_sequence\":19,\"timestamp_ms\":100,\"payload\":{\"key\":\"runtime.tombstone.scoped\",\"session_id\":\"s1\",\"content\":\"runtime scoped stale\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", stale_scoped_put.status);
+    const scoped_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/runtime.tombstone.scoped?store=scratch&session_id=s1&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", scoped_after_stale.status);
+
+    const global_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"runtime-tombstone\",\"origin_sequence\":30,\"timestamp_ms\":200,\"payload\":{\"key\":\"runtime.tombstone.all\",\"content\":\"runtime global live\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", global_put.status);
+    const session_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"runtime-tombstone\",\"origin_sequence\":31,\"timestamp_ms\":210,\"payload\":{\"key\":\"runtime.tombstone.all\",\"session_id\":\"s2\",\"content\":\"runtime session live\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", session_put.status);
+    const delete_all = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.delete_all\",\"operation\":\"delete_all\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"runtime-tombstone\",\"origin_sequence\":32,\"timestamp_ms\":300,\"payload\":{\"key\":\"runtime.tombstone.all\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", delete_all.status);
+    const stale_global_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"runtime-tombstone\",\"origin_sequence\":29,\"timestamp_ms\":150,\"payload\":{\"key\":\"runtime.tombstone.all\",\"content\":\"runtime global stale\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", stale_global_put.status);
+    const stale_session_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"runtime-tombstone\",\"origin_sequence\":28,\"timestamp_ms\":140,\"payload\":{\"key\":\"runtime.tombstone.all\",\"session_id\":\"s2\",\"content\":\"runtime session stale\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", stale_session_put.status);
+
+    const global_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/runtime.tombstone.all?store=scratch&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", global_after_stale.status);
+    const session_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/runtime.tombstone.all?store=scratch&session_id=s2&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", session_after_stale.status);
+}
+
 test "api memory feed endpoints honor named runtime route selection" {
     var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
         .agent_memory_stores = &.{.{ .name = "scratch", .config = .{ .backend = .memory_lru } }},

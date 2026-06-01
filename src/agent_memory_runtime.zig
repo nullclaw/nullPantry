@@ -70,6 +70,12 @@ pub const NamedConfig = struct {
     config: Config,
 };
 
+pub const EventOrder = struct {
+    timestamp_ms: i64,
+    origin_instance_id: []const u8,
+    origin_sequence: i64,
+};
+
 pub const Input = struct {
     key: []const u8,
     content: []const u8,
@@ -81,12 +87,71 @@ pub const Input = struct {
     actor_id: ?[]const u8 = null,
     writer_actor_id: ?[]const u8 = null,
     operation: domain.AgentMemoryOperation = .put,
+    event_order: ?EventOrder = null,
 };
 
 fn normalizeInput(input: Input) Input {
     var out = input;
     out.session_id = access.normalizeSessionId(input.session_id);
     return out;
+}
+
+fn eventTimestampMs(input: Input) i64 {
+    return if (input.event_order) |order| order.timestamp_ms else ids.nowMs();
+}
+
+fn compareEventOrder(input: EventOrder, existing_timestamp_ms: i64, existing_origin_instance_id: []const u8, existing_origin_sequence: i64) i8 {
+    if (input.timestamp_ms < existing_timestamp_ms) return -1;
+    if (input.timestamp_ms > existing_timestamp_ms) return 1;
+    return switch (std.mem.order(u8, input.origin_instance_id, existing_origin_instance_id)) {
+        .lt => -1,
+        .gt => 1,
+        .eq => if (input.origin_sequence < existing_origin_sequence) -1 else if (input.origin_sequence > existing_origin_sequence) 1 else 0,
+    };
+}
+
+fn compareEventOrderToMemoryEntry(input: EventOrder, entry: MemoryEntry) i8 {
+    const existing_timestamp_ms = if (entry.event_order) |order| order.timestamp_ms else parseMemoryTimestamp(entry.entry.timestamp);
+    const existing_origin_instance_id = if (entry.event_order) |order| order.origin_instance_id else "";
+    const existing_origin_sequence = if (entry.event_order) |order| order.origin_sequence else 0;
+    return compareEventOrder(input, existing_timestamp_ms, existing_origin_instance_id, existing_origin_sequence);
+}
+
+fn cloneEventOrder(allocator: std.mem.Allocator, order: EventOrder) !EventOrder {
+    return .{
+        .timestamp_ms = order.timestamp_ms,
+        .origin_instance_id = try allocator.dupe(u8, order.origin_instance_id),
+        .origin_sequence = order.origin_sequence,
+    };
+}
+
+fn freeEventOrder(allocator: std.mem.Allocator, order: *EventOrder) void {
+    allocator.free(order.origin_instance_id);
+}
+
+fn tombstoneSessionKey(session_id: ?[]const u8) []const u8 {
+    return session_id orelse "__global__";
+}
+
+fn ignoredAgentMemory(allocator: std.mem.Allocator, input: Input, owner_actor: []const u8, writer_actor: []const u8) !domain.AgentMemory {
+    const scope = try access.agentMemoryScope(allocator, owner_actor, input.session_id, input.scope);
+    defer allocator.free(scope);
+    const permissions = try access.agentMemoryPermissions(allocator, owner_actor, input.scope, input.permissions_json);
+    defer allocator.free(permissions);
+    const timestamp = eventTimestampMs(input);
+    return .{
+        .id = try memoryEntryId(allocator, owner_actor, input.session_id, input.key),
+        .key = try allocator.dupe(u8, input.key),
+        .content = try allocator.dupe(u8, input.content),
+        .category = try allocator.dupe(u8, input.category),
+        .timestamp = try std.fmt.allocPrint(allocator, "{d}", .{timestamp}),
+        .session_id = if (input.session_id) |sid| try allocator.dupe(u8, sid) else null,
+        .actor_id = try allocator.dupe(u8, owner_actor),
+        .writer_actor_id = try allocator.dupe(u8, writer_actor),
+        .scope = try allocator.dupe(u8, scope),
+        .permissions_json = try allocator.dupe(u8, permissions),
+        .status = try allocator.dupe(u8, "ignored"),
+    };
 }
 
 pub const Message = struct {
@@ -335,6 +400,17 @@ pub const Runtime = union(BackendKind) {
         };
     }
 
+    pub fn deleteOrdered(self: *Runtime, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?EventOrder) !bool {
+        const normalized_session_id = access.normalizeSessionId(session_id);
+        return switch (self.*) {
+            .none => false,
+            .native => error.NativeAgentMemoryRuntime,
+            .memory_lru => |*engine| engine.deleteOrdered(key, normalized_session_id, actor_id, writer_actor_id, event_order),
+            .redis => |*engine| engine.deleteOrdered(key, normalized_session_id, actor_id, writer_actor_id, event_order),
+            .api => |*engine| engine.deleteOrdered(key, normalized_session_id, actor_id, writer_actor_id, event_order),
+        };
+    }
+
     pub fn deleteAll(self: *Runtime, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
         return switch (self.*) {
             .none => false,
@@ -342,6 +418,16 @@ pub const Runtime = union(BackendKind) {
             .memory_lru => |*engine| engine.deleteAll(key, actor_id, writer_actor_id),
             .redis => |*engine| engine.deleteAll(key, actor_id, writer_actor_id),
             .api => |*engine| engine.deleteAll(key, actor_id, writer_actor_id),
+        };
+    }
+
+    pub fn deleteAllOrdered(self: *Runtime, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?EventOrder) !bool {
+        return switch (self.*) {
+            .none => false,
+            .native => error.NativeAgentMemoryRuntime,
+            .memory_lru => |*engine| engine.deleteAllOrdered(key, actor_id, writer_actor_id, event_order),
+            .redis => |*engine| engine.deleteAllOrdered(key, actor_id, writer_actor_id, event_order),
+            .api => |*engine| engine.deleteAllOrdered(key, actor_id, writer_actor_id, event_order),
         };
     }
 
@@ -594,7 +680,19 @@ const MemoryUsage = struct {
 
 const MemoryEntry = struct {
     entry: domain.AgentMemory,
+    event_order: ?EventOrder = null,
     last_access_ms: i64,
+};
+
+const MemoryTombstoneScope = enum { scoped, all };
+
+const MemoryTombstone = struct {
+    key: []const u8,
+    actor_id: []const u8,
+    scope: MemoryTombstoneScope,
+    session_key: []const u8,
+    session_id: ?[]const u8,
+    event_order: EventOrder,
 };
 
 fn noopAgentMemory(allocator: std.mem.Allocator, input: Input) !domain.AgentMemory {
@@ -630,6 +728,7 @@ pub const MemoryAgentMemory = struct {
     allocator: std.mem.Allocator,
     config: MemoryConfig = .{},
     entries: std.ArrayListUnmanaged(MemoryEntry) = .empty,
+    tombstones: std.ArrayListUnmanaged(MemoryTombstone) = .empty,
     messages: std.ArrayListUnmanaged(MemorySessionMessage) = .empty,
     usage: std.ArrayListUnmanaged(MemoryUsage) = .empty,
 
@@ -638,8 +737,10 @@ pub const MemoryAgentMemory = struct {
     }
 
     pub fn deinit(self: *MemoryAgentMemory) void {
-        for (self.entries.items) |*entry| freeAgentMemory(self.allocator, &entry.entry);
+        for (self.entries.items) |*entry| self.freeMemoryEntry(entry);
         self.entries.deinit(self.allocator);
+        for (self.tombstones.items) |*tombstone| self.freeTombstone(tombstone);
+        self.tombstones.deinit(self.allocator);
         for (self.messages.items) |*message| freeMemorySessionMessage(self.allocator, message);
         self.messages.deinit(self.allocator);
         for (self.usage.items) |*item| freeMemoryUsage(self.allocator, item);
@@ -658,12 +759,23 @@ pub const MemoryAgentMemory = struct {
         defer allocator.free(permissions);
         const status = domain.defaultMemoryStatus("agent", scope);
         const existing_idx = self.findEntryIndex(owner_actor, input.session_id, input.key);
+        if (input.event_order) |order| {
+            if (try self.tombstoneBlocksPut(input.key, input.session_id, owner_actor, order)) {
+                if (existing_idx) |idx| return cloneAgentMemory(allocator, self.entries.items[idx].entry);
+                return ignoredAgentMemory(allocator, input, owner_actor, writer_actor);
+            }
+            if (existing_idx) |idx| {
+                if (compareEventOrderToMemoryEntry(order, self.entries.items[idx]) <= 0) {
+                    return cloneAgentMemory(allocator, self.entries.items[idx].entry);
+                }
+            }
+        }
         const existing_content = if (existing_idx) |idx| self.entries.items[idx].entry.content else null;
         const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, existing_content, input.content);
         defer allocator.free(reduced_content);
         _ = try self.delete(input.key, input.session_id, owner_actor, writer_actor);
 
-        const timestamp = ids.nowMs();
+        const timestamp = eventTimestampMs(input);
         const timestamp_text = try std.fmt.allocPrint(self.allocator, "{d}", .{timestamp});
         var timestamp_owned = true;
         errdefer if (timestamp_owned) self.allocator.free(timestamp_text);
@@ -689,11 +801,13 @@ pub const MemoryAgentMemory = struct {
         errdefer {
             if (stored_owned) freeAgentMemory(self.allocator, &stored);
         }
-        try self.entries.append(self.allocator, .{ .entry = stored, .last_access_ms = timestamp });
+        var stored_order = if (input.event_order) |order| try cloneEventOrder(self.allocator, order) else null;
+        errdefer if (stored_order) |*order| freeEventOrder(self.allocator, order);
+        try self.entries.append(self.allocator, .{ .entry = stored, .event_order = stored_order, .last_access_ms = timestamp });
         stored_owned = false;
         errdefer {
             var removed = self.entries.orderedRemove(self.entries.items.len - 1);
-            freeAgentMemory(self.allocator, &removed.entry);
+            self.freeMemoryEntry(&removed);
         }
         const result = try cloneAgentMemory(allocator, stored);
         self.enforceLimits();
@@ -800,7 +914,19 @@ pub const MemoryAgentMemory = struct {
         const owner = actor_id orelse return false;
         const idx = self.findEntryIndex(owner, session_id, key) orelse return false;
         var removed = self.entries.orderedRemove(idx);
-        freeAgentMemory(self.allocator, &removed.entry);
+        self.freeMemoryEntry(&removed);
+        return true;
+    }
+
+    pub fn deleteOrdered(self: *MemoryAgentMemory, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?EventOrder) !bool {
+        const order = event_order orelse return self.delete(key, session_id, actor_id, writer_actor_id);
+        self.purgeExpired();
+        const owner = actor_id orelse return false;
+        try self.upsertTombstone(key, owner, .scoped, session_id, order);
+        const idx = self.findEntryIndex(owner, session_id, key) orelse return false;
+        if (compareEventOrderToMemoryEntry(order, self.entries.items[idx]) < 0) return false;
+        var removed = self.entries.orderedRemove(idx);
+        self.freeMemoryEntry(&removed);
         return true;
     }
 
@@ -813,7 +939,31 @@ pub const MemoryAgentMemory = struct {
             const entry = self.entries.items[i].entry;
             if (std.mem.eql(u8, entry.actor_id, owner) and std.mem.eql(u8, entry.key, key)) {
                 var removed = self.entries.orderedRemove(i);
-                freeAgentMemory(self.allocator, &removed.entry);
+                self.freeMemoryEntry(&removed);
+                changed = true;
+                continue;
+            }
+            i += 1;
+        }
+        return changed;
+    }
+
+    pub fn deleteAllOrdered(self: *MemoryAgentMemory, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?EventOrder) !bool {
+        const order = event_order orelse return self.deleteAll(key, actor_id, writer_actor_id);
+        self.purgeExpired();
+        const owner = actor_id orelse return false;
+        try self.upsertTombstone(key, owner, .all, null, order);
+        var changed = false;
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i].entry;
+            if (std.mem.eql(u8, entry.actor_id, owner) and std.mem.eql(u8, entry.key, key)) {
+                if (compareEventOrderToMemoryEntry(order, self.entries.items[i]) < 0) {
+                    i += 1;
+                    continue;
+                }
+                var removed = self.entries.orderedRemove(i);
+                self.freeMemoryEntry(&removed);
                 changed = true;
                 continue;
             }
@@ -1068,6 +1218,60 @@ pub const MemoryAgentMemory = struct {
         return null;
     }
 
+    fn tombstoneBlocksPut(self: *MemoryAgentMemory, key: []const u8, session_id: ?[]const u8, owner_actor: []const u8, event_order: EventOrder) !bool {
+        const session_key = tombstoneSessionKey(session_id);
+        for (self.tombstones.items) |tombstone| {
+            if (!std.mem.eql(u8, tombstone.key, key)) continue;
+            if (!std.mem.eql(u8, tombstone.actor_id, owner_actor)) continue;
+            const matches_scope = switch (tombstone.scope) {
+                .scoped => std.mem.eql(u8, tombstone.session_key, session_key),
+                .all => std.mem.eql(u8, tombstone.session_key, "*"),
+            };
+            if (!matches_scope) continue;
+            if (compareEventOrder(event_order, tombstone.event_order.timestamp_ms, tombstone.event_order.origin_instance_id, tombstone.event_order.origin_sequence) <= 0) return true;
+        }
+        return false;
+    }
+
+    fn upsertTombstone(self: *MemoryAgentMemory, key: []const u8, owner_actor: []const u8, scope: MemoryTombstoneScope, session_id: ?[]const u8, event_order: EventOrder) !void {
+        const session_key = if (scope == .all) "*" else tombstoneSessionKey(session_id);
+        for (self.tombstones.items) |*tombstone| {
+            if (!std.mem.eql(u8, tombstone.key, key)) continue;
+            if (!std.mem.eql(u8, tombstone.actor_id, owner_actor)) continue;
+            if (tombstone.scope != scope) continue;
+            if (!std.mem.eql(u8, tombstone.session_key, session_key)) continue;
+            if (compareEventOrder(event_order, tombstone.event_order.timestamp_ms, tombstone.event_order.origin_instance_id, tombstone.event_order.origin_sequence) <= 0) return;
+            freeEventOrder(self.allocator, &tombstone.event_order);
+            tombstone.event_order = try cloneEventOrder(self.allocator, event_order);
+            if (tombstone.session_id) |sid| self.allocator.free(sid);
+            tombstone.session_id = if (session_id) |sid| try self.allocator.dupe(u8, sid) else null;
+            return;
+        }
+        var tombstone = MemoryTombstone{
+            .key = try self.allocator.dupe(u8, key),
+            .actor_id = try self.allocator.dupe(u8, owner_actor),
+            .scope = scope,
+            .session_key = try self.allocator.dupe(u8, session_key),
+            .session_id = if (session_id) |sid| try self.allocator.dupe(u8, sid) else null,
+            .event_order = try cloneEventOrder(self.allocator, event_order),
+        };
+        errdefer self.freeTombstone(&tombstone);
+        try self.tombstones.append(self.allocator, tombstone);
+    }
+
+    fn freeMemoryEntry(self: *MemoryAgentMemory, entry: *MemoryEntry) void {
+        freeAgentMemory(self.allocator, &entry.entry);
+        if (entry.event_order) |*order| freeEventOrder(self.allocator, order);
+    }
+
+    fn freeTombstone(self: *MemoryAgentMemory, tombstone: *MemoryTombstone) void {
+        self.allocator.free(tombstone.key);
+        self.allocator.free(tombstone.actor_id);
+        self.allocator.free(tombstone.session_key);
+        if (tombstone.session_id) |sid| self.allocator.free(sid);
+        freeEventOrder(self.allocator, &tombstone.event_order);
+    }
+
     fn touchEntryById(self: *MemoryAgentMemory, id: []const u8, at_ms: i64) void {
         for (self.entries.items) |*wrapped| {
             if (std.mem.eql(u8, wrapped.entry.id, id)) {
@@ -1085,7 +1289,7 @@ pub const MemoryAgentMemory = struct {
         while (i < self.entries.items.len) {
             if (parseMemoryTimestamp(self.entries.items[i].entry.timestamp) <= cutoff) {
                 var removed = self.entries.orderedRemove(i);
-                freeAgentMemory(self.allocator, &removed.entry);
+                self.freeMemoryEntry(&removed);
                 continue;
             }
             i += 1;
@@ -1137,7 +1341,7 @@ pub const MemoryAgentMemory = struct {
             }
         }
         var removed = self.entries.orderedRemove(idx);
-        freeAgentMemory(self.allocator, &removed.entry);
+        self.freeMemoryEntry(&removed);
         return true;
     }
 
@@ -1245,9 +1449,13 @@ pub const RedisAgentMemory = struct {
         const permissions = try access.agentMemoryPermissions(allocator, owner_actor, input.scope, input.permissions_json);
         defer allocator.free(permissions);
         const status = domain.defaultMemoryStatus("agent", scope);
-        const timestamp = ids.nowMs();
+        const timestamp = eventTimestampMs(input);
         const timestamp_text = try std.fmt.allocPrint(allocator, "{d}", .{timestamp});
         defer allocator.free(timestamp_text);
+        const origin_instance_id = if (input.event_order) |order| order.origin_instance_id else "";
+        const origin_sequence = if (input.event_order) |order| order.origin_sequence else 0;
+        const origin_sequence_text = try std.fmt.allocPrint(allocator, "{d}", .{origin_sequence});
+        defer allocator.free(origin_sequence_text);
         const entry_key = try self.entryKey(allocator, owner_actor, input.session_id, input.key);
         defer allocator.free(entry_key);
         const entry_id = try self.entryId(allocator, owner_actor, input.session_id, input.key);
@@ -1256,6 +1464,18 @@ pub const RedisAgentMemory = struct {
         defer old_hash.deinit(self.allocator);
         var old_entry = try self.agentMemoryFromHash(self.allocator, old_hash);
         defer if (old_entry) |*entry| freeAgentMemory(self.allocator, entry);
+        if (input.event_order) |order| {
+            if (try self.tombstoneBlocksPut(allocator, input.key, input.session_id, owner_actor, order)) {
+                if (old_entry) |entry| return cloneAgentMemory(allocator, entry);
+                return ignoredAgentMemory(allocator, input, owner_actor, writer_actor);
+            }
+            if (redisEventOrderFromHash(old_hash)) |stored_order| {
+                if (compareEventOrder(order, stored_order.timestamp_ms, stored_order.origin_instance_id, stored_order.origin_sequence) <= 0) {
+                    if (old_entry) |entry| return cloneAgentMemory(allocator, entry);
+                    return ignoredAgentMemory(allocator, input, owner_actor, writer_actor);
+                }
+            }
+        }
         const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, if (old_entry) |entry| entry.content else null, input.content);
         defer allocator.free(reduced_content);
 
@@ -1274,18 +1494,21 @@ pub const RedisAgentMemory = struct {
 
         if (old_entry) |entry| try self.queueRemoveEntryIndexes(entry_key, entry);
         try self.queueCommand(&.{
-            "HSET",             entry_key,
-            "id",               entry_id,
-            "key",              input.key,
-            "content",          reduced_content,
-            "category",         input.category,
-            "timestamp",        timestamp_text,
-            "session_id",       input.session_id orelse "",
-            "actor_id",         owner_actor,
-            "writer_actor_id",  writer_actor,
-            "scope",            scope,
-            "permissions_json", permissions,
-            "status",           status,
+            "HSET",               entry_key,
+            "id",                 entry_id,
+            "key",                input.key,
+            "content",            reduced_content,
+            "category",           input.category,
+            "timestamp",          timestamp_text,
+            "session_id",         input.session_id orelse "",
+            "actor_id",           owner_actor,
+            "writer_actor_id",    writer_actor,
+            "scope",              scope,
+            "permissions_json",   permissions,
+            "status",             status,
+            "event_timestamp_ms", timestamp_text,
+            "origin_instance_id", origin_instance_id,
+            "origin_sequence",    origin_sequence_text,
         });
         try self.queueCommand(&.{ "SADD", global, entry_key });
         try self.queueCommand(&.{ "SADD", owner, entry_key });
@@ -1449,6 +1672,20 @@ pub const RedisAgentMemory = struct {
         };
     }
 
+    pub fn deleteOrdered(self: *RedisAgentMemory, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?EventOrder) !bool {
+        const order = event_order orelse return self.delete(key, session_id, actor_id, writer_actor_id);
+        const owner = actor_id orelse return false;
+        try self.upsertTombstone(key, owner, .scoped, session_id, order);
+        const entry_key = try self.entryKey(self.allocator, owner, session_id, key);
+        defer self.allocator.free(entry_key);
+        var existing_hash = try self.client.command(&.{ "HGETALL", entry_key });
+        defer existing_hash.deinit(self.allocator);
+        if (redisEventOrderFromHash(existing_hash)) |stored_order| {
+            if (compareEventOrder(order, stored_order.timestamp_ms, stored_order.origin_instance_id, stored_order.origin_sequence) < 0) return false;
+        }
+        return self.delete(key, session_id, owner, writer_actor_id);
+    }
+
     pub fn deleteAll(self: *RedisAgentMemory, key: []const u8, actor_id: ?[]const u8, _: ?[]const u8) !bool {
         const owner = actor_id orelse return false;
         const Candidate = struct {
@@ -1494,6 +1731,83 @@ pub const RedisAgentMemory = struct {
                 .redis_key = redis_key_copy,
                 .entry = entry,
             });
+            appended = true;
+        }
+        if (candidates.items.len == 0) return false;
+
+        try self.beginTransaction();
+        var committed = false;
+        defer if (!committed) self.discardTransaction();
+        for (candidates.items) |candidate| {
+            try self.queueRemoveEntryIndexes(candidate.redis_key, candidate.entry);
+            try self.queueCommand(&.{ "DEL", candidate.redis_key });
+        }
+        var resp = try self.execTransaction();
+        committed = true;
+        defer resp.deinit(self.allocator);
+        const replies = switch (resp) {
+            .array => |maybe_items| maybe_items orelse return false,
+            else => return false,
+        };
+        for (replies) |reply| switch (reply) {
+            .integer => |changed| if (changed > 0) return true,
+            else => {},
+        };
+        return false;
+    }
+
+    pub fn deleteAllOrdered(self: *RedisAgentMemory, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?EventOrder) !bool {
+        const order = event_order orelse return self.deleteAll(key, actor_id, writer_actor_id);
+        const owner = actor_id orelse return false;
+        try self.upsertTombstone(key, owner, .all, null, order);
+        const Candidate = struct {
+            redis_key: []u8,
+            entry: domain.AgentMemory,
+        };
+        const owner_index = try self.ownerIndexKey(self.allocator, owner);
+        defer self.allocator.free(owner_index);
+        var members_resp = try self.client.command(&.{ "SMEMBERS", owner_index });
+        defer members_resp.deinit(self.allocator);
+        const members = switch (members_resp) {
+            .array => |maybe_items| maybe_items orelse return false,
+            else => return false,
+        };
+        var candidates: std.ArrayListUnmanaged(Candidate) = .empty;
+        defer {
+            for (candidates.items) |*candidate| {
+                self.allocator.free(candidate.redis_key);
+                freeAgentMemory(self.allocator, &candidate.entry);
+            }
+            candidates.deinit(self.allocator);
+        }
+        for (members) |member| {
+            const redis_key = member.asString() orelse continue;
+            var hash = try self.client.command(&.{ "HGETALL", redis_key });
+            const maybe_entry = self.agentMemoryFromHash(self.allocator, hash) catch |err| {
+                hash.deinit(self.allocator);
+                return err;
+            };
+            const is_newer_than_delete = if (redisEventOrderFromHash(hash)) |existing|
+                compareEventOrder(order, existing.timestamp_ms, existing.origin_instance_id, existing.origin_sequence) < 0
+            else
+                false;
+            hash.deinit(self.allocator);
+            var entry = maybe_entry orelse continue;
+            if (!std.mem.eql(u8, entry.actor_id, owner) or !std.mem.eql(u8, entry.key, key)) {
+                freeAgentMemory(self.allocator, &entry);
+                continue;
+            }
+            if (is_newer_than_delete) {
+                freeAgentMemory(self.allocator, &entry);
+                continue;
+            }
+            const redis_key_copy = try self.allocator.dupe(u8, redis_key);
+            var appended = false;
+            errdefer if (!appended) {
+                self.allocator.free(redis_key_copy);
+                freeAgentMemory(self.allocator, &entry);
+            };
+            try candidates.append(self.allocator, .{ .redis_key = redis_key_copy, .entry = entry });
             appended = true;
         }
         if (candidates.items.len == 0) return false;
@@ -1818,6 +2132,55 @@ pub const RedisAgentMemory = struct {
         try self.queueCommand(&.{ "EXPIRE", key, ttl_text });
     }
 
+    fn expireKey(self: *RedisAgentMemory, key: []const u8) !void {
+        const ttl = self.ttl_seconds orelse return;
+        if (ttl == 0) return;
+        var ttl_buf: [16]u8 = undefined;
+        const ttl_text = try std.fmt.bufPrint(&ttl_buf, "{d}", .{ttl});
+        var resp = try self.client.command(&.{ "EXPIRE", key, ttl_text });
+        defer resp.deinit(self.allocator);
+    }
+
+    fn tombstoneBlocksPut(self: *RedisAgentMemory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, owner_actor: []const u8, event_order: EventOrder) !bool {
+        const scoped_key = try self.tombstoneKey(allocator, owner_actor, key, .scoped, tombstoneSessionKey(session_id));
+        defer allocator.free(scoped_key);
+        if (try self.tombstoneKeyBlocksPut(scoped_key, event_order)) return true;
+        const all_key = try self.tombstoneKey(allocator, owner_actor, key, .all, "*");
+        defer allocator.free(all_key);
+        return self.tombstoneKeyBlocksPut(all_key, event_order);
+    }
+
+    fn tombstoneKeyBlocksPut(self: *RedisAgentMemory, redis_key: []const u8, event_order: EventOrder) !bool {
+        var hash = try self.client.command(&.{ "HGETALL", redis_key });
+        defer hash.deinit(self.allocator);
+        const stored_order = redisEventOrderFromHash(hash) orelse return false;
+        return compareEventOrder(event_order, stored_order.timestamp_ms, stored_order.origin_instance_id, stored_order.origin_sequence) <= 0;
+    }
+
+    fn upsertTombstone(self: *RedisAgentMemory, key: []const u8, owner_actor: []const u8, scope: MemoryTombstoneScope, session_id: ?[]const u8, event_order: EventOrder) !void {
+        const session_key = if (scope == .all) "*" else tombstoneSessionKey(session_id);
+        const redis_key = try self.tombstoneKey(self.allocator, owner_actor, key, scope, session_key);
+        defer self.allocator.free(redis_key);
+        if (try self.tombstoneKeyBlocksPut(redis_key, event_order)) return;
+        const timestamp_text = try std.fmt.allocPrint(self.allocator, "{d}", .{event_order.timestamp_ms});
+        defer self.allocator.free(timestamp_text);
+        const sequence_text = try std.fmt.allocPrint(self.allocator, "{d}", .{event_order.origin_sequence});
+        defer self.allocator.free(sequence_text);
+        var resp = try self.client.command(&.{
+            "HSET",               redis_key,
+            "key",                key,
+            "actor_id",           owner_actor,
+            "scope",              if (scope == .all) "all" else "scoped",
+            "session_key",        session_key,
+            "session_id",         session_id orelse "",
+            "event_timestamp_ms", timestamp_text,
+            "origin_instance_id", event_order.origin_instance_id,
+            "origin_sequence",    sequence_text,
+        });
+        defer resp.deinit(self.allocator);
+        try self.expireKey(redis_key);
+    }
+
     fn indexEntry(self: *RedisAgentMemory, entry_key: []const u8, owner_actor: []const u8, session_id: ?[]const u8, category: []const u8) !void {
         const global = try self.globalIndexKey(self.allocator);
         defer self.allocator.free(global);
@@ -2065,6 +2428,22 @@ pub const RedisAgentMemory = struct {
         return std.fmt.allocPrint(allocator, "{s}:agent-memory:item:{s}:{s}:{s}", .{ self.prefix, actor_hex, session_hex, key_hex });
     }
 
+    fn tombstoneKey(self: *RedisAgentMemory, allocator: std.mem.Allocator, actor: []const u8, key: []const u8, scope: MemoryTombstoneScope, session_key: []const u8) ![]u8 {
+        const actor_hex = try hex(allocator, actor);
+        defer allocator.free(actor_hex);
+        const key_hex = try hex(allocator, key);
+        defer allocator.free(key_hex);
+        const session_hex = try hex(allocator, session_key);
+        defer allocator.free(session_hex);
+        return std.fmt.allocPrint(allocator, "{s}:agent-memory:tombstone:{s}:{s}:{s}:{s}", .{
+            self.prefix,
+            actor_hex,
+            key_hex,
+            if (scope == .all) "all" else "scoped",
+            session_hex,
+        });
+    }
+
     fn entryId(self: *RedisAgentMemory, allocator: std.mem.Allocator, actor: []const u8, session_id: ?[]const u8, key: []const u8) ![]u8 {
         _ = self;
         var hash_value = std.hash.Wyhash.hash(0, actor);
@@ -2271,7 +2650,33 @@ pub const ApiAgentMemory = struct {
     pub fn deleteAll(self: *ApiAgentMemory, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
         const owner = actor_id orelse return false;
         const actor = writer_actor_id orelse owner;
-        const body = try agentMemoryDeleteAllApplyPayload(self.allocator, key, owner, actor);
+        const body = try agentMemoryDeleteAllApplyPayload(self.allocator, key, owner, actor, null);
+        defer self.allocator.free(body);
+        const response = try self.request(self.allocator, .POST, "/memory/apply", "", actor, self.config.actor_scopes_json, body);
+        defer self.allocator.free(response.body);
+        if (response.status == .not_found) return false;
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return true;
+    }
+
+    pub fn deleteOrdered(self: *ApiAgentMemory, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?EventOrder) !bool {
+        const order = event_order orelse return self.delete(key, session_id, actor_id, writer_actor_id);
+        const owner = actor_id orelse return false;
+        const actor = writer_actor_id orelse owner;
+        const body = try agentMemoryDeleteApplyPayload(self.allocator, key, session_id, owner, actor, order);
+        defer self.allocator.free(body);
+        const response = try self.request(self.allocator, .POST, "/memory/apply", "", actor, self.config.actor_scopes_json, body);
+        defer self.allocator.free(response.body);
+        if (response.status == .not_found) return false;
+        if (response.status != .ok) return error.AgentMemoryStorageUnavailable;
+        return true;
+    }
+
+    pub fn deleteAllOrdered(self: *ApiAgentMemory, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?EventOrder) !bool {
+        const order = event_order orelse return self.deleteAll(key, actor_id, writer_actor_id);
+        const owner = actor_id orelse return false;
+        const actor = writer_actor_id orelse owner;
+        const body = try agentMemoryDeleteAllApplyPayload(self.allocator, key, owner, actor, order);
         defer self.allocator.free(body);
         const response = try self.request(self.allocator, .POST, "/memory/apply", "", actor, self.config.actor_scopes_json, body);
         defer self.allocator.free(response.body);
@@ -2523,6 +2928,7 @@ fn agentMemoryApplyPayload(allocator: std.mem.Allocator, input: Input, actor_id:
     try out.appendSlice(allocator, input.operation.name());
     try out.appendSlice(allocator, "\",\"object_type\":\"agent_memory\",\"actor_id\":");
     try json.appendString(&out, allocator, actor_id);
+    try appendEventOrderFields(allocator, &out, input.event_order);
     try out.appendSlice(allocator, ",\"payload\":{\"key\":");
     try json.appendString(&out, allocator, input.key);
     try out.appendSlice(allocator, ",\"category\":");
@@ -2551,6 +2957,13 @@ fn agentMemoryApplyPayload(allocator: std.mem.Allocator, input: Input, actor_id:
     }
     try out.appendSlice(allocator, "}}");
     return out.toOwnedSlice(allocator);
+}
+
+fn appendEventOrderFields(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), event_order: ?EventOrder) !void {
+    const order = event_order orelse return;
+    try out.print(allocator, ",\"timestamp_ms\":{d},\"origin_instance_id\":", .{order.timestamp_ms});
+    try json.appendString(out, allocator, order.origin_instance_id);
+    try out.print(allocator, ",\"origin_sequence\":{d}", .{order.origin_sequence});
 }
 
 fn appendStringSetMergePayload(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, content: []const u8) !void {
@@ -2583,11 +2996,32 @@ fn appendObjectMergePayload(out: *std.ArrayListUnmanaged(u8), allocator: std.mem
     try out.appendSlice(allocator, value_json);
 }
 
-fn agentMemoryDeleteAllApplyPayload(allocator: std.mem.Allocator, key: []const u8, owner_actor_id: []const u8, writer_actor_id: []const u8) ![]u8 {
+fn agentMemoryDeleteApplyPayload(allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, writer_actor_id: []const u8, event_order: EventOrder) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"event_type\":\"agent_memory.delete\",\"operation\":\"delete\",\"object_type\":\"agent_memory\",\"actor_id\":");
+    try json.appendString(&out, allocator, writer_actor_id);
+    try appendEventOrderFields(allocator, &out, event_order);
+    try out.appendSlice(allocator, ",\"payload\":{\"key\":");
+    try json.appendString(&out, allocator, key);
+    try out.appendSlice(allocator, ",\"session_id\":");
+    try json.appendNullableString(&out, allocator, session_id);
+    if (sharedScopeFromOwner(owner_actor_id)) |scope| {
+        try out.appendSlice(allocator, ",\"scope\":");
+        try json.appendString(&out, allocator, scope);
+    }
+    try out.appendSlice(allocator, ",\"owner_id\":");
+    try json.appendString(&out, allocator, owner_actor_id);
+    try out.appendSlice(allocator, "}}");
+    return out.toOwnedSlice(allocator);
+}
+
+fn agentMemoryDeleteAllApplyPayload(allocator: std.mem.Allocator, key: []const u8, owner_actor_id: []const u8, writer_actor_id: []const u8, event_order: ?EventOrder) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"event_type\":\"agent_memory.delete_all\",\"operation\":\"delete_all\",\"object_type\":\"agent_memory\",\"actor_id\":");
     try json.appendString(&out, allocator, writer_actor_id);
+    try appendEventOrderFields(allocator, &out, event_order);
     try out.appendSlice(allocator, ",\"payload\":{\"key\":");
     try json.appendString(&out, allocator, key);
     if (sharedScopeFromOwner(owner_actor_id)) |scope| {
@@ -3246,6 +3680,20 @@ fn hashField(fields: []const redis.RespValue, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, key, name)) return fields[i + 1].asString();
     }
     return null;
+}
+
+fn redisEventOrderFromHash(resp: redis.RespValue) ?EventOrder {
+    const fields = switch (resp) {
+        .array => |maybe_items| maybe_items orelse return null,
+        else => return null,
+    };
+    if (fields.len == 0) return null;
+    const timestamp_raw = hashField(fields, "event_timestamp_ms") orelse hashField(fields, "timestamp") orelse return null;
+    return .{
+        .timestamp_ms = std.fmt.parseInt(i64, timestamp_raw, 10) catch return null,
+        .origin_instance_id = hashField(fields, "origin_instance_id") orelse "",
+        .origin_sequence = if (hashField(fields, "origin_sequence")) |raw| std.fmt.parseInt(i64, raw, 10) catch 0 else 0,
+    };
 }
 
 fn messagePayload(allocator: std.mem.Allocator, role: []const u8, content: []const u8, created_at_ms: i64) ![]u8 {
