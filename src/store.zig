@@ -14918,10 +14918,10 @@ fn finalizeSearchResults(allocator: std.mem.Allocator, input: SearchInput, candi
     var ordered = try unique.toOwnedSlice(allocator);
     ordered = try filterSearchResultsByMinRelevance(allocator, ordered, input.min_relevance);
     if (ordered.len == 0) return ordered;
-    if (input.use_temporal_decay or input.allow_reranker) {
+    if (input.use_temporal_decay) {
         var ranked = try rankSearchResultsByIdentity(allocator, ordered);
         defer ranked.deinit(allocator);
-        const quality = try retrieval_mod.rerankByQuality(allocator, ranked.ranked, ids.nowMs(), input.half_life_days, ordered.len);
+        const quality = try retrieval_mod.rerankByTemporalDecay(allocator, ranked.ranked, ids.nowMs(), input.half_life_days, ordered.len);
         defer allocator.free(quality);
         var reranked: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
         errdefer reranked.deinit(allocator);
@@ -15565,6 +15565,47 @@ test "sqlite retrieval applies temporal quality ranking before truncation" {
     try std.testing.expect(results.len >= 2);
     try std.testing.expect(!std.mem.eql(u8, results[0].id, old.id));
     try std.testing.expect(std.mem.indexOf(u8, results[0].text, "fresh decision") != null);
+}
+
+test "retrieval finalization keeps LLM reranker separate from temporal decay" {
+    const alloc = std.testing.allocator;
+    const relevant = domain.SearchResult{
+        .id = "relevant",
+        .result_type = "memory_atom",
+        .title = "Relevant",
+        .text = "high lexical relevance",
+        .scope = "public",
+        .status = "verified",
+        .score = 1.0,
+        .source_ids_json = "[]",
+        .created_at_ms = 0,
+        .confidence = 0.1,
+    };
+    const trusted = domain.SearchResult{
+        .id = "trusted",
+        .result_type = "memory_atom",
+        .title = "Trusted",
+        .text = "lower lexical relevance but high confidence",
+        .scope = "public",
+        .status = "verified",
+        .score = 0.8,
+        .source_ids_json = "[]",
+        .created_at_ms = 0,
+        .confidence = 0.99,
+    };
+    const candidates = [_]domain.SearchResult{ trusted, relevant };
+    const results = try finalizeSearchResults(alloc, .{
+        .query = "relevance",
+        .scopes_json = "[\"public\"]",
+        .limit = 10,
+        .use_temporal_decay = false,
+        .use_mmr = false,
+        .allow_reranker = true,
+    }, &candidates, 10);
+    defer alloc.free(results);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("relevant", results[0].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), results[0].score, 0.000001);
 }
 
 test "sqlite retrieval applies minimum relevance before final limit" {

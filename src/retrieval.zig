@@ -114,13 +114,13 @@ pub fn applyTemporalDecay(score: f64, age_ms: i64, half_life_days: f64) f64 {
     return score * std.math.pow(f64, 0.5, age_days / half_life_days);
 }
 
-pub fn rerankByQuality(allocator: std.mem.Allocator, items: []const RankedItem, now_ms: i64, half_life_days: f64, limit: usize) ![]RankedItem {
+pub fn rerankByTemporalDecay(allocator: std.mem.Allocator, items: []const RankedItem, now_ms: i64, half_life_days: f64, limit: usize) ![]RankedItem {
     var out = try allocator.alloc(RankedItem, items.len);
     errdefer allocator.free(out);
     for (items, 0..) |item, i| {
         const age = if (item.created_at_ms > 0 and now_ms > item.created_at_ms) now_ms - item.created_at_ms else 0;
         out[i] = item;
-        out[i].score = applyTemporalDecay(item.score, age, half_life_days) + item.confidence;
+        out[i].score = applyTemporalDecay(item.score, age, half_life_days);
     }
     sortRanked(out);
     if (out.len > limit) return allocator.realloc(out, limit);
@@ -914,6 +914,19 @@ test "retrieval temporal decay lowers old scores" {
     const old = applyTemporalDecay(1.0, 14 * 24 * 60 * 60 * 1000, 7);
     try std.testing.expect(fresh > old);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), old, 0.0001);
+}
+
+test "retrieval temporal decay rerank does not add confidence twice" {
+    const items = [_]RankedItem{
+        .{ .id = "trusted", .score = 0.8, .confidence = 0.99, .created_at_ms = 0 },
+        .{ .id = "relevant", .score = 1.0, .confidence = 0.1, .created_at_ms = 0 },
+    };
+    const ranked = try rerankByTemporalDecay(std.testing.allocator, &items, 1000, 30, 10);
+    defer std.testing.allocator.free(ranked);
+    try std.testing.expectEqualStrings("relevant", ranked[0].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), ranked[0].score, 0.000001);
+    try std.testing.expectEqualStrings("trusted", ranked[1].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), ranked[1].score, 0.000001);
 }
 
 test "retrieval MMR diversifies selections" {
