@@ -9,6 +9,7 @@ const vector_text = @import("vector_text.zig");
 const json = @import("json_util.zig");
 const ids = @import("ids.zig");
 const compat = @import("compat.zig");
+const embedding_cache = @import("embedding_cache.zig");
 
 pub const RunOptions = struct {
     scopes_json: []const u8 = "[\"admin\"]",
@@ -22,6 +23,8 @@ pub const RunOptions = struct {
     embedding_fallbacks: []const providers.EmbeddingEndpointConfig = &.{},
     embedding_dimensions: usize = 64,
     embedding_allow_insecure_http: bool = false,
+    use_embedding_cache: bool = true,
+    embedding_cache_max_entries: usize = embedding_cache.default_max_entries,
     llm_base_url: ?[]const u8 = null,
     llm_api_key: ?[]const u8 = null,
     llm_model: ?[]const u8 = null,
@@ -487,7 +490,7 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
             const payload = try store_mod.vectorEmbedPayloadJson(allocator, @intCast(count), chunk_text, scope, permissions_json, heading_path_json, options.embedding_model, options.embedding_dimensions);
             const outbox_id = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
             if (!try store.claimVectorOutboxAs(outbox_id, options.actor_id)) return count;
-            const embedding_result = providers.embedText(allocator, .{
+            const embedding_result = embedding_cache.embedTextCached(allocator, store, .{
                 .provider = options.embedding_provider,
                 .base_url = options.embedding_base_url,
                 .api_key = options.embedding_api_key,
@@ -497,7 +500,7 @@ fn upsertVector(allocator: std.mem.Allocator, store: *store_mod.Store, options: 
                 .allow_insecure_http = options.embedding_allow_insecure_http,
                 .fallbacks = options.embedding_fallbacks,
                 .runtime = options.provider_runtime,
-            }, chunk_text, options.embedding_dimensions) catch {
+            }, chunk_text, options.embedding_dimensions, options.use_embedding_cache, options.embedding_cache_max_entries) catch {
                 _ = try store.finishVectorOutboxAs(outbox_id, "pending", options.actor_id);
                 return count;
             };
@@ -552,7 +555,7 @@ fn processEmbeddingOutboxEntry(allocator: std.mem.Allocator, store: *store_mod.S
         try rawJsonField(allocator, obj, "heading_path_json", "[]");
     const chunk_ordinal = json.intField(obj, "chunk_ordinal") orelse 0;
     const dimensions: usize = @intCast(@max(@as(i64, 1), json.intField(obj, "dimensions") orelse @as(i64, @intCast(options.embedding_dimensions))));
-    const embedding_result = try providers.embedText(allocator, .{
+    const embedding_result = try embedding_cache.embedTextCached(allocator, store, .{
         .provider = options.embedding_provider,
         .base_url = options.embedding_base_url,
         .api_key = options.embedding_api_key,
@@ -562,7 +565,7 @@ fn processEmbeddingOutboxEntry(allocator: std.mem.Allocator, store: *store_mod.S
         .allow_insecure_http = options.embedding_allow_insecure_http,
         .fallbacks = options.embedding_fallbacks,
         .runtime = options.provider_runtime,
-    }, text, dimensions);
+    }, text, dimensions, options.use_embedding_cache, options.embedding_cache_max_entries);
     const embedding_json = try vector.embeddingToJson(allocator, embedding_result.embedding);
     _ = try store.upsertVectorChunk(allocator, .{
         .object_type = entry.object_type,
@@ -777,6 +780,27 @@ test "worker persists embed outbox before provider call and replays locally" {
         if (std.mem.eql(u8, result_item.id, source.id)) saw_source = true;
     }
     try std.testing.expect(saw_source);
+}
+
+test "worker embedding outbox uses shared embedding cache" {
+    var store = try store_mod.Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createMemoryAtom(alloc, .{ .id = "mem_worker_cache_a", .text = "cached worker embedding text", .scope = "public", .created_by = "human" });
+    _ = try store.createMemoryAtom(alloc, .{ .id = "mem_worker_cache_b", .text = "cached worker embedding text", .scope = "public", .created_by = "human" });
+    const payload_a = try store_mod.vectorEmbedPayloadJson(alloc, 0, "cached worker embedding text", "public", "[]", "[]", null, 64);
+    const payload_b = try store_mod.vectorEmbedPayloadJson(alloc, 0, "cached worker embedding text", "public", "[]", "[]", null, 64);
+    _ = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = "memory_atom", .object_id = "mem_worker_cache_a", .payload_json = payload_a });
+    _ = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = "memory_atom", .object_id = "mem_worker_cache_b", .payload_json = payload_b });
+
+    const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]", .outbox_limit = 10 });
+    try std.testing.expect(result.vector_outbox_processed >= 2);
+    const stats = try store.embeddingCacheStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.entries);
+    try std.testing.expectEqual(@as(i64, 1), stats.hits);
 }
 
 test "worker llm extraction falls back to heuristic unless strict" {

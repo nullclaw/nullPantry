@@ -29,9 +29,9 @@ const bootstrap_prompts = @import("bootstrap_prompts.zig");
 const feed_contract = @import("feed_contract.zig");
 const storage_routes = @import("storage_route.zig");
 const kg_compat = @import("kg_compat.zig");
+const embedding_cache = @import("embedding_cache.zig");
 
 const nullclaw_agent_memory_projection = "agent_memory";
-const default_embedding_cache_max_entries: usize = 10_000;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -3938,7 +3938,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
                 .allow_insecure_http = ctx.embedding_allow_insecure_http,
                 .fallbacks = ctx.embedding_fallbacks,
                 .runtime = ctx.provider_runtime,
-            }, chunk_text, ctx.embedding_dimensions, true, default_embedding_cache_max_entries) catch {
+            }, chunk_text, ctx.embedding_dimensions, true, embedding_cache.default_max_entries) catch {
                 _ = try ctx.store.finishVectorOutboxAs(outbox_id, "pending", ctx.actor_id);
                 return count;
             };
@@ -4043,6 +4043,7 @@ fn runJob(ctx: *Context, id: []const u8) HttpResponse {
         .llm_model = ctx.llm_model,
         .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
         .provider_timeout_secs = ctx.provider_timeout_secs,
+        .provider_runtime = ctx.provider_runtime,
         .actor_id = ctx.actor_id,
     }) catch |err| switch (err) {
         error.JobNotQueued => return json.errorResponse(ctx.allocator, 409, "conflict", "Job is not queued"),
@@ -4359,72 +4360,11 @@ fn vectorEmbed(ctx: *Context, body: []const u8) HttpResponse {
 }
 
 fn embedTextCached(ctx: *Context, cfg: providers.EmbeddingConfig, text: []const u8, fallback_dimensions: usize, use_cache: bool, max_entries: usize) !providers.EmbeddingResult {
-    if (!use_cache) return providers.embedText(ctx.allocator, cfg, text, fallback_dimensions);
-    const cache_key = try embeddingCacheKey(ctx.allocator, cfg, text, fallback_dimensions);
-    const now = ids.nowMs();
-    if (try ctx.store.getEmbeddingCache(ctx.allocator, cache_key, now)) |entry| {
-        return .{
-            .provider = entry.provider,
-            .model = entry.model,
-            .embedding = try vector_mod.embeddingFromJson(ctx.allocator, entry.embedding_json),
-        };
-    }
-    const result = try providers.embedText(ctx.allocator, cfg, text, fallback_dimensions);
-    const embedding_json = try vector_mod.embeddingToJson(ctx.allocator, result.embedding);
-    try ctx.store.putEmbeddingCache(.{
-        .cache_key = cache_key,
-        .provider = result.provider,
-        .model = result.model,
-        .dimensions = result.embedding.len,
-        .embedding_json = embedding_json,
-        .now_ms = now,
-        .max_entries = max_entries,
-    });
-    return result;
-}
-
-fn embeddingCacheKey(allocator: std.mem.Allocator, cfg: providers.EmbeddingConfig, text: []const u8, fallback_dimensions: usize) ![]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    updateEmbeddingEndpointHash(&hasher, cfg.provider.name(), cfg.base_url, cfg.model, cfg.dimensions);
-    updateHashUsize(&hasher, fallback_dimensions);
-    for (cfg.fallbacks) |fallback| {
-        hasher.update("\x1f");
-        updateEmbeddingEndpointHash(&hasher, fallback.provider.name(), fallback.base_url, fallback.model, fallback.dimensions);
-    }
-    hasher.update("\x00");
-    hasher.update(text);
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    const hex_chars = "0123456789abcdef";
-    var out = try allocator.alloc(u8, 70);
-    @memcpy(out[0..6], "embed:");
-    for (digest, 0..) |byte, i| {
-        out[6 + i * 2] = hex_chars[byte >> 4];
-        out[6 + i * 2 + 1] = hex_chars[byte & 0x0f];
-    }
-    return out;
-}
-
-fn updateEmbeddingEndpointHash(hasher: *std.crypto.hash.sha2.Sha256, provider: []const u8, base_url: ?[]const u8, model: ?[]const u8, dimensions: usize) void {
-    hasher.update(provider);
-    hasher.update("\x1e");
-    hasher.update(base_url orelse "");
-    hasher.update("\x1e");
-    hasher.update(model orelse "");
-    hasher.update("\x1e");
-    updateHashUsize(hasher, dimensions);
-}
-
-fn updateHashUsize(hasher: *std.crypto.hash.sha2.Sha256, value: usize) void {
-    var buf: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
-    hasher.update(text);
+    return embedding_cache.embedTextCached(ctx.allocator, ctx.store, cfg, text, fallback_dimensions, use_cache, max_entries);
 }
 
 fn embeddingCacheMaxEntries(obj: std.json.ObjectMap) usize {
-    const raw = json.intField(obj, "embedding_cache_max_entries") orelse json.intField(obj, "embedding_max_entries") orelse return default_embedding_cache_max_entries;
-    if (raw <= 0) return 0;
-    return @intCast(@min(raw, 1_000_000));
+    return embedding_cache.maxEntriesFromObject(obj);
 }
 
 fn vectorStatus(ctx: *Context) HttpResponse {
@@ -4614,11 +4554,14 @@ fn vectorOutboxRun(ctx: *Context, body: []const u8) HttpResponse {
         .embedding_fallbacks = ctx.embedding_fallbacks,
         .embedding_dimensions = ctx.embedding_dimensions,
         .embedding_allow_insecure_http = ctx.embedding_allow_insecure_http,
+        .use_embedding_cache = json.boolField(parsed.value.object, "use_embedding_cache") orelse json.boolField(parsed.value.object, "use_cache") orelse true,
+        .embedding_cache_max_entries = embeddingCacheMaxEntries(parsed.value.object),
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
         .llm_model = ctx.llm_model,
         .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
         .provider_timeout_secs = ctx.provider_timeout_secs,
+        .provider_runtime = ctx.provider_runtime,
         .actor_id = ctx.actor_id,
     }) catch return serverError(ctx);
     const pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
@@ -4647,11 +4590,14 @@ fn memoryDrainOutbox(ctx: *Context, body: []const u8) HttpResponse {
         .embedding_fallbacks = ctx.embedding_fallbacks,
         .embedding_dimensions = ctx.embedding_dimensions,
         .embedding_allow_insecure_http = ctx.embedding_allow_insecure_http,
+        .use_embedding_cache = json.boolField(parsed.value.object, "use_embedding_cache") orelse json.boolField(parsed.value.object, "use_cache") orelse true,
+        .embedding_cache_max_entries = embeddingCacheMaxEntries(parsed.value.object),
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
         .llm_model = ctx.llm_model,
         .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
         .provider_timeout_secs = ctx.provider_timeout_secs,
+        .provider_runtime = ctx.provider_runtime,
         .actor_id = ctx.actor_id,
     }) catch return serverError(ctx);
     const pending = ctx.store.countVectorOutbox("pending") catch return serverError(ctx);
@@ -4811,11 +4757,14 @@ fn workersRun(ctx: *Context, body: []const u8) HttpResponse {
         .embedding_fallbacks = ctx.embedding_fallbacks,
         .embedding_dimensions = ctx.embedding_dimensions,
         .embedding_allow_insecure_http = ctx.embedding_allow_insecure_http,
+        .use_embedding_cache = json.boolField(parsed.value.object, "use_embedding_cache") orelse json.boolField(parsed.value.object, "use_cache") orelse true,
+        .embedding_cache_max_entries = embeddingCacheMaxEntries(parsed.value.object),
         .llm_base_url = ctx.llm_base_url,
         .llm_api_key = ctx.llm_api_key,
         .llm_model = ctx.llm_model,
         .llm_allow_insecure_http = ctx.llm_allow_insecure_http,
         .provider_timeout_secs = ctx.provider_timeout_secs,
+        .provider_runtime = ctx.provider_runtime,
         .actor_id = ctx.actor_id,
     }) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
