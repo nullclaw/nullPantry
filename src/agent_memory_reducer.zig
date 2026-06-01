@@ -2,6 +2,17 @@ const std = @import("std");
 const domain = @import("domain.zig");
 const json = @import("json_util.zig");
 
+pub const ValueKind = enum {
+    json_object,
+    string_set,
+
+    pub fn parse(raw: []const u8) ?ValueKind {
+        if (std.mem.eql(u8, raw, "json_object")) return .json_object;
+        if (std.mem.eql(u8, raw, "string_set")) return .string_set;
+        return null;
+    }
+};
+
 pub fn reduceContent(
     allocator: std.mem.Allocator,
     operation: domain.AgentMemoryOperation,
@@ -12,6 +23,15 @@ pub fn reduceContent(
         .put => allocator.dupe(u8, update_content),
         .merge_string_set => reduceStringSet(allocator, existing_content, update_content),
         .merge_object => reduceObject(allocator, existing_content, update_content),
+    };
+}
+
+pub fn canonicalizePutContent(allocator: std.mem.Allocator, content: []const u8, value_kind_raw: ?[]const u8) ![]u8 {
+    const value_kind_text = value_kind_raw orelse return allocator.dupe(u8, content);
+    const value_kind = ValueKind.parse(value_kind_text) orelse return error.InvalidPayload;
+    return switch (value_kind) {
+        .json_object => canonicalizeObject(allocator, content),
+        .string_set => reduceStringSet(allocator, null, content),
     };
 }
 
@@ -48,6 +68,17 @@ fn reduceStringSet(allocator: std.mem.Allocator, existing_content: ?[]const u8, 
     try appendStringSetValues(allocator, &values, update_content);
 
     return stringSetJson(allocator, values.items);
+}
+
+fn canonicalizeObject(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendObjectCanonical(&out, allocator, parsed.value.object);
+    return out.toOwnedSlice(allocator);
 }
 
 fn reduceObject(allocator: std.mem.Allocator, existing_content: ?[]const u8, update_content: []const u8) ![]u8 {
@@ -209,6 +240,20 @@ test "agent memory reducer merges objects with patch precedence" {
     const merged = try reduceContent(std.testing.allocator, .merge_object, "{\"language\":\"zig\",\"style\":\"concise\"}", "{\"database\":\"postgres\",\"style\":\"detailed\"}");
     defer std.testing.allocator.free(merged);
     try std.testing.expectEqualStrings("{\"database\":\"postgres\",\"language\":\"zig\",\"style\":\"detailed\"}", merged);
+}
+
+test "agent memory reducer canonicalizes typed put content" {
+    const object = try canonicalizePutContent(std.testing.allocator, "{\"z\":true,\"profile\":{\"style\":\"concise\",\"language\":\"zig\"}}", "json_object");
+    defer std.testing.allocator.free(object);
+    try std.testing.expectEqualStrings("{\"profile\":{\"language\":\"zig\",\"style\":\"concise\"},\"z\":true}", object);
+
+    const set = try canonicalizePutContent(std.testing.allocator, "[\"zig\",\"sqlite\",\"zig\"]", "string_set");
+    defer std.testing.allocator.free(set);
+    try std.testing.expectEqualStrings("[\"sqlite\",\"zig\"]", set);
+
+    const plain = try canonicalizePutContent(std.testing.allocator, "{\"z\":true,\"a\":1}", null);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("{\"z\":true,\"a\":1}", plain);
 }
 
 test "agent memory reducer deep merges objects deterministically" {

@@ -5562,6 +5562,7 @@ fn appendNullClawEventPayload(ctx: *Context, out: *std.ArrayListUnmanaged(u8), o
     try appendOptionalRawField(ctx.allocator, out, obj, "store");
     try appendOptionalRawField(ctx.allocator, out, obj, "storage");
     try appendOptionalRawField(ctx.allocator, out, obj, "stores");
+    try appendOptionalRawField(ctx.allocator, out, obj, "value_kind");
 
     if (std.mem.eql(u8, operation, "merge_string_set")) {
         if (obj.get("values")) |values| {
@@ -6247,6 +6248,13 @@ fn agentMemoryOwnerLease(ctx: *Context, event_actor_id: []const u8, scope: ?[]co
     return .{ .value = computed_owner_id, .owned = computed_owner_id };
 }
 
+fn agentMemoryValueKindField(obj: std.json.ObjectMap) !?[]const u8 {
+    const value = obj.get("value_kind") orelse return null;
+    if (value != .string) return error.InvalidPayload;
+    if (agent_memory_reducer.ValueKind.parse(value.string) == null) return error.InvalidPayload;
+    return value.string;
+}
+
 test "agent memory owner lease owns computed shared owner and rejects spoofed owner" {
     var store = try Store.initSQLite(std.testing.allocator, ":memory:");
     defer store.deinit();
@@ -6398,7 +6406,10 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
 
     const memory_operation = domain.AgentMemoryOperation.parse(operation);
     const content = switch (memory_operation) {
-        .put => json.stringField(obj, "content") orelse json.stringField(obj, "text") orelse try rawField(ctx.allocator, obj, "value", "{}"),
+        .put => blk: {
+            const raw_content = json.stringField(obj, "content") orelse json.stringField(obj, "text") orelse try rawField(ctx.allocator, obj, "value", "{}");
+            break :blk try agent_memory_reducer.canonicalizePutContent(ctx.allocator, raw_content, try agentMemoryValueKindField(obj));
+        },
         .merge_string_set => try agent_memory_reducer.stringSetPatchFromObject(ctx.allocator, obj),
         .merge_object => try agent_memory_reducer.objectPatchFromObject(ctx.allocator, obj),
     };
@@ -12570,6 +12581,24 @@ test "api nullclaw memory adapter exposes replayable api-memory feed contract" {
     try std.testing.expectEqualStrings("200 OK", applied_memory.status);
     try std.testing.expect(std.mem.indexOf(u8, applied_memory.body, "[\\\"zig\\\"]") != null);
 
+    const typed_put_object =
+        \\{"origin_instance_id":"nullclaw-a","origin_sequence":2,"timestamp_ms":124,"operation":"put","key":"api.profile","category":"core","value_kind":"json_object","content":"{\"z\":true,\"a\":1}","scope":"public"}
+    ;
+    const typed_put_object_apply = handleRequest(&source_ctx, "POST", "/v1/agent/memory/apply", typed_put_object, "");
+    try std.testing.expectEqualStrings("200 OK", typed_put_object_apply.status);
+    const typed_object_memory = handleRequest(&source_ctx, "GET", "/v1/agent-memory/api.profile", "", "");
+    try std.testing.expectEqualStrings("200 OK", typed_object_memory.status);
+    try std.testing.expect(std.mem.indexOf(u8, typed_object_memory.body, "{\\\"a\\\":1,\\\"z\\\":true}") != null);
+
+    const typed_put_set =
+        \\{"origin_instance_id":"nullclaw-a","origin_sequence":3,"timestamp_ms":125,"operation":"put","key":"api.typed_tags","category":"core","value_kind":"string_set","content":"[\"zig\",\"sqlite\",\"zig\"]","scope":"public"}
+    ;
+    const typed_put_set_apply = handleRequest(&source_ctx, "POST", "/v1/agent/memory/apply", typed_put_set, "");
+    try std.testing.expectEqualStrings("200 OK", typed_put_set_apply.status);
+    const typed_set_memory = handleRequest(&source_ctx, "GET", "/v1/agent-memory/api.typed_tags", "", "");
+    try std.testing.expectEqualStrings("200 OK", typed_set_memory.status);
+    try std.testing.expect(std.mem.indexOf(u8, typed_set_memory.body, "[\\\"sqlite\\\",\\\"zig\\\"]") != null);
+
     const non_agent = handleRequest(&source_ctx, "POST", "/v1/memory/events", "{\"event_type\":\"memory.note\",\"operation\":\"put\",\"object_type\":\"memory_atom\",\"object_id\":\"not_agent_memory\",\"scope\":\"public\",\"payload\":{\"text\":\"not nullclaw feed\"}}", "");
     try std.testing.expectEqualStrings("200 OK", non_agent.status);
 
@@ -12582,12 +12611,14 @@ test "api nullclaw memory adapter exposes replayable api-memory feed contract" {
     try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"key\":\"api.tags\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"value_kind\":\"string_set\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"content\":\"[\\\"zig\\\"]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"key\":\"api.profile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"value_kind\":\"json_object\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, feed.body, "not nullclaw feed") == null);
 
     const status = handleRequest(&source_ctx, "GET", "/v1/agent/memory/status", "", "");
     try std.testing.expectEqualStrings("200 OK", status.status);
-    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"visible_events\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"last_sequence\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"visible_events\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.body, "\"last_sequence\":4") != null);
 
     const compact = handleRequest(&source_ctx, "POST", "/v1/agent/memory/compact", "{\"through_sequence\":1}", "");
     try std.testing.expectEqualStrings("200 OK", compact.status);
@@ -12606,8 +12637,8 @@ test "api nullclaw memory adapter exposes replayable api-memory feed contract" {
     const compacted_status = handleRequest(&source_ctx, "GET", "/v1/agent/memory/status", "", "");
     try std.testing.expectEqualStrings("200 OK", compacted_status.status);
     try std.testing.expect(std.mem.indexOf(u8, compacted_status.body, "\"cursor_floor\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, compacted_status.body, "\"visible_events\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, compacted_status.body, "\"last_sequence\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compacted_status.body, "\"visible_events\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compacted_status.body, "\"last_sequence\":4") != null);
 
     const checkpoint = handleRequest(&source_ctx, "GET", "/v1/agent/memory/checkpoint?after=0&limit=10", "", "");
     try std.testing.expectEqualStrings("200 OK", checkpoint.status);
@@ -12616,6 +12647,8 @@ test "api nullclaw memory adapter exposes replayable api-memory feed contract" {
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"origin_sequence\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"timestamp_ms\":123") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"key\":\"api.tags\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"key\":\"api.profile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"value_kind\":\"json_object\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "\"object_type\":\"agent_memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.body, "not nullclaw feed") == null);
 
@@ -12624,6 +12657,9 @@ test "api nullclaw memory adapter exposes replayable api-memory feed contract" {
     const restored = handleRequest(&target_ctx, "GET", "/v1/agent-memory/api.tags", "", "");
     try std.testing.expectEqualStrings("200 OK", restored.status);
     try std.testing.expect(std.mem.indexOf(u8, restored.body, "[\\\"zig\\\"]") != null);
+    const restored_profile = handleRequest(&target_ctx, "GET", "/v1/agent-memory/api.profile", "", "");
+    try std.testing.expectEqualStrings("200 OK", restored_profile.status);
+    try std.testing.expect(std.mem.indexOf(u8, restored_profile.body, "{\\\"a\\\":1,\\\"z\\\":true}") != null);
     const restored_expired_feed = handleRequest(&target_ctx, "GET", "/v1/agent/memory/events?after=0&limit=10", "", "");
     try std.testing.expectEqualStrings("410 Gone", restored_expired_feed.status);
     const restored_checkpoint = handleRequest(&target_ctx, "GET", "/v1/agent/memory/checkpoint?after=0&limit=10", "", "");
@@ -15667,6 +15703,18 @@ test "api memory apply supports deterministic agent memory merge reducers" {
     try std.testing.expect(std.mem.indexOf(u8, merged_object.body, "\\\"database\\\":\\\"postgres\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged_object.body, "\\\"language\\\":\\\"zig\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged_object.body, "\\\"style\\\":\\\"detailed\\\"") != null);
+
+    const typed_put_object = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"operation\":\"put\",\"object_type\":\"agent_memory\",\"scope\":\"public\",\"payload\":{\"key\":\"prefs.typed_profile\",\"value_kind\":\"json_object\",\"content\":\"{\\\"z\\\":true,\\\"a\\\":1}\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", typed_put_object.status);
+    const typed_object = handleRequest(&ctx, "GET", "/v1/agent-memory/prefs.typed_profile", "", "");
+    try std.testing.expectEqualStrings("200 OK", typed_object.status);
+    try std.testing.expect(std.mem.indexOf(u8, typed_object.body, "{\\\"a\\\":1,\\\"z\\\":true}") != null);
+
+    const typed_put_set = handleRequest(&ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"operation\":\"put\",\"object_type\":\"agent_memory\",\"scope\":\"public\",\"payload\":{\"key\":\"prefs.typed_tools\",\"value_kind\":\"string_set\",\"content\":\"[\\\"zig\\\",\\\"sqlite\\\",\\\"zig\\\"]\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", typed_put_set.status);
+    const typed_set = handleRequest(&ctx, "GET", "/v1/agent-memory/prefs.typed_tools", "", "");
+    try std.testing.expectEqualStrings("200 OK", typed_set.status);
+    try std.testing.expect(std.mem.indexOf(u8, typed_set.body, "[\\\"sqlite\\\",\\\"zig\\\"]") != null);
 
     var agent_b_ctx = Context{ .allocator = alloc, .store = &store, .actor_id = "agent:b", .actor_scopes_json = "[]" };
     const private_apply = handleRequest(&agent_b_ctx, "POST", "/v1/memory/apply", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"payload\":{\"key\":\"private.note\",\"content\":\"agent b only\"}}", "");
