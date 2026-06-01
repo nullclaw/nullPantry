@@ -158,12 +158,28 @@ pub fn sortResults(items: []domain.SearchResult) void {
     }
 }
 
-pub fn budgetResults(allocator: std.mem.Allocator, results: []const domain.SearchResult, token_budget: i64) ![]domain.SearchResult {
+pub const BudgetedResults = struct {
+    items: []domain.SearchResult,
+    owned_texts: []const []const u8,
+
+    pub fn deinit(self: BudgetedResults, allocator: std.mem.Allocator) void {
+        for (self.owned_texts) |text| allocator.free(text);
+        allocator.free(self.owned_texts);
+        allocator.free(self.items);
+    }
+};
+
+pub fn budgetResults(allocator: std.mem.Allocator, results: []const domain.SearchResult, token_budget: i64) !BudgetedResults {
     const budget_tokens: usize = @intCast(@max(@as(i64, 1), @min(token_budget, @as(i64, 200_000))));
     const max_chars = budget_tokens * 4;
     var used_chars: usize = 0;
     var out: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
-    errdefer out.deinit(allocator);
+    var owned_texts: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (owned_texts.items) |text| allocator.free(text);
+        owned_texts.deinit(allocator);
+        out.deinit(allocator);
+    }
     for (results) |result| {
         const metadata_cost = result.id.len + result.result_type.len + result.title.len + result.scope.len + result.status.len + result.source_ids_json.len + result.heading_path_json.len + result.required_scopes_json.len + 192;
         const cost = metadata_cost + result.text.len;
@@ -178,11 +194,15 @@ pub fn budgetResults(allocator: std.mem.Allocator, results: []const domain.Searc
         if (remaining <= metadata_cost + 24) continue;
         var trimmed = result;
         trimmed.text = try trimTextToChars(allocator, result.text, remaining - metadata_cost);
+        try owned_texts.append(allocator, trimmed.text);
         used_chars += metadata_cost + trimmed.text.len;
         try out.append(allocator, trimmed);
         break;
     }
-    return out.toOwnedSlice(allocator);
+    return .{
+        .items = try out.toOwnedSlice(allocator),
+        .owned_texts = try owned_texts.toOwnedSlice(allocator),
+    };
 }
 
 pub fn trimSummaryToBudget(allocator: std.mem.Allocator, summary: []const u8, token_budget: i64) ![]u8 {
@@ -429,16 +449,14 @@ test "context pack budget trims first oversized result" {
         sample("src_big", "source", "Oversized source", huge_text, "public", "active", 1),
     };
     const budgeted = try budgetResults(std.testing.allocator, &items, 96);
-    defer {
-        if (budgeted[0].text.ptr != huge_text.ptr) std.testing.allocator.free(budgeted[0].text);
-        std.testing.allocator.free(budgeted);
-    }
-    try std.testing.expectEqual(@as(usize, 1), budgeted.len);
-    try std.testing.expect(budgeted[0].text.len < huge_text.len);
-    try std.testing.expect(std.mem.indexOf(u8, budgeted[0].text, "tail-marker") == null);
-    try std.testing.expect(std.mem.indexOf(u8, budgeted[0].text, "truncated to token_budget") != null);
+    defer budgeted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), budgeted.items.len);
+    try std.testing.expectEqual(@as(usize, 1), budgeted.owned_texts.len);
+    try std.testing.expect(budgeted.items[0].text.len < huge_text.len);
+    try std.testing.expect(std.mem.indexOf(u8, budgeted.items[0].text, "tail-marker") == null);
+    try std.testing.expect(std.mem.indexOf(u8, budgeted.items[0].text, "truncated to token_budget") != null);
 
-    const sections = try buildSectionsJson(std.testing.allocator, budgeted);
+    const sections = try buildSectionsJson(std.testing.allocator, budgeted.items);
     defer std.testing.allocator.free(sections);
     try std.testing.expect(std.mem.indexOf(u8, sections, "tail-marker") == null);
 }

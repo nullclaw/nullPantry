@@ -9173,8 +9173,9 @@ pub const SQLiteStore = struct {
             .agent_memory_route = input.agent_memory_route,
         });
         context_pack.sortResults(search_results);
-        const budgeted_results = try context_pack.budgetResults(allocator, search_results, input.token_budget);
-        defer allocator.free(budgeted_results);
+        const budgeted = try context_pack.budgetResults(allocator, search_results, input.token_budget);
+        defer budgeted.deinit(allocator);
+        const budgeted_results = budgeted.items;
         const id = try idOrMake(allocator, input.id, "ctx_");
         const now = ids.nowMs();
         var sources_json: std.ArrayListUnmanaged(u8) = .empty;
@@ -12776,8 +12777,9 @@ pub const PostgresStore = struct {
             .agent_memory_route = input.agent_memory_route,
         });
         context_pack.sortResults(search_results);
-        const budgeted_results = try context_pack.budgetResults(allocator, search_results, input.token_budget);
-        defer allocator.free(budgeted_results);
+        const budgeted = try context_pack.budgetResults(allocator, search_results, input.token_budget);
+        defer budgeted.deinit(allocator);
+        const budgeted_results = budgeted.items;
         const id = try idOrMake(allocator, input.id, "ctx_");
         const now = ids.nowMs();
         const sources = try pgCollectResultIds(allocator, budgeted_results, "source", true);
