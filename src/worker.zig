@@ -89,8 +89,20 @@ pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job:
         return try std.fmt.allocPrint(allocator, "{{\"vector_outbox_processed\":{d},\"vector_outbox_failed\":{d}}}", .{ outbox.processed, outbox.failed });
     }
     if (std.mem.eql(u8, job.job_type, "hygiene")) {
+        const hard_delete = jobBoolOption(allocator, job.input_json, "hard_delete", false);
+        const hygiene_scopes = try jobHygieneScopesJson(allocator, job, options, hard_delete);
+        defer allocator.free(hygiene_scopes);
         const hygiene = try store.runHygiene(.{
-            .scopes_json = options.scopes_json,
+            .stale_after_ms = jobIntOption(allocator, job.input_json, "stale_after_ms", 30 * 24 * 60 * 60 * 1000),
+            .archive_after_ms = jobIntOption(allocator, job.input_json, "archive_after_ms", 90 * 24 * 60 * 60 * 1000),
+            .purge_after_ms = jobIntOption(allocator, job.input_json, "purge_after_ms", 0),
+            .hard_delete = hard_delete,
+            .dedupe_memory_atoms = jobBoolOption(allocator, job.input_json, "dedupe_memory_atoms", jobBoolOption(allocator, job.input_json, "dedupe", false)),
+            .dedupe_normalized = jobBoolOption(allocator, job.input_json, "dedupe_normalized", true),
+            .dedupe_limit = jobUsizeOption(allocator, job.input_json, "dedupe_limit", 5000),
+            .now_ms = jobOptionalIntOption(allocator, job.input_json, "now_ms"),
+            .actor_id = options.actor_id,
+            .scopes_json = hygiene_scopes,
             .capabilities_json = options.capabilities_json,
         });
         return try std.fmt.allocPrint(allocator, "{{\"checked\":{d},\"marked_stale\":{d},\"archived\":{d},\"purged\":{d},\"expired_cache_entries\":{d},\"dedupe_checked\":{d},\"dedupe_groups\":{d},\"dedupe_deprecated\":{d},\"dedupe_purged\":{d}}}", .{ hygiene.checked, hygiene.marked_stale, hygiene.archived, hygiene.purged, hygiene.expired_cache_entries, hygiene.dedupe_checked, hygiene.dedupe_groups, hygiene.dedupe_deprecated, hygiene.dedupe_purged });
@@ -150,6 +162,41 @@ fn jobExecutionScopesJson(allocator: std.mem.Allocator, job: store_mod.Job) ![]c
     return out.toOwnedSlice(allocator);
 }
 
+fn jobHygieneScopesJson(allocator: std.mem.Allocator, job: store_mod.Job, options: RunOptions, hard_delete: bool) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    var count: usize = 0;
+    try appendUniqueScope(allocator, &out, &count, job.scope);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, job.permissions_json, .{}) catch {
+        try appendHygieneMutationScopes(allocator, &out, &count, job.scope, options, hard_delete);
+        try out.append(allocator, ']');
+        return out.toOwnedSlice(allocator);
+    };
+    defer parsed.deinit();
+    if (parsed.value == .array) {
+        for (parsed.value.array.items) |item| {
+            if (item == .string) try appendUniqueScope(allocator, &out, &count, item.string);
+        }
+    }
+    try appendHygieneMutationScopes(allocator, &out, &count, job.scope, options, hard_delete);
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendHygieneMutationScopes(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), count: *usize, scope: []const u8, options: RunOptions, hard_delete: bool) !void {
+    if (domain.hasCapability(options.scopes_json, options.capabilities_json, "verify") and domain.scopeVerifiable(scope, options.scopes_json)) {
+        const verify_scope = try std.fmt.allocPrint(allocator, "verify:{s}", .{scope});
+        defer allocator.free(verify_scope);
+        try appendUniqueScope(allocator, out, count, verify_scope);
+    }
+    if (hard_delete and domain.hasCapability(options.scopes_json, options.capabilities_json, "delete") and domain.scopeDeletable(scope, options.scopes_json)) {
+        const delete_scope = try std.fmt.allocPrint(allocator, "delete:{s}", .{scope});
+        defer allocator.free(delete_scope);
+        try appendUniqueScope(allocator, out, count, delete_scope);
+    }
+}
+
 fn appendUniqueScope(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), count: *usize, scope: []const u8) !void {
     const needle = try std.fmt.allocPrint(allocator, "\"{s}\"", .{scope});
     defer allocator.free(needle);
@@ -186,6 +233,26 @@ fn jobBoolOption(allocator: std.mem.Allocator, input_json: []const u8, name: []c
         .bool => |b| b,
         else => fallback,
     };
+}
+
+fn jobIntOption(allocator: std.mem.Allocator, input_json: []const u8, name: []const u8, fallback: i64) i64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, input_json, .{}) catch return fallback;
+    defer parsed.deinit();
+    if (parsed.value != .object) return fallback;
+    return json.intField(parsed.value.object, name) orelse fallback;
+}
+
+fn jobOptionalIntOption(allocator: std.mem.Allocator, input_json: []const u8, name: []const u8) ?i64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, input_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    return json.intField(parsed.value.object, name);
+}
+
+fn jobUsizeOption(allocator: std.mem.Allocator, input_json: []const u8, name: []const u8, fallback: usize) usize {
+    const raw = jobIntOption(allocator, input_json, name, @intCast(fallback));
+    if (raw <= 0) return fallback;
+    return @intCast(@min(raw, 20_000));
 }
 
 fn jobStorageRouteOption(allocator: std.mem.Allocator, input_json: []const u8) !store_mod.AgentMemoryStorageRoute {
@@ -532,6 +599,35 @@ test "worker processes vector outbox and queued hygiene job" {
     const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]" });
     try std.testing.expect(result.vector_outbox_processed >= 1);
     try std.testing.expectEqual(@as(usize, 1), result.jobs_succeeded);
+}
+
+test "worker hygiene job applies input and stays scoped to job" {
+    var store = try store_mod.Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    _ = try store.createMemoryAtom(alloc, .{ .id = "mem_worker_hygiene_public_a", .text = "Worker Dedup Fact", .predicate = "constraint", .object = "public", .scope = "public", .created_by = "human", .status = "verified" });
+    _ = try store.createMemoryAtom(alloc, .{ .id = "mem_worker_hygiene_public_b", .text = " worker   dedup fact ", .predicate = "constraint", .object = "public", .scope = "public", .created_by = "agent", .status = "proposed" });
+    _ = try store.createMemoryAtom(alloc, .{ .id = "mem_worker_hygiene_project_a", .text = "Worker Dedup Fact", .predicate = "constraint", .object = "project", .scope = "project:nullpantry", .created_by = "human", .status = "verified" });
+    _ = try store.createMemoryAtom(alloc, .{ .id = "mem_worker_hygiene_project_b", .text = " worker   dedup fact ", .predicate = "constraint", .object = "project", .scope = "project:nullpantry", .created_by = "agent", .status = "proposed" });
+
+    const job = try store.createJob(alloc, .{
+        .job_type = "hygiene",
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+        .input_json = "{\"stale_after_ms\":0,\"archive_after_ms\":0,\"dedupe_memory_atoms\":true,\"dedupe_limit\":10}",
+    });
+
+    const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"admin\"]", .job_limit = 5 });
+    try std.testing.expectEqual(@as(usize, 1), result.jobs_succeeded);
+    const finished = (try store.getJob(alloc, job.id)).?;
+    try std.testing.expect(std.mem.indexOf(u8, finished.result_json, "\"dedupe_deprecated\":1") != null);
+    try std.testing.expectEqualStrings("verified", (try store.getMemoryAtom(alloc, "mem_worker_hygiene_public_a")).?.status);
+    try std.testing.expectEqualStrings("deprecated", (try store.getMemoryAtom(alloc, "mem_worker_hygiene_public_b")).?.status);
+    try std.testing.expectEqualStrings("verified", (try store.getMemoryAtom(alloc, "mem_worker_hygiene_project_a")).?.status);
+    try std.testing.expectEqualStrings("proposed", (try store.getMemoryAtom(alloc, "mem_worker_hygiene_project_b")).?.status);
 }
 
 test "worker processes durable Lucid projection jobs" {
