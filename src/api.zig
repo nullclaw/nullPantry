@@ -8575,13 +8575,17 @@ fn lifecycleHygiene(ctx: *Context, body: []const u8) HttpResponse {
         .archive_after_ms = json.intField(obj, "archive_after_ms") orelse 90 * 24 * 60 * 60 * 1000,
         .purge_after_ms = json.intField(obj, "purge_after_ms") orelse 0,
         .hard_delete = json.boolField(obj, "hard_delete") orelse false,
+        .dedupe_memory_atoms = json.boolField(obj, "dedupe_memory_atoms") orelse (json.boolField(obj, "dedupe") orelse false),
+        .dedupe_normalized = json.boolField(obj, "dedupe_normalized") orelse true,
+        .dedupe_limit = @max(@as(usize, 1), @min(positiveLimit(json.intField(obj, "dedupe_limit"), 5000), 20_000)),
+        .actor_id = ctx.actor_id,
         .scopes_json = ctx.actor_scopes_json,
         .capabilities_json = ctx.actor_capabilities_json,
     }) catch return serverError(ctx);
     const response = std.fmt.allocPrint(
         ctx.allocator,
-        "{{\"hygiene\":{{\"checked\":{d},\"marked_stale\":{d},\"archived\":{d},\"purged\":{d},\"expired_cache_entries\":{d}}}}}",
-        .{ result.checked, result.marked_stale, result.archived, result.purged, result.expired_cache_entries },
+        "{{\"hygiene\":{{\"checked\":{d},\"marked_stale\":{d},\"archived\":{d},\"purged\":{d},\"expired_cache_entries\":{d},\"dedupe_checked\":{d},\"dedupe_groups\":{d},\"dedupe_deprecated\":{d},\"dedupe_purged\":{d}}}}}",
+        .{ result.checked, result.marked_stale, result.archived, result.purged, result.expired_cache_entries, result.dedupe_checked, result.dedupe_groups, result.dedupe_deprecated, result.dedupe_purged },
     ) catch return serverError(ctx);
     return .{ .status = "200 OK", .body = response };
 }
@@ -14532,6 +14536,32 @@ test "api lifecycle hygiene report counts duplicate agent memory and atoms witho
 
     const memories = try store.agentMemoryListVisible(alloc, "prefs", "s-1", "agent:hygiene", "[\"public\",\"session:s-1\"]");
     try std.testing.expectEqual(@as(usize, 2), memories.len);
+}
+
+test "api lifecycle hygiene can deprecate duplicate memory atoms" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Context{
+        .allocator = alloc,
+        .store = &store,
+        .actor_id = "agent:hygiene",
+        .actor_scopes_json = "[\"public\",\"verify:public\"]",
+        .actor_capabilities_json = "[\"read\",\"verify\"]",
+    };
+
+    _ = try store.createMemoryAtom(alloc, .{ .id = "mem_api_hygiene_a", .text = "Context Pack Fact", .predicate = "constraint", .object = "nullpantry", .scope = "public", .permissions_json = "[\"public\"]", .created_by = "human", .status = "verified" });
+    _ = try store.createMemoryAtom(alloc, .{ .id = "mem_api_hygiene_b", .text = " context   pack fact ", .predicate = "constraint", .object = "nullpantry", .scope = "public", .permissions_json = "[\"public\"]", .created_by = "agent", .status = "proposed" });
+
+    const hygiene = handleRequest(&ctx, "POST", "/v1/lifecycle/hygiene", "{\"stale_after_ms\":0,\"archive_after_ms\":0,\"dedupe_memory_atoms\":true}", "");
+    try std.testing.expectEqualStrings("200 OK", hygiene.status);
+    try std.testing.expect(std.mem.indexOf(u8, hygiene.body, "\"dedupe_checked\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hygiene.body, "\"dedupe_groups\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hygiene.body, "\"dedupe_deprecated\":1") != null);
+    try std.testing.expectEqualStrings("verified", (try store.getMemoryAtom(alloc, "mem_api_hygiene_a")).?.status);
+    try std.testing.expectEqualStrings("deprecated", (try store.getMemoryAtom(alloc, "mem_api_hygiene_b")).?.status);
 }
 
 test "api response and semantic caches are scoped" {

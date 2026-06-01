@@ -279,6 +279,48 @@ fn hygieneCanDelete(input: HygieneRunInput, scope: []const u8, permissions_json:
         domain.permissionsWritable(permissions_json, input.scopes_json);
 }
 
+const HygieneDedupeWinner = struct {
+    id: []const u8,
+    status: []const u8,
+    scope: []const u8,
+    permissions_json: []const u8,
+    created_at_ms: i64,
+    last_verified_at_ms: ?i64,
+    seen_duplicate: bool = false,
+};
+
+fn hygieneAtomDedupeRank(status: []const u8) u8 {
+    if (std.mem.eql(u8, status, "verified")) return 4;
+    if (std.mem.eql(u8, status, "accepted")) return 4;
+    if (std.mem.eql(u8, status, "proposed")) return 3;
+    if (std.mem.eql(u8, status, "stale")) return 2;
+    return 1;
+}
+
+fn hygieneShouldReplaceWinner(current_status: []const u8, current_created_at_ms: i64, current_last_verified_at_ms: ?i64, winner: HygieneDedupeWinner) bool {
+    const current_rank = hygieneAtomDedupeRank(current_status);
+    const winner_rank = hygieneAtomDedupeRank(winner.status);
+    if (current_rank != winner_rank) return current_rank > winner_rank;
+    const current_seen = current_last_verified_at_ms orelse current_created_at_ms;
+    const winner_seen = winner.last_verified_at_ms orelse winner.created_at_ms;
+    return current_seen > winner_seen;
+}
+
+fn hygieneCanDeprecateAtom(input: HygieneRunInput, status: []const u8, scope: []const u8, permissions_json: []const u8) bool {
+    if (input.hard_delete) return hygieneCanDelete(input, scope, permissions_json);
+    if (std.mem.eql(u8, status, "deprecated") or std.mem.eql(u8, status, "rejected") or std.mem.eql(u8, status, "superseded")) return false;
+    return hygieneCanVerify(input, scope, permissions_json);
+}
+
+fn hygieneAtomDedupeKey(allocator: std.mem.Allocator, scope: []const u8, permissions_json: []const u8, predicate: []const u8, object: []const u8, text: []const u8, normalized: bool) !?[]u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const content = if (normalized) try lifecycle_mod.normalizeDedupeContent(allocator, trimmed) else try allocator.dupe(u8, trimmed);
+    defer allocator.free(content);
+    if (content.len == 0) return null;
+    return try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}", .{ scope, permissions_json, predicate, object, content });
+}
+
 pub const BackendKind = enum {
     sqlite,
     postgres,
@@ -4885,7 +4927,11 @@ pub const HygieneRunInput = struct {
     archive_after_ms: i64 = 90 * 24 * 60 * 60 * 1000,
     purge_after_ms: i64 = 0,
     hard_delete: bool = false,
+    dedupe_memory_atoms: bool = false,
+    dedupe_normalized: bool = true,
+    dedupe_limit: usize = 5000,
     now_ms: ?i64 = null,
+    actor_id: ?[]const u8 = null,
     scopes_json: []const u8 = "[\"admin\"]",
     capabilities_json: []const u8 = "[\"read\",\"write\",\"propose\",\"verify\",\"delete\",\"export\",\"feed_apply\"]",
 };
@@ -4896,6 +4942,10 @@ pub const HygieneRunResult = struct {
     archived: usize = 0,
     purged: usize = 0,
     expired_cache_entries: usize = 0,
+    dedupe_checked: usize = 0,
+    dedupe_groups: usize = 0,
+    dedupe_deprecated: usize = 0,
+    dedupe_purged: usize = 0,
 };
 
 pub const MemoryAtomListInput = struct {
@@ -9454,13 +9504,13 @@ pub const SQLiteStore = struct {
                 .mark_stale => {
                     if (!hygieneCanVerify(input, scope, permissions)) continue;
                     if (!std.mem.eql(u8, status, "stale")) {
-                        if (try self.patchMemoryAtomStatus(id_text, "stale", false)) result.marked_stale += 1;
+                        if (try self.patchMemoryAtomStatusActor(id_text, "stale", false, input.actor_id)) result.marked_stale += 1;
                     }
                 },
                 .archive => {
                     if (!hygieneCanVerify(input, scope, permissions)) continue;
                     if (!std.mem.eql(u8, status, "deprecated")) {
-                        if (try self.patchMemoryAtomStatus(id_text, "deprecated", false)) result.archived += 1;
+                        if (try self.patchMemoryAtomStatusActor(id_text, "deprecated", false, input.actor_id)) result.archived += 1;
                     }
                 },
                 .purge => {
@@ -9469,13 +9519,84 @@ pub const SQLiteStore = struct {
                         if (try self.hardDeleteMemoryAtom(id_text)) result.purged += 1;
                     } else if (!std.mem.eql(u8, status, "deprecated")) {
                         if (!hygieneCanVerify(input, scope, permissions)) continue;
-                        if (try self.patchMemoryAtomStatus(id_text, "deprecated", false)) result.archived += 1;
+                        if (try self.patchMemoryAtomStatusActor(id_text, "deprecated", false, input.actor_id)) result.archived += 1;
                     }
                 },
             }
         }
+        if (input.dedupe_memory_atoms) try self.runMemoryAtomDedupe(input, &result);
         try self.insertAudit("lifecycle.hygiene", "memory_atom", "bulk");
         return result;
+    }
+
+    fn runMemoryAtomDedupe(self: *Self, input: HygieneRunInput, result: *HygieneRunResult) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const limit = @max(@as(usize, 1), @min(input.dedupe_limit, @as(usize, 20_000)));
+        const stmt = try self.prepare("SELECT id,status,last_verified_at_ms,created_at_ms,scope,permissions_json,predicate,object,text FROM memory_atoms WHERE status NOT IN ('rejected','deprecated','superseded') ORDER BY created_at_ms DESC LIMIT ?1");
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(limit));
+
+        var winners: std.StringHashMapUnmanaged(HygieneDedupeWinner) = .{};
+        defer winners.deinit(allocator);
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            result.dedupe_checked += 1;
+            const id_text = try columnText(allocator, stmt, 0);
+            const status = try columnText(allocator, stmt, 1);
+            const last_verified = if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 2);
+            const created = c.sqlite3_column_int64(stmt, 3);
+            const scope = try columnText(allocator, stmt, 4);
+            const permissions = try columnText(allocator, stmt, 5);
+            const predicate = try columnText(allocator, stmt, 6);
+            const object = try columnText(allocator, stmt, 7);
+            const text = try columnText(allocator, stmt, 8);
+            const key = (try hygieneAtomDedupeKey(allocator, scope, permissions, predicate, object, text, input.dedupe_normalized)) orelse continue;
+            const entry = try winners.getOrPut(allocator, key);
+            if (!entry.found_existing) {
+                entry.key_ptr.* = key;
+                entry.value_ptr.* = .{
+                    .id = id_text,
+                    .status = status,
+                    .scope = scope,
+                    .permissions_json = permissions,
+                    .created_at_ms = created,
+                    .last_verified_at_ms = last_verified,
+                };
+                continue;
+            }
+            if (!entry.value_ptr.seen_duplicate) {
+                result.dedupe_groups += 1;
+                entry.value_ptr.seen_duplicate = true;
+            }
+            const replace_winner = hygieneShouldReplaceWinner(status, created, last_verified, entry.value_ptr.*);
+            if (replace_winner) {
+                const duplicate = entry.value_ptr.*;
+                if (hygieneCanDeprecateAtom(input, duplicate.status, duplicate.scope, duplicate.permissions_json)) {
+                    if (input.hard_delete) {
+                        if (try self.hardDeleteMemoryAtom(duplicate.id)) result.dedupe_purged += 1;
+                    } else if (try self.patchMemoryAtomStatusActor(duplicate.id, "deprecated", false, input.actor_id)) {
+                        result.dedupe_deprecated += 1;
+                    }
+                }
+                entry.value_ptr.* = .{
+                    .id = id_text,
+                    .status = status,
+                    .scope = scope,
+                    .permissions_json = permissions,
+                    .created_at_ms = created,
+                    .last_verified_at_ms = last_verified,
+                    .seen_duplicate = true,
+                };
+            } else if (hygieneCanDeprecateAtom(input, status, scope, permissions)) {
+                if (input.hard_delete) {
+                    if (try self.hardDeleteMemoryAtom(id_text)) result.dedupe_purged += 1;
+                } else if (try self.patchMemoryAtomStatusActor(id_text, "deprecated", false, input.actor_id)) {
+                    result.dedupe_deprecated += 1;
+                }
+            }
+        }
     }
 
     pub fn listMemoryAtomsVisible(self: *Self, allocator: std.mem.Allocator, input: MemoryAtomListInput) ![]domain.MemoryAtom {
@@ -13344,23 +13465,98 @@ pub const PostgresStore = struct {
                 .keep => {},
                 .mark_stale => {
                     if (!hygieneCanVerify(input, scope, permissions)) continue;
-                    if (!std.mem.eql(u8, status, "stale") and try self.patchMemoryAtomStatus(id_text, "stale", false)) result.marked_stale += 1;
+                    if (!std.mem.eql(u8, status, "stale") and try self.patchMemoryAtomStatusActor(id_text, "stale", false, input.actor_id)) result.marked_stale += 1;
                 },
                 .archive => {
                     if (!hygieneCanVerify(input, scope, permissions)) continue;
-                    if (!std.mem.eql(u8, status, "deprecated") and try self.patchMemoryAtomStatus(id_text, "deprecated", false)) result.archived += 1;
+                    if (!std.mem.eql(u8, status, "deprecated") and try self.patchMemoryAtomStatusActor(id_text, "deprecated", false, input.actor_id)) result.archived += 1;
                 },
                 .purge => if (input.hard_delete) {
                     if (!hygieneCanDelete(input, scope, permissions)) continue;
                     if (try self.hardDeleteMemoryAtom(id_text)) result.purged += 1;
                 } else {
                     if (!hygieneCanVerify(input, scope, permissions)) continue;
-                    if (!std.mem.eql(u8, status, "deprecated") and try self.patchMemoryAtomStatus(id_text, "deprecated", false)) result.archived += 1;
+                    if (!std.mem.eql(u8, status, "deprecated") and try self.patchMemoryAtomStatusActor(id_text, "deprecated", false, input.actor_id)) result.archived += 1;
                 },
             }
         };
+        if (input.dedupe_memory_atoms) try self.runMemoryAtomDedupe(allocator, input, &result);
         try self.insertAudit(self.allocator, "lifecycle.hygiene", null, "memory_atom", "bulk");
         return result;
+    }
+
+    fn runMemoryAtomDedupe(self: *PostgresStore, allocator: std.mem.Allocator, input: HygieneRunInput, result: *HygieneRunResult) !void {
+        const limit = @max(@as(usize, 1), @min(input.dedupe_limit, @as(usize, 20_000)));
+        const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{limit});
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT id,status,last_verified_at_ms,created_at_ms,scope,permissions_json,predicate,object,text FROM memory_atoms WHERE status NOT IN ('rejected','deprecated','superseded') ORDER BY created_at_ms DESC LIMIT $1::bigint",
+            &.{limit_text},
+        );
+        defer parsed.deinit();
+
+        var winners: std.StringHashMapUnmanaged(HygieneDedupeWinner) = .{};
+        defer winners.deinit(allocator);
+
+        if (parsed.value != .array) return;
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            result.dedupe_checked += 1;
+            const obj = item.object;
+            const id_text = json.stringField(obj, "id") orelse continue;
+            const status = json.stringField(obj, "status") orelse "proposed";
+            const last_verified = json.intField(obj, "last_verified_at_ms");
+            const created = json.intField(obj, "created_at_ms") orelse 0;
+            const scope = json.stringField(obj, "scope") orelse "workspace";
+            const permissions = try rawJsonField(allocator, obj, "permissions_json", "[]");
+            const predicate = json.stringField(obj, "predicate") orelse "fact";
+            const object = json.stringField(obj, "object") orelse "";
+            const text = json.stringField(obj, "text") orelse "";
+            const key = (try hygieneAtomDedupeKey(allocator, scope, permissions, predicate, object, text, input.dedupe_normalized)) orelse continue;
+            const entry = try winners.getOrPut(allocator, key);
+            if (!entry.found_existing) {
+                entry.key_ptr.* = key;
+                entry.value_ptr.* = .{
+                    .id = id_text,
+                    .status = status,
+                    .scope = scope,
+                    .permissions_json = permissions,
+                    .created_at_ms = created,
+                    .last_verified_at_ms = last_verified,
+                };
+                continue;
+            }
+            if (!entry.value_ptr.seen_duplicate) {
+                result.dedupe_groups += 1;
+                entry.value_ptr.seen_duplicate = true;
+            }
+            const replace_winner = hygieneShouldReplaceWinner(status, created, last_verified, entry.value_ptr.*);
+            if (replace_winner) {
+                const duplicate = entry.value_ptr.*;
+                if (hygieneCanDeprecateAtom(input, duplicate.status, duplicate.scope, duplicate.permissions_json)) {
+                    if (input.hard_delete) {
+                        if (try self.hardDeleteMemoryAtom(duplicate.id)) result.dedupe_purged += 1;
+                    } else if (try self.patchMemoryAtomStatusActor(duplicate.id, "deprecated", false, input.actor_id)) {
+                        result.dedupe_deprecated += 1;
+                    }
+                }
+                entry.value_ptr.* = .{
+                    .id = id_text,
+                    .status = status,
+                    .scope = scope,
+                    .permissions_json = permissions,
+                    .created_at_ms = created,
+                    .last_verified_at_ms = last_verified,
+                    .seen_duplicate = true,
+                };
+            } else if (hygieneCanDeprecateAtom(input, status, scope, permissions)) {
+                if (input.hard_delete) {
+                    if (try self.hardDeleteMemoryAtom(id_text)) result.dedupe_purged += 1;
+                } else if (try self.patchMemoryAtomStatusActor(id_text, "deprecated", false, input.actor_id)) {
+                    result.dedupe_deprecated += 1;
+                }
+            }
+        }
     }
 
     pub fn listMemoryAtomsVisible(self: *PostgresStore, allocator: std.mem.Allocator, input: MemoryAtomListInput) ![]domain.MemoryAtom {
@@ -19129,6 +19325,58 @@ test "sqlite hygiene requires scoped verify or delete rights per atom" {
     });
     try std.testing.expectEqual(@as(usize, 1), allowed.marked_stale);
     try std.testing.expectEqualStrings("stale", (try store.getMemoryAtom(alloc, atom.id)).?.status);
+}
+
+test "sqlite hygiene dedupes memory atoms with verify rights and keeps stronger status" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const verified = try store.createMemoryAtom(alloc, .{
+        .id = "mem_hygiene_dedupe_verified",
+        .text = "Graph Fact",
+        .predicate = "constraint",
+        .object = "nullpantry",
+        .scope = "project:nullpantry",
+        .created_by = "human",
+        .status = "verified",
+    });
+    const proposed = try store.createMemoryAtom(alloc, .{
+        .id = "mem_hygiene_dedupe_proposed",
+        .text = " graph   fact ",
+        .predicate = "constraint",
+        .object = "nullpantry",
+        .scope = "project:nullpantry",
+        .created_by = "agent",
+        .status = "proposed",
+    });
+
+    const denied = try store.runHygiene(.{
+        .stale_after_ms = 0,
+        .archive_after_ms = 0,
+        .dedupe_memory_atoms = true,
+        .scopes_json = "[\"project:nullpantry\"]",
+        .capabilities_json = "[\"verify\"]",
+    });
+    try std.testing.expectEqual(@as(usize, 1), denied.dedupe_groups);
+    try std.testing.expectEqual(@as(usize, 0), denied.dedupe_deprecated);
+    try std.testing.expectEqualStrings("verified", (try store.getMemoryAtom(alloc, verified.id)).?.status);
+    try std.testing.expectEqualStrings("proposed", (try store.getMemoryAtom(alloc, proposed.id)).?.status);
+
+    const allowed = try store.runHygiene(.{
+        .stale_after_ms = 0,
+        .archive_after_ms = 0,
+        .dedupe_memory_atoms = true,
+        .scopes_json = "[\"project:nullpantry\",\"verify:project:nullpantry\"]",
+        .capabilities_json = "[\"verify\"]",
+    });
+    try std.testing.expectEqual(@as(usize, 2), allowed.dedupe_checked);
+    try std.testing.expectEqual(@as(usize, 1), allowed.dedupe_groups);
+    try std.testing.expectEqual(@as(usize, 1), allowed.dedupe_deprecated);
+    try std.testing.expectEqualStrings("verified", (try store.getMemoryAtom(alloc, verified.id)).?.status);
+    try std.testing.expectEqualStrings("deprecated", (try store.getMemoryAtom(alloc, proposed.id)).?.status);
 }
 
 test "context pack excludes inaccessible scopes" {

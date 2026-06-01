@@ -54,6 +54,23 @@ pub fn hygieneDecision(status: []const u8, last_verified_at_ms: ?i64, now_ms: i6
     return .keep;
 }
 
+pub fn normalizeDedupeContent(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var pending_space = false;
+    for (trimmed) |ch| {
+        if (std.ascii.isWhitespace(ch)) {
+            pending_space = true;
+            continue;
+        }
+        if (out.items.len > 0 and pending_space) try out.append(allocator, ' ');
+        pending_space = false;
+        try out.append(allocator, std.ascii.toLower(ch));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn summarizeMessages(allocator: std.mem.Allocator, messages: []const []const u8, max_chars: usize) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);

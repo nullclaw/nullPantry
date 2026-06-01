@@ -93,7 +93,7 @@ pub fn runClaimedJob(allocator: std.mem.Allocator, store: *store_mod.Store, job:
             .scopes_json = options.scopes_json,
             .capabilities_json = options.capabilities_json,
         });
-        return try std.fmt.allocPrint(allocator, "{{\"checked\":{d},\"marked_stale\":{d},\"archived\":{d},\"purged\":{d},\"expired_cache_entries\":{d}}}", .{ hygiene.checked, hygiene.marked_stale, hygiene.archived, hygiene.purged, hygiene.expired_cache_entries });
+        return try std.fmt.allocPrint(allocator, "{{\"checked\":{d},\"marked_stale\":{d},\"archived\":{d},\"purged\":{d},\"expired_cache_entries\":{d},\"dedupe_checked\":{d},\"dedupe_groups\":{d},\"dedupe_deprecated\":{d},\"dedupe_purged\":{d}}}", .{ hygiene.checked, hygiene.marked_stale, hygiene.archived, hygiene.purged, hygiene.expired_cache_entries, hygiene.dedupe_checked, hygiene.dedupe_groups, hygiene.dedupe_deprecated, hygiene.dedupe_purged });
     }
     if (std.mem.eql(u8, job.job_type, "scan_conflicts")) {
         const scopes_json = try jobExecutionScopesJson(allocator, job);
