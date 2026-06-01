@@ -4581,7 +4581,27 @@ pub const FeedEvent = struct {
         if (self.compacted_at_ms) |v| try out.print(allocator, "{d}", .{v}) else try out.appendSlice(allocator, "null");
         try out.append(allocator, '}');
     }
+
+    pub fn deinit(self: *FeedEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.event_type);
+        allocator.free(self.operation);
+        allocator.free(self.object_type);
+        allocator.free(self.object_id);
+        allocator.free(self.scope);
+        allocator.free(self.permissions_json);
+        if (self.actor_id) |value| allocator.free(value);
+        if (self.dedupe_key) |value| allocator.free(value);
+        allocator.free(self.causality_json);
+        allocator.free(self.payload_json);
+        allocator.free(self.status);
+        self.* = undefined;
+    }
 };
+
+pub fn freeFeedEvents(allocator: std.mem.Allocator, events: []FeedEvent) void {
+    for (events) |*event| event.deinit(allocator);
+    allocator.free(events);
+}
 
 pub const FeedStatus = struct {
     cursor_floor: i64,
@@ -8677,12 +8697,16 @@ pub const SQLiteStore = struct {
         const stmt = try self.prepare("SELECT id,event_type,operation,object_type,object_id,scope,permissions_json,actor_id,dedupe_key,causality_json,payload_json,status,created_at_ms,applied_at_ms,compacted_at_ms FROM memory_feed_events WHERE id > ?1 ORDER BY id ASC");
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, input.since_id);
+        var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+        defer scratch_arena.deinit();
         var out: std.ArrayListUnmanaged(FeedEvent) = .empty;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-            const scope = try columnText(allocator, stmt, 5);
-            const permissions = try columnText(allocator, stmt, 6);
-            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
-            try out.append(allocator, try readFeedEventWithScope(allocator, stmt, scope));
+            _ = scratch_arena.reset(.retain_capacity);
+            const scratch = scratch_arena.allocator();
+            const scope = try columnText(scratch, stmt, 5);
+            const permissions = try columnText(scratch, stmt, 6);
+            if (!try self.recordVisibleWithPolicyForActor(scratch, scope, permissions, input.scopes_json, input.actor_id)) continue;
+            try out.append(allocator, try readFeedEvent(allocator, stmt));
             if (out.items.len >= visible_limit) break;
         }
         return out.toOwnedSlice(allocator);
@@ -8713,11 +8737,15 @@ pub const SQLiteStore = struct {
         var pending: usize = 0;
         var applying: usize = 0;
         var applied_count: usize = 0;
+        var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+        defer scratch_arena.deinit();
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-            const scope = try columnText(allocator, stmt, 0);
-            const permissions = try columnText(allocator, stmt, 1);
-            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
-            const status = try columnText(allocator, stmt, 2);
+            _ = scratch_arena.reset(.retain_capacity);
+            const scratch = scratch_arena.allocator();
+            const scope = try columnText(scratch, stmt, 0);
+            const permissions = try columnText(scratch, stmt, 1);
+            if (!try self.recordVisibleWithPolicyForActor(scratch, scope, permissions, input.scopes_json, input.actor_id)) continue;
+            const status = try columnText(scratch, stmt, 2);
             visible += 1;
             if (std.mem.eql(u8, status, "pending")) pending += 1 else if (std.mem.eql(u8, status, "applying")) applying += 1 else if (std.mem.eql(u8, status, "applied")) applied_count += 1;
         }
@@ -12246,10 +12274,16 @@ pub const PostgresStore = struct {
         );
         defer parsed.deinit();
         var out: std.ArrayListUnmanaged(FeedEvent) = .empty;
+        var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+        defer scratch_arena.deinit();
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
             if (item != .object) continue;
+            _ = scratch_arena.reset(.retain_capacity);
+            const scratch = scratch_arena.allocator();
+            const scope = json.stringField(item.object, "scope") orelse "workspace";
+            const permissions = try rawJsonField(scratch, item.object, "permissions_json", "[]");
+            if (!try self.recordVisibleWithPolicyForActor(scratch, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const event = try readPgFeedEvent(allocator, item.object);
-            if (!try self.recordVisibleWithPolicyForActor(allocator, event.scope, event.permissions_json, input.scopes_json, input.actor_id)) continue;
             try out.append(allocator, event);
             if (out.items.len >= visible_limit) break;
         };
@@ -12292,11 +12326,15 @@ pub const PostgresStore = struct {
         var pending: usize = 0;
         var applying: usize = 0;
         var applied_count: usize = 0;
+        var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+        defer scratch_arena.deinit();
         if (parsed.value == .array) for (parsed.value.array.items) |item| {
             if (item != .object) continue;
+            _ = scratch_arena.reset(.retain_capacity);
+            const scratch = scratch_arena.allocator();
             const scope = json.stringField(item.object, "scope") orelse "workspace";
-            const permissions = try rawJsonField(allocator, item.object, "permissions_json", "[]");
-            if (!try self.recordVisibleWithPolicyForActor(allocator, scope, permissions, input.scopes_json, input.actor_id)) continue;
+            const permissions = try rawJsonField(scratch, item.object, "permissions_json", "[]");
+            if (!try self.recordVisibleWithPolicyForActor(scratch, scope, permissions, input.scopes_json, input.actor_id)) continue;
             const status = json.stringField(item.object, "status") orelse "";
             visible += 1;
             if (std.mem.eql(u8, status, "pending")) pending += 1 else if (std.mem.eql(u8, status, "applying")) applying += 1 else if (std.mem.eql(u8, status, "applied")) applied_count += 1;
@@ -17178,6 +17216,42 @@ test "sqlite memory feed visibility is actor-aware at store layer" {
 
     const hidden_status = try store.feedStatus(alloc, .{ .scopes_json = "[]", .actor_id = other_actor });
     try std.testing.expectEqual(@as(usize, 0), hidden_status.visible_events);
+}
+
+test "sqlite memory feed visibility does not retain hidden rows in caller allocator" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+
+    _ = try store.appendFeedEvent(.{
+        .event_type = "memory_atom.put",
+        .operation = "put",
+        .object_type = "memory_atom",
+        .object_id = "mem_visible_direct_allocator",
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+        .payload_json = "{\"text\":\"visible\"}",
+        .status = "applied",
+    });
+    _ = try store.appendFeedEvent(.{
+        .event_type = "memory_atom.put",
+        .operation = "put",
+        .object_type = "memory_atom",
+        .object_id = "mem_hidden_direct_allocator",
+        .scope = "project:secret",
+        .permissions_json = "[\"team:secret\"]",
+        .payload_json = "{\"text\":\"hidden\"}",
+        .status = "pending",
+    });
+
+    const visible = try store.listFeedEvents(std.testing.allocator, .{ .scopes_json = "[\"public\"]", .limit = 10 });
+    defer freeFeedEvents(std.testing.allocator, visible);
+    try std.testing.expectEqual(@as(usize, 1), visible.len);
+    try std.testing.expectEqualStrings("mem_visible_direct_allocator", visible[0].object_id);
+
+    const status = try store.feedStatus(std.testing.allocator, .{ .scopes_json = "[\"public\"]" });
+    try std.testing.expectEqual(@as(usize, 1), status.visible_events);
+    try std.testing.expectEqual(@as(usize, 1), status.applied_events);
+    try std.testing.expectEqual(@as(usize, 0), status.pending_events);
 }
 
 test "sqlite memory feed projection compaction is isolated from global and other actors" {
