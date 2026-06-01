@@ -5097,12 +5097,67 @@ pub const AgentMemoryInput = struct {
     writer_actor_id: ?[]const u8 = null,
     operation: domain.AgentMemoryOperation = .put,
     suppress_feed: bool = false,
+    event_order: ?AgentMemoryEventOrder = null,
+};
+
+pub const AgentMemoryEventOrder = struct {
+    timestamp_ms: i64,
+    origin_instance_id: []const u8,
+    origin_sequence: i64,
 };
 
 fn normalizeAgentMemoryInput(input: AgentMemoryInput) AgentMemoryInput {
     var out = input;
     out.session_id = access.normalizeSessionId(input.session_id);
     return out;
+}
+
+fn agentMemoryStoredMetadataJson(allocator: std.mem.Allocator, input: AgentMemoryInput) ![]u8 {
+    const event_order = input.event_order orelse return allocator.dupe(u8, input.metadata_json);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"_feed_event\":{\"timestamp_ms\":");
+    try out.print(allocator, "{d}", .{event_order.timestamp_ms});
+    try out.appendSlice(allocator, ",\"origin_instance_id\":");
+    try json.appendString(&out, allocator, event_order.origin_instance_id);
+    try out.appendSlice(allocator, ",\"origin_sequence\":");
+    try out.print(allocator, "{d}", .{event_order.origin_sequence});
+    try out.appendSlice(allocator, "},\"user\":");
+    try json.appendRawJsonOr(&out, allocator, input.metadata_json, "{}");
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+fn compareAgentMemoryEventOrder(input: AgentMemoryEventOrder, existing_timestamp_ms: i64, existing_origin_instance_id: []const u8, existing_origin_sequence: i64) i8 {
+    if (input.timestamp_ms < existing_timestamp_ms) return -1;
+    if (input.timestamp_ms > existing_timestamp_ms) return 1;
+    return switch (std.mem.order(u8, input.origin_instance_id, existing_origin_instance_id)) {
+        .lt => -1,
+        .gt => 1,
+        .eq => if (input.origin_sequence < existing_origin_sequence) -1 else if (input.origin_sequence > existing_origin_sequence) 1 else 0,
+    };
+}
+
+fn compareAgentMemoryInputToStoredMetadata(allocator: std.mem.Allocator, input_order: AgentMemoryEventOrder, stored_timestamp_ms: i64, stored_metadata_json: []const u8) !i8 {
+    var existing_timestamp_ms = stored_timestamp_ms;
+    var existing_origin_instance_id: []const u8 = "";
+    var existing_origin_sequence: i64 = 0;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, stored_metadata_json, .{}) catch null;
+    defer if (parsed) |*value| value.deinit();
+    if (parsed) |metadata| {
+        if (metadata.value == .object) {
+            if (metadata.value.object.get("_feed_event")) |feed_value| {
+                if (feed_value == .object) {
+                    existing_timestamp_ms = json.intField(feed_value.object, "timestamp_ms") orelse existing_timestamp_ms;
+                    existing_origin_instance_id = json.stringField(feed_value.object, "origin_instance_id") orelse existing_origin_instance_id;
+                    existing_origin_sequence = json.intField(feed_value.object, "origin_sequence") orelse existing_origin_sequence;
+                }
+            }
+        }
+    }
+
+    return compareAgentMemoryEventOrder(input_order, existing_timestamp_ms, existing_origin_instance_id, existing_origin_sequence);
 }
 
 fn appendAgentMemorySlice(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), entries: []domain.AgentMemory) !void {
@@ -9824,12 +9879,18 @@ pub const SQLiteStore = struct {
         defer allocator.free(scope);
         const effective_permissions = try agentMemoryPermissions(allocator, owner_actor_id, input.scope, input.permissions_json);
         defer allocator.free(effective_permissions);
+        if (try self.agentMemoryEventOrderWouldRegressInTx(allocator, input, owner_actor_id)) {
+            return (try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id)).?;
+        }
         const existing_content = try self.agentMemoryContentInTx(allocator, input.key, input.session_id, owner_actor_id);
         defer if (existing_content) |content| allocator.free(content);
         const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, existing_content, input.content);
         defer allocator.free(reduced_content);
+        const stored_metadata_json = try agentMemoryStoredMetadataJson(allocator, input);
+        defer allocator.free(stored_metadata_json);
         const source_title = try std.fmt.allocPrint(allocator, "Agent memory: {s}", .{input.key});
         defer allocator.free(source_title);
+        const item_timestamp_ms = if (input.event_order) |event_order| event_order.timestamp_ms else ids.nowMs();
         const source = try self.createSource(allocator, .{
             .source_type = "agent_observation",
             .title = source_title,
@@ -9874,12 +9935,26 @@ pub const SQLiteStore = struct {
         bindText(stmt, 7, effective_permissions);
         bindText(stmt, 8, atom.id);
         bindText(stmt, 9, input.category);
-        _ = c.sqlite3_bind_int64(stmt, 10, atom.created_at_ms);
-        bindText(stmt, 11, input.metadata_json);
+        _ = c.sqlite3_bind_int64(stmt, 10, item_timestamp_ms);
+        bindText(stmt, 11, stored_metadata_json);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
         try self.upsertAgentMemoryFts(id, input.key, input.category, input.session_id, reduced_content);
         try self.insertAuditActor("agent_memory.upserted", writer_actor_id, "agent_memory", id);
         return (try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id)).?;
+    }
+
+    fn agentMemoryEventOrderWouldRegressInTx(self: *Self, allocator: std.mem.Allocator, input: AgentMemoryInput, owner_actor_id: []const u8) !bool {
+        const event_order = input.event_order orelse return false;
+        const stmt = try self.prepare("SELECT ami.timestamp_ms, ami.metadata_json FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.key = ?1 AND ma.status NOT IN ('rejected','deprecated','superseded') AND " ++ sqlite_agent_session_actor_where_ami ++ " ORDER BY ami.timestamp_ms DESC LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, input.key);
+        bindNullableText(stmt, 2, input.session_id);
+        bindText(stmt, 3, owner_actor_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+        const stored_timestamp_ms = c.sqlite3_column_int64(stmt, 0);
+        const stored_metadata_json = try columnText(allocator, stmt, 1);
+        defer allocator.free(stored_metadata_json);
+        return (try compareAgentMemoryInputToStoredMetadata(allocator, event_order, stored_timestamp_ms, stored_metadata_json)) <= 0;
     }
 
     fn agentMemoryContentInTx(self: *Self, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, owner_actor_id: ?[]const u8) !?[]u8 {
@@ -13752,10 +13827,15 @@ pub const PostgresStore = struct {
     pub fn agentMemoryStore(self: *PostgresStore, allocator: std.mem.Allocator, input: AgentMemoryInput) !domain.AgentMemory {
         const owner_actor_id = try requiredActorId(input.actor_id);
         const writer_actor_id = input.writer_actor_id orelse owner_actor_id;
+        if (try self.agentMemoryEventOrderWouldRegress(allocator, input, owner_actor_id)) {
+            return (try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id)).?;
+        }
         var existing = try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id);
         defer if (existing) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
         const reduced_content = try agent_memory_reducer.reduceContent(allocator, input.operation, if (existing) |entry| entry.content else null, input.content);
         defer allocator.free(reduced_content);
+        const stored_metadata_json = try agentMemoryStoredMetadataJson(allocator, input);
+        defer allocator.free(stored_metadata_json);
         const source_title = try std.fmt.allocPrint(allocator, "Agent memory: {s}", .{input.key});
         defer allocator.free(source_title);
         const source_id = try ids.make(allocator, "src_");
@@ -13768,7 +13848,7 @@ pub const PostgresStore = struct {
         defer allocator.free(source_ids);
         const evidence = try evidenceRangeJson(allocator, source_id, reduced_content.len, "agent_memory");
         defer allocator.free(evidence);
-        const now = ids.nowMs();
+        const now = if (input.event_order) |event_order| event_order.timestamp_ms else ids.nowMs();
         const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
         defer allocator.free(now_text);
         const scope = try agentMemoryScope(allocator, owner_actor_id, input.session_id, input.scope);
@@ -13817,10 +13897,25 @@ pub const PostgresStore = struct {
                 item_id,
                 writer_actor_id,
                 input.category,
-                input.metadata_json,
+                stored_metadata_json,
             },
         );
         return (try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id)).?;
+    }
+
+    fn agentMemoryEventOrderWouldRegress(self: *PostgresStore, allocator: std.mem.Allocator, input: AgentMemoryInput, owner_actor_id: []const u8) !bool {
+        const event_order = input.event_order orelse return false;
+        const parsed = try self.queryRowParamsJson(
+            allocator,
+            "SELECT ami.timestamp_ms,ami.metadata_json FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.key = $1 AND (($2::text IS NULL AND ami.session_id IS NULL) OR ami.session_id = $2) AND ami.actor_id = $3 AND ma.status NOT IN ('rejected','deprecated','superseded') ORDER BY ami.timestamp_ms DESC LIMIT 1",
+            &.{ input.key, input.session_id, owner_actor_id },
+        );
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+        const stored_timestamp_ms = json.intField(parsed.value.object, "timestamp_ms") orelse return false;
+        const stored_metadata_json = try rawJsonField(allocator, parsed.value.object, "metadata_json", "{}");
+        defer allocator.free(stored_metadata_json);
+        return (try compareAgentMemoryInputToStoredMetadata(allocator, event_order, stored_timestamp_ms, stored_metadata_json)) <= 0;
     }
 
     pub fn agentMemoryGet(self: *PostgresStore, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {

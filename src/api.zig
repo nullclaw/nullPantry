@@ -4995,6 +4995,21 @@ fn feedCursorFromQuery(query: []const u8) i64 {
     return 0;
 }
 
+fn agentMemoryEventOrderFromFeedObject(obj: std.json.ObjectMap) ?store_mod.AgentMemoryEventOrder {
+    const timestamp_ms = json.intField(obj, "timestamp_ms") orelse return null;
+    const origin_instance_id = json.stringField(obj, "origin_instance_id") orelse
+        json.stringField(obj, "source_instance_id") orelse
+        return null;
+    const origin_sequence = json.intField(obj, "origin_sequence") orelse
+        json.intField(obj, "source_sequence") orelse
+        return null;
+    return .{
+        .timestamp_ms = timestamp_ms,
+        .origin_instance_id = origin_instance_id,
+        .origin_sequence = origin_sequence,
+    };
+}
+
 fn feedRuntimeForRoute(ctx: *Context, route: store_mod.AgentMemoryStorageRoute) !?*agent_memory_runtime.Runtime {
     return switch (route.target) {
         .primary, .native => null,
@@ -5795,6 +5810,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
     }
     const event_actor_id = json.stringField(obj, "actor_id") orelse ctx.actor_id;
     if (!canApplyAsActor(ctx, event_actor_id)) return forbidden(ctx);
+    const event_order = agentMemoryEventOrderFromFeedObject(obj);
     const payload_json = rawField(ctx.allocator, obj, "payload", "{}") catch return serverError(ctx);
     const event_payload_route = feedObjectPayloadRoute(ctx, object_type, storage_route);
     const event_payload_json = store_mod.payloadWithStorageRouteJson(ctx.allocator, payload_json, event_payload_route) catch return serverError(ctx);
@@ -5836,7 +5852,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
         if (agent_memory_prepared) |*prepared| prepared.deinit(ctx.allocator);
     }
     if (std.mem.eql(u8, object_type, "agent_memory")) {
-        agent_memory_prepared = buildAppliedAgentMemoryInput(ctx, operation, event_payload_json, event_object_id, event_actor_id, event_payload_route) catch |err| switch (err) {
+        agent_memory_prepared = buildAppliedAgentMemoryInput(ctx, operation, event_payload_json, event_object_id, event_actor_id, event_payload_route, event_order) catch |err| switch (err) {
             error.Forbidden => return forbidden(ctx),
             error.InternalAgentMemory => return json.errorResponse(ctx.allocator, 400, "bad_request", "Internal agent memory cannot be applied through the feed"),
             error.MissingKey, error.InvalidPayload => return json.errorResponse(ctx.allocator, 400, "bad_request", "Agent memory apply payload must include key/object_id and valid merge content"),
@@ -6371,7 +6387,7 @@ fn canProposeAgentSessionEvent(ctx: *Context, event_actor_id: []const u8, scope:
     return access.permissionsVisibleForActor(ctx.allocator, permissions_json, ctx.actor_scopes_json, event_actor_id);
 }
 
-fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_json: []const u8, object_id: ?[]const u8, event_actor_id: []const u8, fallback_route: store_mod.AgentMemoryStorageRoute) !AgentMemoryApplyInput {
+fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_json: []const u8, object_id: ?[]const u8, event_actor_id: []const u8, fallback_route: store_mod.AgentMemoryStorageRoute, event_order: ?store_mod.AgentMemoryEventOrder) !AgentMemoryApplyInput {
     const payload = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload_json, .{});
     // Returned input fields borrow slices from this request-arena parse tree.
     if (payload.value != .object) return error.InvalidPayload;
@@ -6428,6 +6444,7 @@ fn buildAppliedAgentMemoryInput(ctx: *Context, operation: []const u8, payload_js
         .actor_id = owner_value,
         .writer_actor_id = event_actor_id,
         .operation = memory_operation,
+        .event_order = event_order,
     }, .route = route, .owned_owner_actor_id = owned_owner_actor_id };
 }
 
@@ -12708,6 +12725,50 @@ test "api nullclaw top-level feed apply deletes scoped and all session variants"
     try std.testing.expectEqualStrings("404 Not Found", global_after_delete_all.status);
     const session_after_delete_all = handleRequest(&ctx, "GET", "/v1/agent-memory/top.delete?session_id=s1", "", "");
     try std.testing.expectEqualStrings("404 Not Found", session_after_delete_all.status);
+}
+
+test "api nullclaw top-level feed apply does not let older puts regress projection" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .store = &store,
+        .actor_id = "agent:nullclaw-order",
+        .actor_scopes_json = "[\"public\",\"write:public\",\"actor:agent:nullclaw-order\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"export\",\"feed_apply\"]",
+    };
+
+    const newer = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-order\",\"origin_sequence\":2,\"timestamp_ms\":200,\"operation\":\"put\",\"key\":\"top.order\",\"category\":\"core\",\"content\":\"newer value\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", newer.status);
+    const older = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-order\",\"origin_sequence\":1,\"timestamp_ms\":100,\"operation\":\"put\",\"key\":\"top.order\",\"category\":\"core\",\"content\":\"older value\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", older.status);
+
+    const current = handleRequest(&ctx, "GET", "/v1/agent-memory/top.order", "", "");
+    try std.testing.expectEqualStrings("200 OK", current.status);
+    try std.testing.expect(std.mem.indexOf(u8, current.body, "newer value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current.body, "older value") == null);
+
+    const feed = handleRequest(&ctx, "GET", "/v1/agent/memory/events?after=0&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"origin_sequence\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"origin_sequence\":1") != null);
+
+    const tie_later_origin = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-z\",\"origin_sequence\":1,\"timestamp_ms\":300,\"operation\":\"put\",\"key\":\"top.order.tie\",\"category\":\"core\",\"content\":\"z value\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", tie_later_origin.status);
+    const tie_earlier_origin = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-a\",\"origin_sequence\":99,\"timestamp_ms\":300,\"operation\":\"put\",\"key\":\"top.order.tie\",\"category\":\"core\",\"content\":\"a value\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", tie_earlier_origin.status);
+    const tie_current = handleRequest(&ctx, "GET", "/v1/agent-memory/top.order.tie", "", "");
+    try std.testing.expectEqualStrings("200 OK", tie_current.status);
+    try std.testing.expect(std.mem.indexOf(u8, tie_current.body, "z value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tie_current.body, "a value") == null);
+
+    const tie_newer_sequence = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-z\",\"origin_sequence\":2,\"timestamp_ms\":300,\"operation\":\"put\",\"key\":\"top.order.tie\",\"category\":\"core\",\"content\":\"z value two\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", tie_newer_sequence.status);
+    const tie_sequence_current = handleRequest(&ctx, "GET", "/v1/agent-memory/top.order.tie", "", "");
+    try std.testing.expectEqualStrings("200 OK", tie_sequence_current.status);
+    try std.testing.expect(std.mem.indexOf(u8, tie_sequence_current.body, "z value two") != null);
 }
 
 test "api nullclaw top-level feed apply accepts lifecycle reducers" {
