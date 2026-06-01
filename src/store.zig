@@ -3507,8 +3507,8 @@ pub const Store = struct {
         }
 
         const deleted = try switch (route.target) {
-            .primary => self.agentMemoryDeleteAll(key, actor_id, writer_actor_id),
-            .native => self.agentMemoryDeleteAllNative(key, actor_id, writer_actor_id),
+            .primary => self.agentMemoryDeleteAllPrimaryOrdered(key, actor_id, writer_actor_id, event_order),
+            .native => self.agentMemoryDeleteAllNativeOrdered(key, actor_id, writer_actor_id, event_order),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.deleteAllOrdered(key, actor_id, writer_actor_id, runtimeAgentMemoryEventOrder(event_order)) else error.AgentMemoryStorageUnavailable,
             .named => (try self.namedAgentMemoryRuntime(route)).deleteAllOrdered(key, actor_id, writer_actor_id, runtimeAgentMemoryEventOrder(event_order)),
             .subset, .all => unreachable,
@@ -3542,8 +3542,8 @@ pub const Store = struct {
         var existing = self.agentMemoryGetRouted(self.allocator, key, normalized_session_id, actor_id, route) catch null;
         defer if (existing) |*entry| agent_memory_runtime.freeAgentMemory(self.allocator, entry);
         const deleted = try switch (route.target) {
-            .primary => self.agentMemoryDelete(key, normalized_session_id, actor_id, writer_actor_id),
-            .native => self.agentMemoryDeleteNative(key, normalized_session_id, actor_id, writer_actor_id),
+            .primary => self.agentMemoryDeletePrimaryOrdered(key, normalized_session_id, actor_id, writer_actor_id, event_order),
+            .native => self.agentMemoryDeleteNativeOrdered(key, normalized_session_id, actor_id, writer_actor_id, event_order),
             .runtime => if (self.agent_memory.isExternal()) self.agent_memory.deleteOrdered(key, normalized_session_id, actor_id, writer_actor_id, runtimeAgentMemoryEventOrder(event_order)) else error.AgentMemoryStorageUnavailable,
             .named => (try self.namedAgentMemoryRuntime(route)).deleteOrdered(key, normalized_session_id, actor_id, writer_actor_id, runtimeAgentMemoryEventOrder(event_order)),
             .subset, .all => unreachable,
@@ -3568,6 +3568,28 @@ pub const Store = struct {
         };
     }
 
+    fn agentMemoryDeletePrimaryOrdered(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?AgentMemoryEventOrder) !bool {
+        if (event_order == null) return self.agentMemoryDelete(key, session_id, actor_id, writer_actor_id);
+        if (self.agent_memory.isExternal()) return self.agent_memory.deleteOrdered(key, session_id, actor_id, writer_actor_id, runtimeAgentMemoryEventOrder(event_order));
+        return self.agentMemoryDeleteNativeOrdered(key, session_id, actor_id, writer_actor_id, event_order);
+    }
+
+    fn agentMemoryDeleteNativeOrdered(self: *Store, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?AgentMemoryEventOrder) !bool {
+        if (event_order == null) return self.agentMemoryDeleteNative(key, session_id, actor_id, writer_actor_id);
+        return switch (self.backend) {
+            .sqlite => |*s| blk: {
+                s.tx_mutex.lockUncancelable(compat.io());
+                defer s.tx_mutex.unlock(compat.io());
+                try s.exec("BEGIN IMMEDIATE");
+                errdefer s.exec("ROLLBACK") catch {};
+                const changed = try s.agentMemoryDeleteInTxOrdered(key, session_id, actor_id, writer_actor_id, event_order);
+                try s.exec("COMMIT");
+                break :blk changed;
+            },
+            .postgres => |*p| p.agentMemoryDeleteOrdered(self.allocator, key, session_id, actor_id, writer_actor_id, event_order),
+        };
+    }
+
     pub fn agentMemoryDeleteAll(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
         if (self.agent_memory.isExternal()) return self.agent_memory.deleteAll(key, actor_id, writer_actor_id);
         return self.agentMemoryDeleteAllNative(key, actor_id, writer_actor_id);
@@ -3577,6 +3599,28 @@ pub const Store = struct {
         return switch (self.backend) {
             .sqlite => |*s| s.agentMemoryDeleteAll(key, actor_id, writer_actor_id),
             .postgres => |*p| p.agentMemoryDeleteAll(key, actor_id, writer_actor_id),
+        };
+    }
+
+    fn agentMemoryDeleteAllPrimaryOrdered(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?AgentMemoryEventOrder) !bool {
+        if (event_order == null) return self.agentMemoryDeleteAll(key, actor_id, writer_actor_id);
+        if (self.agent_memory.isExternal()) return self.agent_memory.deleteAllOrdered(key, actor_id, writer_actor_id, runtimeAgentMemoryEventOrder(event_order));
+        return self.agentMemoryDeleteAllNativeOrdered(key, actor_id, writer_actor_id, event_order);
+    }
+
+    fn agentMemoryDeleteAllNativeOrdered(self: *Store, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?AgentMemoryEventOrder) !bool {
+        if (event_order == null) return self.agentMemoryDeleteAllNative(key, actor_id, writer_actor_id);
+        return switch (self.backend) {
+            .sqlite => |*s| blk: {
+                s.tx_mutex.lockUncancelable(compat.io());
+                defer s.tx_mutex.unlock(compat.io());
+                try s.exec("BEGIN IMMEDIATE");
+                errdefer s.exec("ROLLBACK") catch {};
+                const changed = try s.agentMemoryDeleteAllInTxOrdered(key, actor_id, writer_actor_id, event_order);
+                try s.exec("COMMIT");
+                break :blk changed;
+            },
+            .postgres => |*p| p.agentMemoryDeleteAllOrdered(self.allocator, key, actor_id, writer_actor_id, event_order),
         };
     }
 

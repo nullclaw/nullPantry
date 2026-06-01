@@ -12927,6 +12927,54 @@ test "api named runtime feed apply tombstones block stale puts after deletes" {
     try std.testing.expectEqualStrings("404 Not Found", session_after_stale.status);
 }
 
+test "api all-store feed apply tombstones protect native and runtime stores" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory_stores = &.{.{ .name = "scratch", .config = .{ .backend = .memory_lru } }},
+    });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .store = &store,
+        .actor_id = "agent:all-tombstone",
+        .actor_scopes_json = "[\"public\",\"write:public\",\"session:*\",\"write:session:*\",\"actor:agent:all-tombstone\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"delete\",\"export\",\"feed_apply\"]",
+    };
+
+    const scoped_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=all", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"all-tombstone\",\"origin_sequence\":20,\"timestamp_ms\":200,\"payload\":{\"key\":\"all.tombstone.scoped\",\"session_id\":\"s1\",\"content\":\"all scoped live\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", scoped_put.status);
+    const scoped_delete = handleRequest(&ctx, "POST", "/v1/memory/apply?store=all", "{\"event_type\":\"agent_memory.delete\",\"operation\":\"delete\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"all-tombstone\",\"origin_sequence\":21,\"timestamp_ms\":300,\"payload\":{\"key\":\"all.tombstone.scoped\",\"session_id\":\"s1\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", scoped_delete.status);
+    const stale_scoped_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=all", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"all-tombstone\",\"origin_sequence\":19,\"timestamp_ms\":100,\"payload\":{\"key\":\"all.tombstone.scoped\",\"session_id\":\"s1\",\"content\":\"all scoped stale\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", stale_scoped_put.status);
+
+    const native_scoped_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/all.tombstone.scoped?store=native&session_id=s1&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", native_scoped_after_stale.status);
+    const runtime_scoped_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/all.tombstone.scoped?store=scratch&session_id=s1&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", runtime_scoped_after_stale.status);
+
+    const global_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=all", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"all-tombstone\",\"origin_sequence\":30,\"timestamp_ms\":200,\"payload\":{\"key\":\"all.tombstone.all\",\"content\":\"all global live\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", global_put.status);
+    const session_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=all", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"all-tombstone\",\"origin_sequence\":31,\"timestamp_ms\":210,\"payload\":{\"key\":\"all.tombstone.all\",\"session_id\":\"s2\",\"content\":\"all session live\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", session_put.status);
+    const delete_all = handleRequest(&ctx, "POST", "/v1/memory/apply?store=all", "{\"event_type\":\"agent_memory.delete_all\",\"operation\":\"delete_all\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"all-tombstone\",\"origin_sequence\":32,\"timestamp_ms\":300,\"payload\":{\"key\":\"all.tombstone.all\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", delete_all.status);
+    const stale_global_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=all", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"all-tombstone\",\"origin_sequence\":29,\"timestamp_ms\":150,\"payload\":{\"key\":\"all.tombstone.all\",\"content\":\"all global stale\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", stale_global_put.status);
+    const stale_session_put = handleRequest(&ctx, "POST", "/v1/memory/apply?store=all", "{\"event_type\":\"agent_memory.put\",\"object_type\":\"agent_memory\",\"origin_instance_id\":\"all-tombstone\",\"origin_sequence\":28,\"timestamp_ms\":140,\"payload\":{\"key\":\"all.tombstone.all\",\"session_id\":\"s2\",\"content\":\"all session stale\",\"scope\":\"public\"}}", "");
+    try std.testing.expectEqualStrings("200 OK", stale_session_put.status);
+
+    const native_global_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/all.tombstone.all?store=native&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", native_global_after_stale.status);
+    const native_session_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/all.tombstone.all?store=native&session_id=s2&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", native_session_after_stale.status);
+    const runtime_global_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/all.tombstone.all?store=scratch&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", runtime_global_after_stale.status);
+    const runtime_session_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/all.tombstone.all?store=scratch&session_id=s2&scope=public", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", runtime_session_after_stale.status);
+}
+
 test "api memory feed endpoints honor named runtime route selection" {
     var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
         .agent_memory_stores = &.{.{ .name = "scratch", .config = .{ .backend = .memory_lru } }},
