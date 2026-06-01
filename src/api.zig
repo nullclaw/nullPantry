@@ -5983,6 +5983,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
             },
             .input = input,
             .writer_actor_id = event_actor_id,
+            .event_order = event_order,
         }, agent_memory_route) catch |err| {
             if (reserved_event_id) |event_id| {
                 _ = ctx.store.releaseFeedEventReservation(event_id) catch {};
@@ -6017,6 +6018,7 @@ fn applyMemoryEvent(ctx: *Context, body: []const u8, query: []const u8) HttpResp
             .delete_owner_actor_id = agent_memory_delete_actor_id orelse event_actor_id,
             .delete_all = agent_memory_delete_all,
             .writer_actor_id = event_actor_id,
+            .event_order = event_order,
         }, agent_memory_route) catch |err| {
             if (reserved_event_id) |event_id| {
                 _ = ctx.store.releaseFeedEventReservation(event_id) catch {};
@@ -12769,6 +12771,50 @@ test "api nullclaw top-level feed apply does not let older puts regress projecti
     const tie_sequence_current = handleRequest(&ctx, "GET", "/v1/agent-memory/top.order.tie", "", "");
     try std.testing.expectEqualStrings("200 OK", tie_sequence_current.status);
     try std.testing.expect(std.mem.indexOf(u8, tie_sequence_current.body, "z value two") != null);
+}
+
+test "api nullclaw top-level feed apply tombstones block stale puts after deletes" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .store = &store,
+        .actor_id = "agent:nullclaw-tombstone",
+        .actor_scopes_json = "[\"public\",\"write:public\",\"session:*\",\"write:session:*\",\"actor:agent:nullclaw-tombstone\"]",
+        .actor_capabilities_json = "[\"read\",\"write\",\"delete\",\"export\",\"feed_apply\"]",
+    };
+
+    const scoped_put = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-tombstone\",\"origin_sequence\":20,\"timestamp_ms\":200,\"operation\":\"put\",\"key\":\"top.tombstone.scoped\",\"session_id\":\"s1\",\"content\":\"scoped live\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", scoped_put.status);
+    const scoped_delete = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-tombstone\",\"origin_sequence\":21,\"timestamp_ms\":300,\"operation\":\"delete_scoped\",\"key\":\"top.tombstone.scoped\",\"session_id\":\"s1\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", scoped_delete.status);
+    const stale_scoped_put = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-tombstone\",\"origin_sequence\":19,\"timestamp_ms\":100,\"operation\":\"put\",\"key\":\"top.tombstone.scoped\",\"session_id\":\"s1\",\"content\":\"scoped stale\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", stale_scoped_put.status);
+    const scoped_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/top.tombstone.scoped?session_id=s1", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", scoped_after_stale.status);
+
+    const global_put = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-tombstone\",\"origin_sequence\":30,\"timestamp_ms\":200,\"operation\":\"put\",\"key\":\"top.tombstone.all\",\"content\":\"global live\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", global_put.status);
+    const session_put = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-tombstone\",\"origin_sequence\":31,\"timestamp_ms\":210,\"operation\":\"put\",\"key\":\"top.tombstone.all\",\"session_id\":\"s2\",\"content\":\"session live\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", session_put.status);
+    const delete_all = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-tombstone\",\"origin_sequence\":32,\"timestamp_ms\":300,\"operation\":\"delete_all\",\"key\":\"top.tombstone.all\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", delete_all.status);
+    const stale_global_put = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-tombstone\",\"origin_sequence\":29,\"timestamp_ms\":150,\"operation\":\"put\",\"key\":\"top.tombstone.all\",\"content\":\"global stale\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", stale_global_put.status);
+    const stale_session_put = handleRequest(&ctx, "POST", "/v1/agent/memory/apply", "{\"origin_instance_id\":\"nullclaw-tombstone\",\"origin_sequence\":28,\"timestamp_ms\":140,\"operation\":\"put\",\"key\":\"top.tombstone.all\",\"session_id\":\"s2\",\"content\":\"session stale\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", stale_session_put.status);
+
+    const global_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/top.tombstone.all", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", global_after_stale.status);
+    const session_after_stale = handleRequest(&ctx, "GET", "/v1/agent-memory/top.tombstone.all?session_id=s2", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", session_after_stale.status);
+
+    const feed = handleRequest(&ctx, "GET", "/v1/agent/memory/events?after=0&limit=20", "", "");
+    try std.testing.expectEqualStrings("200 OK", feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"origin_sequence\":19") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body, "\"origin_sequence\":32") != null);
 }
 
 test "api nullclaw top-level feed apply accepts lifecycle reducers" {

@@ -5047,6 +5047,7 @@ pub const FeedAgentMemoryApplyInput = struct {
     delete_owner_actor_id: ?[]const u8 = null,
     delete_all: bool = false,
     writer_actor_id: ?[]const u8 = null,
+    event_order: ?AgentMemoryEventOrder = null,
 };
 
 pub const FeedAgentMemoryApplyResult = struct {
@@ -5158,6 +5159,38 @@ fn compareAgentMemoryInputToStoredMetadata(allocator: std.mem.Allocator, input_o
     }
 
     return compareAgentMemoryEventOrder(input_order, existing_timestamp_ms, existing_origin_instance_id, existing_origin_sequence);
+}
+
+fn agentMemoryTombstoneSessionKey(session_id: ?[]const u8) []const u8 {
+    return session_id orelse "__global__";
+}
+
+fn agentMemoryProjectionId(allocator: std.mem.Allocator, actor_id: []const u8, session_id: ?[]const u8, key: []const u8) ![]u8 {
+    var hash_value = std.hash.Wyhash.hash(0, actor_id);
+    hash_value = std.hash.Wyhash.hash(hash_value, session_id orelse "");
+    hash_value = std.hash.Wyhash.hash(hash_value, key);
+    return std.fmt.allocPrint(allocator, "agm_{x}", .{hash_value});
+}
+
+fn ignoredAgentMemoryProjection(allocator: std.mem.Allocator, input: AgentMemoryInput, owner_actor_id: []const u8, writer_actor_id: []const u8) !domain.AgentMemory {
+    const scope = try agentMemoryScope(allocator, owner_actor_id, input.session_id, input.scope);
+    defer allocator.free(scope);
+    const permissions = try agentMemoryPermissions(allocator, owner_actor_id, input.scope, input.permissions_json);
+    defer allocator.free(permissions);
+    const timestamp_ms = if (input.event_order) |event_order| event_order.timestamp_ms else ids.nowMs();
+    return .{
+        .id = try agentMemoryProjectionId(allocator, owner_actor_id, input.session_id, input.key),
+        .key = try allocator.dupe(u8, input.key),
+        .content = try allocator.dupe(u8, input.content),
+        .category = try allocator.dupe(u8, input.category),
+        .timestamp = try std.fmt.allocPrint(allocator, "{d}", .{timestamp_ms}),
+        .session_id = if (input.session_id) |sid| try allocator.dupe(u8, sid) else null,
+        .actor_id = try allocator.dupe(u8, owner_actor_id),
+        .writer_actor_id = try allocator.dupe(u8, writer_actor_id),
+        .scope = try allocator.dupe(u8, scope),
+        .permissions_json = try allocator.dupe(u8, permissions),
+        .status = try allocator.dupe(u8, "ignored"),
+    };
 }
 
 fn appendAgentMemorySlice(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), entries: []domain.AgentMemory) !void {
@@ -5893,6 +5926,8 @@ pub const SQLiteStore = struct {
         try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_memory_key_session_actor ON agent_memory_items(key, coalesce(session_id, ''), actor_id)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_agent_memory_actor_session ON agent_memory_items(actor_id, session_id, timestamp_ms)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_agent_memory_writer ON agent_memory_items(writer_actor_id, timestamp_ms)");
+        try self.exec("CREATE TABLE IF NOT EXISTS agent_memory_tombstones (key TEXT NOT NULL, actor_id TEXT NOT NULL, tombstone_scope TEXT NOT NULL, session_key TEXT NOT NULL, session_id TEXT, timestamp_ms INTEGER NOT NULL, origin_instance_id TEXT NOT NULL, origin_sequence INTEGER NOT NULL, PRIMARY KEY (key, actor_id, tombstone_scope, session_key))");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_agent_memory_tombstones_lookup ON agent_memory_tombstones(key, actor_id, tombstone_scope, session_key)");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (11, 'native_agent_memory', 'np-011-native-agent-memory', strftime('%s','now') * 1000)");
         try self.exec("UPDATE schema_migrations SET name = 'native_agent_memory', checksum = 'np-011-native-agent-memory' WHERE version = 11");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (12, 'context_pack_acl', 'np-012-context-pack-acl', strftime('%s','now') * 1000)");
@@ -6844,9 +6879,9 @@ pub const SQLiteStore = struct {
             entry = saved;
         } else if (input.delete_key) |key| {
             deleted = if (input.delete_all)
-                try self.agentMemoryDeleteAllInTx(key, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id)
+                try self.agentMemoryDeleteAllInTxOrdered(key, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, input.event_order)
             else
-                try self.agentMemoryDeleteInTx(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id);
+                try self.agentMemoryDeleteInTxOrdered(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, input.event_order);
             object_id = key;
         }
 
@@ -9880,7 +9915,8 @@ pub const SQLiteStore = struct {
         const effective_permissions = try agentMemoryPermissions(allocator, owner_actor_id, input.scope, input.permissions_json);
         defer allocator.free(effective_permissions);
         if (try self.agentMemoryEventOrderWouldRegressInTx(allocator, input, owner_actor_id)) {
-            return (try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id)).?;
+            if (try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id)) |entry| return entry;
+            return ignoredAgentMemoryProjection(allocator, input, owner_actor_id, writer_actor_id);
         }
         const existing_content = try self.agentMemoryContentInTx(allocator, input.key, input.session_id, owner_actor_id);
         defer if (existing_content) |content| allocator.free(content);
@@ -9945,6 +9981,7 @@ pub const SQLiteStore = struct {
 
     fn agentMemoryEventOrderWouldRegressInTx(self: *Self, allocator: std.mem.Allocator, input: AgentMemoryInput, owner_actor_id: []const u8) !bool {
         const event_order = input.event_order orelse return false;
+        if (try self.agentMemoryTombstoneBlocksPutInTx(input.key, input.session_id, owner_actor_id, event_order)) return true;
         const stmt = try self.prepare("SELECT ami.timestamp_ms, ami.metadata_json FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.key = ?1 AND ma.status NOT IN ('rejected','deprecated','superseded') AND " ++ sqlite_agent_session_actor_where_ami ++ " ORDER BY ami.timestamp_ms DESC LIMIT 1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, input.key);
@@ -9955,6 +9992,53 @@ pub const SQLiteStore = struct {
         const stored_metadata_json = try columnText(allocator, stmt, 1);
         defer allocator.free(stored_metadata_json);
         return (try compareAgentMemoryInputToStoredMetadata(allocator, event_order, stored_timestamp_ms, stored_metadata_json)) <= 0;
+    }
+
+    fn agentMemoryTombstoneBlocksPutInTx(self: *Self, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, event_order: AgentMemoryEventOrder) !bool {
+        const session_key = agentMemoryTombstoneSessionKey(session_id);
+        const stmt = try self.prepare("SELECT timestamp_ms, origin_instance_id, origin_sequence FROM agent_memory_tombstones WHERE key = ?1 AND actor_id = ?2 AND ((tombstone_scope = 'scoped' AND session_key = ?3) OR (tombstone_scope = 'all' AND session_key = '*'))");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key);
+        bindText(stmt, 2, owner_actor_id);
+        bindText(stmt, 3, session_key);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const stored_timestamp_ms = c.sqlite3_column_int64(stmt, 0);
+            const stored_origin_instance_id = try columnText(self.allocator, stmt, 1);
+            defer self.allocator.free(stored_origin_instance_id);
+            const stored_origin_sequence = c.sqlite3_column_int64(stmt, 2);
+            if (compareAgentMemoryEventOrder(event_order, stored_timestamp_ms, stored_origin_instance_id, stored_origin_sequence) <= 0) return true;
+        }
+        return false;
+    }
+
+    fn upsertAgentMemoryTombstoneInTx(self: *Self, key: []const u8, owner_actor_id: []const u8, tombstone_scope: []const u8, session_id: ?[]const u8, event_order: AgentMemoryEventOrder) !void {
+        const session_key = if (std.mem.eql(u8, tombstone_scope, "all")) "*" else agentMemoryTombstoneSessionKey(session_id);
+        {
+            const stmt = try self.prepare("SELECT timestamp_ms, origin_instance_id, origin_sequence FROM agent_memory_tombstones WHERE key = ?1 AND actor_id = ?2 AND tombstone_scope = ?3 AND session_key = ?4 LIMIT 1");
+            defer _ = c.sqlite3_finalize(stmt);
+            bindText(stmt, 1, key);
+            bindText(stmt, 2, owner_actor_id);
+            bindText(stmt, 3, tombstone_scope);
+            bindText(stmt, 4, session_key);
+            if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                const stored_timestamp_ms = c.sqlite3_column_int64(stmt, 0);
+                const stored_origin_instance_id = try columnText(self.allocator, stmt, 1);
+                defer self.allocator.free(stored_origin_instance_id);
+                const stored_origin_sequence = c.sqlite3_column_int64(stmt, 2);
+                if (compareAgentMemoryEventOrder(event_order, stored_timestamp_ms, stored_origin_instance_id, stored_origin_sequence) <= 0) return;
+            }
+        }
+        const stmt = try self.prepare("INSERT INTO agent_memory_tombstones (key, actor_id, tombstone_scope, session_key, session_id, timestamp_ms, origin_instance_id, origin_sequence) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(key, actor_id, tombstone_scope, session_key) DO UPDATE SET session_id = excluded.session_id, timestamp_ms = excluded.timestamp_ms, origin_instance_id = excluded.origin_instance_id, origin_sequence = excluded.origin_sequence");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key);
+        bindText(stmt, 2, owner_actor_id);
+        bindText(stmt, 3, tombstone_scope);
+        bindText(stmt, 4, session_key);
+        bindNullableText(stmt, 5, session_id);
+        _ = c.sqlite3_bind_int64(stmt, 6, event_order.timestamp_ms);
+        bindText(stmt, 7, event_order.origin_instance_id);
+        _ = c.sqlite3_bind_int64(stmt, 8, event_order.origin_sequence);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
     }
 
     fn agentMemoryContentInTx(self: *Self, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, owner_actor_id: ?[]const u8) !?[]u8 {
@@ -10253,56 +10337,82 @@ pub const SQLiteStore = struct {
     }
 
     fn agentMemoryDeleteInTx(self: *Self, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        return self.agentMemoryDeleteInTxOrdered(key, session_id, actor_id, writer_actor_id, null);
+    }
+
+    fn agentMemoryDeleteInTxOrdered(self: *Self, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?AgentMemoryEventOrder) !bool {
         const audit_actor = writer_actor_id orelse actor_id;
+        const owner_actor = actor_id orelse return false;
+        if (event_order) |order| {
+            try self.upsertAgentMemoryTombstoneInTx(key, owner_actor, "scoped", session_id, order);
+        }
+        var changed = false;
         {
-            const stmt = try self.prepare("SELECT memory_atom_id,id FROM agent_memory_items WHERE key = ?1 AND " ++ sqlite_agent_session_actor_where);
+            const stmt = try self.prepare("SELECT memory_atom_id,id,timestamp_ms,metadata_json FROM agent_memory_items WHERE key = ?1 AND " ++ sqlite_agent_session_actor_where);
             defer _ = c.sqlite3_finalize(stmt);
             bindText(stmt, 1, key);
             bindNullableText(stmt, 2, session_id);
             bindNullableText(stmt, 3, actor_id);
             while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                if (event_order) |order| {
+                    const stored_timestamp_ms = c.sqlite3_column_int64(stmt, 2);
+                    const stored_metadata_json = try columnText(self.allocator, stmt, 3);
+                    defer self.allocator.free(stored_metadata_json);
+                    if ((try compareAgentMemoryInputToStoredMetadata(self.allocator, order, stored_timestamp_ms, stored_metadata_json)) < 0) continue;
+                }
                 const id_text = try columnText(self.allocator, stmt, 0);
                 defer self.allocator.free(id_text);
                 _ = try self.patchMemoryAtomStatusActor(id_text, "deprecated", false, audit_actor);
                 const item_id = try columnText(self.allocator, stmt, 1);
                 defer self.allocator.free(item_id);
                 try self.deleteFtsRow("agent_memory_fts", item_id);
+                const del = try self.prepare("DELETE FROM agent_memory_items WHERE id = ?1");
+                defer _ = c.sqlite3_finalize(del);
+                bindText(del, 1, item_id);
+                if (c.sqlite3_step(del) != c.SQLITE_DONE) return error.DeleteFailed;
+                changed = c.sqlite3_changes(self.db) > 0 or changed;
             }
         }
-        const del = try self.prepare("DELETE FROM agent_memory_items WHERE key = ?1 AND " ++ sqlite_agent_session_actor_where);
-        defer _ = c.sqlite3_finalize(del);
-        bindText(del, 1, key);
-        bindNullableText(del, 2, session_id);
-        bindNullableText(del, 3, actor_id);
-        if (c.sqlite3_step(del) != c.SQLITE_DONE) return error.DeleteFailed;
-        const changed = c.sqlite3_changes(self.db) > 0;
         if (changed) try self.insertAuditActor("agent_memory.deleted", audit_actor, "agent_memory", key);
         return changed;
     }
 
     fn agentMemoryDeleteAllInTx(self: *Self, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
+        return self.agentMemoryDeleteAllInTxOrdered(key, actor_id, writer_actor_id, null);
+    }
+
+    fn agentMemoryDeleteAllInTxOrdered(self: *Self, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?AgentMemoryEventOrder) !bool {
         const owner_actor = actor_id orelse return false;
         const audit_actor = writer_actor_id orelse owner_actor;
+        if (event_order) |order| {
+            try self.upsertAgentMemoryTombstoneInTx(key, owner_actor, "all", null, order);
+        }
+        var changed = false;
         {
-            const stmt = try self.prepare("SELECT memory_atom_id,id FROM agent_memory_items WHERE key = ?1 AND actor_id = ?2");
+            const stmt = try self.prepare("SELECT memory_atom_id,id,timestamp_ms,metadata_json FROM agent_memory_items WHERE key = ?1 AND actor_id = ?2");
             defer _ = c.sqlite3_finalize(stmt);
             bindText(stmt, 1, key);
             bindText(stmt, 2, owner_actor);
             while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                if (event_order) |order| {
+                    const stored_timestamp_ms = c.sqlite3_column_int64(stmt, 2);
+                    const stored_metadata_json = try columnText(self.allocator, stmt, 3);
+                    defer self.allocator.free(stored_metadata_json);
+                    if ((try compareAgentMemoryInputToStoredMetadata(self.allocator, order, stored_timestamp_ms, stored_metadata_json)) < 0) continue;
+                }
                 const id_text = try columnText(self.allocator, stmt, 0);
                 defer self.allocator.free(id_text);
                 _ = try self.patchMemoryAtomStatusActor(id_text, "deprecated", false, audit_actor);
                 const item_id = try columnText(self.allocator, stmt, 1);
                 defer self.allocator.free(item_id);
                 try self.deleteFtsRow("agent_memory_fts", item_id);
+                const del = try self.prepare("DELETE FROM agent_memory_items WHERE id = ?1");
+                defer _ = c.sqlite3_finalize(del);
+                bindText(del, 1, item_id);
+                if (c.sqlite3_step(del) != c.SQLITE_DONE) return error.DeleteFailed;
+                changed = c.sqlite3_changes(self.db) > 0 or changed;
             }
         }
-        const del = try self.prepare("DELETE FROM agent_memory_items WHERE key = ?1 AND actor_id = ?2");
-        defer _ = c.sqlite3_finalize(del);
-        bindText(del, 1, key);
-        bindText(del, 2, owner_actor);
-        if (c.sqlite3_step(del) != c.SQLITE_DONE) return error.DeleteFailed;
-        const changed = c.sqlite3_changes(self.db) > 0;
         if (changed) try self.insertAuditActor("agent_memory.deleted_all", audit_actor, "agent_memory", key);
         return changed;
     }
@@ -11248,6 +11358,18 @@ pub const PostgresStore = struct {
             \\CREATE UNIQUE INDEX IF NOT EXISTS agent_memory_key_session_actor_idx ON agent_memory_items(key, coalesce(session_id, ''), actor_id);
             \\CREATE INDEX IF NOT EXISTS agent_memory_actor_session_idx ON agent_memory_items(actor_id, session_id, timestamp_ms);
             \\CREATE INDEX IF NOT EXISTS agent_memory_writer_idx ON agent_memory_items(writer_actor_id, timestamp_ms);
+            \\CREATE TABLE IF NOT EXISTS agent_memory_tombstones (
+            \\  key text NOT NULL,
+            \\  actor_id text NOT NULL,
+            \\  tombstone_scope text NOT NULL,
+            \\  session_key text NOT NULL,
+            \\  session_id text,
+            \\  timestamp_ms bigint NOT NULL,
+            \\  origin_instance_id text NOT NULL,
+            \\  origin_sequence bigint NOT NULL,
+            \\  PRIMARY KEY (key, actor_id, tombstone_scope, session_key)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS agent_memory_tombstones_lookup_idx ON agent_memory_tombstones(key, actor_id, tombstone_scope, session_key);
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (11, 'native_agent_memory', 'np-011-native-agent-memory', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
             \\UPDATE schema_migrations SET name = 'native_agent_memory', checksum = 'np-011-native-agent-memory' WHERE version = 11;
             \\INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (12, 'context_pack_acl', 'np-012-context-pack-acl', (extract(epoch from clock_timestamp()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
@@ -11977,9 +12099,9 @@ pub const PostgresStore = struct {
             entry = saved;
         } else if (input.delete_key) |key| {
             deleted = if (input.delete_all)
-                try self.agentMemoryDeleteAll(key, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id)
+                try self.agentMemoryDeleteAllOrdered(allocator, key, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, input.event_order)
             else
-                try self.agentMemoryDelete(key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id);
+                try self.agentMemoryDeleteOrdered(allocator, key, input.delete_session_id, input.delete_owner_actor_id, input.writer_actor_id orelse input.event.actor_id, input.event_order);
             object_id = key;
         }
 
@@ -13828,7 +13950,8 @@ pub const PostgresStore = struct {
         const owner_actor_id = try requiredActorId(input.actor_id);
         const writer_actor_id = input.writer_actor_id orelse owner_actor_id;
         if (try self.agentMemoryEventOrderWouldRegress(allocator, input, owner_actor_id)) {
-            return (try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id)).?;
+            if (try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id)) |entry| return entry;
+            return ignoredAgentMemoryProjection(allocator, input, owner_actor_id, writer_actor_id);
         }
         var existing = try self.agentMemoryGet(allocator, input.key, input.session_id, owner_actor_id);
         defer if (existing) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
@@ -13905,6 +14028,7 @@ pub const PostgresStore = struct {
 
     fn agentMemoryEventOrderWouldRegress(self: *PostgresStore, allocator: std.mem.Allocator, input: AgentMemoryInput, owner_actor_id: []const u8) !bool {
         const event_order = input.event_order orelse return false;
+        if (try self.agentMemoryTombstoneBlocksPut(allocator, input.key, input.session_id, owner_actor_id, event_order)) return true;
         const parsed = try self.queryRowParamsJson(
             allocator,
             "SELECT ami.timestamp_ms,ami.metadata_json FROM agent_memory_items ami JOIN memory_atoms ma ON ma.id = ami.memory_atom_id WHERE ami.key = $1 AND (($2::text IS NULL AND ami.session_id IS NULL) OR ami.session_id = $2) AND ami.actor_id = $3 AND ma.status NOT IN ('rejected','deprecated','superseded') ORDER BY ami.timestamp_ms DESC LIMIT 1",
@@ -13916,6 +14040,51 @@ pub const PostgresStore = struct {
         const stored_metadata_json = try rawJsonField(allocator, parsed.value.object, "metadata_json", "{}");
         defer allocator.free(stored_metadata_json);
         return (try compareAgentMemoryInputToStoredMetadata(allocator, event_order, stored_timestamp_ms, stored_metadata_json)) <= 0;
+    }
+
+    fn agentMemoryTombstoneBlocksPut(self: *PostgresStore, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, owner_actor_id: []const u8, event_order: AgentMemoryEventOrder) !bool {
+        const session_key = agentMemoryTombstoneSessionKey(session_id);
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT timestamp_ms,origin_instance_id,origin_sequence FROM agent_memory_tombstones WHERE key = $1 AND actor_id = $2 AND ((tombstone_scope = 'scoped' AND session_key = $3) OR (tombstone_scope = 'all' AND session_key = '*'))",
+            &.{ key, owner_actor_id, session_key },
+        );
+        defer parsed.deinit();
+        if (parsed.value != .array) return false;
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            const stored_timestamp_ms = json.intField(item.object, "timestamp_ms") orelse continue;
+            const stored_origin_instance_id = json.stringField(item.object, "origin_instance_id") orelse "";
+            const stored_origin_sequence = json.intField(item.object, "origin_sequence") orelse 0;
+            if (compareAgentMemoryEventOrder(event_order, stored_timestamp_ms, stored_origin_instance_id, stored_origin_sequence) <= 0) return true;
+        }
+        return false;
+    }
+
+    fn upsertAgentMemoryTombstone(self: *PostgresStore, allocator: std.mem.Allocator, key: []const u8, owner_actor_id: []const u8, tombstone_scope: []const u8, session_id: ?[]const u8, event_order: AgentMemoryEventOrder) !void {
+        const session_key = if (std.mem.eql(u8, tombstone_scope, "all")) "*" else agentMemoryTombstoneSessionKey(session_id);
+        const parsed = try self.queryRowParamsJson(
+            allocator,
+            "SELECT timestamp_ms,origin_instance_id,origin_sequence FROM agent_memory_tombstones WHERE key = $1 AND actor_id = $2 AND tombstone_scope = $3 AND session_key = $4 LIMIT 1",
+            &.{ key, owner_actor_id, tombstone_scope, session_key },
+        );
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            const stored_timestamp_ms = json.intField(parsed.value.object, "timestamp_ms") orelse 0;
+            const stored_origin_instance_id = json.stringField(parsed.value.object, "origin_instance_id") orelse "";
+            const stored_origin_sequence = json.intField(parsed.value.object, "origin_sequence") orelse 0;
+            if (compareAgentMemoryEventOrder(event_order, stored_timestamp_ms, stored_origin_instance_id, stored_origin_sequence) <= 0) return;
+        }
+        const timestamp_text = try std.fmt.allocPrint(allocator, "{d}", .{event_order.timestamp_ms});
+        defer allocator.free(timestamp_text);
+        const origin_sequence_text = try std.fmt.allocPrint(allocator, "{d}", .{event_order.origin_sequence});
+        defer allocator.free(origin_sequence_text);
+        try self.runParams(
+            allocator,
+            "INSERT INTO agent_memory_tombstones (key,actor_id,tombstone_scope,session_key,session_id,timestamp_ms,origin_instance_id,origin_sequence) VALUES ($1,$2,$3,$4,$5,$6::bigint,$7,$8::bigint) " ++
+                "ON CONFLICT (key, actor_id, tombstone_scope, session_key) DO UPDATE SET session_id = excluded.session_id, timestamp_ms = excluded.timestamp_ms, origin_instance_id = excluded.origin_instance_id, origin_sequence = excluded.origin_sequence",
+            &.{ key, owner_actor_id, tombstone_scope, session_key, session_id, timestamp_text, event_order.origin_instance_id, origin_sequence_text },
+        );
     }
 
     pub fn agentMemoryGet(self: *PostgresStore, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8) !?domain.AgentMemory {
@@ -14109,6 +14278,31 @@ pub const PostgresStore = struct {
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
     }
 
+    fn agentMemoryDeleteOrdered(self: *PostgresStore, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?AgentMemoryEventOrder) !bool {
+        const order = event_order orelse return self.agentMemoryDelete(key, session_id, actor_id, writer_actor_id);
+        const owner_actor = actor_id orelse return false;
+        try self.upsertAgentMemoryTombstone(allocator, key, owner_actor, "scoped", session_id, order);
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT session_id,timestamp_ms,metadata_json FROM agent_memory_items WHERE key = $1 AND (($2::text IS NULL AND session_id IS NULL) OR session_id = $2) AND actor_id = $3",
+            &.{ key, session_id, owner_actor },
+        );
+        defer parsed.deinit();
+        var changed = false;
+        if (parsed.value == .array) {
+            for (parsed.value.array.items) |item| {
+                if (item != .object) continue;
+                const stored_timestamp_ms = json.intField(item.object, "timestamp_ms") orelse continue;
+                const stored_metadata_json = try rawJsonField(allocator, item.object, "metadata_json", "{}");
+                defer allocator.free(stored_metadata_json);
+                if ((try compareAgentMemoryInputToStoredMetadata(allocator, order, stored_timestamp_ms, stored_metadata_json)) < 0) continue;
+                const row_session_id = json.nullableStringField(item.object, "session_id");
+                changed = (try self.agentMemoryDelete(key, row_session_id, owner_actor, writer_actor_id)) or changed;
+            }
+        }
+        return changed;
+    }
+
     pub fn agentMemoryDeleteAll(self: *PostgresStore, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8) !bool {
         const owner_actor = actor_id orelse return false;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -14126,6 +14320,31 @@ pub const PostgresStore = struct {
             &.{ key, owner_actor, writer_actor_id orelse owner_actor },
         );
         return (std.fmt.parseInt(usize, text, 10) catch 0) > 0;
+    }
+
+    fn agentMemoryDeleteAllOrdered(self: *PostgresStore, allocator: std.mem.Allocator, key: []const u8, actor_id: ?[]const u8, writer_actor_id: ?[]const u8, event_order: ?AgentMemoryEventOrder) !bool {
+        const order = event_order orelse return self.agentMemoryDeleteAll(key, actor_id, writer_actor_id);
+        const owner_actor = actor_id orelse return false;
+        try self.upsertAgentMemoryTombstone(allocator, key, owner_actor, "all", null, order);
+        const parsed = try self.queryArrayParamsJson(
+            allocator,
+            "SELECT session_id,timestamp_ms,metadata_json FROM agent_memory_items WHERE key = $1 AND actor_id = $2",
+            &.{ key, owner_actor },
+        );
+        defer parsed.deinit();
+        var changed = false;
+        if (parsed.value == .array) {
+            for (parsed.value.array.items) |item| {
+                if (item != .object) continue;
+                const stored_timestamp_ms = json.intField(item.object, "timestamp_ms") orelse continue;
+                const stored_metadata_json = try rawJsonField(allocator, item.object, "metadata_json", "{}");
+                defer allocator.free(stored_metadata_json);
+                if ((try compareAgentMemoryInputToStoredMetadata(allocator, order, stored_timestamp_ms, stored_metadata_json)) < 0) continue;
+                const row_session_id = json.nullableStringField(item.object, "session_id");
+                changed = (try self.agentMemoryDelete(key, row_session_id, owner_actor, writer_actor_id)) or changed;
+            }
+        }
+        return changed;
     }
 
     pub fn patchAgentMemoryStatus(self: *PostgresStore, key: []const u8, session_id: ?[]const u8, actor_id: ?[]const u8, status: []const u8, writer_actor_id: ?[]const u8) !bool {
