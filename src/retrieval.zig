@@ -128,24 +128,35 @@ pub fn rerankByQuality(allocator: std.mem.Allocator, items: []const RankedItem, 
 }
 
 pub fn mmrSelect(allocator: std.mem.Allocator, query_embedding: []const f32, candidates: []const MmrCandidate, lambda: f64, limit: usize) ![]RankedItem {
+    if (limit == 0 or candidates.len == 0) return allocator.alloc(RankedItem, 0);
+    const result_limit = @min(limit, candidates.len);
+    const clamped_lambda = if (!std.math.isFinite(lambda))
+        0.72
+    else
+        @max(0.0, @min(1.0, lambda));
+
+    const relevance_scores = try mmrRelevanceScores(allocator, query_embedding, candidates);
+    defer allocator.free(relevance_scores);
+
     var selected_indices: std.ArrayListUnmanaged(usize) = .empty;
     defer selected_indices.deinit(allocator);
+    var selected_scores: std.ArrayListUnmanaged(f64) = .empty;
+    defer selected_scores.deinit(allocator);
     var used = try allocator.alloc(bool, candidates.len);
     defer allocator.free(used);
     @memset(used, false);
 
-    while (selected_indices.items.len < limit and selected_indices.items.len < candidates.len) {
+    while (selected_indices.items.len < result_limit) {
         var best_idx: ?usize = null;
-        var best_score: f64 = -999999;
+        var best_score: f64 = -std.math.inf(f64);
         for (candidates, 0..) |candidate, i| {
             if (used[i]) continue;
             var max_selected_similarity: f64 = 0;
             for (selected_indices.items) |selected_idx| {
                 max_selected_similarity = @max(max_selected_similarity, vector.cosine(candidate.embedding, candidates[selected_idx].embedding));
             }
-            const relevance = @as(f64, vector.cosine(query_embedding, candidate.embedding));
-            const mmr_score = lambda * relevance + (1.0 - lambda) * candidate.score - (1.0 - lambda) * max_selected_similarity;
-            if (best_idx == null or mmr_score > best_score) {
+            const mmr_score = clamped_lambda * relevance_scores[i] - (1.0 - clamped_lambda) * max_selected_similarity;
+            if (best_idx == null or betterMmrCandidate(mmr_score, candidate, best_score, candidates[best_idx.?])) {
                 best_idx = i;
                 best_score = mmr_score;
             }
@@ -153,13 +164,51 @@ pub fn mmrSelect(allocator: std.mem.Allocator, query_embedding: []const f32, can
         const idx = best_idx orelse break;
         used[idx] = true;
         try selected_indices.append(allocator, idx);
+        try selected_scores.append(allocator, best_score);
     }
 
     var out = try allocator.alloc(RankedItem, selected_indices.items.len);
     for (selected_indices.items, 0..) |idx, i| {
-        out[i] = .{ .id = candidates[idx].id, .score = candidates[idx].score };
+        out[i] = .{ .id = candidates[idx].id, .score = selected_scores.items[i] };
     }
     return out;
+}
+
+fn mmrRelevanceScores(allocator: std.mem.Allocator, query_embedding: []const f32, candidates: []const MmrCandidate) ![]f64 {
+    var min_score: f64 = std.math.inf(f64);
+    var max_score: f64 = -std.math.inf(f64);
+    for (candidates) |candidate| {
+        if (!std.math.isFinite(candidate.score)) continue;
+        min_score = @min(min_score, candidate.score);
+        max_score = @max(max_score, candidate.score);
+    }
+    const has_finite_scores = std.math.isFinite(min_score) and std.math.isFinite(max_score);
+    const score_range = if (has_finite_scores) max_score - min_score else 0;
+
+    const out = try allocator.alloc(f64, candidates.len);
+    errdefer allocator.free(out);
+    for (candidates, 0..) |candidate, i| {
+        const normalized_score = if (has_finite_scores and score_range > 0 and std.math.isFinite(candidate.score))
+            (candidate.score - min_score) / score_range
+        else if (std.math.isFinite(candidate.score))
+            @as(f64, 1.0)
+        else
+            @as(f64, 0.0);
+        const semantic_relevance = if (query_embedding.len > 0 and candidate.embedding.len == query_embedding.len)
+            @as(f64, vector.cosine(query_embedding, candidate.embedding))
+        else
+            normalized_score;
+        out[i] = (0.72 * semantic_relevance) + (0.28 * normalized_score);
+    }
+    return out;
+}
+
+fn betterMmrCandidate(candidate_mmr: f64, candidate: MmrCandidate, best_mmr: f64, best: MmrCandidate) bool {
+    if (candidate_mmr > best_mmr) return true;
+    if (candidate_mmr < best_mmr) return false;
+    if (candidate.score > best.score) return true;
+    if (candidate.score < best.score) return false;
+    return std.mem.order(u8, candidate.id, best.id) == .lt;
 }
 
 const QueryExpansion = struct {
@@ -870,12 +919,30 @@ test "retrieval temporal decay lowers old scores" {
 test "retrieval MMR diversifies selections" {
     const candidates = [_]MmrCandidate{
         .{ .id = "a", .score = 1, .embedding = &[_]f32{ 1, 0 } },
-        .{ .id = "b", .score = 0.9, .embedding = &[_]f32{ 1, 0 } },
+        .{ .id = "b", .score = 0.99, .embedding = &[_]f32{ 1, 0 } },
         .{ .id = "c", .score = 0.8, .embedding = &[_]f32{ 0, 1 } },
     };
     const selected = try mmrSelect(std.testing.allocator, &[_]f32{ 1, 0 }, &candidates, 0.5, 2);
     defer std.testing.allocator.free(selected);
     try std.testing.expectEqual(@as(usize, 2), selected.len);
+    try std.testing.expectEqualStrings("a", selected[0].id);
+    try std.testing.expectEqualStrings("c", selected[1].id);
+    try std.testing.expect(selected[0].score != candidates[0].score);
+    try std.testing.expect(selected[1].score != candidates[2].score);
+}
+
+test "retrieval MMR is deterministic for score ties and zero limits" {
+    const empty = try mmrSelect(std.testing.allocator, &[_]f32{ 1, 0 }, &[_]MmrCandidate{}, 0.5, 10);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    const candidates = [_]MmrCandidate{
+        .{ .id = "b", .score = 1, .embedding = &[_]f32{ 1, 0 } },
+        .{ .id = "a", .score = 1, .embedding = &[_]f32{ 1, 0 } },
+    };
+    const selected = try mmrSelect(std.testing.allocator, &[_]f32{ 1, 0 }, &candidates, std.math.nan(f64), 1);
+    defer std.testing.allocator.free(selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
     try std.testing.expectEqualStrings("a", selected[0].id);
 }
 
