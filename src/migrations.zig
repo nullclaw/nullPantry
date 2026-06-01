@@ -170,6 +170,17 @@ pub const sqlite_schema =
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_vector_chunks_object ON vector_chunks(object_type, object_id);
     \\CREATE INDEX IF NOT EXISTS idx_vector_chunks_scope ON vector_chunks(scope);
+    \\CREATE TABLE IF NOT EXISTS embedding_cache (
+    \\  cache_key TEXT PRIMARY KEY,
+    \\  provider TEXT NOT NULL,
+    \\  model TEXT NOT NULL DEFAULT '',
+    \\  dimensions INTEGER NOT NULL,
+    \\  embedding_json TEXT NOT NULL,
+    \\  created_at_ms INTEGER NOT NULL,
+    \\  accessed_at_ms INTEGER NOT NULL,
+    \\  hit_count INTEGER NOT NULL DEFAULT 0
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_embedding_cache_accessed ON embedding_cache(accessed_at_ms);
     \\CREATE TABLE IF NOT EXISTS vector_outbox (
     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
     \\  action TEXT NOT NULL,
@@ -545,6 +556,17 @@ pub const postgres_schema =
     \\CREATE INDEX IF NOT EXISTS vector_chunks_object_idx ON vector_chunks(object_type, object_id);
     \\CREATE INDEX IF NOT EXISTS vector_chunks_scope_idx ON vector_chunks(scope);
     \\CREATE INDEX IF NOT EXISTS vector_chunks_embedding_1536_idx ON vector_chunks USING ivfflat ((embedding::vector(1536)) vector_cosine_ops) WHERE dimensions = 1536;
+    \\CREATE TABLE IF NOT EXISTS embedding_cache (
+    \\  cache_key text PRIMARY KEY,
+    \\  provider text NOT NULL,
+    \\  model text NOT NULL DEFAULT '',
+    \\  dimensions bigint NOT NULL,
+    \\  embedding_json jsonb NOT NULL,
+    \\  created_at_ms bigint NOT NULL,
+    \\  accessed_at_ms bigint NOT NULL,
+    \\  hit_count bigint NOT NULL DEFAULT 0
+    \\);
+    \\CREATE INDEX IF NOT EXISTS embedding_cache_accessed_idx ON embedding_cache(accessed_at_ms);
     \\CREATE TABLE IF NOT EXISTS vector_outbox (
     \\  id bigserial PRIMARY KEY,
     \\  action text NOT NULL,

@@ -31,6 +31,7 @@ const storage_routes = @import("storage_route.zig");
 const kg_compat = @import("kg_compat.zig");
 
 const nullclaw_agent_memory_projection = "agent_memory";
+const default_embedding_cache_max_entries: usize = 10_000;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -252,6 +253,10 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return semanticCacheStats(ctx);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "semantic-cache") and eql(seg3, "clear") and is_post) {
         return semanticCacheClear(ctx, body);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "embedding-cache") and eql(seg3, "stats") and (is_get or is_post)) {
+        return embeddingCacheStats(ctx);
+    } else if (eql(seg1, "lifecycle") and eql(seg2, "embedding-cache") and eql(seg3, "clear") and is_post) {
+        return embeddingCacheClear(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "hygiene-report") and is_post) {
         return lifecycleHygieneReport(ctx, body);
     } else if (eql(seg1, "lifecycle") and eql(seg2, "hygiene") and is_post) {
@@ -2640,6 +2645,8 @@ fn openApiDocument(ctx: *Context) HttpResponse {
         .{ .path = "/lifecycle/semantic-cache/search", .post = "searchSemanticCache" },
         .{ .path = "/lifecycle/semantic-cache/stats", .get = "semanticCacheStats", .post = "semanticCacheStats" },
         .{ .path = "/lifecycle/semantic-cache/clear", .post = "clearSemanticCache" },
+        .{ .path = "/lifecycle/embedding-cache/stats", .get = "embeddingCacheStats", .post = "embeddingCacheStats" },
+        .{ .path = "/lifecycle/embedding-cache/clear", .post = "clearEmbeddingCache" },
         .{ .path = "/lifecycle/hygiene-report", .post = "createHygieneReport" },
         .{ .path = "/lifecycle/hygiene", .post = "runHygiene" },
         .{ .path = "/lifecycle/summarize", .post = "summarize" },
@@ -2682,7 +2689,7 @@ fn appendOpenApiOperation(allocator: std.mem.Allocator, out: *std.ArrayListUnman
 
 fn capabilities(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime","hybrid-sqlite-markdown"],"agent_memory_backends":["none","native","memory","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","agent_session_terminate","nullclaw_api_memory_adapter","bootstrap_prompts","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_stats","memory_count","memory_list","memory_search","memory_get","memory_store","memory_update","memory_delete","memory_export_jsonl","memory_hygiene_report","memory_reindex","memory_drain_outbox","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","jsonl_export","hygiene_report","cache_stats","cache_clear","semantic_cache_stats","semantic_cache_clear","lifecycle_migrate","lifecycle_rollout","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","embedding_mmr","llm_rerank","candidate_id_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
+        \\{"service":"nullpantry","headless":true,"product":["knowledge_base","long_term_memory","rag","knowledge_graph","context_serving_api"],"consumers":["agents","nullhub","nulldesk"],"primitives":["source","artifact","memory_atom","entity","relation","context_pack","agent_memory","space","policy_scope"],"content_types":["page","spec","decision","runbook","recipe","meeting_note","research","incident_report","memory_item"],"storage":["sqlite","postgres-libpq-runtime","hybrid-sqlite-markdown"],"agent_memory_backends":["none","native","memory","memory_lru","redis-resp-runtime","api-http-runtime"],"agent_memory_routing":["primary","native","runtime","named","subset","all"],"knowledge_storage_routing":["canonical","runtime_mirror","named","subset","all"],"vector_backends":["local","postgres-pgvector","qdrant-http-runtime","lancedb-sdk-runtime","lancedb-http-runtime"],"projection_backends":["lucid-cli-runtime"],"analytics_backends":["clickhouse-http-runtime"],"apis":["agent_memory","agent_sessions","agent_session_terminate","nullclaw_api_memory_adapter","bootstrap_prompts","named_agent_memory_stores","remember","search","ask","get_context_pack","create_source","create_space","upsert_policy_scope","extract_memory","create_decision","link","forget","verify","mark_stale","ingest","connector_ingest","connector_cursor","qmd_connector","qmd_session_export","qmd_session_prune","markdown_import","markdown_import_directory","markdown_export","markdown_export_directory","graph_schema","graph_query","graph_neighbors","graph_path","jobs","workers","conflicts","memory_feed","memory_status","memory_stats","memory_count","memory_list","memory_search","memory_get","memory_store","memory_update","memory_delete","memory_export_jsonl","memory_hygiene_report","memory_reindex","memory_drain_outbox","memory_compact","memory_checkpoint","vector_status","vector_embed","vector_upsert","vector_search","vector_delete","vector_rebuild","vector_reconcile","vector_outbox","snapshot_export","snapshot_import","snapshot_hydrate","jsonl_export","hygiene_report","cache_stats","cache_clear","semantic_cache_stats","semantic_cache_clear","embedding_cache_stats","embedding_cache_clear","lifecycle_migrate","lifecycle_rollout","lucid_projection_status","lucid_projection_rebuild","analytics_export","analytics_status","analytics_query"],"providers":["local-deterministic","openai-compatible-embeddings","gemini-embeddings","voyage-embeddings","ollama-embeddings","embedding-fallback-chain","openai-compatible-chat","ollama-compatible"],"retrieval":["acl","fts","vector","adaptive_retrieval","entity_graph","graph_schema","graph_query","graph_neighbors","graph_path","named_runtime_memory","qmd_canonical_ingest","qmd_agent_session_export","lucid_projection","rrf","min_relevance","temporal_decay","embedding_mmr","llm_rerank","candidate_id_rerank","citations","conflict_warnings"],"permissions":["read","write","propose","verify","delete","export","feed_apply"],"auth":["single_bearer_token","token_principal_registry","request_scope_narrowing"]}
     );
 }
 
@@ -3612,7 +3619,7 @@ fn listPolicyScopes(ctx: *Context, query: []const u8) HttpResponse {
 
 fn sdkManifest(ctx: *Context) HttpResponse {
     return ok(ctx,
-        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_memory_events":"GET /v1/agent/memory/events","nullclaw_api_memory_status":"GET /v1/agent/memory/status","nullclaw_api_memory_stats":"GET /v1/agent/memory/stats","nullclaw_api_memory_reindex":"POST /v1/agent/memory/reindex","nullclaw_api_memory_drain_outbox":"POST /v1/agent/memory/drain-outbox","nullclaw_api_memory_compact":"POST /v1/agent/memory/compact","nullclaw_api_memory_checkpoint":"GET|POST /v1/agent/memory/checkpoint","nullclaw_api_memory_apply":"POST /v1/agent/memory/apply","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_session_terminate":"DELETE /v1/agent/sessions/{id}|POST /v1/agent/sessions/{id}/terminate","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_terminate":"DELETE /v1/agent-sessions/{id}|POST /v1/agent-sessions/{id}/terminate","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","memory_stats":"GET /v1/lifecycle/stats|GET /v1/memory/stats|GET /v1/agent/memory/stats","memory_count":"GET /v1/memory/count","memory_list":"GET /v1/memory/list","memory_search":"POST /v1/memory/search","memory_get":"GET /v1/memory/get/{key}","memory_store":"POST|PUT /v1/memory/store/{key}|POST /v1/memory/store","memory_update":"POST|PUT /v1/memory/update/{key}|POST /v1/memory/update","memory_delete":"DELETE /v1/memory/delete/{key}|DELETE /v1/memory/forget/{key}|POST /v1/memory/delete|POST /v1/memory/forget","memory_export_jsonl":"POST /v1/memory/export-jsonl","memory_hygiene_report":"POST /v1/memory/hygiene-report","memory_reindex":"POST /v1/memory/reindex|POST /v1/agent/memory/reindex","memory_drain_outbox":"POST /v1/memory/drain-outbox|POST /v1/agent/memory/drain-outbox","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","cache_stats":"GET|POST /v1/lifecycle/cache/stats","cache_clear":"POST /v1/lifecycle/cache/clear","semantic_cache_stats":"GET|POST /v1/lifecycle/semantic-cache/stats","semantic_cache_clear":"POST /v1/lifecycle/semantic-cache/clear","lifecycle_migrate":"POST /v1/lifecycle/migrate","lifecycle_rollout":"POST /v1/lifecycle/rollout","jsonl_export":"POST /v1/lifecycle/export-jsonl","hygiene_report":"POST /v1/lifecycle/hygiene-report","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
+        \\{"name":"nullpantry","version":"v1","base_path":"/v1","methods":{"agent_memory_put":"PUT /v1/agent-memory/{key}","agent_memory_get":"GET /v1/agent-memory/{key}","agent_memory_list":"GET /v1/agent-memory","agent_memory_search":"POST /v1/agent-memory/search","agent_memory_delete":"DELETE /v1/agent-memory/{key}","agent_memory_count":"GET /v1/agent-memory/count","nullclaw_api_memory_put":"PUT /v1/agent/memories/{key}","nullclaw_api_memory_get":"GET /v1/agent/memories/{key}","nullclaw_api_memory_list":"GET /v1/agent/memories","nullclaw_api_memory_search":"POST /v1/agent/memories/search","nullclaw_api_memory_count":"GET /v1/agent/memories/count","nullclaw_api_memory_events":"GET /v1/agent/memory/events","nullclaw_api_memory_status":"GET /v1/agent/memory/status","nullclaw_api_memory_stats":"GET /v1/agent/memory/stats","nullclaw_api_memory_reindex":"POST /v1/agent/memory/reindex","nullclaw_api_memory_drain_outbox":"POST /v1/agent/memory/drain-outbox","nullclaw_api_memory_compact":"POST /v1/agent/memory/compact","nullclaw_api_memory_checkpoint":"GET|POST /v1/agent/memory/checkpoint","nullclaw_api_memory_apply":"POST /v1/agent/memory/apply","nullclaw_api_sessions":"GET|POST|DELETE /v1/agent/sessions/{id}/messages","nullclaw_api_session_terminate":"DELETE /v1/agent/sessions/{id}|POST /v1/agent/sessions/{id}/terminate","nullclaw_api_usage":"GET|PUT|DELETE /v1/agent/sessions/{id}/usage","nullclaw_api_history":"GET /v1/agent/history/{id}","bootstrap_prompts_list":"GET /v1/bootstrap/prompts","bootstrap_prompt_get":"GET /v1/bootstrap/prompts/{filename}","bootstrap_prompt_put":"PUT /v1/bootstrap/prompts/{filename}","bootstrap_prompt_delete":"DELETE /v1/bootstrap/prompts/{filename}","bootstrap_prompts_import_directory":"POST /v1/bootstrap/prompts/import-directory","agent_sessions_list":"GET /v1/agent-sessions","agent_session_history":"GET /v1/agent-sessions/{id}","agent_session_terminate":"DELETE /v1/agent-sessions/{id}|POST /v1/agent-sessions/{id}/terminate","agent_session_messages_get":"GET /v1/agent-sessions/{id}/messages","agent_session_messages_post":"POST /v1/agent-sessions/{id}/messages","agent_session_messages_delete":"DELETE /v1/agent-sessions/{id}/messages","agent_session_usage_get":"GET /v1/agent-sessions/{id}/usage","agent_session_usage_put":"PUT /v1/agent-sessions/{id}/usage","agent_session_usage_delete":"DELETE /v1/agent-sessions/{id}/usage","agent_session_auto_saved_delete":"DELETE /v1/agent-sessions/auto-saved?session_id={id}","remember":"POST /v1/remember","search":"POST /v1/search","ask":"POST /v1/ask","get_context_pack":"POST /v1/context-packs","create_source":"POST /v1/sources","create_space":"POST /v1/spaces","upsert_policy_scope":"POST /v1/policy-scopes","extract_memory":"POST /v1/extract-memory","create_decision":"POST /v1/artifacts type=decision","link":"POST /v1/relations","forget":"POST /v1/forget","verify":"POST /v1/verify","mark_stale":"POST /v1/mark-stale","ingest":"POST /v1/ingest","connector_ingest":"POST /v1/connectors/{name}/ingest","connector_cursor":"GET|POST /v1/connectors/{name}/cursor","qmd_session_export":"POST /v1/connectors/qmd/export-sessions","qmd_session_prune":"POST /v1/connectors/qmd/prune-sessions","markdown_import":"POST /v1/markdown/import","markdown_import_directory":"POST /v1/markdown/import-directory","markdown_export":"POST /v1/markdown/export","markdown_export_directory":"POST /v1/markdown/export-directory","graph_schema":"GET /v1/graph/schema","graph_query":"POST /v1/graph/query","graph_neighbors":"POST /v1/graph/neighbors","graph_path":"POST /v1/graph/path","providers":"GET /v1/providers","feed":"GET|POST /v1/memory/feed","events":"GET|POST /v1/memory/events","feed_status":"GET /v1/memory/status","memory_stats":"GET /v1/lifecycle/stats|GET /v1/memory/stats|GET /v1/agent/memory/stats","memory_count":"GET /v1/memory/count","memory_list":"GET /v1/memory/list","memory_search":"POST /v1/memory/search","memory_get":"GET /v1/memory/get/{key}","memory_store":"POST|PUT /v1/memory/store/{key}|POST /v1/memory/store","memory_update":"POST|PUT /v1/memory/update/{key}|POST /v1/memory/update","memory_delete":"DELETE /v1/memory/delete/{key}|DELETE /v1/memory/forget/{key}|POST /v1/memory/delete|POST /v1/memory/forget","memory_export_jsonl":"POST /v1/memory/export-jsonl","memory_hygiene_report":"POST /v1/memory/hygiene-report","memory_reindex":"POST /v1/memory/reindex|POST /v1/agent/memory/reindex","memory_drain_outbox":"POST /v1/memory/drain-outbox|POST /v1/agent/memory/drain-outbox","feed_compact":"POST /v1/memory/compact","checkpoint_export":"GET /v1/memory/checkpoint","checkpoint_restore":"POST /v1/memory/checkpoint","apply":"POST /v1/memory/apply","worker_run":"POST /v1/workers/run","vector_status":"GET /v1/vector/status","vector_embed":"POST /v1/vector/embed","vector_upsert":"POST /v1/vector/upsert","vector_search":"POST /v1/vector/search","vector_delete":"POST /v1/vector/delete","vector_rebuild":"POST /v1/vector/rebuild","vector_reconcile":"POST /v1/vector/reconcile","vector_outbox":"GET /v1/vector/outbox","vector_outbox_run":"POST /v1/vector/outbox/run","lucid_projection_status":"GET /v1/lifecycle/lucid/status","lucid_projection_rebuild":"POST /v1/lifecycle/lucid/rebuild","analytics_status":"GET /v1/lifecycle/analytics/status","analytics_query":"POST /v1/lifecycle/analytics/query","analytics_export":"POST /v1/lifecycle/analytics/export","cache_stats":"GET|POST /v1/lifecycle/cache/stats","cache_clear":"POST /v1/lifecycle/cache/clear","semantic_cache_stats":"GET|POST /v1/lifecycle/semantic-cache/stats","semantic_cache_clear":"POST /v1/lifecycle/semantic-cache/clear","embedding_cache_stats":"GET|POST /v1/lifecycle/embedding-cache/stats","embedding_cache_clear":"POST /v1/lifecycle/embedding-cache/clear","lifecycle_migrate":"POST /v1/lifecycle/migrate","lifecycle_rollout":"POST /v1/lifecycle/rollout","jsonl_export":"POST /v1/lifecycle/export-jsonl","hygiene_report":"POST /v1/lifecycle/hygiene-report","snapshot_export":"POST /v1/lifecycle/snapshot/export","snapshot_import":"POST /v1/lifecycle/snapshot/import","snapshot_hydrate":"POST /v1/lifecycle/snapshot/hydrate"},"headers":{"actor_id":"X-NullPantry-Actor-Id","actor_scopes":"X-NullPantry-Actor-Scopes","actor_capabilities":"X-NullPantry-Actor-Capabilities"},"auth":{"token_principals_env":"NULLPANTRY_TOKEN_PRINCIPALS","note":"token principal scopes/capabilities are authoritative; request headers can only narrow them"}}
     );
 }
 
@@ -3921,7 +3928,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
             const payload = try store_mod.vectorEmbedPayloadJson(ctx.allocator, @intCast(count), chunk_text, scope, permissions_json, heading_path_json, ctx.embedding_model, ctx.embedding_dimensions);
             const outbox_id = try ctx.store.enqueueVectorOutbox(.{ .action = "embed", .object_type = object_type, .object_id = object_id, .payload_json = payload });
             if (!try ctx.store.claimVectorOutboxAs(outbox_id, ctx.actor_id)) return count;
-            const embedding_result = providers.embedText(ctx.allocator, .{
+            const embedding_result = embedTextCached(ctx, .{
                 .provider = ctx.embedding_provider,
                 .base_url = ctx.embedding_base_url,
                 .api_key = ctx.embedding_api_key,
@@ -3931,7 +3938,7 @@ fn upsertAutoVector(ctx: *Context, object_type: []const u8, object_id: []const u
                 .allow_insecure_http = ctx.embedding_allow_insecure_http,
                 .fallbacks = ctx.embedding_fallbacks,
                 .runtime = ctx.provider_runtime,
-            }, chunk_text, ctx.embedding_dimensions) catch {
+            }, chunk_text, ctx.embedding_dimensions, true, default_embedding_cache_max_entries) catch {
                 _ = try ctx.store.finishVectorOutboxAs(outbox_id, "pending", ctx.actor_id);
                 return count;
             };
@@ -4336,7 +4343,8 @@ fn vectorEmbed(ctx: *Context, body: []const u8) HttpResponse {
         .fallbacks = ctx.embedding_fallbacks,
         .runtime = ctx.provider_runtime,
     };
-    const result = providers.embedText(ctx.allocator, cfg, text, @min(dimensions, 4096)) catch return serverError(ctx);
+    const use_cache = json.boolField(obj, "use_embedding_cache") orelse json.boolField(obj, "use_cache") orelse true;
+    const result = embedTextCached(ctx, cfg, text, @min(dimensions, 4096), use_cache, embeddingCacheMaxEntries(obj)) catch return serverError(ctx);
     const embedding_json = @import("vector.zig").embeddingToJson(ctx.allocator, result.embedding) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"provider\":") catch return serverError(ctx);
@@ -4348,6 +4356,75 @@ fn vectorEmbed(ctx: *Context, body: []const u8) HttpResponse {
     out.appendSlice(ctx.allocator, embedding_json) catch return serverError(ctx);
     out.append(ctx.allocator, '}') catch return serverError(ctx);
     return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn embedTextCached(ctx: *Context, cfg: providers.EmbeddingConfig, text: []const u8, fallback_dimensions: usize, use_cache: bool, max_entries: usize) !providers.EmbeddingResult {
+    if (!use_cache) return providers.embedText(ctx.allocator, cfg, text, fallback_dimensions);
+    const cache_key = try embeddingCacheKey(ctx.allocator, cfg, text, fallback_dimensions);
+    const now = ids.nowMs();
+    if (try ctx.store.getEmbeddingCache(ctx.allocator, cache_key, now)) |entry| {
+        return .{
+            .provider = entry.provider,
+            .model = entry.model,
+            .embedding = try vector_mod.embeddingFromJson(ctx.allocator, entry.embedding_json),
+        };
+    }
+    const result = try providers.embedText(ctx.allocator, cfg, text, fallback_dimensions);
+    const embedding_json = try vector_mod.embeddingToJson(ctx.allocator, result.embedding);
+    try ctx.store.putEmbeddingCache(.{
+        .cache_key = cache_key,
+        .provider = result.provider,
+        .model = result.model,
+        .dimensions = result.embedding.len,
+        .embedding_json = embedding_json,
+        .now_ms = now,
+        .max_entries = max_entries,
+    });
+    return result;
+}
+
+fn embeddingCacheKey(allocator: std.mem.Allocator, cfg: providers.EmbeddingConfig, text: []const u8, fallback_dimensions: usize) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    updateEmbeddingEndpointHash(&hasher, cfg.provider.name(), cfg.base_url, cfg.model, cfg.dimensions);
+    updateHashUsize(&hasher, fallback_dimensions);
+    for (cfg.fallbacks) |fallback| {
+        hasher.update("\x1f");
+        updateEmbeddingEndpointHash(&hasher, fallback.provider.name(), fallback.base_url, fallback.model, fallback.dimensions);
+    }
+    hasher.update("\x00");
+    hasher.update(text);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const hex_chars = "0123456789abcdef";
+    var out = try allocator.alloc(u8, 70);
+    @memcpy(out[0..6], "embed:");
+    for (digest, 0..) |byte, i| {
+        out[6 + i * 2] = hex_chars[byte >> 4];
+        out[6 + i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+    return out;
+}
+
+fn updateEmbeddingEndpointHash(hasher: *std.crypto.hash.sha2.Sha256, provider: []const u8, base_url: ?[]const u8, model: ?[]const u8, dimensions: usize) void {
+    hasher.update(provider);
+    hasher.update("\x1e");
+    hasher.update(base_url orelse "");
+    hasher.update("\x1e");
+    hasher.update(model orelse "");
+    hasher.update("\x1e");
+    updateHashUsize(hasher, dimensions);
+}
+
+fn updateHashUsize(hasher: *std.crypto.hash.sha2.Sha256, value: usize) void {
+    var buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
+    hasher.update(text);
+}
+
+fn embeddingCacheMaxEntries(obj: std.json.ObjectMap) usize {
+    const raw = json.intField(obj, "embedding_cache_max_entries") orelse json.intField(obj, "embedding_max_entries") orelse return default_embedding_cache_max_entries;
+    if (raw <= 0) return 0;
+    return @intCast(@min(raw, 1_000_000));
 }
 
 fn vectorStatus(ctx: *Context) HttpResponse {
@@ -8434,6 +8511,24 @@ fn semanticCacheClear(ctx: *Context, body: []const u8) HttpResponse {
     return cacheClearJson(ctx, "semantic", cleared);
 }
 
+fn embeddingCacheStats(ctx: *Context) HttpResponse {
+    if (!hasCapability(ctx, "read")) return forbidden(ctx);
+    const stats = ctx.store.embeddingCacheStats() catch return serverError(ctx);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.print(ctx.allocator, "{{\"cache\":\"embedding\",\"entries\":{d},\"hits\":{d}}}", .{ stats.entries, stats.hits }) catch return serverError(ctx);
+    return .{ .status = "200 OK", .body = out.toOwnedSlice(ctx.allocator) catch return serverError(ctx) };
+}
+
+fn embeddingCacheClear(ctx: *Context, body: []const u8) HttpResponse {
+    if (!hasCapability(ctx, "delete")) return forbidden(ctx);
+    var parsed = parseBody(ctx, body) catch return badJson(ctx);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const cache_key = json.nullableStringField(obj, "key") orelse json.nullableStringField(obj, "cache_key");
+    const cleared = ctx.store.clearEmbeddingCache(.{ .cache_key = cache_key }) catch return serverError(ctx);
+    return cacheClearJson(ctx, "embedding", cleared);
+}
+
 fn cacheStatsJson(ctx: *Context, cache_name: []const u8, stats: store_mod.CacheEntryStats) HttpResponse {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"cache\":") catch return serverError(ctx);
@@ -10964,7 +11059,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
         query_embedding_provider = "adaptive_keyword_only";
     }
     if (use_vector and query.len > 0) {
-        const embedding_result = providers.embedText(ctx.allocator, .{
+        const embedding_result = embedTextCached(ctx, .{
             .provider = ctx.embedding_provider,
             .base_url = ctx.embedding_base_url,
             .api_key = ctx.embedding_api_key,
@@ -10974,7 +11069,7 @@ fn buildSearchInput(ctx: *Context, obj: std.json.ObjectMap, query: []const u8, l
             .allow_insecure_http = ctx.embedding_allow_insecure_http,
             .fallbacks = ctx.embedding_fallbacks,
             .runtime = ctx.provider_runtime,
-        }, query, embedding_dimensions) catch |err| {
+        }, query, embedding_dimensions, json.boolField(obj, "use_embedding_cache") orelse true, embeddingCacheMaxEntries(obj)) catch |err| {
             if (strict_vector) return err;
             use_vector = false;
             query_embedding_provider = "unavailable";
@@ -13606,6 +13701,8 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"clearResponseCache\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"semanticCacheStats\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"clearSemanticCache\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"embeddingCacheStats\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"clearEmbeddingCache\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "created_by_actor_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"operationId\":\"loadAgentSessionMessages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi_resp.body, "\"min_relevance\"") != null);
@@ -13630,6 +13727,8 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"cache_clear\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"semantic_cache_stats\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"semantic_cache_clear\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"embedding_cache_stats\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"embedding_cache_clear\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"lifecycle_migrate\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"min_relevance\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"adaptive_retrieval\"") != null);
@@ -14131,6 +14230,17 @@ test "api vector embed uses configured embedding fallback chain and rejects prov
     try std.testing.expectEqualStrings("200 OK", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"provider\":\"local-deterministic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"dimensions\":5") != null);
+
+    const second = handleRequest(&ctx, "POST", "/v1/vector/embed", "{\"text\":\"fallback provider vector\"}", "");
+    try std.testing.expectEqualStrings("200 OK", second.status);
+    const stats = handleRequest(&ctx, "GET", "/v1/lifecycle/embedding-cache/stats", "", "");
+    try std.testing.expectEqualStrings("200 OK", stats.status);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"cache\":\"embedding\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"entries\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats.body, "\"hits\":1") != null);
+    const clear = handleRequest(&ctx, "POST", "/v1/lifecycle/embedding-cache/clear", "{}", "");
+    try std.testing.expectEqualStrings("200 OK", clear.status);
+    try std.testing.expect(std.mem.indexOf(u8, clear.body, "\"cleared\":1") != null);
 
     const override = handleRequest(&ctx, "POST", "/v1/vector/embed", "{\"text\":\"x\",\"provider\":\"gemini\"}", "");
     try std.testing.expectEqualStrings("400 Bad Request", override.status);

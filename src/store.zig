@@ -1853,6 +1853,34 @@ pub const Store = struct {
         };
     }
 
+    pub fn putEmbeddingCache(self: *Store, input: EmbeddingCacheInput) !void {
+        return switch (self.backend) {
+            .sqlite => |*s| s.putEmbeddingCache(input),
+            .postgres => |*p| p.putEmbeddingCache(input),
+        };
+    }
+
+    pub fn getEmbeddingCache(self: *Store, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64) !?EmbeddingCacheEntry {
+        return switch (self.backend) {
+            .sqlite => |*s| s.getEmbeddingCache(allocator, cache_key, now_ms),
+            .postgres => |*p| p.getEmbeddingCache(allocator, cache_key, now_ms),
+        };
+    }
+
+    pub fn embeddingCacheStats(self: *Store) !EmbeddingCacheStats {
+        return switch (self.backend) {
+            .sqlite => |*s| s.embeddingCacheStats(),
+            .postgres => |*p| p.embeddingCacheStats(),
+        };
+    }
+
+    pub fn clearEmbeddingCache(self: *Store, input: EmbeddingCacheClearInput) !usize {
+        return switch (self.backend) {
+            .sqlite => |*s| s.clearEmbeddingCache(input),
+            .postgres => |*p| p.clearEmbeddingCache(input),
+        };
+    }
+
     pub fn runHygiene(self: *Store, input: HygieneRunInput) !HygieneRunResult {
         return switch (self.backend) {
             .sqlite => |*s| s.runHygiene(input),
@@ -4787,6 +4815,36 @@ pub const CacheEntryStats = struct {
     embedding_entries: usize = 0,
 };
 
+pub const EmbeddingCacheInput = struct {
+    cache_key: []const u8,
+    provider: []const u8,
+    model: []const u8 = "",
+    dimensions: usize,
+    embedding_json: []const u8,
+    now_ms: ?i64 = null,
+    max_entries: usize = 0,
+};
+
+pub const EmbeddingCacheEntry = struct {
+    cache_key: []const u8,
+    provider: []const u8,
+    model: []const u8,
+    dimensions: usize,
+    embedding_json: []const u8,
+    created_at_ms: i64,
+    accessed_at_ms: i64,
+    hit_count: i64 = 0,
+};
+
+pub const EmbeddingCacheStats = struct {
+    entries: usize = 0,
+    hits: i64 = 0,
+};
+
+pub const EmbeddingCacheClearInput = struct {
+    cache_key: ?[]const u8 = null,
+};
+
 pub const SemanticCacheInput = struct {
     cache_key: []const u8,
     query: []const u8,
@@ -5666,6 +5724,8 @@ pub const SQLiteStore = struct {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_session_messages_session_actor ON session_messages(session_id, actor_id, id)");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (2, 'security_and_retrieval_hardening', 'np-002-security-retrieval', strftime('%s','now') * 1000)");
         try self.exec("INSERT OR IGNORE INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (3, 'runtime_lifecycle_cache', 'np-003-runtime-lifecycle-cache', strftime('%s','now') * 1000)");
+        try self.exec("CREATE TABLE IF NOT EXISTS embedding_cache (cache_key TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', dimensions INTEGER NOT NULL, embedding_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL, accessed_at_ms INTEGER NOT NULL, hit_count INTEGER NOT NULL DEFAULT 0)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_embedding_cache_accessed ON embedding_cache(accessed_at_ms)");
         try self.exec("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, job_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', scope TEXT NOT NULL DEFAULT 'workspace', permissions_json TEXT NOT NULL DEFAULT '[]', object_type TEXT NOT NULL DEFAULT '', object_id TEXT NOT NULL DEFAULT '', input_json TEXT NOT NULL DEFAULT '{}', result_json TEXT NOT NULL DEFAULT '{}', error_text TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)");
         if (!try self.columnExists("jobs", "permissions_json")) {
             try self.exec("ALTER TABLE jobs ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '[]'");
@@ -9001,13 +9061,14 @@ pub const SQLiteStore = struct {
         const pending = try self.countVectorOutbox("pending");
         const response_cache = try self.countSql("SELECT COUNT(*) FROM response_cache");
         const semantic_cache = try self.countSql("SELECT COUNT(*) FROM semantic_cache");
+        const embedding_cache = try self.countSql("SELECT COUNT(*) FROM embedding_cache");
         return .{
             .total_memory_atoms = @intCast(total),
             .stale_memory_atoms = @intCast(stale),
             .vector_outbox_pending = pending,
             .lucid_projection_pending = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE job_type = 'lucid_projection' AND (status = 'queued' OR status = 'running')")),
             .lucid_projection_failed = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE job_type = 'lucid_projection' AND status = 'failed'")),
-            .cache_entries = @intCast(response_cache + semantic_cache),
+            .cache_entries = @intCast(response_cache + semantic_cache + embedding_cache),
             .queued_jobs = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE status = 'queued'")),
             .running_jobs = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE status = 'running'")),
             .failed_jobs = @intCast(try self.countSql("SELECT COUNT(*) FROM jobs WHERE status = 'failed'")),
@@ -9280,6 +9341,81 @@ pub const SQLiteStore = struct {
         const changed: usize = @intCast(c.sqlite3_changes(self.db));
         if (changed > 0) try self.insertAuditActor("cache.semantic.clear", input.actor_id, "semantic_cache", input.cache_key orelse input.actor_id);
         return changed;
+    }
+
+    pub fn putEmbeddingCache(self: *Self, input: EmbeddingCacheInput) !void {
+        const parsed_embedding = try vector_mod.embeddingFromJson(self.allocator, input.embedding_json);
+        defer self.allocator.free(parsed_embedding);
+        const now = input.now_ms orelse ids.nowMs();
+        const stmt = try self.prepare("INSERT INTO embedding_cache (cache_key,provider,model,dimensions,embedding_json,created_at_ms,accessed_at_ms,hit_count) VALUES (?1,?2,?3,?4,?5,?6,?6,0) ON CONFLICT(cache_key) DO UPDATE SET provider=excluded.provider, model=excluded.model, dimensions=excluded.dimensions, embedding_json=excluded.embedding_json, created_at_ms=excluded.created_at_ms, accessed_at_ms=excluded.accessed_at_ms, hit_count=0");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, input.cache_key);
+        bindText(stmt, 2, input.provider);
+        bindText(stmt, 3, input.model);
+        _ = c.sqlite3_bind_int64(stmt, 4, @intCast(input.dimensions));
+        bindText(stmt, 5, input.embedding_json);
+        _ = c.sqlite3_bind_int64(stmt, 6, now);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+        try self.evictEmbeddingCacheLru(input.max_entries);
+    }
+
+    pub fn getEmbeddingCache(self: *Self, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64) !?EmbeddingCacheEntry {
+        const stmt = try self.prepare("SELECT cache_key,provider,model,dimensions,embedding_json,created_at_ms,accessed_at_ms,hit_count FROM embedding_cache WHERE cache_key = ?1 LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, cache_key);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        try self.touchEmbeddingCache(cache_key, now_ms);
+        return .{
+            .cache_key = try columnText(allocator, stmt, 0),
+            .provider = try columnText(allocator, stmt, 1),
+            .model = try columnText(allocator, stmt, 2),
+            .dimensions = @intCast(c.sqlite3_column_int64(stmt, 3)),
+            .embedding_json = try columnText(allocator, stmt, 4),
+            .created_at_ms = c.sqlite3_column_int64(stmt, 5),
+            .accessed_at_ms = now_ms,
+            .hit_count = c.sqlite3_column_int64(stmt, 7) + 1,
+        };
+    }
+
+    fn touchEmbeddingCache(self: *Self, cache_key: []const u8, now_ms: i64) !void {
+        const stmt = try self.prepare("UPDATE embedding_cache SET accessed_at_ms = ?2, hit_count = hit_count + 1 WHERE cache_key = ?1");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, cache_key);
+        _ = c.sqlite3_bind_int64(stmt, 2, now_ms);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UpdateFailed;
+    }
+
+    fn evictEmbeddingCacheLru(self: *Self, max_entries: usize) !void {
+        if (max_entries == 0) return;
+        const total = try self.countSql("SELECT COUNT(*) FROM embedding_cache");
+        const total_usize: usize = @intCast(total);
+        if (total_usize <= max_entries) return;
+        const remove_count = total_usize - max_entries;
+        const stmt = try self.prepare("DELETE FROM embedding_cache WHERE cache_key IN (SELECT cache_key FROM embedding_cache ORDER BY accessed_at_ms ASC, created_at_ms ASC, cache_key ASC LIMIT ?1)");
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(remove_count));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
+    }
+
+    pub fn embeddingCacheStats(self: *Self) !EmbeddingCacheStats {
+        const stmt = try self.prepare("SELECT COUNT(*), COALESCE(SUM(hit_count),0) FROM embedding_cache");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return .{};
+        return .{
+            .entries = @intCast(c.sqlite3_column_int64(stmt, 0)),
+            .hits = c.sqlite3_column_int64(stmt, 1),
+        };
+    }
+
+    pub fn clearEmbeddingCache(self: *Self, input: EmbeddingCacheClearInput) !usize {
+        const stmt = if (input.cache_key != null)
+            try self.prepare("DELETE FROM embedding_cache WHERE cache_key = ?1")
+        else
+            try self.prepare("DELETE FROM embedding_cache");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (input.cache_key) |cache_key| bindText(stmt, 1, cache_key);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
+        return @intCast(c.sqlite3_changes(self.db));
     }
 
     pub fn runHygiene(self: *Self, input: HygieneRunInput) !HygieneRunResult {
@@ -10764,6 +10900,17 @@ pub const PostgresStore = struct {
             \\  PRIMARY KEY (object_type, object_id)
             \\);
             \\CREATE INDEX IF NOT EXISTS primitive_lifecycle_type_status_idx ON primitive_lifecycle(object_type, status);
+            \\CREATE TABLE IF NOT EXISTS embedding_cache (
+            \\  cache_key text PRIMARY KEY,
+            \\  provider text NOT NULL,
+            \\  model text NOT NULL DEFAULT '',
+            \\  dimensions bigint NOT NULL,
+            \\  embedding_json jsonb NOT NULL,
+            \\  created_at_ms bigint NOT NULL,
+            \\  accessed_at_ms bigint NOT NULL,
+            \\  hit_count bigint NOT NULL DEFAULT 0
+            \\);
+            \\CREATE INDEX IF NOT EXISTS embedding_cache_accessed_idx ON embedding_cache(accessed_at_ms);
             \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS scopes_json jsonb NOT NULL DEFAULT '[]'::jsonb;
             \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS actor_id text NOT NULL DEFAULT '';
             \\ALTER TABLE response_cache ADD COLUMN IF NOT EXISTS accessed_at_ms bigint NOT NULL DEFAULT 0;
@@ -12826,7 +12973,7 @@ pub const PostgresStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const sql = "SELECT json_build_object('total_memory_atoms',(SELECT count(*) FROM memory_atoms),'stale_memory_atoms',(SELECT count(*) FROM memory_atoms WHERE status='stale'),'vector_outbox_pending',(SELECT count(*) FROM vector_outbox WHERE status='pending'),'lucid_projection_pending',(SELECT count(*) FROM jobs WHERE job_type='lucid_projection' AND (status='queued' OR status='running')),'lucid_projection_failed',(SELECT count(*) FROM jobs WHERE job_type='lucid_projection' AND status='failed'),'cache_entries',(SELECT count(*) FROM response_cache)+(SELECT count(*) FROM semantic_cache),'queued_jobs',(SELECT count(*) FROM jobs WHERE status='queued'),'running_jobs',(SELECT count(*) FROM jobs WHERE status='running'),'failed_jobs',(SELECT count(*) FROM jobs WHERE status='failed'),'pending_feed_events',(SELECT count(*) FROM memory_feed_events WHERE status='pending' OR status='applying'),'open_conflicts',(SELECT count(*) FROM knowledge_conflicts WHERE status='open'),'agent_memories',(SELECT count(*) FROM agent_memory_items),'sessions',(SELECT count(*) FROM (SELECT session_id FROM session_messages WHERE role <> '" ++ domain.runtime_command_role ++ "' GROUP BY session_id) s))::text";
+        const sql = "SELECT json_build_object('total_memory_atoms',(SELECT count(*) FROM memory_atoms),'stale_memory_atoms',(SELECT count(*) FROM memory_atoms WHERE status='stale'),'vector_outbox_pending',(SELECT count(*) FROM vector_outbox WHERE status='pending'),'lucid_projection_pending',(SELECT count(*) FROM jobs WHERE job_type='lucid_projection' AND (status='queued' OR status='running')),'lucid_projection_failed',(SELECT count(*) FROM jobs WHERE job_type='lucid_projection' AND status='failed'),'cache_entries',(SELECT count(*) FROM response_cache)+(SELECT count(*) FROM semantic_cache)+(SELECT count(*) FROM embedding_cache),'queued_jobs',(SELECT count(*) FROM jobs WHERE status='queued'),'running_jobs',(SELECT count(*) FROM jobs WHERE status='running'),'failed_jobs',(SELECT count(*) FROM jobs WHERE status='failed'),'pending_feed_events',(SELECT count(*) FROM memory_feed_events WHERE status='pending' OR status='applying'),'open_conflicts',(SELECT count(*) FROM knowledge_conflicts WHERE status='open'),'agent_memories',(SELECT count(*) FROM agent_memory_items),'sessions',(SELECT count(*) FROM (SELECT session_id FROM session_messages WHERE role <> '" ++ domain.runtime_command_role ++ "' GROUP BY session_id) s))::text";
         const parsed = try self.queryJson(allocator, sql);
         defer parsed.deinit();
         const obj = parsed.value.object;
@@ -13080,6 +13227,94 @@ pub const PostgresStore = struct {
         else
             &.{ input.actor_id, object_id, now_param };
         const text = try self.queryParamsText(allocator, sql, params);
+        return std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 0;
+    }
+
+    pub fn putEmbeddingCache(self: *PostgresStore, input: EmbeddingCacheInput) !void {
+        const parsed_embedding = try vector_mod.embeddingFromJson(self.allocator, input.embedding_json);
+        defer self.allocator.free(parsed_embedding);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const now = input.now_ms orelse ids.nowMs();
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now});
+        const dimensions_text = try std.fmt.allocPrint(allocator, "{d}", .{input.dimensions});
+        _ = try self.queryParamsText(
+            allocator,
+            "INSERT INTO embedding_cache (cache_key,provider,model,dimensions,embedding_json,created_at_ms,accessed_at_ms,hit_count) VALUES ($1,$2,$3,$4::bigint,$5::jsonb,$6::bigint,$6::bigint,0) " ++
+                "ON CONFLICT(cache_key) DO UPDATE SET provider=excluded.provider, model=excluded.model, dimensions=excluded.dimensions, embedding_json=excluded.embedding_json, created_at_ms=excluded.created_at_ms, accessed_at_ms=excluded.accessed_at_ms, hit_count=0 RETURNING cache_key",
+            &.{ input.cache_key, input.provider, input.model, dimensions_text, input.embedding_json, now_text },
+        );
+        try self.evictEmbeddingCacheLru(input.max_entries);
+    }
+
+    pub fn getEmbeddingCache(self: *PostgresStore, allocator: std.mem.Allocator, cache_key: []const u8, now_ms: i64) !?EmbeddingCacheEntry {
+        const parsed = try self.queryRowParamsJson(allocator, "SELECT cache_key,provider,model,dimensions,embedding_json,created_at_ms,accessed_at_ms,hit_count FROM embedding_cache WHERE cache_key = $1 LIMIT 1", &.{cache_key});
+        defer parsed.deinit();
+        if (parsed.value == .null) return null;
+        const obj = parsed.value.object;
+        try self.touchEmbeddingCache(cache_key, now_ms);
+        return .{
+            .cache_key = try dupStringField(allocator, obj, "cache_key", ""),
+            .provider = try dupStringField(allocator, obj, "provider", ""),
+            .model = try dupStringField(allocator, obj, "model", ""),
+            .dimensions = @intCast(json.intField(obj, "dimensions") orelse 0),
+            .embedding_json = try rawJsonField(allocator, obj, "embedding_json", "[]"),
+            .created_at_ms = json.intField(obj, "created_at_ms") orelse 0,
+            .accessed_at_ms = now_ms,
+            .hit_count = (json.intField(obj, "hit_count") orelse 0) + 1,
+        };
+    }
+
+    fn touchEmbeddingCache(self: *PostgresStore, cache_key: []const u8, now_ms: i64) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const now_text = try std.fmt.allocPrint(allocator, "{d}", .{now_ms});
+        try self.runParams(allocator, "UPDATE embedding_cache SET accessed_at_ms = $2::bigint, hit_count = hit_count + 1 WHERE cache_key = $1", &.{ cache_key, now_text });
+    }
+
+    fn evictEmbeddingCacheLru(self: *PostgresStore, max_entries: usize) !void {
+        if (max_entries == 0) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const max_text = try std.fmt.allocPrint(allocator, "{d}", .{max_entries});
+        _ = try self.queryParamsText(
+            allocator,
+            "WITH ranked AS (SELECT cache_key, row_number() OVER (ORDER BY accessed_at_ms DESC, created_at_ms DESC, cache_key DESC) AS rn FROM embedding_cache), deleted AS (DELETE FROM embedding_cache ec USING ranked r WHERE ec.cache_key = r.cache_key AND r.rn > $1::bigint RETURNING 1) SELECT count(*)::text FROM deleted",
+            &.{max_text},
+        );
+    }
+
+    pub fn embeddingCacheStats(self: *PostgresStore) !EmbeddingCacheStats {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const parsed = try self.queryRowParamsJson(arena.allocator(), "SELECT count(*)::bigint AS entries, COALESCE(SUM(hit_count),0)::bigint AS hits FROM embedding_cache", &.{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return .{};
+        const obj = parsed.value.object;
+        return .{
+            .entries = @intCast(json.intField(obj, "entries") orelse 0),
+            .hits = json.intField(obj, "hits") orelse 0,
+        };
+    }
+
+    pub fn clearEmbeddingCache(self: *PostgresStore, input: EmbeddingCacheClearInput) !usize {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const sql = if (input.cache_key != null)
+            "WITH deleted AS (DELETE FROM embedding_cache WHERE cache_key = $1 RETURNING 1) SELECT count(*)::text FROM deleted"
+        else
+            "WITH deleted AS (DELETE FROM embedding_cache RETURNING 1) SELECT count(*)::text FROM deleted";
+        const text = if (input.cache_key) |cache_key| blk: {
+            const params = [_]?[]const u8{cache_key};
+            break :blk try self.queryParamsText(allocator, sql, &params);
+        } else blk: {
+            const params = [_]?[]const u8{};
+            break :blk try self.queryParamsText(allocator, sql, &params);
+        };
         return std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 0;
     }
 
@@ -18081,6 +18316,37 @@ test "sqlite lifecycle cache lru eviction is actor scoped" {
     try std.testing.expectEqual(@as(usize, 1), try store.clearSemanticCache(.{ .actor_id = "agent:a", .cache_key = "s:old" }));
     try std.testing.expectEqual(@as(usize, 1), try store.clearSemanticCache(.{ .actor_id = "agent:a", .cache_key = "s:new" }));
     try std.testing.expectEqual(@as(usize, 1), try store.clearSemanticCache(.{ .actor_id = "agent:b", .cache_key = "s:other" }));
+}
+
+test "sqlite embedding cache tracks hits and prunes lru entries" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const e1 = try vector_mod.embeddingToJson(alloc, &[_]f32{ 1, 0 });
+    const e2 = try vector_mod.embeddingToJson(alloc, &[_]f32{ 0, 1 });
+    const e3 = try vector_mod.embeddingToJson(alloc, &[_]f32{ 0.5, 0.5 });
+
+    try store.putEmbeddingCache(.{ .cache_key = "embed:a", .provider = "local-deterministic", .model = "local", .dimensions = 2, .embedding_json = e1, .now_ms = 100, .max_entries = 2 });
+    try store.putEmbeddingCache(.{ .cache_key = "embed:b", .provider = "local-deterministic", .model = "local", .dimensions = 2, .embedding_json = e2, .now_ms = 200, .max_entries = 2 });
+    const hit = (try store.getEmbeddingCache(alloc, "embed:a", 300)).?;
+    try std.testing.expectEqualStrings("local-deterministic", hit.provider);
+    try std.testing.expectEqual(@as(usize, 2), hit.dimensions);
+    try std.testing.expectEqual(@as(i64, 1), hit.hit_count);
+    try std.testing.expectEqual(@as(i64, 300), hit.accessed_at_ms);
+
+    const stats = try store.embeddingCacheStats();
+    try std.testing.expectEqual(@as(usize, 2), stats.entries);
+    try std.testing.expectEqual(@as(i64, 1), stats.hits);
+
+    try store.putEmbeddingCache(.{ .cache_key = "embed:c", .provider = "local-deterministic", .model = "local", .dimensions = 2, .embedding_json = e3, .now_ms = 400, .max_entries = 2 });
+    try std.testing.expect((try store.getEmbeddingCache(alloc, "embed:a", 500)) != null);
+    try std.testing.expect((try store.getEmbeddingCache(alloc, "embed:b", 500)) == null);
+    try std.testing.expect((try store.getEmbeddingCache(alloc, "embed:c", 500)) != null);
+    try std.testing.expectEqual(@as(usize, 1), try store.clearEmbeddingCache(.{ .cache_key = "embed:a" }));
+    try std.testing.expectEqual(@as(usize, 1), try store.clearEmbeddingCache(.{ .cache_key = "embed:c" }));
 }
 
 test "native agent memory maps keyed memory to memory atoms" {
