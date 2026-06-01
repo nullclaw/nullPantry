@@ -28,6 +28,7 @@ const agent_memory_runtime = @import("agent_memory_runtime.zig");
 const bootstrap_prompts = @import("bootstrap_prompts.zig");
 const feed_contract = @import("feed_contract.zig");
 const storage_routes = @import("storage_route.zig");
+const kg_compat = @import("kg_compat.zig");
 
 const nullclaw_agent_memory_projection = "agent_memory";
 
@@ -755,12 +756,17 @@ fn nullClawAgentMemoryStore(ctx: *Context, key: []const u8, body: []const u8) Ht
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const obj = parsed.value.object;
+    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
+    if (kgMemoryRequest(key, storage_target)) {
+        const entry = kgMemoryStoreEntry(ctx, key, obj, "core") catch |err| return kgMemoryErrorResponse(ctx, err);
+        return nullClawAgentMemoryEntryResponse(ctx, entry);
+    }
+
     const stored = agentMemoryStoreParsed(ctx, key, obj);
     if (!std.mem.eql(u8, stored.status, "200 OK")) return stored;
 
     const session_id = nullableStringFieldAlias(obj, "session_id", "session");
     const requested_scope = json.nullableStringField(obj, "scope");
-    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     const entry = loadAgentMemoryForRequest(ctx, key, session_id, requested_scope, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -777,6 +783,11 @@ fn nullClawAgentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) Htt
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    if (kgMemoryRequest(key, storage_target)) {
+        const entry = kgMemoryGetEntry(ctx, key) catch |err| return kgMemoryErrorResponse(ctx, err);
+        if (entry == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
+        return nullClawAgentMemoryEntryResponse(ctx, entry.?);
+    }
     const entry = loadAgentMemoryForRequest(ctx, key, session_id, requested_scope, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -806,6 +817,10 @@ fn nullClawAgentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     const limit = parseLimit(json.queryParam(query, "limit"), std.math.maxInt(usize));
     const offset = parseLimit(json.queryParam(query, "offset"), 0);
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    if (storageRouteTargetsKg(storage_target)) {
+        const entries = kgMemoryListEntries(ctx, category, requested_scope) catch |err| return kgMemoryErrorResponse(ctx, err);
+        return nullClawAgentMemoryEntriesResponseWithContent(ctx, entries, include_internal, include_content, limit, offset);
+    }
     const exact_owner = if (requested_scope) |scope| access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx) else null;
     defer if (exact_owner) |owner| ctx.allocator.free(owner);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
@@ -904,6 +919,11 @@ fn nullClawAgentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) 
         ctx.actor_id;
     defer if (requested_scope != null) ctx.allocator.free(owner_actor_id);
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    if (kgMemoryRequest(key, storage_target)) {
+        const deleted = kgMemoryDeleteKey(ctx, key) catch |err| return kgMemoryErrorResponse(ctx, err);
+        if (!deleted) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
+        return ok(ctx, "{\"ok\":true}");
+    }
     const deleted = ctx.store.agentMemoryDeleteAllRouted(key, owner_actor_id, ctx.actor_id, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -942,6 +962,14 @@ fn memoryCommandMutationParsed(ctx: *Context, action: []const u8, key: []const u
     const session_id = nullableStringFieldAlias(obj, "session_id", "session");
     const requested_scope = json.nullableStringField(obj, "scope");
     const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return agentMemoryStorageUnavailable(ctx);
+    if (kgMemoryRequest(key, storage_target)) {
+        if (require_existing) {
+            const existing = kgMemoryGetEntry(ctx, key) catch |err| return kgMemoryErrorResponse(ctx, err);
+            if (existing == null) return json.errorResponse(ctx.allocator, 404, "memory_not_found", "Memory entry not found");
+        }
+        const entry = kgMemoryStoreEntry(ctx, key, obj, "conversation") catch |err| return kgMemoryErrorResponse(ctx, err);
+        return memoryCommandMutationResponse(ctx, action, entry);
+    }
     if (require_existing) {
         const existing = loadAgentMemoryForRequest(ctx, key, session_id, requested_scope, storage_target) catch |err| switch (err) {
             error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
@@ -993,6 +1021,10 @@ fn memoryCommandDeleteParsed(ctx: *Context, key: []const u8, session_id: ?[]cons
     if (!hasCapability(ctx, "delete")) return forbidden(ctx);
     if (session_id) |sid| {
         if (!agentSessionWriteAllowed(ctx, sid)) return forbidden(ctx);
+    }
+    if (kgMemoryRequest(key, storage_target)) {
+        const deleted = kgMemoryDeleteKey(ctx, key) catch |err| return kgMemoryErrorResponse(ctx, err);
+        return memoryCommandDeleteResponse(ctx, key, null, deleted);
     }
     const owner_actor_id = if (requested_scope) |scope|
         access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx)
@@ -1897,6 +1929,196 @@ fn graphSearchResultToAgentMemory(ctx: *Context, result: domain.SearchResult) !d
     };
 }
 
+fn storageRouteTargetsKg(route: store_mod.AgentMemoryStorageRoute) bool {
+    if (route.target != .named) return false;
+    const name = route.name orelse return false;
+    return std.ascii.eqlIgnoreCase(name, "kg");
+}
+
+fn kgMemoryRequest(key: []const u8, route: store_mod.AgentMemoryStorageRoute) bool {
+    return kg_compat.isKgKey(key) or storageRouteTargetsKg(route);
+}
+
+fn kgMemoryListEntries(ctx: *Context, category: ?[]const u8, requested_scope: ?[]const u8) ![]domain.AgentMemory {
+    if (!hasCapability(ctx, "read")) return error.Forbidden;
+    var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
+    errdefer entries.deinit(ctx.allocator);
+
+    const include_entities = if (category) |cat| !kgRelationCategory(cat) else true;
+    const include_relations = if (category) |cat| kgRelationCategory(cat) else true;
+
+    if (include_entities) {
+        const entities = try ctx.store.listEntities(ctx.allocator, null);
+        for (entities) |entity| {
+            if (requested_scope) |scope| {
+                if (!std.mem.eql(u8, entity.scope, scope)) continue;
+            }
+            if (category) |cat| {
+                if (!std.mem.eql(u8, entity.entity_type, cat)) continue;
+            }
+            if (!try visibleGraphEntity(ctx, entity, false)) continue;
+            try entries.append(ctx.allocator, try kg_compat.entityToAgentMemory(ctx.allocator, entity, ctx.actor_id));
+        }
+    }
+
+    if (include_relations) {
+        const relations = try ctx.store.listRelations(ctx.allocator, null);
+        for (relations) |relation| {
+            if (requested_scope) |scope| {
+                if (!std.mem.eql(u8, relation.scope, scope)) continue;
+            }
+            const visible = try visibleGraphRelation(ctx, relation, false);
+            if (visible == null) continue;
+            try entries.append(ctx.allocator, try kg_compat.relationToAgentMemory(ctx.allocator, visible.?.relation, ctx.actor_id));
+        }
+    }
+
+    sortAgentMemoryEntriesByTimestamp(entries.items);
+    return entries.toOwnedSlice(ctx.allocator);
+}
+
+fn kgRelationCategory(category: []const u8) bool {
+    return std.mem.eql(u8, category, kg_compat.relation_category) or std.mem.eql(u8, category, "relation") or std.mem.eql(u8, category, "knowledge_graph:relation");
+}
+
+fn sortAgentMemoryEntriesByTimestamp(items: []domain.AgentMemory) void {
+    std.mem.sort(domain.AgentMemory, items, {}, struct {
+        fn lessThan(_: void, a: domain.AgentMemory, b: domain.AgentMemory) bool {
+            const a_ts = std.fmt.parseInt(i64, a.timestamp, 10) catch 0;
+            const b_ts = std.fmt.parseInt(i64, b.timestamp, 10) catch 0;
+            if (a_ts == b_ts) return std.mem.lessThan(u8, a.key, b.key);
+            return a_ts > b_ts;
+        }
+    }.lessThan);
+}
+
+fn kgMemoryStoreEntry(ctx: *Context, key: []const u8, obj: std.json.ObjectMap, default_category: []const u8) !domain.AgentMemory {
+    if (!(hasCapability(ctx, "write") or hasCapability(ctx, "propose"))) return error.Forbidden;
+    const operation = json.stringField(obj, "operation") orelse "put";
+    if (!std.ascii.eqlIgnoreCase(operation, "put")) return error.UnsupportedKgOperation;
+
+    const scope = json.stringField(obj, "scope") orelse "workspace";
+    const permissions = try rawField(ctx.allocator, obj, "permissions", "[]");
+    if (!canWriteRecord(ctx, scope, permissions)) return error.Forbidden;
+
+    if (kg_compat.isRelationKey(key)) {
+        const parsed = try kg_compat.parseRelationKey(ctx.allocator, key);
+        defer parsed.deinit(ctx.allocator);
+
+        try kgEnsureEndpointEntity(ctx, parsed.subject_id, scope, permissions);
+        try kgEnsureEndpointEntity(ctx, parsed.object_id, scope, permissions);
+
+        const relation = try ctx.store.upsertRelation(ctx.allocator, .{
+            .id = parsed.id,
+            .from_entity_id = parsed.subject_id,
+            .relation_type = parsed.predicate,
+            .to_entity_id = parsed.object_id,
+            .scope = scope,
+            .permissions_json = permissions,
+            .confidence = json.floatField(obj, "confidence") orelse 0.5,
+            .status = json.stringField(obj, "status") orelse "proposed",
+            .actor_id = ctx.actor_id,
+        });
+        const text = vector_text.relation(ctx.allocator, relation) catch "";
+        _ = upsertAutoVector(ctx, "relation", relation.id, text, relation.scope, relation.permissions_json) catch 0;
+        return try kg_compat.relationToAgentMemory(ctx.allocator, relation, ctx.actor_id);
+    }
+
+    const entity_id = kg_compat.entityIdForKey(key);
+    if (entity_id.len == 0) return error.InvalidKgKey;
+    const content = json.stringField(obj, "content") orelse json.stringField(obj, "text") orelse entity_id;
+    const entity = try ctx.store.upsertEntity(ctx.allocator, .{
+        .id = entity_id,
+        .entity_type = json.stringField(obj, "category") orelse json.stringField(obj, "type") orelse default_category,
+        .name = entity_id,
+        .description = content,
+        .scope = scope,
+        .permissions_json = permissions,
+        .metadata_json = try rawField(ctx.allocator, obj, "metadata", "{}"),
+        .actor_id = ctx.actor_id,
+    });
+    _ = try ctx.store.patchPrimitiveLifecycleActor(ctx.allocator, "entity", entity.id, "active", ctx.actor_id, "{\"compat\":\"kg\"}");
+    const text = vector_text.entity(ctx.allocator, entity) catch "";
+    _ = upsertAutoVector(ctx, "entity", entity.id, text, entity.scope, entity.permissions_json) catch 0;
+    return try kg_compat.entityToAgentMemory(ctx.allocator, entity, ctx.actor_id);
+}
+
+fn kgEnsureEndpointEntity(ctx: *Context, entity_id: []const u8, scope: []const u8, permissions: []const u8) !void {
+    if (try ctx.store.getEntity(ctx.allocator, entity_id)) |_| {
+        if (!entityCanBackRecord(ctx, entity_id, scope, permissions)) return error.Forbidden;
+        return;
+    }
+    _ = try ctx.store.resolveEntity(ctx.allocator, .{
+        .id = entity_id,
+        .entity_type = "concept",
+        .name = entity_id,
+        .description = entity_id,
+        .scope = scope,
+        .permissions_json = permissions,
+        .actor_id = ctx.actor_id,
+    });
+}
+
+fn kgMemoryGetEntry(ctx: *Context, key: []const u8) !?domain.AgentMemory {
+    if (!hasCapability(ctx, "read")) return error.Forbidden;
+
+    const entity_id = kg_compat.entityIdForKey(key);
+    if (try ctx.store.getEntity(ctx.allocator, entity_id)) |entity| {
+        if (!try visibleGraphEntity(ctx, entity, false)) return null;
+        return try kg_compat.entityToAgentMemory(ctx.allocator, entity, ctx.actor_id);
+    }
+
+    const relation_id = kg_compat.relationIdForKey(key);
+    if (try ctx.store.getRelation(ctx.allocator, relation_id)) |relation| {
+        const visible = try visibleGraphRelation(ctx, relation, false);
+        if (visible == null) return null;
+        return try kg_compat.relationToAgentMemory(ctx.allocator, visible.?.relation, ctx.actor_id);
+    }
+
+    return null;
+}
+
+fn kgMemoryDeleteKey(ctx: *Context, key: []const u8) !bool {
+    if (!hasCapability(ctx, "delete")) return error.Forbidden;
+
+    const entity_id = kg_compat.entityIdForKey(key);
+    if (try ctx.store.getEntity(ctx.allocator, entity_id)) |entity| {
+        if (!try visibleGraphEntity(ctx, entity, true)) return false;
+        if (!canChangeGraphPrimitiveStatus(ctx, entity.scope, entity.permissions_json, "deprecated")) return error.Forbidden;
+        const changed = try ctx.store.patchPrimitiveLifecycleActor(ctx.allocator, "entity", entity.id, "deprecated", ctx.actor_id, "{\"deleted\":true,\"compat\":\"kg\"}");
+        const relations = try ctx.store.listEntityRelations(ctx.allocator, entity.id, 500);
+        for (relations) |relation| {
+            const visible = try visibleGraphRelation(ctx, relation, true);
+            if (visible == null) continue;
+            if (!canChangeGraphPrimitiveStatus(ctx, relation.scope, relation.permissions_json, "deprecated")) continue;
+            _ = try ctx.store.patchRelationStatusActor(relation.id, "deprecated", ctx.actor_id);
+        }
+        return changed;
+    }
+
+    const relation_id = kg_compat.relationIdForKey(key);
+    if (try ctx.store.getRelation(ctx.allocator, relation_id)) |relation| {
+        const visible = try visibleGraphRelation(ctx, relation, true);
+        if (visible == null) return false;
+        if (!canChangeGraphPrimitiveStatus(ctx, relation.scope, relation.permissions_json, "deprecated")) return error.Forbidden;
+        return try ctx.store.patchRelationStatusActor(relation.id, "deprecated", ctx.actor_id);
+    }
+
+    return false;
+}
+
+fn kgMemoryErrorResponse(ctx: *Context, err: anyerror) HttpResponse {
+    return switch (err) {
+        error.Forbidden => forbidden(ctx),
+        error.InvalidKgKey, error.InvalidRelationKey, error.UnsupportedKgOperation => json.errorResponse(ctx.allocator, 400, "bad_request", "Invalid knowledge graph memory key or operation"),
+        error.InvalidRelationSchema => json.errorResponse(ctx.allocator, 400, "bad_request", "Relation type is not valid for the endpoint entity types"),
+        error.RelationAclBroaderThanEntity => json.errorResponse(ctx.allocator, 400, "bad_request", "Relation ACL cannot be broader than endpoint entity ACL"),
+        error.NotFound => json.errorResponse(ctx.allocator, 404, "not_found", "Knowledge graph memory not found"),
+        error.AgentMemoryStorageUnavailable => agentMemoryStorageUnavailable(ctx),
+        else => serverError(ctx),
+    };
+}
+
 fn graphCommandSearchResults(ctx: *Context, command: graph_mod.Command, options: GraphTraversalOptions, depth: usize, limit: usize) ![]domain.SearchResult {
     return switch (command.kind) {
         .traverse => blk: {
@@ -1906,8 +2128,7 @@ fn graphCommandSearchResults(ctx: *Context, command: graph_mod.Command, options:
         },
         .relations => blk: {
             const entity_id = command.entity_id orelse return error.InvalidGraphCommand;
-            const root_ids = [_][]const u8{entity_id};
-            break :blk try graphSearchFromRoots(ctx, &root_ids, options, 1, limit);
+            break :blk try graphRelationsSearchResults(ctx, entity_id, options, limit);
         },
         .path => try graphPathSearchResults(
             ctx,
@@ -1955,6 +2176,27 @@ fn graphSearchFromRoots(ctx: *Context, root_ids: []const []const u8, options: Gr
             if (results.items.len >= limit) break;
         }
         frontier = next;
+    }
+
+    return results.toOwnedSlice(ctx.allocator);
+}
+
+fn graphRelationsSearchResults(ctx: *Context, entity_id: []const u8, options: GraphTraversalOptions, limit: usize) ![]domain.SearchResult {
+    var results: std.ArrayListUnmanaged(domain.SearchResult) = .empty;
+    errdefer results.deinit(ctx.allocator);
+
+    const root = (try ctx.store.getEntity(ctx.allocator, entity_id)) orelse return results.toOwnedSlice(ctx.allocator);
+    if (!try visibleGraphEntityWithOptions(ctx, root, options)) return results.toOwnedSlice(ctx.allocator);
+    if (!graph_mod.entityMatchesTypeFilter(root.entity_type, options.entity_types)) return results.toOwnedSlice(ctx.allocator);
+
+    const raw_relations = try ctx.store.listEntityRelations(ctx.allocator, entity_id, limit);
+    for (raw_relations) |relation| {
+        const visible = try visibleGraphRelationWithOptions(ctx, relation, options);
+        if (visible == null) continue;
+        if (!graphRelationAllowed(visible.?.relation, options)) continue;
+        if (otherEntityForTraversal(visible.?, entity_id, options) == null) continue;
+        try appendGraphRelationSearchResult(ctx, &results, visible.?, 0.9, limit);
+        if (results.items.len >= limit) break;
     }
 
     return results.toOwnedSlice(ctx.allocator);
@@ -8841,6 +9083,12 @@ fn agentMemoryStoreParsed(ctx: *Context, key: []const u8, obj: std.json.ObjectMa
 
 fn agentMemoryStoreParsedWithDefaultCategory(ctx: *Context, key: []const u8, obj: std.json.ObjectMap, default_category: []const u8) HttpResponse {
     if (!(hasCapability(ctx, "write") or hasCapability(ctx, "propose"))) return forbidden(ctx);
+    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
+    if (kgMemoryRequest(key, storage_target)) {
+        const entry = kgMemoryStoreEntry(ctx, key, obj, default_category) catch |err| return kgMemoryErrorResponse(ctx, err);
+        return agentMemoryEntryResponse(ctx, "memory", entry);
+    }
+
     const operation = domain.AgentMemoryOperation.parse(json.stringField(obj, "operation") orelse "put");
     const content = switch (operation) {
         .put => json.stringField(obj, "content") orelse json.stringField(obj, "text") orelse return json.errorResponse(ctx.allocator, 400, "bad_request", "Missing content"),
@@ -8858,7 +9106,6 @@ fn agentMemoryStoreParsedWithDefaultCategory(ctx: *Context, key: []const u8, obj
     } else if (!domain.permissionsAreOpen(permissions) and !domain.permissionsWritable(permissions, ctx.actor_scopes_json)) {
         return forbidden(ctx);
     }
-    const storage_target = storage_routes.fromObject(ctx.allocator, obj) catch return serverError(ctx);
     const owner_actor_id = access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx);
     defer ctx.allocator.free(owner_actor_id);
     const entry = ctx.store.agentMemoryStoreRouted(ctx.allocator, .{
@@ -8888,6 +9135,11 @@ fn agentMemoryGet(ctx: *Context, key: []const u8, query: []const u8) HttpRespons
         if (!agentSessionReadAllowed(ctx, sid)) return forbidden(ctx);
     }
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    if (kgMemoryRequest(key, storage_target)) {
+        const entry = kgMemoryGetEntry(ctx, key) catch |err| return kgMemoryErrorResponse(ctx, err);
+        if (entry == null) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
+        return agentMemoryEntryResponse(ctx, "memory", entry.?);
+    }
     var entry = if (requested_scope) |scope| blk: {
         const owner_actor_id = access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx);
         defer ctx.allocator.free(owner_actor_id);
@@ -8925,6 +9177,10 @@ fn agentMemoryList(ctx: *Context, query: []const u8) HttpResponse {
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const offset = parseLimit(json.queryParam(query, "offset"), 0);
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    if (storageRouteTargetsKg(storage_target)) {
+        const entries = kgMemoryListEntries(ctx, category, requested_scope) catch |err| return kgMemoryErrorResponse(ctx, err);
+        return agentMemoryEntriesResponseFilteredWithContent(ctx, entries, include_internal, include_content, limit, offset);
+    }
     const exact_owner = if (requested_scope) |scope| access.agentMemoryOwner(ctx.allocator, ctx.actor_id, scope) catch return serverError(ctx) else null;
     defer if (exact_owner) |owner| ctx.allocator.free(owner);
     var entries: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
@@ -9018,6 +9274,11 @@ fn agentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResp
         ctx.actor_id;
     defer if (requested_scope != null) ctx.allocator.free(owner_actor_id);
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    if (kgMemoryRequest(key, storage_target)) {
+        const deleted = kgMemoryDeleteKey(ctx, key) catch |err| return kgMemoryErrorResponse(ctx, err);
+        if (!deleted) return json.errorResponse(ctx.allocator, 404, "not_found", "Agent memory not found");
+        return ok(ctx, "{\"ok\":true}");
+    }
     const entry = ctx.store.agentMemoryGetRouted(ctx.allocator, key, session_id, owner_actor_id, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -9036,6 +9297,13 @@ fn agentMemoryDelete(ctx: *Context, key: []const u8, query: []const u8) HttpResp
 fn agentMemoryCount(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const storage_target = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    if (storageRouteTargetsKg(storage_target)) {
+        const category = json.queryParamDecoded(ctx.allocator, query, "category") catch return serverError(ctx);
+        const requested_scope = json.queryParamDecoded(ctx.allocator, query, "scope") catch return serverError(ctx);
+        const entries = kgMemoryListEntries(ctx, category, requested_scope) catch |err| return kgMemoryErrorResponse(ctx, err);
+        const body = std.fmt.allocPrint(ctx.allocator, "{{\"count\":{d}}}", .{entries.len}) catch return serverError(ctx);
+        return .{ .status = "200 OK", .body = body };
+    }
     const count = ctx.store.agentMemoryCountRouted(ctx.actor_id, ctx.actor_scopes_json, storage_target) catch |err| switch (err) {
         error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -15578,6 +15846,20 @@ test "api graph neighbors and path are acl aware" {
     try std.testing.expect(std.mem.indexOf(u8, relations_command.body, "depends_on") != null);
     try std.testing.expect(std.mem.indexOf(u8, relations_command.body, "implements") != null);
 
+    const relations_search_command = handleRequest(&ctx, "POST", "/v1/search", relations_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", relations_search_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, relations_search_command.body, "\"type\":\"relation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, relations_search_command.body, "\"type\":\"entity\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, relations_search_command.body, "depends_on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, relations_search_command.body, "implements") != null);
+
+    const relations_memory_command = handleRequest(&ctx, "POST", "/v1/agent/memories/search", relations_command_body, "");
+    try std.testing.expectEqualStrings("200 OK", relations_memory_command.status);
+    try std.testing.expect(std.mem.indexOf(u8, relations_memory_command.body, "\"category\":\"knowledge_graph:relation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, relations_memory_command.body, "\"category\":\"knowledge_graph:entity\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, relations_memory_command.body, "depends_on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, relations_memory_command.body, "implements") != null);
+
     const path_command_body = try std.fmt.allocPrint(alloc, "{{\"query\":\"kg:path:{s}:{s}:3\"}}", .{ a.id, c.id });
     const path_command = handleRequest(&ctx, "POST", "/v1/graph/query", path_command_body, "");
     try std.testing.expectEqualStrings("200 OK", path_command.status);
@@ -15673,6 +15955,66 @@ test "api graph neighbors and path are acl aware" {
     const include_deleted = handleRequest(&ctx, "POST", "/v1/graph/neighbors", include_deleted_body, "");
     try std.testing.expectEqualStrings("200 OK", include_deleted.status);
     try std.testing.expect(std.mem.indexOf(u8, include_deleted.body, "Graph B") != null);
+}
+
+test "api kg memory keys store into canonical graph primitives" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ctx = Context{ .allocator = alloc, .store = &store };
+    const entity_put = handleRequest(&ctx, "PUT", "/v1/agent/memories/__kg:entity:kg_alpha", "{\"content\":\"Alpha content\",\"category\":\"service\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", entity_put.status);
+    try std.testing.expect(std.mem.indexOf(u8, entity_put.body, "\"store\":\"kg\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entity_put.body, "\"key\":\"kg_alpha\"") != null);
+
+    const entity_update = handleRequest(&ctx, "PUT", "/v1/agent/memories/__kg:entity:kg_alpha", "{\"content\":\"Alpha updated\",\"category\":\"project\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", entity_update.status);
+    try std.testing.expect(std.mem.indexOf(u8, entity_update.body, "Alpha updated") != null);
+
+    const canonical_entity = handleRequest(&ctx, "GET", "/v1/entities/kg_alpha", "", "");
+    try std.testing.expectEqualStrings("200 OK", canonical_entity.status);
+    try std.testing.expect(std.mem.indexOf(u8, canonical_entity.body, "\"type\":\"project\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, canonical_entity.body, "Alpha updated") != null);
+
+    const relation_put = handleRequest(&ctx, "PUT", "/v1/agent/memories/__kg:rel:kg_alpha:links:kg_beta", "{\"store\":\"kg\",\"scope\":\"public\"}", "");
+    try std.testing.expectEqualStrings("200 OK", relation_put.status);
+    try std.testing.expect(std.mem.indexOf(u8, relation_put.body, "\"category\":\"__kg:relation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, relation_put.body, "__kg:rel:kg_alpha:links:kg_beta") != null);
+
+    const auto_entity = handleRequest(&ctx, "GET", "/v1/entities/kg_beta", "", "");
+    try std.testing.expectEqualStrings("200 OK", auto_entity.status);
+    try std.testing.expect(std.mem.indexOf(u8, auto_entity.body, "\"type\":\"concept\"") != null);
+
+    const relation_get = handleRequest(&ctx, "GET", "/v1/agent/memories/__kg:rel:kg_alpha:links:kg_beta?store=kg", "", "");
+    try std.testing.expectEqualStrings("200 OK", relation_get.status);
+    try std.testing.expect(std.mem.indexOf(u8, relation_get.body, "kg_alpha --links--> kg_beta") != null);
+
+    const relation_query = handleRequest(&ctx, "POST", "/v1/agent/memories/search", "{\"query\":\"kg:relations:kg_alpha\",\"limit\":10}", "");
+    try std.testing.expectEqualStrings("200 OK", relation_query.status);
+    try std.testing.expect(std.mem.indexOf(u8, relation_query.body, "\"category\":\"knowledge_graph:relation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, relation_query.body, "links") != null);
+
+    const kg_count = handleRequest(&ctx, "GET", "/v1/agent/memories/count?store=kg", "", "");
+    try std.testing.expectEqualStrings("200 OK", kg_count.status);
+    try std.testing.expect(std.mem.indexOf(u8, kg_count.body, "\"count\":3") != null);
+
+    const kg_list = handleRequest(&ctx, "GET", "/v1/agent/memories?store=kg&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", kg_list.status);
+    try std.testing.expect(std.mem.indexOf(u8, kg_list.body, "\"key\":\"kg_alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kg_list.body, "__kg:rel:kg_alpha:links:kg_beta") != null);
+
+    const kg_entity_list = handleRequest(&ctx, "GET", "/v1/agent/memories?store=kg&category=project&limit=10", "", "");
+    try std.testing.expectEqualStrings("200 OK", kg_entity_list.status);
+    try std.testing.expect(std.mem.indexOf(u8, kg_entity_list.body, "\"key\":\"kg_alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kg_entity_list.body, "__kg:rel:") == null);
+
+    const relation_delete = handleRequest(&ctx, "DELETE", "/v1/agent/memories/__kg:rel:kg_alpha:links:kg_beta?store=kg", "", "");
+    try std.testing.expectEqualStrings("200 OK", relation_delete.status);
+    const relation_missing = handleRequest(&ctx, "GET", "/v1/agent/memories/__kg:rel:kg_alpha:links:kg_beta?store=kg", "", "");
+    try std.testing.expectEqualStrings("404 Not Found", relation_missing.status);
 }
 
 test "api get source enforces server-side scope" {
