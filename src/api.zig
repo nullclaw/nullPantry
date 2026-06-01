@@ -63,10 +63,15 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
     const parsed = json.parsePath(target);
     const path = parsed.path;
     const seg0 = decodeSegment(ctx.allocator, json.segment(path, 0)) catch return serverError(ctx);
+    defer if (seg0) |value| ctx.allocator.free(value);
     const seg1 = decodeSegment(ctx.allocator, json.segment(path, 1)) catch return serverError(ctx);
+    defer if (seg1) |value| ctx.allocator.free(value);
     const seg2 = decodeSegment(ctx.allocator, json.segment(path, 2)) catch return serverError(ctx);
+    defer if (seg2) |value| ctx.allocator.free(value);
     const seg3 = decodeSegment(ctx.allocator, json.segment(path, 3)) catch return serverError(ctx);
+    defer if (seg3) |value| ctx.allocator.free(value);
     const seg4 = decodeSegment(ctx.allocator, json.segment(path, 4)) catch return serverError(ctx);
+    defer if (seg4) |value| ctx.allocator.free(value);
 
     const is_get = std.mem.eql(u8, method, "GET");
     const is_post = std.mem.eql(u8, method, "POST");
@@ -4735,20 +4740,25 @@ fn nullClawMemoryFeed(ctx: *Context, query: []const u8) HttpResponse {
     const since_id = feedCursorFromQuery(query);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const projection_cursor = feedProjectionCursorName(ctx, nullclaw_agent_memory_projection) catch return serverError(ctx);
+    defer ctx.allocator.free(projection_cursor);
     const projection_floor = ctx.store.feedProjectionCursorFloor(ctx.allocator, projection_cursor) catch return serverError(ctx);
     if (since_id < projection_floor) return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted projection cursor floor; request a checkpoint");
     const events = listCentralFeedEventsByObjectType(ctx, since_id, limit, feed_scopes, true, "agent_memory") catch |err| switch (err) {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor; request a checkpoint"),
         else => return serverError(ctx),
     };
+    defer store_mod.freeFeedEvents(ctx.allocator, events);
     return nullClawFeedEventsResponse(ctx, events);
 }
 
 fn nullClawMemoryFeedStatus(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const projection_cursor = feedProjectionCursorName(ctx, nullclaw_agent_memory_projection) catch return serverError(ctx);
+    defer ctx.allocator.free(projection_cursor);
     const projection_floor = ctx.store.feedProjectionCursorFloor(ctx.allocator, projection_cursor) catch return serverError(ctx);
     const status = centralFeedStatusByObjectTypeFromFloor(ctx, feed_scopes, "agent_memory", projection_floor) catch return serverError(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -4763,12 +4773,15 @@ fn nullClawMemoryFeedCompact(ctx: *Context, body: []const u8, query: []const u8)
     defer parsed.deinit();
     const requested_before_id = feedCompactCursorFromObject(parsed.value.object);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const projection_cursor = feedProjectionCursorName(ctx, nullclaw_agent_memory_projection) catch return serverError(ctx);
+    defer ctx.allocator.free(projection_cursor);
     const projection_floor = ctx.store.feedProjectionCursorFloor(ctx.allocator, projection_cursor) catch return serverError(ctx);
     const status = centralFeedStatusByObjectTypeFromFloor(ctx, feed_scopes, "agent_memory", projection_floor) catch return serverError(ctx);
     const before_id = requested_before_id orelse status.max_event_id;
     const result = ctx.store.compactFeedProjection(projection_cursor, "agent_memory", before_id, ctx.actor_id) catch return serverError(ctx);
     const response = std.fmt.allocPrint(ctx.allocator, "{{\"cursor_floor\":{d},\"compacted_through_sequence\":{d},\"oldest_available_sequence\":{d},\"max_event_id\":{d},\"last_sequence\":{d},\"compacted_events\":{d},\"projection\":", .{ result.cursor_floor, result.cursor_floor, result.cursor_floor + 1, result.max_event_id, result.max_event_id, result.compacted_events }) catch return serverError(ctx);
+    defer ctx.allocator.free(response);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, response) catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, nullclaw_agent_memory_projection) catch return serverError(ctx);
@@ -4780,7 +4793,9 @@ fn nullClawMemoryFeedCompact(ctx: *Context, body: []const u8, query: []const u8)
 fn nullClawMemoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
     if (!(hasCapability(ctx, "read") and hasCapability(ctx, "export"))) return forbidden(ctx);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const projection_cursor = feedProjectionCursorName(ctx, nullclaw_agent_memory_projection) catch return serverError(ctx);
+    defer ctx.allocator.free(projection_cursor);
     const projection_floor = ctx.store.feedProjectionCursorFloor(ctx.allocator, projection_cursor) catch return serverError(ctx);
     const status = centralFeedStatusByObjectTypeFromFloor(ctx, feed_scopes, "agent_memory", projection_floor) catch return serverError(ctx);
     const since_id = feedCursorFromQuery(query);
@@ -4789,6 +4804,7 @@ fn nullClawMemoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor"),
         else => return serverError(ctx),
     };
+    defer store_mod.freeFeedEvents(ctx.allocator, events);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"instance_id\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, ctx.feed_instance_id) catch return serverError(ctx);
@@ -4800,10 +4816,12 @@ fn nullClawMemoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
 
 fn nullClawMemoryFeedCheckpointRestore(ctx: *Context, body: []const u8, query: []const u8) HttpResponse {
     const projection_cursor = feedProjectionCursorName(ctx, nullclaw_agent_memory_projection) catch return serverError(ctx);
+    defer ctx.allocator.free(projection_cursor);
     const transformed = nullClawCheckpointToNativeFeedCheckpoint(ctx, body) catch |err| switch (err) {
         error.NotNullClawCheckpoint => return memoryFeedCheckpointRestoreInternal(ctx, body, query, .{ .name = projection_cursor, .object_type = "agent_memory" }),
         else => return badJson(ctx),
     };
+    defer ctx.allocator.free(transformed);
     return memoryFeedCheckpointRestoreInternal(ctx, transformed, query, .{ .name = projection_cursor, .object_type = "agent_memory" });
 }
 
@@ -4826,12 +4844,14 @@ fn nullClawMemoryFeedApply(ctx: *Context, body: []const u8, query: []const u8) H
 fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const storage_route = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    defer storage_route.deinit(ctx.allocator);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
         return runtimeMemoryFeed(ctx, runtime, query);
     }
     const since_id = feedCursorFromQuery(query);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const projection_floor = routeProjectionCursorFloor(ctx, storage_route) catch return serverError(ctx);
     if (projection_floor) |floor| {
         if (since_id < floor) return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted storage-route cursor floor; request a checkpoint");
@@ -4840,16 +4860,19 @@ fn memoryFeed(ctx: *Context, query: []const u8) HttpResponse {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor; request a checkpoint"),
         else => return serverError(ctx),
     };
+    defer store_mod.freeFeedEvents(ctx.allocator, events);
     return feedEventsResponse(ctx, events);
 }
 
 fn memoryFeedStatus(ctx: *Context, query: []const u8) HttpResponse {
     if (!hasCapability(ctx, "read")) return forbidden(ctx);
     const storage_route = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    defer storage_route.deinit(ctx.allocator);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
         return runtimeMemoryFeedStatus(ctx, runtime);
     }
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const status = if (routeProjectionCursorFloor(ctx, storage_route) catch return serverError(ctx)) |floor|
         centralFeedStatusForRouteFromFloor(ctx, feed_scopes, storage_route, floor) catch return serverError(ctx)
     else
@@ -4864,12 +4887,15 @@ fn memoryFeedCompact(ctx: *Context, body: []const u8, query: []const u8) HttpRes
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
     defer parsed.deinit();
     const storage_route = storage_routes.fromObjectOrQuery(ctx.allocator, parsed.value.object, query) catch return serverError(ctx);
+    defer storage_route.deinit(ctx.allocator);
     const requested_before_id = feedCompactCursorFromObject(parsed.value.object);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
         return runtimeMemoryFeedCompact(ctx, runtime, requested_before_id);
     }
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     if (feedRouteProjectionName(ctx, storage_route) catch return serverError(ctx)) |projection_name| {
+        defer ctx.allocator.free(projection_name);
         const projection_floor = ctx.store.feedProjectionCursorFloor(ctx.allocator, projection_name) catch return serverError(ctx);
         const status = centralFeedStatusForRouteFromFloor(ctx, feed_scopes, storage_route, projection_floor) catch return serverError(ctx);
         const before_id = requested_before_id orelse status.max_event_id;
@@ -4898,10 +4924,12 @@ fn feedCompactCursorFromObject(obj: std.json.ObjectMap) ?i64 {
 fn memoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
     if (!(hasCapability(ctx, "read") and hasCapability(ctx, "export"))) return forbidden(ctx);
     const storage_route = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    defer storage_route.deinit(ctx.allocator);
     if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
         return runtimeMemoryFeedCheckpoint(ctx, runtime, query);
     }
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const status = if (routeProjectionCursorFloor(ctx, storage_route) catch return serverError(ctx)) |floor|
         centralFeedStatusForRouteFromFloor(ctx, feed_scopes, storage_route, floor) catch return serverError(ctx)
     else
@@ -4912,6 +4940,7 @@ fn memoryFeedCheckpoint(ctx: *Context, query: []const u8) HttpResponse {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor"),
         else => return serverError(ctx),
     };
+    defer store_mod.freeFeedEvents(ctx.allocator, events);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.appendSlice(ctx.allocator, "{\"instance_id\":") catch return serverError(ctx);
     json.appendString(&out, ctx.allocator, ctx.feed_instance_id) catch return serverError(ctx);
@@ -4951,6 +4980,7 @@ fn centralFeedRouteNeedsFilter(route: store_mod.AgentMemoryStorageRoute) bool {
 
 fn routeProjectionCursorFloor(ctx: *Context, route: store_mod.AgentMemoryStorageRoute) !?i64 {
     const projection_name = (try feedRouteProjectionName(ctx, route)) orelse return null;
+    defer ctx.allocator.free(projection_name);
     return try ctx.store.feedProjectionCursorFloor(ctx.allocator, projection_name);
 }
 
@@ -5003,8 +5033,16 @@ fn listCentralFeedEventsForRoute(ctx: *Context, since_id: i64, limit: usize, sco
     const target_limit = @max(@as(usize, 1), @min(limit, 500));
     var cursor = since_id;
     var out: std.ArrayListUnmanaged(store_mod.FeedEvent) = .empty;
+    errdefer {
+        for (out.items) |*event| event.deinit(ctx.allocator);
+        out.deinit(ctx.allocator);
+    }
+    var batch_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer batch_arena.deinit();
     while (out.items.len < target_limit) {
-        const batch = try ctx.store.listFeedEvents(ctx.allocator, .{
+        _ = batch_arena.reset(.retain_capacity);
+        const batch_allocator = batch_arena.allocator();
+        const batch = try ctx.store.listFeedEvents(batch_allocator, .{
             .since_id = cursor,
             .limit = 500,
             .scopes_json = scopes_json,
@@ -5014,8 +5052,10 @@ fn listCentralFeedEventsForRoute(ctx: *Context, since_id: i64, limit: usize, sco
         if (batch.len == 0) break;
         for (batch) |event| {
             cursor = @max(cursor, event.id);
-            if (!feedEventMatchesStorageRoute(ctx, event, route)) continue;
-            try out.append(ctx.allocator, event);
+            if (!feedEventMatchesStorageRoute(batch_allocator, event, route)) continue;
+            var cloned = try event.clone(ctx.allocator);
+            errdefer cloned.deinit(ctx.allocator);
+            try out.append(ctx.allocator, cloned);
             if (out.items.len >= target_limit) break;
         }
         if (batch.len < 500) break;
@@ -5041,8 +5081,12 @@ fn centralFeedStatusForRouteFromFloor(ctx: *Context, scopes_json: []const u8, ro
         .applied_events = 0,
     };
     var cursor = cursor_floor;
+    var batch_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer batch_arena.deinit();
     while (true) {
-        const batch = try ctx.store.listFeedEvents(ctx.allocator, .{
+        _ = batch_arena.reset(.retain_capacity);
+        const batch_allocator = batch_arena.allocator();
+        const batch = try ctx.store.listFeedEvents(batch_allocator, .{
             .since_id = cursor,
             .limit = 500,
             .scopes_json = scopes_json,
@@ -5052,7 +5096,7 @@ fn centralFeedStatusForRouteFromFloor(ctx: *Context, scopes_json: []const u8, ro
         if (batch.len == 0) break;
         for (batch) |event| {
             cursor = @max(cursor, event.id);
-            if (!feedEventMatchesStorageRoute(ctx, event, route)) continue;
+            if (!feedEventMatchesStorageRoute(batch_allocator, event, route)) continue;
             filtered.visible_events += 1;
             if (std.mem.eql(u8, event.status, "pending")) {
                 filtered.pending_events += 1;
@@ -5071,8 +5115,16 @@ fn listCentralFeedEventsByObjectType(ctx: *Context, since_id: i64, limit: usize,
     const target_limit = @max(@as(usize, 1), @min(limit, 500));
     var cursor = since_id;
     var out: std.ArrayListUnmanaged(store_mod.FeedEvent) = .empty;
+    errdefer {
+        for (out.items) |*event| event.deinit(ctx.allocator);
+        out.deinit(ctx.allocator);
+    }
+    var batch_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer batch_arena.deinit();
     while (out.items.len < target_limit) {
-        const batch = try ctx.store.listFeedEvents(ctx.allocator, .{
+        _ = batch_arena.reset(.retain_capacity);
+        const batch_allocator = batch_arena.allocator();
+        const batch = try ctx.store.listFeedEvents(batch_allocator, .{
             .since_id = cursor,
             .limit = 500,
             .scopes_json = scopes_json,
@@ -5083,7 +5135,9 @@ fn listCentralFeedEventsByObjectType(ctx: *Context, since_id: i64, limit: usize,
         for (batch) |event| {
             cursor = @max(cursor, event.id);
             if (!std.mem.eql(u8, event.object_type, object_type)) continue;
-            try out.append(ctx.allocator, event);
+            var cloned = try event.clone(ctx.allocator);
+            errdefer cloned.deinit(ctx.allocator);
+            try out.append(ctx.allocator, cloned);
             if (out.items.len >= target_limit) break;
         }
         if (batch.len < 500) break;
@@ -5107,8 +5161,12 @@ fn centralFeedStatusByObjectTypeFromFloor(ctx: *Context, scopes_json: []const u8
         .applied_events = 0,
     };
     var cursor = cursor_floor;
+    var batch_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer batch_arena.deinit();
     while (true) {
-        const batch = try ctx.store.listFeedEvents(ctx.allocator, .{
+        _ = batch_arena.reset(.retain_capacity);
+        const batch_allocator = batch_arena.allocator();
+        const batch = try ctx.store.listFeedEvents(batch_allocator, .{
             .since_id = cursor,
             .limit = 500,
             .scopes_json = scopes_json,
@@ -5133,26 +5191,26 @@ fn centralFeedStatusByObjectTypeFromFloor(ctx: *Context, scopes_json: []const u8
     return filtered;
 }
 
-fn feedEventMatchesStorageRoute(ctx: *Context, event: store_mod.FeedEvent, route: store_mod.AgentMemoryStorageRoute) bool {
+fn feedEventMatchesStorageRoute(allocator: std.mem.Allocator, event: store_mod.FeedEvent, route: store_mod.AgentMemoryStorageRoute) bool {
     return switch (route.target) {
         .primary, .all => true,
-        .native => feedEventMatchesStoreName(ctx, event, "native", true),
-        .runtime => feedEventMatchesStoreName(ctx, event, "runtime", false),
+        .native => feedEventMatchesStoreName(allocator, event, "native", true),
+        .runtime => feedEventMatchesStoreName(allocator, event, "runtime", false),
         .named => blk: {
             const name = route.name orelse break :blk false;
-            break :blk feedEventMatchesStoreName(ctx, event, name, false);
+            break :blk feedEventMatchesStoreName(allocator, event, name, false);
         },
         .subset => blk: {
             for (route.stores) |store_name| {
-                if (feedEventMatchesStoreName(ctx, event, store_name, std.ascii.eqlIgnoreCase(store_name, "native"))) break :blk true;
+                if (feedEventMatchesStoreName(allocator, event, store_name, std.ascii.eqlIgnoreCase(store_name, "native"))) break :blk true;
             }
             break :blk false;
         },
     };
 }
 
-fn feedEventMatchesStoreName(ctx: *Context, event: store_mod.FeedEvent, store_name: []const u8, include_unrouted_native: bool) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, event.payload_json, .{}) catch return include_unrouted_native;
+fn feedEventMatchesStoreName(allocator: std.mem.Allocator, event: store_mod.FeedEvent, store_name: []const u8, include_unrouted_native: bool) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, event.payload_json, .{}) catch return include_unrouted_native;
     defer parsed.deinit();
     if (parsed.value != .object) return include_unrouted_native;
     const obj = parsed.value.object;
@@ -5180,6 +5238,7 @@ fn runtimeMemoryFeed(ctx: *Context, runtime: *agent_memory_runtime.Runtime, quer
     const since_id = feedCursorFromQuery(query);
     const limit = parseLimit(json.queryParam(query, "limit"), 100);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const events = runtime.listFeedEvents(ctx.allocator, since_id, limit, ctx.actor_id, feed_scopes) catch |err| switch (err) {
         error.CursorExpired => return json.errorResponse(ctx.allocator, 410, "cursor_expired", "Feed cursor is older than the compacted cursor floor; request a checkpoint"),
         error.NotSupported, error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
@@ -5194,6 +5253,7 @@ fn runtimeMemoryFeed(ctx: *Context, runtime: *agent_memory_runtime.Runtime, quer
 
 fn runtimeMemoryFeedStatus(ctx: *Context, runtime: *agent_memory_runtime.Runtime) HttpResponse {
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     var status = runtime.feedStatus(ctx.allocator, ctx.actor_id, feed_scopes) catch |err| switch (err) {
         error.NotSupported, error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -5206,6 +5266,7 @@ fn runtimeMemoryFeedStatus(ctx: *Context, runtime: *agent_memory_runtime.Runtime
 
 fn runtimeMemoryFeedCompact(ctx: *Context, runtime: *agent_memory_runtime.Runtime, before_id: ?i64) HttpResponse {
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const result = runtime.compactFeed(ctx.allocator, ctx.actor_id, feed_scopes, before_id) catch |err| switch (err) {
         error.NotSupported, error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -5216,6 +5277,7 @@ fn runtimeMemoryFeedCompact(ctx: *Context, runtime: *agent_memory_runtime.Runtim
 
 fn runtimeMemoryFeedCheckpoint(ctx: *Context, runtime: *agent_memory_runtime.Runtime, query: []const u8) HttpResponse {
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const since_id = feedCursorFromQuery(query);
     const limit = if (json.queryParam(query, "limit")) |raw| parseLimit(raw, 500) else null;
     const body = runtime.exportFeedCheckpoint(ctx.allocator, since_id, limit, ctx.actor_id, feed_scopes) catch |err| switch (err) {
@@ -5227,6 +5289,7 @@ fn runtimeMemoryFeedCheckpoint(ctx: *Context, runtime: *agent_memory_runtime.Run
 
 fn runtimeMemoryFeedCheckpointRestore(ctx: *Context, runtime: *agent_memory_runtime.Runtime, body: []const u8) HttpResponse {
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     runtime.restoreFeedCheckpoint(ctx.allocator, body, ctx.actor_id, feed_scopes) catch |err| switch (err) {
         error.NotSupported, error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -5236,6 +5299,7 @@ fn runtimeMemoryFeedCheckpointRestore(ctx: *Context, runtime: *agent_memory_runt
 
 fn runtimeMemoryFeedApply(ctx: *Context, runtime: *agent_memory_runtime.Runtime, body: []const u8) HttpResponse {
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     runtime.applyFeedEventJson(ctx.allocator, body, ctx.actor_id, feed_scopes) catch |err| switch (err) {
         error.NotSupported, error.AgentMemoryStorageUnavailable => return agentMemoryStorageUnavailable(ctx),
         else => return serverError(ctx),
@@ -5255,13 +5319,17 @@ fn memoryFeedCheckpointRestore(ctx: *Context, body: []const u8, query: []const u
 fn memoryFeedCheckpointRestoreInternal(ctx: *Context, body: []const u8, query: []const u8, projection_compaction: ?FeedProjectionCompaction) HttpResponse {
     if (!canApplyFeed(ctx)) return forbidden(ctx);
     const storage_route = storage_routes.fromQuery(ctx.allocator, query) catch return serverError(ctx);
+    defer storage_route.deinit(ctx.allocator);
     if (projection_compaction == null) {
         if (feedRuntimeForRoute(ctx, storage_route) catch return agentMemoryStorageUnavailable(ctx)) |runtime| {
             return runtimeMemoryFeedCheckpointRestore(ctx, runtime, body);
         }
     }
+    var owned_projection_name: ?[]const u8 = null;
+    defer if (owned_projection_name) |value| ctx.allocator.free(value);
     const effective_projection = projection_compaction orelse blk: {
         const projection_name = (feedRouteProjectionName(ctx, storage_route) catch return serverError(ctx)) orelse break :blk null;
+        owned_projection_name = projection_name;
         break :blk FeedProjectionCompaction{ .name = projection_name };
     };
     var parsed = parseBody(ctx, body) catch return badJson(ctx);
@@ -5270,6 +5338,7 @@ fn memoryFeedCheckpointRestoreInternal(ctx: *Context, body: []const u8, query: [
     if (events_value != .array) return json.errorResponse(ctx.allocator, 400, "bad_request", "Checkpoint restore requires an events array");
     const checkpoint_compacted_through = checkpointCompactedThrough(parsed.value.object);
     const feed_scopes = feedScopesJson(ctx) catch return serverError(ctx);
+    defer ctx.allocator.free(feed_scopes);
     const status_before_restore = if (effective_projection) |projection| blk: {
         const projection_floor = ctx.store.feedProjectionCursorFloor(ctx.allocator, projection.name) catch return serverError(ctx);
         break :blk if (projection.object_type) |object_type|
@@ -5409,6 +5478,7 @@ fn nullClawEventToNativeFeedEvent(ctx: *Context, obj: std.json.ObjectMap) ![]con
     const operation = json.stringField(obj, "operation") orelse "put";
     if (!nullClawMemoryOperationSupported(operation)) return error.InvalidPayload;
     const event_type = try std.fmt.allocPrint(ctx.allocator, "agent_memory.{s}", .{operation});
+    defer ctx.allocator.free(event_type);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
@@ -10065,9 +10135,14 @@ fn appendFeedEventForActorMode(ctx: *Context, out: *std.ArrayListUnmanaged(u8), 
 }
 
 fn feedPayloadForActor(ctx: *Context, event: store_mod.FeedEvent) ![]const u8 {
-    if (!feedEventObjectVisibleToActor(ctx, event)) return feed_contract.redactedPayload();
-    if (!try feedReferencedObjectsVisible(ctx, event.payload_json)) return feed_contract.redactedPayload();
-    if (std.mem.eql(u8, event.object_type, "agent_memory") and try feed_contract.agentMemoryPayloadIsInternal(ctx.allocator, event.payload_json)) return feed_contract.redactedPayload();
+    var scratch_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer scratch_arena.deinit();
+    var scratch_ctx = ctx.*;
+    scratch_ctx.allocator = scratch_arena.allocator();
+
+    if (!feedEventObjectVisibleToActor(&scratch_ctx, event)) return feed_contract.redactedPayload();
+    if (!try feedReferencedObjectsVisible(&scratch_ctx, event.payload_json)) return feed_contract.redactedPayload();
+    if (std.mem.eql(u8, event.object_type, "agent_memory") and try feed_contract.agentMemoryPayloadIsInternal(scratch_ctx.allocator, event.payload_json)) return feed_contract.redactedPayload();
     return event.payload_json;
 }
 
@@ -10672,12 +10747,14 @@ fn feedScopesJson(ctx: *Context) ![]const u8 {
         }
     }
     const own_agent_scope = try domain.defaultAgentMemoryScope(ctx.allocator, ctx.actor_id);
+    defer ctx.allocator.free(own_agent_scope);
     if (!domain.hasJsonString(ctx.actor_scopes_json, own_agent_scope)) {
         if (!first) try out.append(ctx.allocator, ',');
         first = false;
         try json.appendString(&out, ctx.allocator, own_agent_scope);
     }
     const own_actor_grant = try domain.actorGrant(ctx.allocator, ctx.actor_id);
+    defer ctx.allocator.free(own_actor_grant);
     if (!domain.hasJsonString(ctx.actor_scopes_json, own_actor_grant)) {
         if (!first) try out.append(ctx.allocator, ',');
         try json.appendString(&out, ctx.allocator, own_actor_grant);
@@ -11038,13 +11115,11 @@ fn feedRecordVisibleToActor(ctx: *Context, scope: []const u8, permissions_json: 
     if (!domain.isActorOwnedAgentMemoryScope(scope, ctx.actor_id)) return false;
     const policy = ctx.store.getPolicyScope(ctx.allocator, scope) catch return false;
     if (policy) |p| {
-        if (!domain.recordVisible(p.scope, p.permissions_json, tryFeedScopesJson(ctx))) return false;
+        const feed_scopes = feedScopesJson(ctx) catch return false;
+        defer ctx.allocator.free(feed_scopes);
+        if (!domain.recordVisible(p.scope, p.permissions_json, feed_scopes)) return false;
     }
     return access.permissionsVisibleForActor(ctx.allocator, permissions_json, ctx.actor_scopes_json, ctx.actor_id);
-}
-
-fn tryFeedScopesJson(ctx: *Context) []const u8 {
-    return feedScopesJson(ctx) catch ctx.actor_scopes_json;
 }
 
 fn canCreateMemoryAtom(ctx: *Context, input: store_mod.MemoryAtomInput) bool {
@@ -15314,6 +15389,149 @@ test "api memory apply supports deterministic agent memory merge reducers" {
     const visible_to_b = handleRequest(&agent_b_ctx, "GET", "/v1/agent-memory/private.note", "", "");
     try std.testing.expectEqualStrings("200 OK", visible_to_b.status);
     try std.testing.expect(std.mem.indexOf(u8, visible_to_b.body, "agent b only") != null);
+}
+
+test "api filtered central feed scans release skipped batch events" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+
+    var ctx = Context{
+        .allocator = std.testing.allocator,
+        .store = &store,
+        .actor_id = "agent:feed-filter",
+        .actor_scopes_json = "[\"public\"]",
+    };
+
+    _ = try store.appendFeedEvent(.{
+        .event_type = "memory_atom.put",
+        .object_type = "memory_atom",
+        .object_id = "mem_skip_before",
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+        .payload_json = "{\"text\":\"skip before\"}",
+        .status = "applied",
+    });
+    _ = try store.appendFeedEvent(.{
+        .event_type = "agent_memory.runtime_put",
+        .object_type = "agent_memory",
+        .object_id = "ami_keep_scratch",
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+        .payload_json = "{\"store\":\"scratch\",\"key\":\"keep\",\"content\":\"scratch memory\",\"scope\":\"public\"}",
+        .status = "applied",
+    });
+    _ = try store.appendFeedEvent(.{
+        .event_type = "source.put",
+        .object_type = "source",
+        .object_id = "src_skip_after",
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+        .payload_json = "{\"title\":\"skip after\",\"content\":\"not agent memory\"}",
+        .status = "applied",
+    });
+
+    const object_events = try listCentralFeedEventsByObjectType(&ctx, 0, 10, ctx.actor_scopes_json, true, "agent_memory");
+    defer store_mod.freeFeedEvents(std.testing.allocator, object_events);
+    try std.testing.expectEqual(@as(usize, 1), object_events.len);
+    try std.testing.expectEqualStrings("agent_memory", object_events[0].object_type);
+    try std.testing.expectEqualStrings("ami_keep_scratch", object_events[0].object_id);
+
+    const object_status = try centralFeedStatusByObjectTypeFromFloor(&ctx, ctx.actor_scopes_json, "agent_memory", 0);
+    try std.testing.expectEqual(@as(usize, 1), object_status.visible_events);
+    try std.testing.expectEqual(@as(usize, 1), object_status.applied_events);
+
+    const route = store_mod.AgentMemoryStorageRoute.parse("scratch");
+    const route_events = try listCentralFeedEventsForRoute(&ctx, 0, 10, ctx.actor_scopes_json, true, route);
+    defer store_mod.freeFeedEvents(std.testing.allocator, route_events);
+    try std.testing.expectEqual(@as(usize, 1), route_events.len);
+    try std.testing.expectEqualStrings("ami_keep_scratch", route_events[0].object_id);
+
+    const route_status = try centralFeedStatusForRouteFromFloor(&ctx, ctx.actor_scopes_json, route, 0);
+    try std.testing.expectEqual(@as(usize, 1), route_status.visible_events);
+    try std.testing.expectEqual(@as(usize, 1), route_status.applied_events);
+}
+
+test "api memory events route releases filtered feed events" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory_stores = &.{.{ .name = "scratch", .config = .{ .backend = .memory_lru } }},
+    });
+    defer store.deinit();
+
+    var ctx = Context{
+        .allocator = std.testing.allocator,
+        .store = &store,
+        .actor_id = "agent:feed-http",
+        .actor_scopes_json = "[\"public\"]",
+    };
+
+    _ = try store.appendFeedEvent(.{
+        .event_type = "memory_atom.put",
+        .object_type = "memory_atom",
+        .object_id = "mem_http_skip",
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+        .payload_json = "{\"text\":\"http skip\"}",
+        .status = "applied",
+    });
+    _ = try store.appendFeedEvent(.{
+        .event_type = "agent_memory.runtime_put",
+        .object_type = "agent_memory",
+        .object_id = "ami_http_scratch",
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+        .payload_json = "{\"store\":\"scratch\",\"key\":\"http.keep\",\"content\":\"http scratch memory\",\"scope\":\"public\"}",
+        .status = "applied",
+    });
+
+    const response = handleRequest(&ctx, "GET", "/v1/memory/events?store=scratch&limit=10", "", "");
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "http scratch memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "http skip") == null);
+}
+
+test "api feed rendering releases backing visibility lookups" {
+    var store = try Store.initSQLite(std.testing.allocator, ":memory:");
+    defer store.deinit();
+    var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup_arena.deinit();
+    const setup = setup_arena.allocator();
+
+    const source = try store.createSource(setup, .{
+        .title = "Feed render source",
+        .content = "feed render source body",
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+    });
+    _ = try store.appendFeedEvent(.{
+        .event_type = "source.put",
+        .object_type = "source",
+        .object_id = source.id,
+        .scope = "public",
+        .permissions_json = "[\"public\"]",
+        .payload_json = "{\"title\":\"Feed render source\",\"content\":\"feed render source body\"}",
+        .status = "applied",
+    });
+
+    var ctx = Context{
+        .allocator = std.testing.allocator,
+        .store = &store,
+        .actor_id = "agent:feed-render",
+        .actor_scopes_json = "[\"public\"]",
+    };
+
+    const events = try store.listFeedEvents(std.testing.allocator, .{
+        .scopes_json = ctx.actor_scopes_json,
+        .actor_id = ctx.actor_id,
+        .limit = 10,
+    });
+    defer store_mod.freeFeedEvents(std.testing.allocator, events);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    _ = try appendFeedEventsForActor(&ctx, &out, events);
+    const body = try out.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "feed render source body") != null);
 }
 
 test "api graph and conflict mutations require write-like capabilities" {

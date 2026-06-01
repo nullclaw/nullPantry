@@ -2664,10 +2664,10 @@ pub const Store = struct {
     fn agentMemoryListVisibleSubset(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, route: AgentMemoryStorageRoute) anyerror![]domain.AgentMemory {
         const stores = try requireSubsetStores(route);
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer freeAgentMemoryArrayList(allocator, &out);
         for (stores) |store_name| {
             const entries = try self.agentMemoryListVisibleRouted(allocator, category, session_id, actor_id, scopes_json, routeForSubsetStoreName(store_name));
-            defer allocator.free(entries);
+            defer freeAgentMemorySlice(allocator, entries);
             if (out.items.len == 0) {
                 try appendAgentMemorySlice(allocator, &out, entries);
             } else {
@@ -2680,10 +2680,10 @@ pub const Store = struct {
     fn agentMemoryListAnyVisibleSubset(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, actor_id: []const u8, scopes_json: []const u8, route: AgentMemoryStorageRoute) anyerror![]domain.AgentMemory {
         const stores = try requireSubsetStores(route);
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer freeAgentMemoryArrayList(allocator, &out);
         for (stores) |store_name| {
             const entries = try self.agentMemoryListAnyVisibleRouted(allocator, category, actor_id, scopes_json, routeForSubsetStoreName(store_name));
-            defer allocator.free(entries);
+            defer freeAgentMemorySlice(allocator, entries);
             try appendMissingAgentMemorySlice(allocator, &out, entries);
         }
         return out.toOwnedSlice(allocator);
@@ -2692,10 +2692,10 @@ pub const Store = struct {
     fn agentMemoryListSubset(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror![]domain.AgentMemory {
         const stores = try requireSubsetStores(route);
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer freeAgentMemoryArrayList(allocator, &out);
         for (stores) |store_name| {
             const entries = try self.agentMemoryListRouted(allocator, category, session_id, actor_id, routeForSubsetStoreName(store_name));
-            defer allocator.free(entries);
+            defer freeAgentMemorySlice(allocator, entries);
             if (out.items.len == 0) {
                 try appendAgentMemorySlice(allocator, &out, entries);
             } else {
@@ -2708,10 +2708,10 @@ pub const Store = struct {
     fn agentMemorySearchSubset(self: *Store, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror![]domain.AgentMemory {
         const stores = try requireSubsetStores(route);
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer freeAgentMemoryArrayList(allocator, &out);
         for (stores) |store_name| {
             const entries = try self.agentMemorySearchRouted(allocator, query, limit, session_id, scopes_json, actor_id, routeForSubsetStoreName(store_name));
-            defer allocator.free(entries);
+            defer freeAgentMemorySlice(allocator, entries);
             if (out.items.len == 0) {
                 try appendAgentMemorySlice(allocator, &out, entries);
             } else {
@@ -2726,10 +2726,10 @@ pub const Store = struct {
     fn agentMemorySearchAnyVisibleSubset(self: *Store, allocator: std.mem.Allocator, query: []const u8, limit: usize, scopes_json: []const u8, actor_id: ?[]const u8, route: AgentMemoryStorageRoute) anyerror![]domain.AgentMemory {
         const stores = try requireSubsetStores(route);
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer freeAgentMemoryArrayList(allocator, &out);
         for (stores) |store_name| {
             const entries = try self.agentMemorySearchAnyVisibleRouted(allocator, query, limit, scopes_json, actor_id, routeForSubsetStoreName(store_name));
-            defer allocator.free(entries);
+            defer freeAgentMemorySlice(allocator, entries);
             try appendMissingAgentMemorySlice(allocator, &out, entries);
         }
         sortAgentMemoryResults(out.items);
@@ -3257,84 +3257,84 @@ pub const Store = struct {
 
     fn agentMemoryListVisibleAll(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer freeAgentMemoryArrayList(allocator, &out);
         if (self.agent_memory.isExternal()) {
             const runtime = try self.agent_memory.listVisible(allocator, category, session_id, actor_id, scopes_json);
-            defer allocator.free(runtime);
+            defer freeAgentMemorySlice(allocator, runtime);
             try tagAgentMemorySliceStore(allocator, runtime, "runtime");
             try appendAgentMemorySlice(allocator, &out, runtime);
         }
         for (self.agent_memory_stores.stores.items) |*named| {
             const runtime = try named.runtime.listVisible(allocator, category, session_id, actor_id, scopes_json);
-            defer allocator.free(runtime);
+            defer freeAgentMemorySlice(allocator, runtime);
             try tagAgentMemorySliceStore(allocator, runtime, named.name);
             try appendMissingAgentMemorySlice(allocator, &out, runtime);
         }
         const native = try self.agentMemoryListVisibleNative(allocator, category, session_id, actor_id, scopes_json);
-        defer allocator.free(native);
+        defer freeAgentMemorySlice(allocator, native);
         try appendMissingAgentMemorySlice(allocator, &out, native);
         return out.toOwnedSlice(allocator);
     }
 
     fn agentMemoryListAnyVisibleAll(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, actor_id: []const u8, scopes_json: []const u8) ![]domain.AgentMemory {
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer freeAgentMemoryArrayList(allocator, &out);
         if (self.agent_memory.isExternal()) {
             const runtime = try self.agent_memory.listAnyVisible(allocator, category, actor_id, scopes_json);
-            defer allocator.free(runtime);
+            defer freeAgentMemorySlice(allocator, runtime);
             try tagAgentMemorySliceStore(allocator, runtime, "runtime");
             try appendAgentMemorySlice(allocator, &out, runtime);
         }
         for (self.agent_memory_stores.stores.items) |*named| {
             const runtime = try named.runtime.listAnyVisible(allocator, category, actor_id, scopes_json);
-            defer allocator.free(runtime);
+            defer freeAgentMemorySlice(allocator, runtime);
             try tagAgentMemorySliceStore(allocator, runtime, named.name);
             try appendMissingAgentMemorySlice(allocator, &out, runtime);
         }
         const native = try self.agentMemoryListAnyVisibleNative(allocator, category, actor_id, scopes_json);
-        defer allocator.free(native);
+        defer freeAgentMemorySlice(allocator, native);
         try appendMissingAgentMemorySlice(allocator, &out, native);
         return out.toOwnedSlice(allocator);
     }
 
     fn agentMemoryListAll(self: *Store, allocator: std.mem.Allocator, category: ?[]const u8, session_id: ?[]const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer freeAgentMemoryArrayList(allocator, &out);
         if (self.agent_memory.isExternal()) {
             const runtime = try self.agent_memory.list(allocator, category, session_id, actor_id);
-            defer allocator.free(runtime);
+            defer freeAgentMemorySlice(allocator, runtime);
             try tagAgentMemorySliceStore(allocator, runtime, "runtime");
             try appendAgentMemorySlice(allocator, &out, runtime);
         }
         for (self.agent_memory_stores.stores.items) |*named| {
             const runtime = try named.runtime.list(allocator, category, session_id, actor_id);
-            defer allocator.free(runtime);
+            defer freeAgentMemorySlice(allocator, runtime);
             try tagAgentMemorySliceStore(allocator, runtime, named.name);
             try appendMissingAgentMemorySlice(allocator, &out, runtime);
         }
         const native = try self.agentMemoryListNative(allocator, category, session_id, actor_id);
-        defer allocator.free(native);
+        defer freeAgentMemorySlice(allocator, native);
         try appendMissingAgentMemorySlice(allocator, &out, native);
         return out.toOwnedSlice(allocator);
     }
 
     fn agentMemorySearchAll(self: *Store, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer freeAgentMemoryArrayList(allocator, &out);
         if (self.agent_memory.isExternal()) {
             const runtime = try self.agent_memory.search(allocator, query, limit, session_id, scopes_json, actor_id);
-            defer allocator.free(runtime);
+            defer freeAgentMemorySlice(allocator, runtime);
             try tagAgentMemorySliceStore(allocator, runtime, "runtime");
             try appendAgentMemorySlice(allocator, &out, runtime);
         }
         for (self.agent_memory_stores.stores.items) |*named| {
             const runtime = try named.runtime.search(allocator, query, limit, session_id, scopes_json, actor_id);
-            defer allocator.free(runtime);
+            defer freeAgentMemorySlice(allocator, runtime);
             try tagAgentMemorySliceStore(allocator, runtime, named.name);
             try appendMissingAgentMemorySlice(allocator, &out, runtime);
         }
         const native = try self.agentMemorySearchNative(allocator, query, limit, session_id, scopes_json, actor_id);
-        defer allocator.free(native);
+        defer freeAgentMemorySlice(allocator, native);
         try appendMissingAgentMemorySlice(allocator, &out, native);
         sortAgentMemoryResults(out.items);
         trimAgentMemoryResults(allocator, &out, limit);
@@ -3343,21 +3343,21 @@ pub const Store = struct {
 
     fn agentMemorySearchAnyVisibleAll(self: *Store, allocator: std.mem.Allocator, query: []const u8, limit: usize, scopes_json: []const u8, actor_id: ?[]const u8) ![]domain.AgentMemory {
         var out: std.ArrayListUnmanaged(domain.AgentMemory) = .empty;
-        errdefer out.deinit(allocator);
+        errdefer freeAgentMemoryArrayList(allocator, &out);
         if (self.agent_memory.isExternal()) {
             const runtime = try self.agent_memory.searchAnyVisible(allocator, query, limit, scopes_json, actor_id);
-            defer allocator.free(runtime);
+            defer freeAgentMemorySlice(allocator, runtime);
             try tagAgentMemorySliceStore(allocator, runtime, "runtime");
             try appendAgentMemorySlice(allocator, &out, runtime);
         }
         for (self.agent_memory_stores.stores.items) |*named| {
             const runtime = try named.runtime.searchAnyVisible(allocator, query, limit, scopes_json, actor_id);
-            defer allocator.free(runtime);
+            defer freeAgentMemorySlice(allocator, runtime);
             try tagAgentMemorySliceStore(allocator, runtime, named.name);
             try appendMissingAgentMemorySlice(allocator, &out, runtime);
         }
         const native = try self.agentMemorySearchAnyVisibleNative(allocator, query, limit, scopes_json, actor_id);
-        defer allocator.free(native);
+        defer freeAgentMemorySlice(allocator, native);
         try appendMissingAgentMemorySlice(allocator, &out, native);
         sortAgentMemoryResults(out.items);
         trimAgentMemoryResults(allocator, &out, limit);
@@ -4582,6 +4582,49 @@ pub const FeedEvent = struct {
         try out.append(allocator, '}');
     }
 
+    pub fn clone(self: FeedEvent, allocator: std.mem.Allocator) !FeedEvent {
+        const event_type = try allocator.dupe(u8, self.event_type);
+        errdefer allocator.free(event_type);
+        const operation = try allocator.dupe(u8, self.operation);
+        errdefer allocator.free(operation);
+        const object_type = try allocator.dupe(u8, self.object_type);
+        errdefer allocator.free(object_type);
+        const object_id = try allocator.dupe(u8, self.object_id);
+        errdefer allocator.free(object_id);
+        const scope = try allocator.dupe(u8, self.scope);
+        errdefer allocator.free(scope);
+        const permissions_json = try allocator.dupe(u8, self.permissions_json);
+        errdefer allocator.free(permissions_json);
+        const actor_id = if (self.actor_id) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (actor_id) |value| allocator.free(value);
+        const dedupe_key = if (self.dedupe_key) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (dedupe_key) |value| allocator.free(value);
+        const causality_json = try allocator.dupe(u8, self.causality_json);
+        errdefer allocator.free(causality_json);
+        const payload_json = try allocator.dupe(u8, self.payload_json);
+        errdefer allocator.free(payload_json);
+        const status = try allocator.dupe(u8, self.status);
+        errdefer allocator.free(status);
+
+        return .{
+            .id = self.id,
+            .event_type = event_type,
+            .operation = operation,
+            .object_type = object_type,
+            .object_id = object_id,
+            .scope = scope,
+            .permissions_json = permissions_json,
+            .actor_id = actor_id,
+            .dedupe_key = dedupe_key,
+            .causality_json = causality_json,
+            .payload_json = payload_json,
+            .status = status,
+            .created_at_ms = self.created_at_ms,
+            .applied_at_ms = self.applied_at_ms,
+            .compacted_at_ms = self.compacted_at_ms,
+        };
+    }
+
     pub fn deinit(self: *FeedEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.event_type);
         allocator.free(self.operation);
@@ -4897,7 +4940,10 @@ fn normalizeAgentMemoryInput(input: AgentMemoryInput) AgentMemoryInput {
 }
 
 fn appendAgentMemorySlice(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), entries: []domain.AgentMemory) !void {
-    for (entries) |entry| try out.append(allocator, entry);
+    for (entries) |*entry| {
+        try out.append(allocator, entry.*);
+        detachAgentMemoryResult(entry);
+    }
 }
 
 fn tagAgentMemoryStore(allocator: std.mem.Allocator, entry: *domain.AgentMemory, store_name: []const u8) !void {
@@ -4910,14 +4956,24 @@ fn tagAgentMemorySliceStore(allocator: std.mem.Allocator, entries: []domain.Agen
 }
 
 fn appendMissingAgentMemorySlice(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory), entries: []domain.AgentMemory) !void {
-    for (entries) |entry| {
-        if (agentMemorySliceContains(out.items, entry)) {
-            var skipped = entry;
-            agent_memory_runtime.freeAgentMemory(allocator, &skipped);
+    for (entries) |*entry| {
+        if (agentMemorySliceContains(out.items, entry.*)) {
+            agent_memory_runtime.freeAgentMemory(allocator, entry);
             continue;
         }
-        try out.append(allocator, entry);
+        try out.append(allocator, entry.*);
+        detachAgentMemoryResult(entry);
     }
+}
+
+fn freeAgentMemoryArrayList(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(domain.AgentMemory)) void {
+    for (out.items) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+    out.deinit(allocator);
+}
+
+fn freeAgentMemorySlice(allocator: std.mem.Allocator, entries: []domain.AgentMemory) void {
+    for (entries) |*entry| agent_memory_runtime.freeAgentMemory(allocator, entry);
+    allocator.free(entries);
 }
 
 fn sortAgentMemoryResults(items: []domain.AgentMemory) void {
@@ -17566,6 +17622,44 @@ test "agent memory all fanout releases overwritten result ownership" {
     }, .{ .target = .all });
     defer agent_memory_runtime.freeAgentMemory(std.testing.allocator, &saved);
     try std.testing.expectEqualStrings("archive", saved.store);
+}
+
+test "agent memory all-store fan-in returns owned list and search entries" {
+    var store = try Store.initSQLiteWithOptions(std.testing.allocator, ":memory:", .{
+        .agent_memory = .{ .backend = .memory_lru },
+        .agent_memory_stores = &.{
+            .{ .name = "scratch", .config = .{ .backend = .memory_lru } },
+            .{ .name = "archive", .config = .{ .backend = .memory_lru } },
+        },
+    });
+    defer store.deinit();
+
+    var saved_native = try store.agentMemoryStoreRouted(std.testing.allocator, .{
+        .key = "fanin.native",
+        .content = "fan in native value",
+        .actor_id = "agent:fanin",
+    }, .{ .target = .native });
+    defer agent_memory_runtime.freeAgentMemory(std.testing.allocator, &saved_native);
+    var saved_runtime = try store.agentMemoryStoreRouted(std.testing.allocator, .{
+        .key = "fanin.runtime",
+        .content = "fan in runtime value",
+        .actor_id = "agent:fanin",
+    }, .{ .target = .runtime });
+    defer agent_memory_runtime.freeAgentMemory(std.testing.allocator, &saved_runtime);
+    var saved_scratch = try store.agentMemoryStoreRouted(std.testing.allocator, .{
+        .key = "fanin.scratch",
+        .content = "fan in scratch value",
+        .actor_id = "agent:fanin",
+    }, AgentMemoryStorageRoute.parse("scratch"));
+    defer agent_memory_runtime.freeAgentMemory(std.testing.allocator, &saved_scratch);
+
+    const listed = try store.agentMemoryListAnyVisibleRouted(std.testing.allocator, null, "agent:fanin", "[]", .{ .target = .all });
+    defer freeAgentMemorySlice(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+
+    const searched = try store.agentMemorySearchAnyVisibleRouted(std.testing.allocator, "fan in", 10, "[]", "agent:fanin", .{ .target = .all });
+    defer freeAgentMemorySlice(std.testing.allocator, searched);
+    try std.testing.expectEqual(@as(usize, 3), searched.len);
 }
 
 test "native agent memory backing rows do not leak through generic search" {
