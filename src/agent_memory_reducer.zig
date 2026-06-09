@@ -1,0 +1,305 @@
+const std = @import("std");
+const domain = @import("domain.zig");
+const json = @import("json_util.zig");
+
+pub const ValueKind = enum {
+    json_object,
+    string_set,
+
+    pub fn parse(raw: []const u8) ?ValueKind {
+        if (std.mem.eql(u8, raw, "json_object")) return .json_object;
+        if (std.mem.eql(u8, raw, "string_set")) return .string_set;
+        return null;
+    }
+};
+
+pub fn reduceContent(
+    allocator: std.mem.Allocator,
+    operation: domain.AgentMemoryOperation,
+    existing_content: ?[]const u8,
+    update_content: []const u8,
+) ![]u8 {
+    return switch (operation) {
+        .put => allocator.dupe(u8, update_content),
+        .merge_string_set => reduceStringSet(allocator, existing_content, update_content),
+        .merge_object => reduceObject(allocator, existing_content, update_content),
+    };
+}
+
+pub fn canonicalizePutContent(allocator: std.mem.Allocator, content: []const u8, value_kind_raw: ?[]const u8) ![]u8 {
+    const value_kind_text = value_kind_raw orelse return allocator.dupe(u8, content);
+    const value_kind = ValueKind.parse(value_kind_text) orelse return error.InvalidPayload;
+    return switch (value_kind) {
+        .json_object => canonicalizeObject(allocator, content),
+        .string_set => reduceStringSet(allocator, null, content),
+    };
+}
+
+pub fn stringSetPatchFromObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8 {
+    var values: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer freeStringList(allocator, &values);
+
+    if (obj.get("values")) |value| {
+        try appendStringValue(allocator, &values, value);
+    } else if (obj.get("value")) |value| {
+        try appendStringValue(allocator, &values, value);
+    } else if (json.stringField(obj, "content")) |content| {
+        try appendUniqueString(allocator, &values, content);
+    } else if (json.stringField(obj, "text")) |text| {
+        try appendUniqueString(allocator, &values, text);
+    } else {
+        return error.InvalidPayload;
+    }
+
+    return stringSetJson(allocator, values.items);
+}
+
+pub fn objectPatchFromObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8 {
+    const patch_value = obj.get("object") orelse obj.get("value") orelse return error.InvalidPayload;
+    if (patch_value != .object) return error.InvalidPayload;
+    return json.jsonFromValue(allocator, patch_value);
+}
+
+fn reduceStringSet(allocator: std.mem.Allocator, existing_content: ?[]const u8, update_content: []const u8) ![]u8 {
+    var values: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer freeStringList(allocator, &values);
+
+    if (existing_content) |content| try appendStringSetValues(allocator, &values, content);
+    try appendStringSetValues(allocator, &values, update_content);
+
+    return stringSetJson(allocator, values.items);
+}
+
+fn canonicalizeObject(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendObjectCanonical(&out, allocator, parsed.value.object);
+    return out.toOwnedSlice(allocator);
+}
+
+fn reduceObject(allocator: std.mem.Allocator, existing_content: ?[]const u8, update_content: []const u8) ![]u8 {
+    var existing_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (existing_parsed) |*parsed| parsed.deinit();
+    var existing_obj: ?std.json.ObjectMap = null;
+    if (existing_content) |content| {
+        existing_parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+        if (existing_parsed.?.value != .object) return error.InvalidPayload;
+        existing_obj = existing_parsed.?.value.object;
+    }
+
+    const patch_parsed = try std.json.parseFromSlice(std.json.Value, allocator, update_content, .{});
+    defer patch_parsed.deinit();
+    if (patch_parsed.value != .object) return error.InvalidPayload;
+    const patch_obj = patch_parsed.value.object;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendMergedObjectCanonical(&out, allocator, existing_obj, patch_obj);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendCanonicalJsonValue(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: std.json.Value) anyerror!void {
+    switch (value) {
+        .null => try out.appendSlice(allocator, "null"),
+        .bool => |inner| try out.appendSlice(allocator, if (inner) "true" else "false"),
+        .integer => |inner| try out.print(allocator, "{d}", .{inner}),
+        .float => |inner| try out.print(allocator, "{d}", .{inner}),
+        .number_string => |inner| try out.appendSlice(allocator, inner),
+        .string => |inner| try json.appendString(out, allocator, inner),
+        .array => |inner| {
+            try out.append(allocator, '[');
+            for (inner.items, 0..) |item, i| {
+                if (i > 0) try out.append(allocator, ',');
+                try appendCanonicalJsonValue(out, allocator, item);
+            }
+            try out.append(allocator, ']');
+        },
+        .object => |inner| try appendObjectCanonical(out, allocator, inner),
+    }
+}
+
+fn appendObjectCanonical(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, object: std.json.ObjectMap) anyerror!void {
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer freeStringList(allocator, &keys);
+    var it = object.iterator();
+    while (it.next()) |entry| try appendUniqueString(allocator, &keys, entry.key_ptr.*);
+    std.mem.sort([]const u8, keys.items, {}, stringLessThan);
+
+    try out.append(allocator, '{');
+    for (keys.items, 0..) |item_key, i| {
+        if (i > 0) try out.append(allocator, ',');
+        try json.appendString(out, allocator, item_key);
+        try out.append(allocator, ':');
+        try appendCanonicalJsonValue(out, allocator, object.get(item_key).?);
+    }
+    try out.append(allocator, '}');
+}
+
+fn appendMergedObjectCanonical(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, existing_obj: ?std.json.ObjectMap, patch_obj: std.json.ObjectMap) anyerror!void {
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer freeStringList(allocator, &keys);
+    if (existing_obj) |map| {
+        var existing_it = map.iterator();
+        while (existing_it.next()) |entry| try appendUniqueString(allocator, &keys, entry.key_ptr.*);
+    }
+    var patch_it = patch_obj.iterator();
+    while (patch_it.next()) |entry| try appendUniqueString(allocator, &keys, entry.key_ptr.*);
+    std.mem.sort([]const u8, keys.items, {}, stringLessThan);
+
+    try out.append(allocator, '{');
+    for (keys.items, 0..) |item_key, i| {
+        if (i > 0) try out.append(allocator, ',');
+        try json.appendString(out, allocator, item_key);
+        try out.append(allocator, ':');
+
+        const patch_value = patch_obj.get(item_key);
+        const existing_value = if (existing_obj) |map| map.get(item_key) else null;
+        if (patch_value) |value| {
+            if (existing_value) |existing| {
+                if (existing == .object and value == .object) {
+                    try appendMergedObjectCanonical(out, allocator, existing.object, value.object);
+                    continue;
+                }
+            }
+            try appendCanonicalJsonValue(out, allocator, value);
+        } else if (existing_value) |value| {
+            try appendCanonicalJsonValue(out, allocator, value);
+        } else {
+            return error.InvalidPayload;
+        }
+    }
+    try out.append(allocator, '}');
+}
+
+fn appendStringSetValues(allocator: std.mem.Allocator, values: *std.ArrayListUnmanaged([]const u8), content: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
+        if (content.len > 0) try appendUniqueString(allocator, values, content);
+        return;
+    };
+    defer parsed.deinit();
+    try appendStringValue(allocator, values, parsed.value);
+}
+
+fn appendStringValue(allocator: std.mem.Allocator, values: *std.ArrayListUnmanaged([]const u8), value: std.json.Value) !void {
+    switch (value) {
+        .string => |s| try appendUniqueString(allocator, values, s),
+        .array => |items| for (items.items) |item| {
+            if (item == .string) try appendUniqueString(allocator, values, item.string);
+        },
+        else => return error.InvalidPayload,
+    }
+}
+
+fn appendUniqueString(allocator: std.mem.Allocator, values: *std.ArrayListUnmanaged([]const u8), value: []const u8) !void {
+    for (values.items) |existing| {
+        if (std.mem.eql(u8, existing, value)) return;
+    }
+    try values.append(allocator, try allocator.dupe(u8, value));
+}
+
+fn freeStringList(allocator: std.mem.Allocator, values: *std.ArrayListUnmanaged([]const u8)) void {
+    for (values.items) |value| allocator.free(value);
+    values.deinit(allocator);
+}
+
+fn stringSetJson(allocator: std.mem.Allocator, values: [][]const u8) ![]u8 {
+    std.mem.sort([]const u8, values, {}, stringLessThan);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    var last: ?[]const u8 = null;
+    var written: usize = 0;
+    for (values) |value| {
+        if (last != null and std.mem.eql(u8, last.?, value)) continue;
+        if (written > 0) try out.append(allocator, ',');
+        try json.appendString(&out, allocator, value);
+        last = value;
+        written += 1;
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+test "agent memory reducer converges string sets" {
+    const first = try reduceContent(std.testing.allocator, .merge_string_set, null, "[\"zig\",\"sqlite\"]");
+    defer std.testing.allocator.free(first);
+    const second = try reduceContent(std.testing.allocator, .merge_string_set, first, "[\"postgres\",\"zig\"]");
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings("[\"postgres\",\"sqlite\",\"zig\"]", second);
+}
+
+test "agent memory reducer string set merge is idempotent" {
+    const once = try reduceContent(std.testing.allocator, .merge_string_set, null, "[\"zig\",\"sqlite\",\"zig\"]");
+    defer std.testing.allocator.free(once);
+    const twice = try reduceContent(std.testing.allocator, .merge_string_set, once, "[\"sqlite\",\"zig\"]");
+    defer std.testing.allocator.free(twice);
+    const scalar_duplicate = try reduceContent(std.testing.allocator, .merge_string_set, twice, "\"zig\"");
+    defer std.testing.allocator.free(scalar_duplicate);
+
+    try std.testing.expectEqualStrings("[\"sqlite\",\"zig\"]", once);
+    try std.testing.expectEqualStrings(once, twice);
+    try std.testing.expectEqualStrings(once, scalar_duplicate);
+}
+
+test "agent memory reducer merges objects with patch precedence" {
+    const merged = try reduceContent(std.testing.allocator, .merge_object, "{\"language\":\"zig\",\"style\":\"concise\"}", "{\"database\":\"postgres\",\"style\":\"detailed\"}");
+    defer std.testing.allocator.free(merged);
+    try std.testing.expectEqualStrings("{\"database\":\"postgres\",\"language\":\"zig\",\"style\":\"detailed\"}", merged);
+}
+
+test "agent memory reducer independent object patches associate" {
+    const base = "{\"profile\":{\"language\":\"zig\"},\"seen\":true}";
+    const patch_a = "{\"profile\":{\"style\":\"concise\"},\"database\":\"sqlite\"}";
+    const patch_b = "{\"profile\":{\"formatter\":\"zig fmt\"},\"runtime\":\"memory_lru\"}";
+
+    const left_step = try reduceContent(std.testing.allocator, .merge_object, base, patch_a);
+    defer std.testing.allocator.free(left_step);
+    const left = try reduceContent(std.testing.allocator, .merge_object, left_step, patch_b);
+    defer std.testing.allocator.free(left);
+
+    const combined_patch = try reduceContent(std.testing.allocator, .merge_object, patch_a, patch_b);
+    defer std.testing.allocator.free(combined_patch);
+    const right = try reduceContent(std.testing.allocator, .merge_object, base, combined_patch);
+    defer std.testing.allocator.free(right);
+
+    const swapped_step = try reduceContent(std.testing.allocator, .merge_object, base, patch_b);
+    defer std.testing.allocator.free(swapped_step);
+    const swapped = try reduceContent(std.testing.allocator, .merge_object, swapped_step, patch_a);
+    defer std.testing.allocator.free(swapped);
+
+    try std.testing.expectEqualStrings(left, right);
+    try std.testing.expectEqualStrings(left, swapped);
+    try std.testing.expectEqualStrings("{\"database\":\"sqlite\",\"profile\":{\"formatter\":\"zig fmt\",\"language\":\"zig\",\"style\":\"concise\"},\"runtime\":\"memory_lru\",\"seen\":true}", left);
+}
+
+test "agent memory reducer canonicalizes typed put content" {
+    const object = try canonicalizePutContent(std.testing.allocator, "{\"z\":true,\"profile\":{\"style\":\"concise\",\"language\":\"zig\"}}", "json_object");
+    defer std.testing.allocator.free(object);
+    try std.testing.expectEqualStrings("{\"profile\":{\"language\":\"zig\",\"style\":\"concise\"},\"z\":true}", object);
+
+    const set = try canonicalizePutContent(std.testing.allocator, "[\"zig\",\"sqlite\",\"zig\"]", "string_set");
+    defer std.testing.allocator.free(set);
+    try std.testing.expectEqualStrings("[\"sqlite\",\"zig\"]", set);
+
+    const plain = try canonicalizePutContent(std.testing.allocator, "{\"z\":true,\"a\":1}", null);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("{\"z\":true,\"a\":1}", plain);
+}
+
+test "agent memory reducer deep merges objects deterministically" {
+    const first = try reduceContent(std.testing.allocator, .merge_object, null, "{\"profile\":{\"style\":\"concise\",\"language\":\"zig\"},\"tools\":[{\"name\":\"sqlite\",\"rank\":2}],\"z\":true}");
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("{\"profile\":{\"language\":\"zig\",\"style\":\"concise\"},\"tools\":[{\"name\":\"sqlite\",\"rank\":2}],\"z\":true}", first);
+
+    const second = try reduceContent(std.testing.allocator, .merge_object, first, "{\"profile\":{\"database\":\"postgres\",\"style\":\"detailed\"},\"a\":1}");
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings("{\"a\":1,\"profile\":{\"database\":\"postgres\",\"language\":\"zig\",\"style\":\"detailed\"},\"tools\":[{\"name\":\"sqlite\",\"rank\":2}],\"z\":true}", second);
+}

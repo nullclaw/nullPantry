@@ -1,0 +1,9 @@
+pub const supermemory_default_base_url = "https://api.supermemory.ai";
+pub const openviking_default_base_url = "http://localhost:1933";
+pub const honcho_default_base_url = "https://api.honcho.dev/v3";
+pub const mem0_default_base_url = "https://api.mem0.ai";
+pub const hindsight_default_base_url = "https://api.hindsight.vectorize.io";
+pub const retaindb_default_base_url = "https://api.retaindb.com";
+pub const zep_default_base_url = "https://api.getzep.com/api/v2";
+pub const falkordb_default_base_url = "http://localhost:3000";
+pub const byterover_default_command = "brv";
