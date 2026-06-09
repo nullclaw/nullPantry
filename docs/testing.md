@@ -60,6 +60,17 @@ zig build test-full-engine
 
 `zig build test -Dserver-tests=true` is still available when a script wants the old default behavior without changing the step name. `-Dfull-import-tests=true` adds aggregate import coverage to `zig build test`; it is ignored for `-Dengine-profile=minimal`.
 
+## GitHub Gates
+
+Pull requests into `main` run the required `CI` baseline matrix on Linux, macOS, and Windows. Each matrix job runs:
+
+```sh
+zig build test --summary all
+zig build --summary all
+```
+
+These checks are intentionally small enough to stay required for every merge. Full engine import checks, external runtime contracts, and release artifact builds run from the `Release` workflow on `v*` tags or manual dispatch before release artifacts are published.
+
 ## External Contracts
 
 Concrete backend contracts stay opt-in because they require external services:

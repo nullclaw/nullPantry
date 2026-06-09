@@ -696,7 +696,38 @@ fn permissionsGroupOrWorldWritable(permissions: std.Io.File.Permissions) bool {
 }
 
 fn supportsPosixOwnerCheck() bool {
-    return builtin.link_libc and switch (builtin.os.tag) {
+    return switch (builtin.os.tag) {
+        .linux => true,
+        .windows, .wasi, .emscripten, .freestanding, .other => false,
+        else => builtin.link_libc,
+    };
+}
+
+fn openHandleOwnedByEffectiveUser(handle: std.posix.fd_t) !bool {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx_buf: linux.Statx = undefined;
+        switch (linux.errno(linux.statx(
+            @intCast(handle),
+            "",
+            linux.AT.EMPTY_PATH | linux.AT.NO_AUTOMOUNT,
+            .{ .UID = true },
+            &statx_buf,
+        ))) {
+            .SUCCESS => {},
+            else => return error.UntrustedRuntimeConfig,
+        }
+        if (!statx_buf.mask.UID) return error.UntrustedRuntimeConfig;
+        return statx_buf.uid == linux.geteuid();
+    } else if (comptime builtin.link_libc) {
+        var stat_buf: std.c.Stat = undefined;
+        if (fstat(@intCast(handle), &stat_buf) != 0) return error.UntrustedRuntimeConfig;
+        return stat_buf.uid == geteuid();
+    } else return false;
+}
+
+fn supportsSecureCreateMode() bool {
+    return switch (builtin.os.tag) {
         .windows, .wasi, .emscripten, .freestanding, .other => false,
         else => true,
     };
@@ -705,9 +736,7 @@ fn supportsPosixOwnerCheck() bool {
 fn validateOpenHandleTrust(handle: std.posix.fd_t, permissions: std.Io.File.Permissions) !void {
     if (permissionsGroupOrWorldWritable(permissions)) return error.UntrustedRuntimeConfig;
     if (comptime supportsPosixOwnerCheck()) {
-        var stat_buf: std.c.Stat = undefined;
-        if (fstat(@intCast(handle), &stat_buf) != 0) return error.UntrustedRuntimeConfig;
-        if (stat_buf.uid != geteuid()) return error.UntrustedRuntimeConfig;
+        if (!try openHandleOwnedByEffectiveUser(handle)) return error.UntrustedRuntimeConfig;
     }
 }
 
@@ -745,7 +774,7 @@ fn loadImplicitHomeConfigFile(out: *ConfigFileEnv, config_path: []const u8) !voi
 fn ensureRuntimeHomeRoot(home_path: []const u8) !void {
     const trimmed = std.mem.trim(u8, home_path, " \t\r\n");
     if (trimmed.len == 0) return;
-    const permissions: std.Io.Dir.Permissions = if (comptime @hasDecl(std.Io.Dir.Permissions, "fromMode"))
+    const permissions: std.Io.Dir.Permissions = if (comptime @hasDecl(std.Io.Dir.Permissions, "fromMode") and supportsSecureCreateMode())
         .fromMode(0o700)
     else
         .default_dir;
