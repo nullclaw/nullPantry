@@ -391,6 +391,25 @@ fn addRecursiveFilteredServerTestStep(
     return step;
 }
 
+fn addRecursiveContractServerTestStep(
+    b: *std.Build,
+    name: []const u8,
+    description: []const u8,
+    require_env_name: ?[]const u8,
+    build_args: []const []const u8,
+    filters: []const []const u8,
+) *std.Build.Step {
+    const step = b.step(name, description);
+    for (filters) |filter| {
+        const cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "test-server" });
+        for (build_args) |arg| cmd.addArg(arg);
+        cmd.addArg(b.fmt("-Dtest-filter={s}", .{filter}));
+        if (require_env_name) |name_| cmd.setEnvironmentVariable(name_, "1");
+        step.dependOn(&cmd.step);
+    }
+    return step;
+}
+
 test "engine list keeps lancedb sdk and http adapter explicit" {
     const selected = try parseEnginesOption("sqlite,lancedb");
     try std.testing.expect(selected.enable_sqlite);
@@ -749,46 +768,20 @@ pub fn build(b: *std.Build) void {
     matrix_step.dependOn(nullclaw_step);
     matrix_step.dependOn(full_engine_step);
 
-    const postgres_contract_cmd = b.addRunArtifact(server_entrypoint_tests);
-    postgres_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_POSTGRES_TEST", "1");
-    const postgres_contract_step = b.step("postgres-contract", "Run the required Postgres/pgvector storage contract with NULLPANTRY_TEST_POSTGRES_URL");
-    postgres_contract_step.dependOn(&postgres_contract_cmd.step);
-
-    const pgvector_contract_cmd = b.addRunArtifact(server_entrypoint_tests);
-    pgvector_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_PGVECTOR_TEST", "1");
-    const pgvector_contract_step = b.step("pgvector-contract", "Run the standalone pgvector vector runtime contract with NULLPANTRY_TEST_PGVECTOR_URL");
-    pgvector_contract_step.dependOn(&pgvector_contract_cmd.step);
-
-    const redis_contract_cmd = b.addRunArtifact(server_entrypoint_tests);
-    redis_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_REDIS_TEST", "1");
-    const redis_contract_step = b.step("redis-contract", "Run the Redis agent-memory contract with NULLPANTRY_TEST_REDIS_URL");
-    redis_contract_step.dependOn(&redis_contract_cmd.step);
-
-    const qdrant_contract_cmd = b.addRunArtifact(server_entrypoint_tests);
-    qdrant_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_QDRANT_TEST", "1");
-    const qdrant_contract_step = b.step("qdrant-contract", "Run the Qdrant vector runtime contract with NULLPANTRY_TEST_QDRANT_URL");
-    qdrant_contract_step.dependOn(&qdrant_contract_cmd.step);
-
-    const lancedb_contract_cmd = b.addRunArtifact(server_entrypoint_tests);
-    lancedb_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_LANCEDB_TEST", "1");
-    const lancedb_contract_step = b.step("lancedb-contract", "Run the LanceDB SDK or HTTP vector runtime contract with NULLPANTRY_TEST_LANCEDB_URI or NULLPANTRY_TEST_LANCEDB_URL");
-    lancedb_contract_step.dependOn(&lancedb_contract_cmd.step);
-
-    const clickhouse_contract_cmd = b.addRunArtifact(server_entrypoint_tests);
-    clickhouse_contract_cmd.setEnvironmentVariable("NULLPANTRY_REQUIRE_CLICKHOUSE_TEST", "1");
-    const clickhouse_contract_step = b.step("clickhouse-contract", "Run the ClickHouse analytics runtime contract with NULLPANTRY_TEST_CLICKHOUSE_URL");
-    clickhouse_contract_step.dependOn(&clickhouse_contract_cmd.step);
-
-    const lucid_contract_cmd = b.addRunArtifact(server_entrypoint_tests);
-    const lucid_contract_step = b.step("lucid-contract", "Run the Lucid projection runtime contract with a fake Lucid CLI");
-    lucid_contract_step.dependOn(&lucid_contract_cmd.step);
+    const postgres_contract_step = addRecursiveContractServerTestStep(b, "postgres-contract", "Run the required Postgres storage contract with NULLPANTRY_TEST_POSTGRES_URL", "NULLPANTRY_REQUIRE_POSTGRES_TEST", &.{"-Denable-postgres=true"}, &.{"postgres storage contract covers primitives when configured"});
+    const pgvector_contract_step = addRecursiveContractServerTestStep(b, "pgvector-contract", "Run the standalone pgvector vector runtime contract with NULLPANTRY_TEST_PGVECTOR_URL", "NULLPANTRY_REQUIRE_PGVECTOR_TEST", &.{"-Denable-pgvector=true"}, &.{"pgvector live vector contract when configured"});
+    const redis_contract_step = addRecursiveContractServerTestStep(b, "redis-contract", "Run the Redis agent-memory contract with NULLPANTRY_TEST_REDIS_URL", "NULLPANTRY_REQUIRE_REDIS_TEST", &.{"-Denable-redis=true"}, &.{"redis agent memory contract when configured"});
+    const qdrant_contract_step = addRecursiveContractServerTestStep(b, "qdrant-contract", "Run the Qdrant vector runtime contract with NULLPANTRY_TEST_QDRANT_URL", "NULLPANTRY_REQUIRE_QDRANT_TEST", &.{"-Denable-qdrant=true"}, &.{"qdrant live vector contract when configured"});
+    const lancedb_contract_step = addRecursiveContractServerTestStep(b, "lancedb-contract", "Run the LanceDB SDK or HTTP vector runtime contract with NULLPANTRY_TEST_LANCEDB_URI or NULLPANTRY_TEST_LANCEDB_URL", "NULLPANTRY_REQUIRE_LANCEDB_TEST", &.{"-Denable-lancedb=true"}, &.{"lancedb live vector contract when configured"});
+    const clickhouse_contract_step = addRecursiveContractServerTestStep(b, "clickhouse-contract", "Run the ClickHouse analytics and agent-memory contracts with NULLPANTRY_TEST_CLICKHOUSE_URL", "NULLPANTRY_REQUIRE_CLICKHOUSE_TEST", &.{"-Denable-clickhouse=true"}, &.{ "agent memory clickhouse live contract when configured", "clickhouse analytics live contract when configured" });
+    const lucid_contract_step = addRecursiveContractServerTestStep(b, "lucid-contract", "Run the Lucid projection runtime contracts with a fake Lucid CLI", null, &.{"-Denable-lucid=true"}, &.{ "lucid projection CLI contract with fake command", "worker processes durable Lucid projection jobs" });
 
     const runtime_contracts_step = b.step("runtime-contracts", "Run concrete external runtime contracts when their services are configured");
-    runtime_contracts_step.dependOn(&postgres_contract_cmd.step);
-    runtime_contracts_step.dependOn(&pgvector_contract_cmd.step);
-    runtime_contracts_step.dependOn(&redis_contract_cmd.step);
-    runtime_contracts_step.dependOn(&qdrant_contract_cmd.step);
-    runtime_contracts_step.dependOn(&lancedb_contract_cmd.step);
-    runtime_contracts_step.dependOn(&clickhouse_contract_cmd.step);
-    runtime_contracts_step.dependOn(&lucid_contract_cmd.step);
+    runtime_contracts_step.dependOn(postgres_contract_step);
+    runtime_contracts_step.dependOn(pgvector_contract_step);
+    runtime_contracts_step.dependOn(redis_contract_step);
+    runtime_contracts_step.dependOn(qdrant_contract_step);
+    runtime_contracts_step.dependOn(lancedb_contract_step);
+    runtime_contracts_step.dependOn(clickhouse_contract_step);
+    runtime_contracts_step.dependOn(lucid_contract_step);
 }

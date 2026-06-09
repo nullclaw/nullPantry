@@ -15216,7 +15216,7 @@ test "agent memory clickhouse live contract when configured" {
 
     const feed_events = try engine.listFeedEventsByInput(std.testing.allocator, .{
         .since_id = 0,
-        .limit = 20,
+        .limit = 100,
         .actor_id = "agent:a",
         .scopes_json = "[\"agent:agent:a\"]",
     });

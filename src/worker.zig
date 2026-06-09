@@ -2051,7 +2051,7 @@ test "worker releases vector outbox entries and embedding temporaries on long-li
     });
 
     const result = try runOnce(std.testing.allocator, &store, .{
-        .scopes_json = "[\"public\"]",
+        .scopes_json = "[\"admin\",\"public\"]",
         .outbox_limit = 10,
         .actor_id = "worker:vector-release",
     });
@@ -2550,7 +2550,7 @@ test "worker persists embed outbox before provider call and replays locally" {
         try std.testing.expect(entry.locked_until_ms == null);
     }
 
-    const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]", .outbox_limit = 50 });
+    const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"admin\",\"public\"]", .outbox_limit = 50 });
     try std.testing.expect(result.vector_outbox_processed >= pending.len);
     const still_pending = try store.listVectorOutbox(alloc, .{ .action = "embed", .status = "pending", .limit = 20 });
     try std.testing.expectEqual(@as(usize, 0), still_pending.len);
@@ -2583,7 +2583,7 @@ test "worker embedding outbox uses shared embedding cache" {
     _ = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = "memory_atom", .object_id = "mem_worker_cache_a", .payload_json = payload_a });
     _ = try store.enqueueVectorOutbox(.{ .action = "embed", .object_type = "memory_atom", .object_id = "mem_worker_cache_b", .payload_json = payload_b });
 
-    const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"public\"]", .outbox_limit = 10 });
+    const result = try runOnce(alloc, &store, .{ .scopes_json = "[\"admin\",\"public\"]", .outbox_limit = 10 });
     try std.testing.expect(result.vector_outbox_processed >= 2);
     const stats = try store.embeddingCacheStats();
     try std.testing.expectEqual(@as(usize, 1), stats.entries);

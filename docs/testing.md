@@ -69,7 +69,7 @@ zig build test --summary all
 zig build --summary all
 ```
 
-These checks are intentionally small enough to stay required for every merge. Full engine import checks, external runtime contracts, and release artifact builds run from the `Release` workflow on `v*` tags or manual dispatch before release artifacts are published.
+These checks are intentionally small enough to stay required for every merge. Full engine import checks and external runtime contracts can be run without publishing artifacts from the manual `Contracts` workflow. The `Release` workflow runs the same verification on `v*` tags or manual dispatch before release artifacts are published.
 
 ## External Contracts
 
@@ -81,7 +81,7 @@ NULLPANTRY_TEST_REDIS_URL='redis://:password@localhost:6379/0' zig build redis-c
 NULLPANTRY_TEST_QDRANT_URL='http://localhost:6333' zig build qdrant-contract
 NULLPANTRY_TEST_PGVECTOR_URL='postgres://localhost/nullpantry_test' zig build pgvector-contract
 NULLPANTRY_TEST_CLICKHOUSE_URL='http://localhost:8123' zig build clickhouse-contract
-NULLPANTRY_TEST_LANCEDB_URI='.nullpantry/lancedb-contract' zig build lancedb-contract
+NULLPANTRY_TEST_LANCEDB_URI='.nullpantry/lancedb-contract' NULLPANTRY_TEST_LANCEDB_COMMAND="$(command -v python3)" zig build lancedb-contract
 zig build lucid-contract
 ```
 

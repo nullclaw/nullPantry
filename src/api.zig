@@ -45,6 +45,15 @@ fn engineProfileIsFull() bool {
 fn localPrimitiveRouteTestsEnabled() bool {
     return build_options.enable_engine_markdown and !engineProfileIsFull();
 }
+
+fn testingDrainWorkerJobs(store: *Store, allocator: std.mem.Allocator) !worker.RunResult {
+    const result = try worker.runOnce(allocator, store, .{
+        .job_limit = 100,
+        .outbox_limit = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 0), result.jobs_failed);
+    return result;
+}
 const api_types = @import("api_types.zig");
 const api_responses = @import("api_responses.zig");
 const api_registry = @import("api_registry.zig");
@@ -20022,6 +20031,7 @@ test "api agent memory supports named stores and federated runtime reads" {
 
     const scratch_source = handleRequest(&ctx, "POST", "/v1/sources", "{\"title\":\"Primitive Scratch Source\",\"content\":\"Primitive scratch source body\",\"scope\":\"public\",\"store\":\"scratch\"}", "POST /v1/sources HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", scratch_source.status);
+    _ = try testingDrainWorkerJobs(&store, alloc);
     const scratch_source_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Primitive scratch source body\",\"store\":\"scratch\",\"use_vector\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", scratch_source_search.status);
     try std.testing.expect(std.mem.indexOf(u8, scratch_source_search.body, "Primitive Scratch Source") != null);
@@ -20034,6 +20044,7 @@ test "api agent memory supports named stores and federated runtime reads" {
 
     const archive_artifact = handleRequest(&ctx, "POST", "/v1/artifacts", "{\"type\":\"page\",\"title\":\"Primitive Archive Artifact\",\"body\":\"Primitive archive artifact body\",\"scope\":\"public\",\"store\":\"archive\"}", "POST /v1/artifacts HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", archive_artifact.status);
+    _ = try testingDrainWorkerJobs(&store, alloc);
     const archive_artifact_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Primitive archive artifact body\",\"store\":\"archive\",\"use_vector\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", archive_artifact_search.status);
     try std.testing.expect(std.mem.indexOf(u8, archive_artifact_search.body, "Primitive Archive Artifact") != null);
@@ -20043,6 +20054,7 @@ test "api agent memory supports named stores and federated runtime reads" {
 
     const scratch_atom = handleRequest(&ctx, "POST", "/v1/memory-atoms", "{\"text\":\"Primitive scratch atom body\",\"scope\":\"public\",\"created_by\":\"agent\",\"store\":\"scratch\"}", "POST /v1/memory-atoms HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", scratch_atom.status);
+    _ = try testingDrainWorkerJobs(&store, alloc);
     const scratch_atom_search = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Primitive scratch atom body\",\"store\":\"scratch\",\"use_vector\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n{}");
     try std.testing.expectEqualStrings("200 OK", scratch_atom_search.status);
     try std.testing.expect(std.mem.indexOf(u8, scratch_atom_search.body, "Primitive scratch atom body") != null);
@@ -21493,6 +21505,7 @@ test "api memory feed endpoints honor named runtime route selection" {
     try std.testing.expectEqualStrings("200 OK", source_apply.status);
     const source_retry = handleRequest(&ctx, "POST", "/v1/memory/apply?store=scratch", source_apply_body, "");
     try std.testing.expectEqualStrings("200 OK", source_retry.status);
+    _ = try testingDrainWorkerJobs(&store, alloc);
     const scratch_source = handleRequest(&ctx, "GET", "/v1/agent-memory/primitive:source:src_routed_apply?store=scratch&scope=public", "", "");
     try std.testing.expectEqualStrings("200 OK", scratch_source.status);
     try std.testing.expect(std.mem.indexOf(u8, scratch_source.body, "Scratch routed source body") != null);
@@ -21968,6 +21981,7 @@ test "api memory checkpoint restore preserves primitive named runtime mirrors" {
     const restore = handleRequest(&target_ctx, "POST", "/v1/memory/checkpoint", checkpoint.body, "POST /v1/memory/checkpoint HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", restore.status);
     try std.testing.expect(std.mem.indexOf(u8, restore.body, "\"applied_events\"") != null);
+    _ = try testingDrainWorkerJobs(&target_store, target_arena.allocator());
 
     const scratch_source = handleRequest(&target_ctx, "POST", "/v1/search", "{\"query\":\"Checkpoint scratch primitive body\",\"store\":\"scratch\",\"use_vector\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", scratch_source.status);
@@ -22007,6 +22021,7 @@ test "api runtime primitive mirrors honor canonical memory atom lifecycle" {
     const atom_body = try std.fmt.allocPrint(alloc, "{{\"text\":\"Lifecycle mirror unique atom\",\"scope\":\"public\",\"created_by\":\"agent\",\"source_ids\":[\"{s}\"],\"store\":\"scratch\"}}", .{source_id});
     const atom = handleRequest(&ctx, "POST", "/v1/memory-atoms", atom_body, raw);
     try std.testing.expectEqualStrings("200 OK", atom.status);
+    _ = try testingDrainWorkerJobs(&store, alloc);
     const atom_id = try extractJsonString(alloc, atom.body, "\"id\":\"");
 
     const before = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"Lifecycle mirror unique atom\",\"store\":\"scratch\",\"use_vector\":false,\"limit\":10}", "POST /v1/search HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
@@ -22017,6 +22032,7 @@ test "api runtime primitive mirrors honor canonical memory atom lifecycle" {
     const deleted = handleRequest(&ctx, "DELETE", delete_path, "", "DELETE /v1/memory-atoms HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", deleted.status);
     try std.testing.expect(std.mem.indexOf(u8, deleted.body, "\"status\":\"deprecated\"") != null);
+    _ = try testingDrainWorkerJobs(&store, alloc);
     const patch_feed = handleRequest(&ctx, "GET", "/v1/memory/events?limit=100", "", "GET /v1/memory/events?limit=100 HTTP/1.1\r\nAuthorization: Bearer agent-route\r\n\r\n");
     try std.testing.expectEqualStrings("200 OK", patch_feed.status);
     try std.testing.expect(std.mem.indexOf(u8, patch_feed.body, "\"event_type\":\"memory_atom.delete\"") != null);
@@ -22355,7 +22371,12 @@ test "api memory curated facade edits MEMORY and USER bootstrap prompts" {
 
     const remove = handleRequest(&ctx, "POST", "/v1/memory/curated", "{\"action\":\"remove\",\"target\":\"memory\",\"old_text\":\"Zig 0.16\"}", "");
     try std.testing.expectEqualStrings("200 OK", remove.status);
-    try std.testing.expect(std.mem.indexOf(u8, remove.body, "Zig 0.16 examples") == null);
+    var remove_json = try std.json.parseFromSlice(std.json.Value, alloc, remove.body, .{});
+    defer remove_json.deinit();
+    const remove_entries = remove_json.value.object.get("entries").?.array.items;
+    for (remove_entries) |entry| {
+        try std.testing.expect(std.mem.indexOf(u8, entry.string, "Zig 0.16 examples") == null);
+    }
 
     const rejected = handleRequest(&ctx, "POST", "/v1/memory/curated", "{\"action\":\"add\",\"target\":\"memory\",\"content\":\"<memory-context>hidden</memory-context>\"}", "");
     try std.testing.expectEqualStrings("400 Bad Request", rejected.status);
@@ -22851,6 +22872,7 @@ test "api primitive and ingest surfaces honor query storage selectors" {
     try std.testing.expectEqualStrings("200 OK", ingested.status);
     const connector_ingested = handleRequest(&ctx, "POST", "/v1/connectors/ticket/ingest?store=scratch", "{\"scope\":\"public\",\"run_now\":true,\"items\":[{\"title\":\"Query Routed Connector\",\"content\":\"query routed connector body\"}]}", "");
     try std.testing.expectEqualStrings("200 OK", connector_ingested.status);
+    _ = try testingDrainWorkerJobs(&store, alloc);
 
     const scratch_source = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"query routed source body\",\"store\":\"scratch\",\"use_vector\":false,\"limit\":10}", "");
     try std.testing.expectEqualStrings("200 OK", scratch_source.status);
@@ -22901,6 +22923,7 @@ test "api primitive and ingest surfaces honor query storage selectors" {
 
     const snapshot = handleRequest(&ctx, "POST", "/v1/lifecycle/snapshot/import?store=scratch", "{\"objects\":[{\"object_type\":\"source\",\"title\":\"Snapshot Routed Source\",\"content\":\"snapshot routed source body\",\"scope\":\"public\"},{\"object_type\":\"memory_atom\",\"text\":\"snapshot routed atom body\",\"scope\":\"public\",\"created_by\":\"agent\"},{\"object_type\":\"agent_memory\",\"key\":\"snapshot.routed.pref\",\"content\":\"Snapshot routed agent memory\",\"scope\":\"public\"}]}", "");
     try std.testing.expectEqualStrings("200 OK", snapshot.status);
+    _ = try testingDrainWorkerJobs(&store, alloc);
     const snapshot_source = handleRequest(&ctx, "POST", "/v1/search", "{\"query\":\"snapshot routed source body\",\"store\":\"scratch\",\"use_vector\":false,\"limit\":10}", "");
     try std.testing.expectEqualStrings("200 OK", snapshot_source.status);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_source.body, "Snapshot Routed Source") != null);
@@ -23597,7 +23620,9 @@ test "api exposes engine registry retrieval plan vector and lifecycle endpoints"
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"engine_roles\":{\"records\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"retrieval\":{\"is_backend\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"engine_candidates\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"name\":\"weaviate\",\"primary_role\":\"vectors\"") != null);
+    if (engines.kindEnabled(.weaviate)) {
+        try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"name\":\"weaviate\",\"primary_role\":\"vectors\"") != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, capabilities_resp.body, "\"name\":\"vespa\",\"primary_role\":\"search\"") != null);
     for (engines.descriptors) |descriptor| {
         if (!engines.kindEnabled(descriptor.kind)) continue;

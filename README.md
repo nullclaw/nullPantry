@@ -58,6 +58,11 @@ zig build
 # Compile every backend/runtime adapter.
 zig build -Dengine-profile=full
 
+# Published release image.
+docker run --rm -p 8765:8765 \
+  -e NULLPANTRY_TOKEN=dev-secret \
+  ghcr.io/nullclaw/nullpantry:latest
+
 # Production-style canonical store.
 NULLPANTRY_DATABASE_URL='postgres://user:pass@host:5432/nullpantry' \
 NULLPANTRY_TOKEN='prod-secret' \

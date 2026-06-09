@@ -787,6 +787,7 @@ fn pgvectorQueryParams(allocator: std.mem.Allocator, cfg: Config, runtime: ?*Run
         rt.pgvector_transport_mutex.lockUncancelable(compat.io());
         defer rt.pgvector_transport_mutex.unlock(compat.io());
         const transport = try rt.pgvectorTransport(allocator, cfg);
+        if (params.len == 0) return try transport.queryRaw(allocator, sql);
         return try transport.queryParamsRaw(allocator, sql, params);
     }
     const raw_url = cfg.postgres_url orelse return error.VectorBackendUnavailable;
@@ -794,6 +795,7 @@ fn pgvectorQueryParams(allocator: std.mem.Allocator, cfg: Config, runtime: ?*Run
     defer allocator.free(url);
     var transport = try postgres_transport.QueryTransport.init(allocator, url);
     defer transport.deinit();
+    if (params.len == 0) return try transport.queryRaw(allocator, sql);
     return try transport.queryParamsRaw(allocator, sql, params);
 }
 
@@ -1670,7 +1672,6 @@ fn parseCandidateArray(allocator: std.mem.Allocator, items: []const std.json.Val
 
 fn candidateVectorId(obj: std.json.ObjectMap) ?[]const u8 {
     if (json.stringField(obj, "vector_id")) |id| if (id.len > 0) return id;
-    if (json.stringField(obj, "id")) |id| if (id.len > 0) return id;
     if (obj.get("payload")) |payload| {
         if (payload == .object) {
             if (json.stringField(payload.object, "vector_id")) |id| if (id.len > 0) return id;
@@ -1689,6 +1690,7 @@ fn candidateVectorId(obj: std.json.ObjectMap) ?[]const u8 {
             if (json.stringField(additional.object, "id")) |id| if (id.len > 0) return id;
         }
     }
+    if (json.stringField(obj, "id")) |id| if (id.len > 0) return id;
     if (json.stringField(obj, "_id")) |id| if (id.len > 0) return id;
     return null;
 }
@@ -2653,6 +2655,11 @@ test "lancedb sdk command contract builds lifecycle argv and payloads" {
     try std.testing.expectEqual(@as(usize, 1), candidates.len);
     try std.testing.expectEqualStrings("vec_contract", candidates[0].vector_id);
     try std.testing.expectApproxEqAbs(@as(f32, 0.99), candidates[0].score, 0.0001);
+
+    const qdrant_candidates = try parseCandidates(std.testing.allocator, "{\"result\":[{\"id\":\"backend-uuid\",\"score\":1.0,\"payload\":{\"vector_id\":\"vec_contract\"}}]}");
+    defer freeCandidates(std.testing.allocator, qdrant_candidates);
+    try std.testing.expectEqual(@as(usize, 1), qdrant_candidates.len);
+    try std.testing.expectEqualStrings("vec_contract", qdrant_candidates[0].vector_id);
 }
 
 test "pgvector live vector contract when configured" {

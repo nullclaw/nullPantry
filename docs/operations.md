@@ -39,6 +39,26 @@ Profiles:
 | `full` | Integration and release validation | Every record, memory, vector, graph, analytics, provider, and connector adapter |
 | `custom` | Production-specific binaries | Only explicit `-Drecords`, `-Dagent-memory`, `-Dvectors`, or `-Denable-*` choices |
 
+## Container Image
+
+Tagged releases publish a multi-architecture GHCR image:
+
+```sh
+docker pull ghcr.io/nullclaw/nullpantry:latest
+docker pull ghcr.io/nullclaw/nullpantry:v2026.06.09
+docker pull ghcr.io/nullclaw/nullpantry:2026.06.09
+```
+
+The image runs as a non-root user, stores local state under `/var/lib/nullpantry`, and listens on `0.0.0.0:8765` so Docker port publishing works. Because non-loopback binds require authentication, provide `NULLPANTRY_TOKEN` or `NULLPANTRY_TOKEN_PRINCIPALS` unless you intentionally set `NULLPANTRY_ALLOW_NO_AUTH_NON_LOOPBACK=true` for a trusted local-only environment.
+
+```sh
+docker run --rm \
+  -p 8765:8765 \
+  -e NULLPANTRY_TOKEN=prod-secret \
+  -v nullpantry-data:/var/lib/nullpantry \
+  ghcr.io/nullclaw/nullpantry:latest
+```
+
 ## Runtime Home
 
 Use `--home PATH`, `--home=PATH`, or `NULLPANTRY_HOME=PATH` when one local directory should hold NullPantry's default files:
@@ -439,7 +459,7 @@ NULLPANTRY_TEST_REDIS_URL='redis://:password@localhost:6379/0' zig build redis-c
 NULLPANTRY_TEST_QDRANT_URL='http://localhost:6333' zig build qdrant-contract --summary all
 NULLPANTRY_TEST_PGVECTOR_URL='postgres://localhost/nullpantry_test' zig build pgvector-contract --summary all
 NULLPANTRY_TEST_CLICKHOUSE_URL='http://localhost:8123' zig build clickhouse-contract --summary all
-NULLPANTRY_TEST_LANCEDB_URI='.nullpantry/lancedb-contract' zig build lancedb-contract --summary all
+NULLPANTRY_TEST_LANCEDB_URI='.nullpantry/lancedb-contract' NULLPANTRY_TEST_LANCEDB_COMMAND="$(command -v python3)" zig build lancedb-contract --summary all
 zig build lucid-contract --summary all
 ```
 

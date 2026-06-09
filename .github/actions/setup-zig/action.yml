@@ -1,0 +1,53 @@
+name: Setup Zig
+description: Install a pinned Zig toolchain without a JavaScript action runtime.
+inputs:
+  version:
+    description: Zig version to install.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install Zig on Unix
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        version="${{ inputs.version }}"
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) target="x86_64-linux" ;;
+          Linux-aarch64|Linux-arm64) target="aarch64-linux" ;;
+          Darwin-x86_64) target="x86_64-macos" ;;
+          Darwin-arm64) target="aarch64-macos" ;;
+          *)
+            echo "Unsupported Zig runner: $(uname -s)-$(uname -m)" >&2
+            exit 1
+            ;;
+        esac
+
+        archive="$RUNNER_TEMP/zig-$target-$version.tar.xz"
+        install_dir="$RUNNER_TEMP/zig-$version"
+        curl -fsSL "https://ziglang.org/download/$version/zig-$target-$version.tar.xz" -o "$archive"
+        rm -rf "$install_dir"
+        mkdir -p "$install_dir"
+        tar -xJf "$archive" -C "$install_dir" --strip-components=1
+        echo "$install_dir" >> "$GITHUB_PATH"
+        "$install_dir/zig" version
+
+    - name: Install Zig on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $Version = "${{ inputs.version }}"
+        $Target = "x86_64-windows"
+        $Archive = Join-Path $env:RUNNER_TEMP "zig-$Target-$Version.zip"
+        $Extracted = Join-Path $env:RUNNER_TEMP "zig-$Target-$Version"
+        $InstallDir = Join-Path $env:RUNNER_TEMP "zig-$Version"
+
+        Invoke-WebRequest -Uri "https://ziglang.org/download/$Version/zig-$Target-$Version.zip" -OutFile $Archive
+        Remove-Item -Path $Extracted -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+        Expand-Archive -Path $Archive -DestinationPath $env:RUNNER_TEMP -Force
+        Move-Item -Path $Extracted -Destination $InstallDir
+        Add-Content -Path $env:GITHUB_PATH -Value $InstallDir
+        & (Join-Path $InstallDir "zig.exe") version
